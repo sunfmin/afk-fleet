@@ -51,36 +51,54 @@ Do these in order every time the skill is invoked:
 
 ## The coordinator loop
 
-Repeat until the user stops it (or the frontier stays empty past the poll horizon and the user has
-signalled done):
+The coordinator holds **no durable state in its context** — GitHub is the source of truth (see
+"Bounded coordinator context" below). Each pass rebuilds its working set from GitHub, so a fresh
+session and a continued one behave identically. Repeat until the user stops it (or the frontier
+stays empty past the poll horizon and the user has signalled done):
 
-1. **Query the frontier** (step 2 above). A dispatchable issue = `open` + `ready_label` + no
-   `epic_labels` + no assignee + zero open `blocked_by`.
+1. **Rebuild the working set from GitHub** (never from memory). Two derivations:
+   - **Frontier** — the dispatchable set (step 2 above; `open` + `ready_label` + no `epic_labels` +
+     no assignee + zero open `blocked_by`). Run the query + selector in an **ephemeral subagent**
+     that returns only `{dispatch:[…], excluded:[…]}`; the 200-issue JSON stays in the subagent,
+     never the coordinator.
+   - **In-flight** — `open` issues with `assignee == @me`, sub-classified purely from each one's PR +
+     checks: PR green → *awaiting merge*; PR pending → *awaiting CI*; PR red → *failure handling*; no
+     PR yet → probe the worker's **liveness** via orca-cli (bounded, never a transcript read) —
+     alive → still implementing, leave it; no live worker → **orphaned claim**, reconcile it (tear
+     down any stale worktree and re-dispatch, or release the claim).
 2. **Fill to `concurrency`.** For each free slot, take the next frontier issue and **claim it
    atomically**: `gh issue edit <n> --repo <repo> --add-assignee @me`. Re-check it's still
    unassigned right before claiming to avoid races.
 3. **Dispatch a worker.** Create a worktree off latest `base_branch`
    (`git worktree add ../wt-issue-<n> -b issue-<n>-<slug> origin/<base>`), and use the **orca-cli**
    skill to spawn a real Claude Code in it with [references/worker-prompt.md](references/worker-prompt.md)
-   (filled from config + the issue). Track it via the **orchestration** skill's dispatch /
-   `worker_done` / escalation waits.
-4. **On worker done** (PR opened + local gate green), run the **completion gate**, then **merge**
+   (filled from config + the issue). Do **not** read the worker's terminal for its result — a done
+   worker is observed as its **PR** (branch `issue-<n>-*`, body `Closes #<n>`), a blocked worker as an
+   **issue comment** it posts; both surface in the next rebuild (step 1). Touch the worker terminal
+   only for the bounded liveness probe.
+4. **On an in-flight PR going green** (seen in step 1), run the **completion gate**, then **merge**
    (both below).
 5. **On worker failure / gate red / refute / merge conflict**, run **failure handling** (below).
 6. **When all slots idle and the frontier is empty**, `ScheduleWakeup` after `poll_interval_seconds`
-   (~25 min default) and re-poll — this is how newly-created and newly-unblocked issues get picked up.
+   (~25 min default) and re-poll. This idle boundary is also the **reset point**: the working set is
+   near-empty (nothing to remember — it is all in GitHub), so drop it and re-enter fresh at step 1.
+   This is how newly-created and newly-unblocked issues get picked up, and how the context stays
+   bounded over a multi-day run.
 
 ## Completion gate
 
 A worker's PR may merge only when **all** configured gates are green:
 
 - **CI machine gate** — wait for the PR's GitHub checks to pass (`astro build` / lint / tests /
-  render, whatever the repo defines). Progressive: before CI exists, the gate is the issue's
-  acceptance criteria + whatever local build/test exists.
+  render, whatever the repo defines). Read the checks — and on red, the failing-log excerpt — in an
+  **ephemeral subagent** that returns only `{status: green|red, reason}`; raw CI logs never enter the
+  coordinator. Progressive: before CI exists, the gate is the issue's acceptance criteria + whatever
+  local build/test exists.
 - **Independent adversarial verification** (if `gate.adversarial_verify`) — spawn a *separate* agent
   (not the author, doesn't see its reasoning) that re-derives the result and tries to **refute** it
   (e.g. re-solve and assert `final == official answer:`, audit the derivation). Refute-first: any
-  refutation blocks the merge and feeds back as a retry reason.
+  refutation blocks the merge; the verifier **posts it as a PR review comment** (so it is durable and
+  re-readable on retry) and it feeds back as a retry reason.
 
 ## Merge (serialized)
 
@@ -99,11 +117,36 @@ human-gated step — never done here.
 
 Per issue, on any of {worker failed, gate red, adversarial refute, unresolvable rebase conflict}:
 
-1. **Retry up to `retry` times** (default 2): tear down the worktree, create a fresh one, and
-   re-dispatch a worker **with the failure reason / refutation / conflict fed back** in its prompt.
-2. **Still failing → escalate:** remove the assignee, remove `ready_label`, add `escalate_label`
-   (`ready-for-human`), and (if `escalate_comment`) comment the stuck-point with PR + log links.
-   Then **skip it** and move on — the fleet must never silently drop or silently merge bad work.
+1. **Retry up to `retry` times** (default 2). The attempt count lives as an **`afk-attempt/<n>`
+   label** on the issue (not in coordinator memory): read it, and while `n < retry` swap it to
+   `afk-attempt/<n+1>`, tear down the worktree, create a fresh one, and re-dispatch. The failure
+   reason fed into the new worker's prompt is **re-read from where it already lives** — the PR's CI
+   checks, the verifier's PR review comment, or the reproduced rebase conflict — never carried in
+   context.
+2. **Still failing → escalate:** remove the assignee, remove `ready_label` and any `afk-attempt/*`
+   label, add `escalate_label` (`ready-for-human`), and (if `escalate_comment`) comment the
+   stuck-point with PR + log links. Then **skip it** and move on — the fleet must never silently drop
+   or silently merge bad work.
+
+## Bounded coordinator context
+
+The coordinator runs unattended for days, so its context must **not grow without bound** — and it
+does not, because **fleet state lives in GitHub, not in the context.** Five rules enforce that:
+
+- **Re-entrant.** A fresh coordinator, given only the repo + config, rebuilds the identical working
+  set (loop step 1) and continues with zero loss. Compaction, a restart, or a `ScheduleWakeup`
+  re-entry are all safe by construction.
+- **Workers are never read.** Results arrive as PRs, blockers as issue comments; the worker terminal
+  is touched only for a bounded liveness probe — a full worker transcript never enters the context.
+- **Bulky reads are delegated.** The frontier query and the gate/CI read run in ephemeral subagents
+  that return only a compact structured result; raw issue JSON and CI logs live and die in the
+  subagent.
+- **State that isn't naturally in GitHub is put there.** Attempt count is an `afk-attempt/<n>` label;
+  in-flight is reconstructed from `assignee=@me` + PR/checks; failure reasons are re-read at retry,
+  not retained.
+- **Reset is taken, not just allowed.** Each pass recomputes from GitHub instead of referencing the
+  prior pass; the idle poll boundary is the drop-and-re-enter point; harness auto-compaction is the
+  lossless safety net for a long busy stretch.
 
 ## Concurrency
 

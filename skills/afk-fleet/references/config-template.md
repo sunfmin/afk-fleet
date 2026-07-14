@@ -35,7 +35,7 @@ merge:
   delete_branch: true
 
 # --- failure handling ---
-retry: 2                               # per-issue retries (fresh worktree, prior failure fed back)
+retry: 2                               # per-issue retries; count tracked via an afk-attempt/<n> label on the issue
 escalate_label: ready-for-human        # applied (with ready_label removed, assignee cleared) on give-up
 escalate_comment: true                 # comment the stuck-point + PR/log links
 
@@ -52,3 +52,6 @@ poll_interval_seconds: 1500            # idle re-poll cadence (~25 min) via Sche
   repos; turn it on for content/correctness repos where a machine gate can't catch a wrong answer.
 - **Deploy is out of scope.** The fleet's mandate ends at a green merge to `merge.target`. Deploying
   (secrets, live infra) is never done by the fleet.
+- **Reserved labels.** The fleet manages `afk-attempt/<n>` labels itself to track each issue's retry
+  count durably in GitHub — this is what keeps the coordinator stateless (see the skill's "Bounded
+  coordinator context"). Don't hand-edit them or reuse the `afk-attempt/*` prefix for anything else.
