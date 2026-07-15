@@ -83,8 +83,9 @@ second-guess a live owner's workers).
 
 - **Config:** `claim: ref` replaces `claim: assignee`; add `claim_lease_ttl_seconds` (default ~4500,
   3× idle). `refs/afk/*` joins `afk-attempt/*` as fleet-reserved.
-- **Dispatch contract:** `select_frontier.py` keys on `claimed` (from `git ls-remote 'refs/afk/claim/*'`)
-  and `has_open_pr` (from open PRs' `closingIssuesReferences`) instead of the assignee.
+- **Dispatch contract:** the frontier selector keys on `claimed` (from `git ls-remote 'refs/afk/claim/*'`)
+  and `has_open_pr` (from open PRs' `closingIssuesReferences`) instead of the assignee. (The selector
+  itself was later folded into the `afk` tool's decision core — see ADR-0004.)
 - **Pacing coupling:** while holding any claim a fleet may not sleep past ~`claim_lease_ttl`/2, so a
   fleet with in-flight work cannot drop to the deep-idle cadence — the accepted price of a
   time-based lease.

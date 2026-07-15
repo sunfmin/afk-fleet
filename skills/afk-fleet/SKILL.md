@@ -62,9 +62,10 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
    the template and stop; never run on guessed settings.
 2. **Establish this fleet instance** — mint a short unique **instance id** (this launcher run's
    identity, held only in the launcher and injected into every tick, exactly like the authorization
-   below). Probe the claim namespace: push one throwaway ref to `refs/afk/probe` and delete it; if an
-   org ruleset rejects it, fall back to `refs/heads/afk-claim/*` and **warn** that claim refs are then
-   ordinary branches and may trigger `on: push` CI. See [Cooperative multi-fleet](#cooperative-multi-fleet).
+   below). Probe the claim namespace with `afk probe`; if it reports `blocked` (an org ruleset forbids
+   `refs/afk/*`), pass its fallback `--ns refs/heads` to every later `afk` call and **warn** that claim
+   refs are then ordinary branches that may trigger `on: push` CI. See
+   [Cooperative multi-fleet](#cooperative-multi-fleet).
 3. **Preview** — run one `--plan` and show the dispatch plan (which issues, order, concurrency, gate
    steps, merge target).
 4. **Authorize (the one gate)** — state plainly: *"I will push worker branches and **auto-merge**
@@ -87,13 +88,38 @@ Repeat until you stop it:
    idle, `idle_interval` (~25 min). After `idle_ticks_before_sleep` consecutive empty ticks (frontier
    empty **and** no in-flight), drop to the long idle cadence. **While the fleet holds any claim
    (`in_flight > 0`), never sleep past `claim_lease_ttl`/2** — the heartbeat (refreshed inside the
-   tick) must not lapse, or a peer will reclaim live work.
-4. **Stop** on the user's word: run one final **drain** tick that releases claims with no PR yet and
-   retains those with an open PR (see [Cooperative multi-fleet](#cooperative-multi-fleet)), then spawn
-   no more ticks. In-flight workers finish on their own; their PRs are inherited and merged by a peer
-   (or a later run) once the lease expires; escalated issues stay labelled for the human.
+   tick) must not lapse, or a peer will reclaim live work. `afk pace --summary <last summary> --config
+   <config>` encodes exactly these rules (including the `ttl/2` cap) and returns the seconds.
+4. **Stop** on the user's word: run one final **drain** tick that `afk release <n>`s claims with no PR
+   yet and retains those with an open PR (see [Cooperative multi-fleet](#cooperative-multi-fleet)), then
+   spawn no more ticks. In-flight workers finish on their own; their PRs are inherited and merged by a
+   peer (or a later run) once the lease expires; escalated issues stay labelled for the human.
 
 The launcher never dispatches, merges, or reads a worker itself — all of that happens inside a tick.
+
+## Tools (`scripts/afk.py`) — the deterministic muscle
+
+Every **deterministic** step below is a subcommand of `afk.py`; the tick (an LLM) orchestrates and
+judges, but calls the tool for the fixed mechanics rather than re-deriving git/gh incantations from
+prose each pass (ADR-0004). Each prints one JSON object. Pure verdicts live in `afk_decide.py`
+(fixture-tested); effectful ops drive git refs / gh.
+
+| Subcommand | Does | Kind |
+|---|---|---|
+| `afk frontier --stdin` | dispatchable set (the published contract; `--plan` and live agree) | pure |
+| `afk scan` | read all `afk-claim/*` + `afk-heartbeat/*` refs → `{claims, heartbeats}` | effect |
+| `afk classify-claims --instance <id> --ttl <s>` | partition claims → `{mine, peer_live, stale}` | pure core |
+| `afk claim <n> --instance <id>` | atomic create-or-lose the claim ref → `{won}` | effect |
+| `afk reclaim <n> --instance <id> --expect-sha <sha>` | `--force-with-lease` takeover of a stale claim → `{won}` | effect |
+| `afk release <n>` | delete a claim ref (idempotent) | effect |
+| `afk heartbeat --instance <id> --ttl <s>` | refresh my heartbeat if due → `{refreshed}` | effect |
+| `afk next-attempt --labels <csv> --retry <n>` | retry-or-escalate from `afk-attempt/*` | pure |
+| `afk subclassify --pr <s> --checks <s>` | a claim's PR state → awaiting-merge/CI/failure/no-PR | pure |
+| `afk pace --summary <json> --config <json>` | next launcher sleep, with the `ttl/2` cap | pure |
+
+Judgment stays with the tick and is **not** a tool: is the implementation correct (the gate),
+adversarial verify, resolving a rebase conflict, the orphan-vs-alive read of a liveness probe, wording
+an escalation, the human authorization.
 
 ## A tick (`--tick`) — one reconciliation pass
 
@@ -102,41 +128,41 @@ workers it dispatches.
 
 1. **Rebuild the working set from GitHub** (never from memory):
    - **Frontier** — the dispatchable set: `open` + `ready_label` + no `epic_labels` + **unclaimed** +
-     **no open linked PR** + zero open `blocked_by`. Run the query + selector in an **ephemeral
-     sub-read** that returns only `{dispatch:[…], excluded:[…]}` (the 200-issue JSON stays there):
+     **no open linked PR** + zero open `blocked_by`. In an **ephemeral sub-read** (the 200-issue JSON
+     stays there), gather the candidates and hand them to `afk frontier`, which returns only
+     `{dispatch:[…], excluded:[…]}`:
      ```bash
-     gh issue list --repo <repo> --state open --limit 200 \
-       --json number,title,labels | python3 <skill>/scripts/select_frontier.py --stdin \
-         --ready-label "<ready_label>" --epic-labels "<epic_labels csv>"
+     gh issue list --repo <repo> --state open --limit 200 --json number,title,labels \
+       | python3 <skill>/scripts/afk.py frontier --stdin \
+           --ready-label "<ready_label>" --epic-labels "<epic_labels csv>"
      ```
      Three fields aren't in `gh issue list`; set each on the candidates before selecting:
-     - `claimed` ← the claimed-set from one `git ls-remote origin 'refs/afk/claim/*'` (the issue number
-       is in the ref name). This — not the assignee — is "already taken."
+     - `claimed` ← the claimed-set from `afk scan` (`.claims[].number`). This — not the assignee — is
+       "already taken."
      - `has_open_pr` ← issues named by open PRs' closing refs:
        `gh pr list --repo <repo> --state open --json number,closingIssuesReferences`.
      - `open_blockers` ← for each candidate `gh api repos/<owner>/<repo>/issues/<n> --jq
        '.issue_dependencies_summary.blocked_by'` (native `blocked_by`, open only).
-   - **In-flight** — the issues *I* own: each `afk-claim/<n>` ref whose marker names **my**
-     `instance_id`. Sub-classify purely from each one's PR + checks: PR green → *awaiting merge*; PR
-     pending → *awaiting CI*; PR red → *failure handling*; no PR yet → probe the worker's **liveness**
-     via orca-cli (bounded, never a transcript read) — alive → still implementing, leave it; no live
-     worker → **orphaned claim**, reconcile (tear down any stale worktree and re-dispatch, or release
-     the claim by deleting its ref).
-   - **Stale peer claims** — `afk-claim/<n>` refs owned by *another* instance whose `afk-heartbeat/<id>`
-     is expired past `claim_lease_ttl`. These are the only foreign claims I may take: reclaim by an
-     atomic `--force-with-lease` takeover (see [Cooperative multi-fleet](#cooperative-multi-fleet)),
-     then treat as my own in-flight. A peer whose heartbeat is *fresh* is left strictly alone.
+   - **In-flight** — run `afk classify-claims --instance <id> --ttl <claim_lease_ttl>` (it calls `scan`
+     internally) → `{mine, peer_live, stale}`. For each of **`mine`**, get its status from `afk
+     subclassify` on the issue's PR + checks: *awaiting_merge* → merge; *awaiting_ci* → leave;
+     *failure* → failure handling; *no_pr* → probe the worker's **liveness** via orca-cli (bounded,
+     never a transcript read) — alive → still implementing, leave it; no live worker → **orphaned
+     claim**, reconcile (tear down any stale worktree and re-dispatch, or `afk release <n>`).
+   - **Stale peer claims** — the **`stale`** list from `classify-claims` (a peer owns it and its
+     `afk-heartbeat/<id>` is expired past `claim_lease_ttl`) is the only foreign claim I may take:
+     `afk reclaim <n> --instance <id> --expect-sha <the sha scan reported>` (atomic — fails if it moved),
+     then treat as my own in-flight. **`peer_live`** is left strictly alone.
 2. **Act**, in this order:
-   - **Merge** every green in-flight PR (serialized — see below). Delete each merged issue's claim ref.
+   - **Merge** every green in-flight PR (serialized — see below). `afk release <n>` on each merged issue.
    - **Escalate** any retry-exhausted issue (see failure handling).
-   - **Dispatch** to fill free slots up to `concurrency`: **claim atomically** by creating the lock ref
-     `afk-claim/<n>` with my instance marker — if the push is **rejected** (`already exists`), a peer
-     won the race, so skip it. On a won claim, create a worktree off latest `base_branch` (`git
-     worktree add ../wt-issue-<n> -b issue-<n>-<slug> origin/<base>`) and use **orca-cli** to spawn a
-     Claude Code worker with [references/worker-prompt.md](references/worker-prompt.md). Do **not** wait
-     for it. (Claim mechanics: [Cooperative multi-fleet](#cooperative-multi-fleet).)
-   - **Heartbeat** — if I hold ≥1 claim and my `afk-heartbeat/<id>` is older than `claim_lease_ttl`/3,
-     force-push a fresh timestamp. Cheap and stateless: read the old ts from the ref itself.
+   - **Dispatch** to fill free slots up to `concurrency`: `afk claim <n> --instance <id>` — if it
+     returns `{"won": false}`, a peer won the race, so skip it. On `{"won": true}`, create a worktree
+     off latest `base_branch` (`git worktree add ../wt-issue-<n> -b issue-<n>-<slug> origin/<base>`) and
+     use **orca-cli** to spawn a Claude Code worker with
+     [references/worker-prompt.md](references/worker-prompt.md). Do **not** wait for it.
+   - **Heartbeat** — `afk heartbeat --instance <id> --ttl <claim_lease_ttl>`; it refreshes only if due
+     and only matters while I hold ≥1 claim. Cheap, stateless (it reads the old ts from the ref itself).
 3. **Return** the compact summary and **exit**. Freshly-dispatched workers' PRs are picked up by a
    later tick.
 
@@ -148,35 +174,39 @@ an issue), so ownership lives in atomic **git refs** under the hidden `refs/afk/
 liveness in a **per-instance lease**. See
 [ADR-0003](../../docs/adr/0003-cooperative-multi-fleet-claims.md).
 
+All of the mechanics below are `afk.py` subcommands (see [Tools](#tools-scriptsafkpy)); the raw git
+each one runs is shown so the mechanism is legible, but the tick calls the tool.
+
 - **Instance id** — minted once per launcher run at bootstrap, injected into every tick. It stamps
-  every claim this fleet makes and names this fleet's heartbeat.
-- **Claim = create `afk-claim/<n>`** pointing at a marker commit whose message carries
-  `instance=<id> host=<host>`; the ref name is the issue number *only*. Creating a ref that already
-  exists is **rejected by the server** — that rejection *is* the compare-and-swap. Won → proceed;
-  rejected → a peer owns it, skip. The claim ref is immutable after creation.
+  every claim this fleet makes (`--instance <id>`) and names this fleet's heartbeat.
+- **Claim → `afk claim <n> --instance <id>`.** Internally it creates `afk-claim/<n>` pointing at a
+  marker commit carrying `instance=<id> host=<host>`; the ref name is the issue number *only*. Creating
+  a ref that already exists is **rejected by the server** — that rejection *is* the compare-and-swap.
+  `{"won": true}` → proceed; `{"won": false}` (with the current `owner`) → a peer has it, skip. The
+  claim ref is immutable after creation.
   ```bash
   sha=$(git commit-tree $(git hash-object -t tree /dev/null) -m "afk-claim instance=$ID host=$(hostname)")
   git push origin "$sha:refs/afk/claim/$n"    # nonzero exit ⇒ lost the race, back off
   ```
-- **Owner check** — on rebuild, `git ls-remote origin 'refs/afk/claim/*'` lists every claimed issue;
-  read a ref's marker (fetch it, then `git log -1 --format=%s`) to see whose it is. In-flight = claims
-  stamped with *my* id; everything else is a peer's.
-- **Heartbeat (the lease)** — one ref `afk-heartbeat/<id>` carries a timestamp. Any tick holding ≥1
-  claim refreshes it **if due** (`now - ts > claim_lease_ttl/3`) by force-pushing a new marker — read
-  the old ts from the ref, so this stays stateless. **Per instance, not per claim** (claim refs never
-  churn); idle fleets don't heartbeat at all.
-- **Reclaim a stale peer claim** — a foreign claim is reclaimable *only* once its owner's heartbeat is
-  expired past `claim_lease_ttl`. Take it over atomically so two reclaimers can't both win:
+- **Owner check → `afk scan` / `afk classify-claims`.** `scan` lists every `afk-claim/*` ref with its
+  parsed marker; `classify-claims --instance <id> --ttl <s>` partitions them into `mine` / `peer_live`
+  / `stale` (in-flight = `mine`).
+- **Heartbeat (the lease) → `afk heartbeat --instance <id> --ttl <s>`.** One ref `afk-heartbeat/<id>`
+  carries a timestamp; the tool refreshes it **only if due** (`now - ts > ttl/3`) by force-pushing a
+  new marker (it reads the old ts itself, so this stays stateless). **Per instance, not per claim**
+  (claim refs never churn); a fleet holding no claims never beats.
+- **Reclaim a stale peer claim → `afk reclaim <n> --instance <id> --expect-sha <sha>`.** Only the
+  `stale` list is reclaimable. The takeover is atomic (two reclaimers can't both win):
   ```bash
   git push origin --force-with-lease="refs/afk/claim/$n:$sha_i_read" "$my_sha:refs/afk/claim/$n"
   ```
   A peer with a *fresh* heartbeat is left strictly alone — it reconciles its own dead workers locally.
-- **Release / cleanup** — delete the claim ref (`git push origin --delete afk-claim/<n>`) on **merge**,
-  **escalate**, and **orphan-release**. On **graceful stop**, the drain tick releases claims with **no
-  PR yet** and **retains** those with an open PR (a peer inherits and merges the finished PR once the
-  lease expires). The **open-PR guard** — an issue with an open linked PR is never in the frontier — is
-  what makes releasing safe: a still-finishing orphan's PR is never re-dispatched, and a human's PR is
-  left alone. A skipped delete is a **phantom lock** that silently starves an issue.
+- **Release / cleanup → `afk release <n>`** (idempotent) on **merge**, **escalate**, and
+  **orphan-release**. On **graceful stop**, the drain tick releases claims with **no PR yet** and
+  **retains** those with an open PR (a peer inherits and merges the finished PR once the lease expires).
+  The **open-PR guard** — an issue with an open linked PR is never in the frontier — is what makes
+  releasing safe: a still-finishing orphan's PR is never re-dispatched, and a human's PR is left alone.
+  A skipped delete is a **phantom lock** that silently starves an issue.
 - **Namespace fallback** — if bootstrap's probe shows an org ruleset forbids `refs/afk/*`, fall back to
   `refs/heads/afk-claim/*` + `refs/heads/afk-heartbeat/*` and warn that `on: push` CI fires on claim
   churn.
@@ -204,9 +234,9 @@ corrupt `main`:
 2. Re-confirm the gate is still green after the rebase.
 3. `gh pr merge <n> --squash --delete-branch` (per `merge.strategy`). The issue auto-closes via
    `Closes #<n>`.
-4. **Delete the claim** — `git push origin --delete afk-claim/<n>` (a *different* ref from the work
-   branch that `--delete-branch` removed). Then remove the worktree (`worktree_cleanup`) and free the
-   slot. A skipped claim-ref delete is a phantom lock that silently starves the issue.
+4. **Delete the claim** — `afk release <n>` (a *different* ref from the work branch that
+   `--delete-branch` removed). Then remove the worktree (`worktree_cleanup`) and free the slot. A
+   skipped claim-ref delete is a phantom lock that silently starves the issue.
 
 The fleet's mandate **ends at a green merge to `merge.target`.** Deploying is a separate,
 human-gated step — never done here.
@@ -216,15 +246,14 @@ human-gated step — never done here.
 Per issue, on any of {worker failed, gate red, adversarial refute, unresolvable rebase conflict}:
 
 1. **Retry up to `retry` times** (default 2). The attempt count lives as an **`afk-attempt/<n>`
-   label** on the issue (not in tick memory): read it, and while `n < retry` swap it to
-   `afk-attempt/<n+1>`, tear down the worktree, and re-dispatch — **keeping the claim ref** (you still
-   own the issue). The failure reason handed to the new worker is **re-read from where it already
-   lives** — the PR's CI checks, the verifier's PR review comment, or the reproduced rebase conflict —
-   never carried in context.
-2. **Still failing → escalate:** **delete the claim** (`git push origin --delete afk-claim/<n>`),
-   remove `ready_label` and any `afk-attempt/*` label, add `escalate_label` (`ready-for-human`), and
-   (if `escalate_comment`) comment the stuck-point with PR + log links. Then move on — never silently
-   drop or silently merge bad work.
+   label** on the issue (not in tick memory). `afk next-attempt --labels <the issue's labels> --retry
+   <retry>` reads it and returns the verdict: on `{"action":"retry", "to_label":…}`, swap the label,
+   tear down the worktree, and re-dispatch — **keeping the claim ref** (you still own the issue). The
+   failure reason handed to the new worker is **re-read from where it already lives** — the PR's CI
+   checks, the verifier's PR review comment, or the reproduced rebase conflict — never carried in context.
+2. **On `{"action":"escalate"}`:** `afk release <n>` (delete the claim), remove `ready_label` and any
+   `afk-attempt/*` label, add `escalate_label` (`ready-for-human`), and (if `escalate_comment`) comment
+   the stuck-point with PR + log links. Then move on — never silently drop or silently merge bad work.
 
 ## Concurrency
 
