@@ -1,6 +1,8 @@
 # Coordinator context is disposable; fleet state lives in GitHub
 
-**Status:** accepted
+**Status:** accepted — its *single long-lived coordinator* premise is superseded by
+[ADR-0002](0002-launcher-and-disposable-ticks.md) (launcher + disposable ticks); its
+*fleet-state-in-GitHub* foundation (rules 1–5) stands and is what makes disposable ticks safe.
 
 ## Decision
 

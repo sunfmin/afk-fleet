@@ -3,7 +3,7 @@
 Copy this into the **target repo** at `docs/agents/afk-fleet.md`. The fleet reads it on startup.
 Everything is repo-specific here; the skill core is repo-agnostic. Anything omitted uses the
 default shown. `authorize` is intentionally NOT a config key — push+auto-merge is confirmed
-interactively at launch, never pre-armed in a file.
+interactively at launcher startup for the whole run (each tick inherits it), never pre-armed in a file.
 
 ```yaml
 # --- dispatch contract ---
@@ -39,8 +39,10 @@ retry: 2                               # per-issue retries; count tracked via an
 escalate_label: ready-for-human        # applied (with ready_label removed, assignee cleared) on give-up
 escalate_comment: true                 # comment the stuck-point + PR/log links
 
-# --- loop ---
-poll_interval_seconds: 1500            # idle re-poll cadence (~25 min) via ScheduleWakeup
+# --- loop (launcher pacing) ---
+busy_interval_seconds: 90              # re-tick soon (~1.5 min) when the last tick had work / in-flight PRs
+idle_interval_seconds: 1500            # slow re-tick (~25 min) when idle
+idle_ticks_before_sleep: 3             # this many empty ticks (frontier empty + no in-flight) → idle cadence
 ```
 
 ## Notes
@@ -53,5 +55,5 @@ poll_interval_seconds: 1500            # idle re-poll cadence (~25 min) via Sche
 - **Deploy is out of scope.** The fleet's mandate ends at a green merge to `merge.target`. Deploying
   (secrets, live infra) is never done by the fleet.
 - **Reserved labels.** The fleet manages `afk-attempt/<n>` labels itself to track each issue's retry
-  count durably in GitHub — this is what keeps the coordinator stateless (see the skill's "Bounded
-  coordinator context"). Don't hand-edit them or reuse the `afk-attempt/*` prefix for anything else.
+  count durably in GitHub — this is what keeps ticks stateless (see the skill's "Why it runs forever
+  (bounded by construction)"). Don't hand-edit them or reuse the `afk-attempt/*` prefix for anything else.
