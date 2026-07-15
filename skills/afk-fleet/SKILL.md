@@ -41,7 +41,9 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
 - **All durable state lives in GitHub**, so any fresh tick reconstructs the exact working set:
   `afk-claim/<n>` ref = claim (owned by a **fleet instance**) · PR (`Closes #n`) = result · issue
   comment = blocker · `afk-attempt/<n>` label = retry count · `afk-heartbeat/<id>` ref = owner
-  liveness. Nothing is remembered between ticks.
+  liveness. Nothing is remembered between ticks. (The human-facing **status board** comment is a
+  *derived projection* of this state onto the issue surface, re-rendered each tick — never itself a
+  source of truth, and never read back by a tick.)
 
 ## Modes
 
@@ -124,6 +126,7 @@ prose each pass (ADR-0004). Each prints one JSON object. Pure verdicts live in `
 | `afk next-attempt --labels <csv> --retry <n>` | retry-or-escalate from `afk-attempt/*` | pure |
 | `afk subclassify --pr <s> --checks <s>` | a claim's PR state → awaiting-merge/CI/failure/no-PR | pure |
 | `afk pace --summary <json> --config <json>` | next launcher sleep, with the `ttl/2` cap | pure |
+| `afk status <n> --repo <r> --state <json>` | upsert the human-facing progress **status board** comment, idempotently | pure render + effect |
 
 Judgment stays with the tick and is **not** a tool: is the implementation correct (the gate),
 adversarial verify, resolving a rebase conflict, the orphan-vs-alive read of a liveness probe, wording
@@ -183,6 +186,16 @@ spawns).
      orca sets the branch.)
    - **Heartbeat** — `afk heartbeat --instance <id> --ttl <claim_lease_ttl>`; it refreshes only if due
      and only matters while I hold ≥1 claim. Cheap, stateless (it reads the old ts from the ref itself).
+   - **Render progress** (if `progress_comment`) — for each of my claims, upsert the human-facing
+     **status board** so a person reading the issue sees how far along it is (esp. the otherwise-invisible
+     "claimed, coding, no PR yet" phase — the claim lives in the hidden `refs/afk/*` and the assignee is
+     unused). `afk status <n> --repo <repo> --state <json>` renders a progress checklist and writes the
+     one marker-tagged comment **only when it changed** (idempotent — re-entrant ticks and retries never
+     spam). The `phase` is *derived from state this pass already computed*, never a new fact:
+     `no_pr` + live worker → `claimed`; `awaiting_ci` → `pr_open`; `failure` heading to retry →
+     `ci_failed` (pass `attempt`/`retry_max`); `awaiting_merge` → `awaiting_merge`. The two **terminal**
+     phases are upserted **before the claim is released**: `merged` in the merge sequence, `escalated` in
+     the escalate step. The board is human-read only — no tick ever parses it back (ADR-0006).
 3. **Return** the compact summary and **exit**. Freshly-dispatched workers' PRs are picked up by a
    later tick.
 
@@ -254,6 +267,8 @@ corrupt `main`:
 2. Re-confirm the gate is still green after the rebase.
 3. `gh pr merge <n> --squash --delete-branch` (per `merge.strategy`). The issue auto-closes via
    `Closes #<n>`.
+   If `progress_comment`, upsert the terminal board now (`afk status <n> --repo <repo> --state
+   '{"phase":"merged",…}'`) — **before** the release below, while the issue is still one of my claims.
 4. **Delete the claim** — `afk release <n>` (a *different* ref from the work branch that
    `--delete-branch` removed). Then remove the worktree if `worktree_cleanup`
    (`orca worktree rm --worktree issue:<n> --force`, since orca owns it — ADR-0005) and free the slot.
@@ -273,9 +288,12 @@ Per issue, on any of {worker failed, gate red, adversarial refute, unresolvable 
    **keeping the claim ref** (you still own the issue). The
    failure reason handed to the new worker is **re-read from where it already lives** — the PR's CI
    checks, the verifier's PR review comment, or the reproduced rebase conflict — never carried in context.
-2. **On `{"action":"escalate"}`:** `afk release <n>` (delete the claim), remove `ready_label` and any
-   `afk-attempt/*` label, add `escalate_label` (`ready-for-human`), and (if `escalate_comment`) comment
-   the stuck-point with PR + log links. Then move on — never silently drop or silently merge bad work.
+2. **On `{"action":"escalate"}`:** (if `progress_comment`, upsert the terminal board
+   `--state '{"phase":"escalated",…}'` **before** releasing, while it's still my claim), then `afk
+   release <n>` (delete the claim), remove
+   `ready_label` and any `afk-attempt/*` label, add `escalate_label` (`ready-for-human`), and (if
+   `escalate_comment`) comment the stuck-point with PR + log links — the status board points a reader
+   here. Then move on — never silently drop or silently merge bad work.
 
 ## Concurrency
 
@@ -298,5 +316,6 @@ touch shared root config are naturally throttled by the DAG — chain them with 
   only when its heartbeat is expired (**stale claim**), never while it is fresh.
 - **A human reserves an issue by removing `ready_label`**, not by assigning it — the fleet no longer
   reads the assignee. Keep the tracker honest so a peer fleet or a human never double-takes.
-- Reserved: the fleet manages `afk-attempt/<n>` labels **and the `refs/afk/*` ref namespace**
-  (`afk-claim/*`, `afk-heartbeat/*`) itself — don't hand-edit them or reuse those prefixes.
+- Reserved: the fleet manages `afk-attempt/<n>` labels, **the `refs/afk/*` ref namespace**
+  (`afk-claim/*`, `afk-heartbeat/*`), and the single status-board comment tagged `<!--afk:status-->`
+  — don't hand-edit them or reuse those prefixes / that marker.

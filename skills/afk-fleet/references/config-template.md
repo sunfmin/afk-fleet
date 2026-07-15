@@ -43,6 +43,13 @@ retry: 2                               # per-issue retries; count tracked via an
 escalate_label: ready-for-human        # applied (with ready_label removed, claim ref deleted) on give-up
 escalate_comment: true                 # comment the stuck-point + PR/log links
 
+# --- progress (human-facing) ---
+progress_comment: true                 # upsert ONE "status board" comment per issue — a progress checklist
+                                       #   rendered from fleet state (claim + PR + checks + afk-attempt) so a
+                                       #   human reading the issue sees how far along it is, including the
+                                       #   otherwise-invisible "claimed, coding, no PR yet" phase. Edited in
+                                       #   place, never appended; human-read only, never a tick input (ADR-0006).
+
 # --- loop (launcher pacing) ---
 busy_interval_seconds: 90              # re-tick soon (~1.5 min) when the last tick had work / in-flight PRs
 idle_interval_seconds: 1500            # slow re-tick (~25 min) when idle
@@ -61,9 +68,12 @@ claim_lease_ttl_seconds: 4500          # a claim is live while its owner's heart
   repos; turn it on for content/correctness repos where a machine gate can't catch a wrong answer.
 - **Deploy is out of scope.** The fleet's mandate ends at a green merge to `merge.target`. Deploying
   (secrets, live infra) is never done by the fleet.
-- **Reserved labels & refs.** The fleet manages, durably in GitHub, the `afk-attempt/<n>` labels
-  (retry count) and the hidden `refs/afk/*` ref namespace — `afk-claim/<n>` (the claim, one per owned
-  issue) and `afk-heartbeat/<id>` (per-instance liveness). This is what keeps ticks stateless and lets
-  fleets cooperate (see the skill's "Why it runs forever" and ADR-0003). Don't hand-edit them or reuse
-  the `afk-attempt/*` or `refs/afk/*` prefixes. If an org ruleset forbids non-branch refs, the fleet
-  falls back to `refs/heads/afk-claim/*` at bootstrap and warns that `on: push` CI will then fire.
+- **Reserved labels, refs & the status comment.** The fleet manages, durably in GitHub, the
+  `afk-attempt/<n>` labels (retry count), the hidden `refs/afk/*` ref namespace — `afk-claim/<n>` (the
+  claim, one per owned issue) and `afk-heartbeat/<id>` (per-instance liveness) — and, when
+  `progress_comment` is on, the single status-board comment tagged `<!--afk:status-->` (found and
+  overwritten by that marker each tick). This is what keeps ticks stateless and lets fleets cooperate
+  (see the skill's "Why it runs forever" and ADR-0003). Don't hand-edit them or reuse the
+  `afk-attempt/*` / `refs/afk/*` prefixes or the `<!--afk:status-->` marker. If an org ruleset forbids
+  non-branch refs, the fleet falls back to `refs/heads/afk-claim/*` at bootstrap and warns that `on:
+  push` CI will then fire.

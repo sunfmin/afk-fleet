@@ -88,6 +88,45 @@ def test_next_attempt():
         {"action": "escalate", "from_label": "afk-attempt/3"}
 
 
+def test_render_status_board():
+    # ci_failed: PR opened, gate red, retrying — the two happy steps ticked, the
+    # rest open, and the current-line names the attempt count.
+    body = d.render_status_board({"phase": "ci_failed", "instance": "fl-abc",
+                                  "pr": 123, "attempt": 2, "retry_max": 2})
+    assert body.startswith(d.STATUS_MARKER)          # marker leads → find-or-create anchor
+    assert "认领方 `fl-abc`" in body
+    assert "- [x] 已认领 · worker 实现中" in body
+    assert "- [x] PR 已开 (#123) · 等 CI" in body
+    assert "- [ ] 门已绿 · 待合并" in body
+    assert "- [ ] 已合并" in body
+    assert "CI 失败,修复重试中(2/2)" in body
+
+    # claimed: the invisible phase this whole feature exists to surface.
+    claimed = d.render_status_board({"phase": "claimed", "instance": "x"})
+    assert claimed.count("- [x]") == 1 and "尚无 PR" in claimed
+
+    # merged: every step ticked, none open.
+    merged = d.render_status_board({"phase": "merged", "pr": 7})
+    assert merged.count("- [x]") == 4 and "- [ ]" not in merged
+    assert "已合并,完成" in merged
+
+    # escalated: terminal give-up — only what truly happened stays ticked.
+    esc = d.render_status_board({"phase": "escalated", "pr": 9})
+    assert esc.count("- [x]") == 2 and "已升级给人处理" in esc      # 认领 + PR
+    assert d.render_status_board({"phase": "escalated"}).count("- [x]") == 1  # no PR → only 认领
+
+    # determinism: identical state → identical body (write-only-on-change relies on it).
+    assert d.render_status_board({"phase": "pr_open", "pr": 5}) == \
+        d.render_status_board({"phase": "pr_open", "pr": 5})
+
+    # unknown phase is rejected, not silently rendered.
+    try:
+        d.render_status_board({"phase": "bogus"})
+        assert False, "expected ValueError for unknown phase"
+    except ValueError:
+        pass
+
+
 def test_pace():
     cfg = {"busy_interval_seconds": 90, "idle_interval_seconds": 1500,
            "idle_ticks_before_sleep": 3, "claim_lease_ttl_seconds": TTL}

@@ -118,3 +118,16 @@ instance died mid-flight. It is the only claim a fleet may take from another: re
 `git push --force-with-lease` takeover of the ref, and only then. A live peer's claim is never touched
 — that is what keeps cooperating fleets from cannibalising each other's in-flight work.
 _Avoid_: dead claim, abandoned claim, orphaned claim (that is one's *own* worker-less claim)
+
+**Status board** (a.k.a. progress comment):
+The human-facing projection of an issue's lifecycle onto the issue surface: a **single** comment the
+owning **fleet instance**'s **tick** upserts each **rebuild**, rendering a milestone checklist (claimed
+→ PR open → gate green → merged, with the *ci-failed* and *escalated* off-ramps) **derived** from
+**fleet state**. It exists because the **claim** lives in a hidden ref namespace and the assignee is
+unused, so the "claimed but no PR yet" phase is otherwise invisible to a reader. It is a *rendering* of
+existing state, **never a source of truth** and **never read back by a tick**; it is edited in place
+(idempotent — identical state renders identical text, so re-entrant ticks don't churn it), never
+appended. Contrast the **escalation comment**, which is a durable, appended, re-readable handoff record
+the board merely points to (ADR-0006).
+_Avoid_: progress log (it is upserted, not appended), worklog, status label (a label is machine state;
+this is human narration), progress ref

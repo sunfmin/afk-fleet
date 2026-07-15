@@ -172,6 +172,103 @@ def subclassify_pr(pr_state, checks_state):
 
 
 # --------------------------------------------------------------------------- #
+# Human-facing progress status board — render only (ADR-0006)                  #
+# --------------------------------------------------------------------------- #
+#
+# The fleet's machine state (claim ref + PR + checks + afk-attempt label) is the
+# single source of truth for *decisions*. But a human reading the issue can't see
+# the claim — it lives in the hidden refs/afk/* namespace — and the assignee is
+# unused, so the whole "claimed, worker coding, no PR yet" phase is invisible on
+# the issue surface. The status board projects that lifecycle onto the issue as
+# ONE comment the owning tick upserts each rebuild. It is a *rendering* of state
+# the tick already derived — never a second source of truth, never read back by a
+# tick. Rendered as a GitHub task list so the issue shows a progress meter.
+#
+# Idempotent by construction: the body carries NO wall-clock time, so identical
+# lifecycle state renders identical text; the effectful layer then writes only
+# when the text actually changed, and re-entrant/disposable ticks never spam.
+
+STATUS_MARKER = "<!--afk:status-->"
+
+# The closed set of lifecycle phases the board renders. Happy path plus two
+# off-ramps (ci_failed, escalated) that reuse the same checkboxes + an annotation.
+STATUS_PHASES = ("claimed", "pr_open", "ci_failed", "awaiting_merge", "merged", "escalated")
+
+# Happy-path milestones, in order — these are the task-list checkboxes.
+_STATUS_STEPS = (
+    ("claimed",        "已认领 · worker 实现中"),
+    ("pr_open",        "PR 已开 · 等 CI"),
+    ("awaiting_merge", "门已绿 · 待合并"),
+    ("merged",         "已合并"),
+)
+
+# How far along the happy path each phase has reached (index of the last DONE
+# step). escalated is a terminal give-up handled specially in `render_status_board`.
+_PHASE_REACHED = {
+    "claimed": 0, "pr_open": 1, "ci_failed": 1, "awaiting_merge": 2, "merged": 3,
+    "escalated": 1,
+}
+
+
+def _status_current_line(phase, attempt, retry_max):
+    """The single ▸/✅/⚠️ 'where are we now' line under the checklist."""
+    if phase == "claimed":
+        return "▸ 当前:worker 实现中,尚无 PR"
+    if phase == "pr_open":
+        return "▸ 当前:等 CI"
+    if phase == "ci_failed":
+        return f"▸ 当前:CI 失败,修复重试中({attempt}/{retry_max}) —— 见下方 CI 与评论"
+    if phase == "awaiting_merge":
+        return "▸ 当前:门已绿,待合并"
+    if phase == "merged":
+        return "✅ 已合并,完成"
+    return "⚠️ 已升级给人处理 —— 见下方评论"   # escalated
+
+
+def render_status_board(state):
+    """
+    Render the human-facing progress *status board* comment body. Pure: a function
+    of the discrete lifecycle state the tick already derived from fleet state; no
+    I/O and no clock, so identical state → identical body (this is what lets the
+    upsert write only when it changed, and keeps re-entrant ticks from spamming).
+    Human-read only — never parsed back as a source of truth.
+
+      state = {
+        "phase":     one of STATUS_PHASES (required),
+        "instance":  owning fleet-instance id (str, optional — shown in the header),
+        "pr":        PR number (int) or None,
+        "attempt":   current attempt n (int, default 0)  — shown only for ci_failed,
+        "retry_max": max retries (int, default 2)         — shown only for ci_failed,
+      }
+    Returns the full markdown body, led by STATUS_MARKER (the find-or-create anchor).
+    """
+    phase = state.get("phase")
+    if phase not in STATUS_PHASES:
+        raise ValueError(f"unknown status phase: {phase!r}")
+    pr = state.get("pr")
+    attempt = int(state.get("attempt", 0) or 0)
+    retry_max = int(state.get("retry_max", 2) or 0)
+    inst = state.get("instance")
+    reached = _PHASE_REACHED[phase]
+    escalated = phase == "escalated"
+
+    def done(i, key):
+        if escalated:              # terminal give-up: only what truly happened stays ticked
+            return i == 0 or (key == "pr_open" and bool(pr))
+        return i <= reached
+
+    header = "**afk-fleet 进度**" + (f" · 认领方 `{inst}`" if inst else "")
+    lines = [STATUS_MARKER, header, ""]
+    for i, (key, label) in enumerate(_STATUS_STEPS):
+        if key == "pr_open" and pr:
+            label = f"PR 已开 (#{pr}) · 等 CI"
+        lines.append(f"- [{'x' if done(i, key) else ' '}] {label}")
+    lines.append("")
+    lines.append(_status_current_line(phase, attempt, retry_max))
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
 # Retry accounting + launcher pacing                                          #
 # --------------------------------------------------------------------------- #
 

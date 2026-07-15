@@ -56,6 +56,13 @@ def _git(args, check=True):
     return p
 
 
+def _gh(args, check=True):
+    p = subprocess.run(["gh", *args], capture_output=True, text=True, env=_GIT_ENV)
+    if check and p.returncode != 0:
+        raise RuntimeError(f"gh {' '.join(args[:2])} failed: {p.stderr.strip()}")
+    return p
+
+
 def _marker_commit(message):
     """A parentless commit on the empty tree, carrying `message`. Its sha is what
     we push to a ref; it drags none of the repo history along."""
@@ -200,6 +207,44 @@ def cmd_heartbeat(a):
     return {"refreshed": True, "ts": now, "ref": ref}
 
 
+def _find_status_comment(repo, number):
+    """Find the fleet's existing status-board comment by its marker.
+    Returns (comment_id, body), or (None, None) if there isn't one yet."""
+    jq = f'.[] | select((.body // "") | contains("{afk_decide.STATUS_MARKER}")) | {{id, body}}'
+    p = _gh(["api", "--paginate", f"repos/{repo}/issues/{number}/comments", "--jq", jq], check=False)
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr.strip())
+    for line in p.stdout.splitlines():
+        line = line.strip()
+        if line:
+            obj = json.loads(line)
+            return obj.get("id"), obj.get("body", "")
+    return None, None
+
+
+def cmd_status(a):
+    """Upsert the human-facing progress status board comment (idempotent, ADR-0006).
+    Renders the body from the injected discrete state (pure), then find-or-create by
+    marker and write ONLY when the body changed — so re-entrant/disposable ticks and
+    retry re-dispatches never spam the issue. `--print` renders without touching gh."""
+    state = json.loads(a.state)
+    body = afk_decide.render_status_board(state)
+    if a.print_only:
+        return {"action": "render-only", "issue": a.number, "body": body}
+    if not a.repo:
+        raise ValueError("--repo owner/name is required unless --print")
+    cid, cur = _find_status_comment(a.repo, a.number)
+    if cid is None:
+        p = _gh(["api", "--method", "POST", f"repos/{a.repo}/issues/{a.number}/comments",
+                 "-f", f"body={body}"], check=True)
+        return {"action": "created", "issue": a.number, "comment_id": json.loads(p.stdout).get("id")}
+    if (cur or "").strip() == body.strip():
+        return {"action": "unchanged", "issue": a.number, "comment_id": cid}
+    _gh(["api", "--method", "PATCH", f"repos/{a.repo}/issues/comments/{cid}",
+         "-f", f"body={body}"], check=True)
+    return {"action": "updated", "issue": a.number, "comment_id": cid}
+
+
 def cmd_probe(a):
     """Decide the claim namespace: can we push under refs/afk/*? Else fall back to
     branches (refs/heads/afk-claim/*) and flag that on:push CI will fire."""
@@ -311,6 +356,16 @@ def build_parser():
     # probe
     p = sub.add_parser("probe", help="pick the claim namespace (effectful)")
     add_ns(p); p.add_argument("--now", type=int, default=None); p.set_defaults(fn=cmd_probe)
+
+    # status — human-facing progress board (effectful, idempotent; ADR-0006)
+    p = sub.add_parser("status", help="upsert the human-facing progress status board comment (effectful, idempotent)")
+    p.add_argument("number", type=int)
+    p.add_argument("--repo", default=None, help="owner/name (for gh api; required unless --print)")
+    p.add_argument("--state", required=True,
+                   help='JSON: {"phase":…,"instance":…,"pr":…,"attempt":…,"retry_max":…}')
+    p.add_argument("--print", dest="print_only", action="store_true",
+                   help="render the body only, do not touch GitHub")
+    p.set_defaults(fn=cmd_status)
 
     # pace
     p = sub.add_parser("pace", help="next launcher sleep in seconds (pure)")
