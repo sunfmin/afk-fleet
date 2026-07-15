@@ -45,7 +45,8 @@ per-tick summary.
 ## Consequences
 
 - Published modes: `/afk-fleet` = **launcher** (default); `--tick` = one reconciliation pass (what the
-  launcher spawns, also runnable headless); `--plan` = dry-run preview.
+  launcher spawns, also runnable headless); `--plan` = **`--tick` short-circuited before the Act
+  phase** — same **rebuild**, returns the dispatch plan instead of acting (see the refinement below).
 - **Authorization is per-run, launcher-held.** Confirmed interactively once at bootstrap (the human is
   present), injected into each tick's spawn prompt, gone when the launcher stops. Not a config key; no
   dead-man re-confirm (that would fight permanent unattended runtime). A cold `--tick` without an
@@ -57,3 +58,33 @@ per-tick summary.
 - ADR-0001's rules 1–5 (re-entrancy, workers-never-read, in-flight-reconstructed, retry-label +
   reason-re-read, bulky-reads-delegated) carry over unchanged and now run *inside a tick*. Its rule 6
   ("reset taken at the idle boundary + auto-compaction") is replaced by structural per-tick reset.
+
+## Refinement (2026-07-15): the launcher is thin *by construction*, and `--plan` is the tick short-circuited
+
+A launcher run against a real repo showed the launcher accreting context the design meant to keep out:
+it read the `afk.py` / `afk_decide.py` tool source and `worker-prompt.md` (all tick-only), and computed
+the whole frontier *in its own context* for the bootstrap preview — then the first tick rebuilt all of
+it again. None of that threatens the multi-day flatness (bootstrap is one-time), but it contradicts the
+premise that the launcher does no coordination, and each interactive re-preview ("start again") repeats
+the bloat.
+
+Two decisions tighten this:
+
+- **The launcher reads only its repo config, and delegates the preview to a subagent.** It never reads
+  the skill's tool source or `worker-prompt.md` (it calls `afk` subcommands and spawns ticks; it never
+  needs their internals), and it never computes a **frontier** in its own context. The bootstrap
+  preview is a **plan tick** subagent whose returned plan the human authorizes against. So the
+  launcher's *first* coordination action is already "spawn a subagent, ingest a summary" — thin by
+  construction, not by later compaction (which ADR-0001 rule 6 and this ADR both reject as the
+  mechanism).
+- **`--plan` is `--tick` short-circuited before the Act phase.** One procedure: rebuild the working set
+  (frontier + in-flight + stale classification), then, in plan mode, return the dispatch plan and exit
+  instead of merging / dispatching / reclaiming. A single source of truth for "what will happen this
+  pass" — the preview a human authorizes against is computed by the exact code path a live tick runs,
+  so it cannot drift. Standalone `/afk-fleet --plan` runs the same short-circuit inline in a disposable
+  one-shot session (flatness is moot there — it exits immediately).
+
+Considered and rejected: **inline bootstrap preview + a `/compact` before the loop.** It works, but it
+is "flat by discipline / hoped-for compaction" — exactly the mechanism ADR-0001 rule 6 and this ADR
+replace with structural reset. Delegating the preview to a subagent keeps the launcher flat from its
+first action with no reliance on compaction.

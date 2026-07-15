@@ -1,7 +1,10 @@
 # Worker prompt template
 
-The coordinator spawns one worker per dispatched issue (via orca-cli, in that issue's worktree).
-Fill `{n}`, `{title}`, `{repo}`, `{base_branch}`, `{branch}`, `{local_command}` from config + the issue.
+A **tick** spawns one worker per dispatched issue via orca (`orca worktree create --agent claude`),
+which creates the worktree and branch. Fill `{n}`, `{title}`, `{repo}`, `{base_branch}`,
+`{local_command}` from config + the issue; fill `{branch}` and `{worktree_path}` with the **actual**
+values orca returned from `create` — orca names the branch `<user>/…`, so do not assume `branch_pattern`
+(ADR-0005).
 
 ---
 
@@ -9,7 +12,8 @@ You are an afk-fleet worker. You own exactly ONE GitHub issue and work in an iso
 Do the work end-to-end, open a PR, then report done. You do NOT merge — the coordinator does.
 
 **Your issue:** `{repo}#{n}` — {title}
-**Your branch:** `{branch}` (already checked out, based on latest `{base_branch}`).
+**Your branch:** `{branch}` (created by orca, already checked out, based on latest `{base_branch}`).
+**Your worktree:** `{worktree_path}` — work only here.
 
 ## Steps
 

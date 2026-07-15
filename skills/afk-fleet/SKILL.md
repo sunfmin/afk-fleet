@@ -23,7 +23,7 @@ context-bounded:
 |---|---|---|
 | **launcher** | The interactive session you invoke `/afk-fleet` in. It authorizes once, then loops: spawn a tick → ingest a one-line summary → pace → repeat. | Long-lived, but only accumulates ~one compact summary per tick (auto-compaction keeps it flat). |
 | **tick** | A **fresh-context [Agent] subagent** that does exactly **one reconciliation pass** against GitHub, then returns a compact structured summary and dies. | Short. Its bulky context is discarded on return. |
-| **worker** | A fire-and-forget autonomous Claude Code spawned by orca in an isolated git worktree, one per issue. Communicates only through GitHub (its PR, and issue comments). | Independent of the coordinator — never read by it. |
+| **worker** | A fire-and-forget autonomous Claude Code spawned by orca — which creates its worktree, branch, and agent terminal in one step — one per issue. Communicates only through GitHub (its PR, and issue comments). | Independent of the coordinator — never read by it. |
 
 **This skill only *consumes* a backlog.** It does not decompose a PRD/epic into issues — that is
 upstream work, and epics are explicitly excluded from dispatch. Assume the issues already exist,
@@ -46,8 +46,10 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
 ## Modes
 
 - `/afk-fleet` — **launcher** (default): bootstrap, then loop spawning ticks. The main entry.
-- `/afk-fleet --plan` — **dry-run**: print the frontier selection + dispatch plan and exit. Spawns
-  nothing, pushes nothing, needs no authorization.
+- `/afk-fleet --plan` — **dry-run**: a **tick short-circuited before the Act phase**. It does the full
+  rebuild (frontier + in-flight + stale classification), prints the dispatch plan, and exits —
+  merges/dispatches/reclaims **nothing**, needs no authorization. Same rebuild code path as `--tick`,
+  so the plan can't drift from what a live tick would do (ADR-0002).
 - `/afk-fleet --tick` — **one reconciliation pass** and exit with a summary. This is what the
   launcher spawns each cycle (and what you'd run headless). It auto-merges only under the run
   authorization its launcher injects; invoked cold without it, it dispatches + gates but holds
@@ -66,8 +68,10 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
    `refs/afk/*`), pass its fallback `--ns refs/heads` to every later `afk` call and **warn** that claim
    refs are then ordinary branches that may trigger `on: push` CI. See
    [Cooperative multi-fleet](#cooperative-multi-fleet).
-3. **Preview** — run one `--plan` and show the dispatch plan (which issues, order, concurrency, gate
-   steps, merge target).
+3. **Preview** — spawn a **plan tick** (a `--tick` in plan mode) as an [Agent] subagent and show the
+   dispatch plan it returns (which issues, order, concurrency, gate steps, merge target). The frontier
+   is computed **inside the subagent, never in the launcher's own context**; the launcher only ingests
+   the returned plan (ADR-0002).
 4. **Authorize (the one gate)** — state plainly: *"I will push worker branches and **auto-merge**
    green PRs to `<target>` in `<repo>` unattended — this overrides the standing 'never push without
    asking' rule, for this repo, for this run. Confirm?"* Get an explicit yes. This authorization is
@@ -95,7 +99,11 @@ Repeat until you stop it:
    spawn no more ticks. In-flight workers finish on their own; their PRs are inherited and merged by a
    peer (or a later run) once the lease expires; escalated issues stay labelled for the human.
 
-The launcher never dispatches, merges, or reads a worker itself — all of that happens inside a tick.
+The launcher never dispatches, merges, or reads a worker itself, never computes the frontier in its own
+context, and never reads the tick's files (the `afk.py`/`afk_decide.py` source, `worker-prompt.md`) — it
+reads only the repo config, calls `afk` subcommands, and spawns ticks. All coordination happens inside a
+tick; even the bootstrap preview is a plan-tick subagent. This keeps the launcher thin *by construction*
+(ADR-0002), not by later compaction.
 
 ## Tools (`scripts/afk.py`) — the deterministic muscle
 
@@ -124,7 +132,9 @@ an escalation, the human authorization.
 ## A tick (`--tick`) — one reconciliation pass
 
 A tick is stateless: it rebuilds from GitHub, acts, summarizes, and exits. It never waits for the
-workers it dispatches.
+workers it dispatches. In `--plan` mode it stops after step 1 (**Rebuild**) and returns the plan
+instead of acting — same rebuild, zero side effects (this is what the launcher's bootstrap preview
+spawns).
 
 1. **Rebuild the working set from GitHub** (never from memory):
    - **Frontier** — the dispatchable set: `open` + `ready_label` + no `epic_labels` + **unclaimed** +
@@ -148,7 +158,8 @@ workers it dispatches.
      subclassify` on the issue's PR + checks: *awaiting_merge* → merge; *awaiting_ci* → leave;
      *failure* → failure handling; *no_pr* → probe the worker's **liveness** via orca-cli (bounded,
      never a transcript read) — alive → still implementing, leave it; no live worker → **orphaned
-     claim**, reconcile (tear down any stale worktree and re-dispatch, or `afk release <n>`).
+     claim**, reconcile (tear down any stale worktree with `orca worktree rm --worktree issue:<n>
+     --force` and re-dispatch, or `afk release <n>`).
    - **Stale peer claims** — the **`stale`** list from `classify-claims` (a peer owns it and its
      `afk-heartbeat/<id>` is expired past `claim_lease_ttl`) is the only foreign claim I may take:
      `afk reclaim <n> --instance <id> --expect-sha <the sha scan reported>` (atomic — fails if it moved),
@@ -157,10 +168,19 @@ workers it dispatches.
    - **Merge** every green in-flight PR (serialized — see below). `afk release <n>` on each merged issue.
    - **Escalate** any retry-exhausted issue (see failure handling).
    - **Dispatch** to fill free slots up to `concurrency`: `afk claim <n> --instance <id>` — if it
-     returns `{"won": false}`, a peer won the race, so skip it. On `{"won": true}`, create a worktree
-     off latest `base_branch` (`git worktree add ../wt-issue-<n> -b issue-<n>-<slug> origin/<base>`) and
-     use **orca-cli** to spawn a Claude Code worker with
-     [references/worker-prompt.md](references/worker-prompt.md). Do **not** wait for it.
+     returns `{"won": false}`, a peer won the race, so skip it. On `{"won": true}`, hand the worktree to
+     **orca** — it owns worktree + branch + spawn in one step; the tick never runs raw `git worktree`
+     ([ADR-0005](../../docs/adr/0005-orca-owns-the-worktree.md)):
+     ```bash
+     git fetch origin <base_branch> --quiet     # the worker must start from the latest base
+     orca worktree create --repo id:<repo-id> --name issue-<n>-<slug> --no-parent \
+          --base-branch <base_branch> --issue <n> --agent claude --json
+     ```
+     Then read the create result for the **actual branch** (orca prefixes `<user>/…`) and the worktree
+     path, fill [references/worker-prompt.md](references/worker-prompt.md) with that real branch + path,
+     wait for the agent (`orca terminal wait --for tui-idle`), and deliver the prompt (`orca terminal
+     send`). Do **not** wait for the worker. (`--name` comes from `branch_pattern` — a name hint only;
+     orca sets the branch.)
    - **Heartbeat** — `afk heartbeat --instance <id> --ttl <claim_lease_ttl>`; it refreshes only if due
      and only matters while I hold ≥1 claim. Cheap, stateless (it reads the old ts from the ref itself).
 3. **Return** the compact summary and **exit**. Freshly-dispatched workers' PRs are picked up by a
@@ -235,8 +255,9 @@ corrupt `main`:
 3. `gh pr merge <n> --squash --delete-branch` (per `merge.strategy`). The issue auto-closes via
    `Closes #<n>`.
 4. **Delete the claim** — `afk release <n>` (a *different* ref from the work branch that
-   `--delete-branch` removed). Then remove the worktree (`worktree_cleanup`) and free the slot. A
-   skipped claim-ref delete is a phantom lock that silently starves the issue.
+   `--delete-branch` removed). Then remove the worktree if `worktree_cleanup`
+   (`orca worktree rm --worktree issue:<n> --force`, since orca owns it — ADR-0005) and free the slot.
+   A skipped claim-ref delete is a phantom lock that silently starves the issue.
 
 The fleet's mandate **ends at a green merge to `merge.target`.** Deploying is a separate,
 human-gated step — never done here.
@@ -248,7 +269,8 @@ Per issue, on any of {worker failed, gate red, adversarial refute, unresolvable 
 1. **Retry up to `retry` times** (default 2). The attempt count lives as an **`afk-attempt/<n>`
    label** on the issue (not in tick memory). `afk next-attempt --labels <the issue's labels> --retry
    <retry>` reads it and returns the verdict: on `{"action":"retry", "to_label":…}`, swap the label,
-   tear down the worktree, and re-dispatch — **keeping the claim ref** (you still own the issue). The
+   tear down the worktree (`orca worktree rm --worktree issue:<n> --force`), and re-dispatch —
+   **keeping the claim ref** (you still own the issue). The
    failure reason handed to the new worker is **re-read from where it already lives** — the PR's CI
    checks, the verifier's PR review comment, or the reproduced rebase conflict — never carried in context.
 2. **On `{"action":"escalate"}`:** `afk release <n>` (delete the claim), remove `ready_label` and any
