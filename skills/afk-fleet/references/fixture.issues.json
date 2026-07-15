@@ -1,6 +1,7 @@
 [
-  { "number": 101, "state": "open", "labels": ["ready-for-agent"], "assignees": [], "open_blockers": 0 },
-  { "number": 102, "state": "open", "labels": ["ready-for-agent"], "assignees": [], "open_blockers": 1 },
-  { "number": 103, "state": "open", "labels": ["epic"], "assignees": [], "open_blockers": 0 },
-  { "number": 104, "state": "open", "labels": ["ready-for-agent"], "assignees": ["sunfmin"], "open_blockers": 0 }
+  { "number": 101, "state": "open", "labels": ["ready-for-agent"], "claimed": false, "has_open_pr": false, "open_blockers": 0 },
+  { "number": 102, "state": "open", "labels": ["ready-for-agent"], "claimed": false, "has_open_pr": false, "open_blockers": 1 },
+  { "number": 103, "state": "open", "labels": ["epic"], "claimed": false, "has_open_pr": false, "open_blockers": 0 },
+  { "number": 104, "state": "open", "labels": ["ready-for-agent"], "claimed": true, "has_open_pr": false, "open_blockers": 0 },
+  { "number": 105, "state": "open", "labels": ["ready-for-agent"], "claimed": false, "has_open_pr": true, "open_blockers": 0 }
 ]

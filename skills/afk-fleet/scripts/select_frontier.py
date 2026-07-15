@@ -4,24 +4,35 @@ select_frontier.py — the afk-fleet dispatch contract, as one pure function.
 
 Given a normalized list of issues, decide which are dispatchable RIGHT NOW.
 This is the single source of truth for "can a worker take this issue?", shared by
-`--plan` (dry-run preview) and the live coordinator loop. Keeping it pure and
-fixture-driven is what makes the fleet's core logic testable without touching gh,
-git worktrees, or the network.
+`--plan` (dry-run preview) and the live tick. Keeping it pure and fixture-driven is
+what makes the fleet's core logic testable without touching gh, git refs, or the
+network.
 
 An issue is dispatchable iff ALL hold:
   - state == "open"
   - the ready label is present               (default: ready-for-agent)
   - NO epic/PRD label is present             (default: epic, prd, wayfinder:map)
-  - it has no assignee                       (assignee == the claim marker)
+  - it is NOT claimed                        (no afk-claim/<n> lock ref exists)
+  - it has NO open linked PR                 (a PR is itself in-flight evidence)
   - it has zero OPEN blocking dependencies   (GitHub native blocked_by, open only)
 
-Input shape (normalized; the live loop builds this from `gh` + the dependencies API):
+Two of these — `claimed` and `has_open_pr` — replace the old `assignee` check.
+Under a shared GitHub account, multiple cooperating fleets can't tell each other
+apart by assignee, so the claim moved to an atomic lock ref `refs/afk/claim/<n>`
+(see ADR-0003). The assignee is no longer a claim signal at all. The live tick
+computes these two booleans from git/gh and passes them in, exactly as it already
+does for `open_blockers`:
+  - `claimed`      ← `git ls-remote origin 'refs/afk/claim/*'` (the claimed-set)
+  - `has_open_pr`  ← open PRs' `closingIssuesReferences`
+Keeping them as pre-computed inputs is what keeps this function pure.
+
+Input shape (normalized; the live tick builds this from `gh` + git refs):
   [{"number": 101, "state": "open", "labels": ["ready-for-agent"],
-    "assignees": [], "open_blockers": 0}, ...]
+    "claimed": false, "has_open_pr": false, "open_blockers": 0}, ...]
 
 Usage:
   select_frontier.py --fixture issues.json
-  gh issue list --json number,state,labels,assignees ... | select_frontier.py --stdin
+  gh issue list --json number,state,labels ... | select_frontier.py --stdin
   select_frontier.py --fixture f.json --ready-label ready-for-agent \
                      --epic-labels epic,prd,wayfinder:map
 
@@ -46,11 +57,24 @@ def _label_names(issue):
     return out
 
 
-def _assignee_count(issue):
-    a = issue.get("assignees", [])
-    if isinstance(a, int):
-        return a
-    return len(a or [])
+def _claimed(issue):
+    """
+    True iff an afk-claim/<n> lock ref exists for this issue (any owner). The live
+    tick derives this from `git ls-remote 'refs/afk/claim/*'`; the fixture passes
+    it directly. This — not the assignee — is the single source of truth for
+    "already taken" (ADR-0003).
+    """
+    return bool(issue.get("claimed", False))
+
+
+def _has_open_pr(issue):
+    """
+    True iff an open PR already closes this issue. A PR is durable in-flight
+    evidence independent of the claim ref, so it keeps a fleet from re-dispatching
+    work that is already done — including a human's PR, or an orphan worker still
+    finishing after its claim was released on graceful stop (ADR-0003).
+    """
+    return bool(issue.get("has_open_pr", False))
 
 
 def _open_blockers(issue):
@@ -82,8 +106,11 @@ def classify(issues, ready_label, epic_labels):
         if hit_epic:
             excluded.append({"number": num, "reason": f"epic label ({', '.join(sorted(hit_epic))})"})
             continue
-        if _assignee_count(issue) > 0:
-            excluded.append({"number": num, "reason": "already claimed (has assignee)"})
+        if _claimed(issue):
+            excluded.append({"number": num, "reason": "already claimed (afk-claim ref exists)"})
+            continue
+        if _has_open_pr(issue):
+            excluded.append({"number": num, "reason": "has an open linked PR"})
             continue
         ob = _open_blockers(issue)
         if ob > 0:

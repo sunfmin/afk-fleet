@@ -2,7 +2,10 @@
 
 **Status:** accepted — its *single long-lived coordinator* premise is superseded by
 [ADR-0002](0002-launcher-and-disposable-ticks.md) (launcher + disposable ticks); its
-*fleet-state-in-GitHub* foundation (rules 1–5) stands and is what makes disposable ticks safe.
+*fleet-state-in-GitHub* foundation (rules 1–5) stands and is what makes disposable ticks safe — except
+that rule 3's *assignee-as-claim* is amended by [ADR-0003](0003-cooperative-multi-fleet-claims.md): the
+claim is now an atomic `refs/afk/claim/<n>` lock ref (assignee dropped), so cooperating fleets under one
+GitHub account can tell their own claims from a peer's.
 
 ## Decision
 
