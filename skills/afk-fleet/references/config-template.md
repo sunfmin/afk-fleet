@@ -8,8 +8,10 @@ interactively at launcher startup for the whole run (each tick inherits it), nev
 ```yaml
 # --- dispatch contract ---
 ready_label: ready-for-agent          # a child issue is dispatchable when it carries this
+                                      #   (a human reserves an issue by REMOVING this label)
 epic_labels: [epic, prd, wayfinder:map]   # never dispatched (a PRD is not a worker task)
-claim: assignee                        # add-assignee @me marks an issue as taken
+claim: ref                            # atomic lock ref refs/afk/claim/<n> marks an issue as taken —
+                                      #   replaces assignee; required for cooperating multi-fleet (ADR-0003)
 dependencies: native                   # GitHub native blocked_by (open blockers gate dispatch)
 
 # --- workers ---
@@ -36,13 +38,16 @@ merge:
 
 # --- failure handling ---
 retry: 2                               # per-issue retries; count tracked via an afk-attempt/<n> label on the issue
-escalate_label: ready-for-human        # applied (with ready_label removed, assignee cleared) on give-up
+escalate_label: ready-for-human        # applied (with ready_label removed, claim ref deleted) on give-up
 escalate_comment: true                 # comment the stuck-point + PR/log links
 
 # --- loop (launcher pacing) ---
 busy_interval_seconds: 90              # re-tick soon (~1.5 min) when the last tick had work / in-flight PRs
 idle_interval_seconds: 1500            # slow re-tick (~25 min) when idle
 idle_ticks_before_sleep: 3             # this many empty ticks (frontier empty + no in-flight) → idle cadence
+claim_lease_ttl_seconds: 4500          # a claim is live while its owner's heartbeat is this fresh (~75 min,
+                                      #   3× idle). A peer may reclaim only a staler claim; while holding a
+                                      #   claim the launcher never sleeps past ttl/2 so the lease can't lapse.
 ```
 
 ## Notes
@@ -54,6 +59,9 @@ idle_ticks_before_sleep: 3             # this many empty ticks (frontier empty +
   repos; turn it on for content/correctness repos where a machine gate can't catch a wrong answer.
 - **Deploy is out of scope.** The fleet's mandate ends at a green merge to `merge.target`. Deploying
   (secrets, live infra) is never done by the fleet.
-- **Reserved labels.** The fleet manages `afk-attempt/<n>` labels itself to track each issue's retry
-  count durably in GitHub — this is what keeps ticks stateless (see the skill's "Why it runs forever
-  (bounded by construction)"). Don't hand-edit them or reuse the `afk-attempt/*` prefix for anything else.
+- **Reserved labels & refs.** The fleet manages, durably in GitHub, the `afk-attempt/<n>` labels
+  (retry count) and the hidden `refs/afk/*` ref namespace — `afk-claim/<n>` (the claim, one per owned
+  issue) and `afk-heartbeat/<id>` (per-instance liveness). This is what keeps ticks stateless and lets
+  fleets cooperate (see the skill's "Why it runs forever" and ADR-0003). Don't hand-edit them or reuse
+  the `afk-attempt/*` or `refs/afk/*` prefixes. If an org ruleset forbids non-branch refs, the fleet
+  falls back to `refs/heads/afk-claim/*` at bootstrap and warns that `on: push` CI will then fire.
