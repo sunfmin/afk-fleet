@@ -16,10 +16,12 @@ dependencies: native                   # GitHub native blocked_by (open blockers
 
 # --- workers ---
 base_branch: main
-branch_pattern: "issue-{number}-{slug}"
-worker: orca                           # orca-cli spawns a real Claude Code in a git worktree
+branch_pattern: "issue-{number}-{slug}"   # worktree-NAME hint passed to `orca worktree create --name`;
+                                      #   orca sets the real branch (prefixed <user>/…) — ADR-0005
+worker: orca                           # the only supported backend: orca creates the worktree + branch
+                                      #   and spawns a real Claude Code in it, in one step (ADR-0005)
 concurrency: 3                         # max workers running at once
-worktree_cleanup: true                 # remove the worktree after merge/escalate
+worktree_cleanup: true                 # after merge/escalate, remove via `orca worktree rm issue:<n>`
 
 # --- completion gate ---
 gate:

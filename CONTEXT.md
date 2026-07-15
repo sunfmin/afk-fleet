@@ -9,10 +9,13 @@ PRs to the target branch.
 
 **Launcher**:
 The interactive session `/afk-fleet` is invoked in. It authorizes once, mints a **fleet-instance**
-id, then loops: spawn a **tick**, ingest its one-line summary, heartbeat + pace, repeat. It does no
-coordination itself, so its context stays flat over a multi-day run. Several launchers — on several
-machines, even under one GitHub account — may run against the same repo at once; they cooperate only
-through **claims**, never a central coordinator.
+id, then loops: spawn a **tick**, ingest its one-line summary, pace, repeat. It does no coordination
+itself: it never computes the **frontier**, never reads tick-only files (the `afk.py`/`afk_decide.py`
+source, `worker-prompt.md`), and delegates even the bootstrap **preview** to a **plan tick**. It is
+thin *by construction* from its first action — it only ever spawns subagents and ingests their compact
+summaries — so its context stays flat over a multi-day run. Several launchers — on several machines,
+even under one GitHub account — may run against the same repo at once; they cooperate only through
+**claims**, never a central coordinator.
 _Avoid_: coordinator (there is no single long-lived coordinator; a tick coordinates one pass),
 orchestrator, manager, main agent
 
@@ -31,10 +34,22 @@ a compact summary, and dies — without waiting for the workers it dispatched. R
 because ticks are disposable, not because one session stays disciplined.
 _Avoid_: batch (implies draining a whole wave), poll (a tick acts, not just observes), coordinator
 
+**Plan tick**:
+A **tick** run in dry-run mode (`--plan`): it does the full **rebuild** (recompute the **frontier**,
+classify claims into mine/peer-live/stale) and then **stops before the Act phase**, returning the
+dispatch plan instead of merging/dispatching/reclaiming. It is the *same* procedure as an acting tick,
+short-circuited — so the plan a human authorizes against at bootstrap cannot drift from what a live
+tick will actually do. Used both for standalone `/afk-fleet --plan` and for the launcher's bootstrap
+preview (spawned there as a subagent, so the launcher never computes a frontier in its own context).
+_Avoid_: dry run (that is its mode, not its name), preview pass
+
 **Worker**:
 A fire-and-forget, ephemeral Claude Code session, isolated in one git worktree, that owns exactly one
 issue, opens a PR, and reports done via GitHub. It never merges, and its terminal is never read for
-its result.
+its result. Its worktree is created and later torn down by the **worker backend** — orca (`orca
+worktree create` / `orca worktree rm`), the only supported backend — never by the tick with raw `git
+worktree`; orca also names the branch (a `<user>/…` prefix), and the tick **reads that back** rather
+than dictating it (ADR-0005).
 _Avoid_: agent (too generic), subagent, child
 
 **Mechanics vs judgment**:
