@@ -37,6 +37,19 @@ issue, opens a PR, and reports done via GitHub. It never merges, and its termina
 its result.
 _Avoid_: agent (too generic), subagent, child
 
+**Mechanics vs judgment**:
+The line that divides the fleet's work into what code owns and what the LLM owns. **Mechanics** are
+the deterministic steps whose inputs uniquely fix the correct action, so a wrong result is a defect,
+not a difference of opinion — selecting the **frontier**, claiming/reclaiming/releasing, the
+mine/live-peer/stale partition, lease arithmetic, retry accounting, pacing. They are extracted into
+tested **tools**. **Judgment** is everything that must read context and can be reasonably contested —
+whether an implementation is correct (the gate), whether a refutation holds, whether a PR-less claim
+is an **orphaned claim** or a live worker still coding, how to word an escalation, granting the run
+authorization. It stays with the **tick** (an LLM). "Extract mechanics to code, keep judgment in the
+LLM" is the fleet's core build rule.
+_Avoid_: automation vs decision, deterministic vs heuristic (near, but this is specifically the
+code/LLM ownership split), script vs agent (the tick is not a script)
+
 **Fleet state**:
 The authoritative record of the fleet's progress — what is claimed, in-flight, gated, merged,
 escalated, and retried. It lives *outside* any context, in GitHub (claim/heartbeat refs, labels, PR
