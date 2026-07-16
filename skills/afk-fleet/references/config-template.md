@@ -72,6 +72,10 @@ force_tick_after_skips: 6              # safety net: a full tick at least every 
   earliest issues have stood up CI.
 - **Adversarial verify** is the pluggable, domain-specific half. Leave it `false` for plain software
   repos; turn it on for content/correctness repos where a machine gate can't catch a wrong answer.
+- **Set `gate.local_command` as soon as the repo can build.** The fleet's most expensive failure is
+  a retry: a red CI gate tears the worker down and a *fresh* worker re-reads the issue, the docs,
+  and the failure from scratch. A local `build && test` gate catches most failures inside the same
+  worker session — a few fix-up edits instead of a full re-spawn plus a CI round-trip.
 - **Fingerprint gate.** On a skipped cycle the launcher spawns no tick — its only cost is the tool
   call — and, while holding claims, refreshes the lease itself (`afk heartbeat`), so skipping never
   lapses a lease. Correctness never depends on the gate: a missed change waits at most
