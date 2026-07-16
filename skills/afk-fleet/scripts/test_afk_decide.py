@@ -251,6 +251,90 @@ def test_assemble_working_set():
     assert {e["number"] for e in ws2["frontier"]["dispatch"]} == {1, 2}
 
 
+def test_parse_config_yaml():
+    text = """
+# leading comment
+ready_label: ready-for-agent          # trailing comment
+epic_labels: [epic, prd]
+concurrency: 5
+worktree_cleanup: false
+branch_pattern: "issue-{number}-{slug}"   # quoted value with a # inside comment
+gate:
+  ci: required
+  adversarial_verify: true
+merge:
+  strategy: rebase
+retry: 3
+"""
+    p = d.parse_config_yaml(text)
+    assert p["ready_label"] == "ready-for-agent"
+    assert p["epic_labels"] == ["epic", "prd"]
+    assert p["concurrency"] == 5 and p["worktree_cleanup"] is False
+    assert p["branch_pattern"] == "issue-{number}-{slug}"
+    assert p["gate"] == {"ci": "required", "adversarial_verify": True}
+    assert p["merge"] == {"strategy": "rebase"}
+    assert p["retry"] == 3          # top-level scalar after a section closes it
+
+    # a whole markdown file: the first ```yaml fence is the config
+    assert d.parse_config_yaml("intro\n```yaml\nretry: 1\n```\nnotes") == {"retry": 1}
+
+    # parsing IS validation: typo'd keys, wrong shapes, and file-armed
+    # authorize are all refused, never silently ignored
+    for bad in ("readylabel: x",            # unknown top-level key
+                "gate:\n  cii: x",          # unknown nested key
+                "retry: soon",              # wrong type
+                "gate: on",                 # scalar for a section
+                "  ci: required",           # indented key outside a section
+                "authorize: true"):         # never a config key
+        try:
+            d.parse_config_yaml(bad)
+            assert False, f"expected ValueError for {bad!r}"
+        except ValueError:
+            pass
+
+
+def test_resolve_config():
+    full = d.resolve_config({})
+    assert full["concurrency"] == 3 and full["gate"]["ci"] == "required"
+    r = d.resolve_config({"concurrency": 5, "gate": {"adversarial_verify": True}})
+    assert r["concurrency"] == 5
+    # deep-merge keeps sibling defaults; untouched sections stay whole
+    assert r["gate"]["adversarial_verify"] is True and r["gate"]["ci"] == "required"
+    assert r["merge"]["strategy"] == "squash"
+    # idempotent: resolving canonical config is a no-op
+    assert d.resolve_config(r) == r
+
+
+def test_pace_omission_is_uniform():
+    # pace resolves partial config through the one defaults table (ADR-0009):
+    # omission defaults instead of crashing, and the ttl/2 cap can no longer
+    # be silently disabled by a missing claim_lease_ttl_seconds.
+    assert d.pace({"in_flight": 0, "empty_streak": 9}, {}) == 1500
+    assert d.pace({"in_flight": 1, "empty_streak": 0}, {"busy_interval_seconds": 999999}) == TTL // 2
+
+
+def test_template_matches_defaults():
+    # the gate on the one unavoidable hand-sync (ADR-0009): the shipped
+    # template must parse clean, and every value it shows must BE the default —
+    # a drifted hand-edit turns this red.
+    import os
+    tpl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "..", "references", "config-template.md")
+    with open(tpl) as f:
+        parsed = d.parse_config_yaml(f.read())
+    full = d.resolve_config({})
+    for k, v in parsed.items():
+        if isinstance(v, dict):
+            for sk, sv in v.items():
+                assert full[k][sk] == sv, f"template drifted at {k}.{sk}: {sv!r}"
+        else:
+            assert full[k] == v, f"template drifted at {k}: {v!r}"
+    # and the template shows every key the schema knows (nothing undocumented)
+    assert set(parsed) == set(d.CONFIG_DEFAULTS)
+    for k in ("gate", "merge"):
+        assert set(parsed[k]) == set(d.CONFIG_DEFAULTS[k]), f"template missing keys in {k}:"
+
+
 def run():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

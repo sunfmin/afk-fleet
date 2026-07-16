@@ -65,9 +65,13 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
 
 ### Bootstrap (once, with the human present)
 
-1. **Load config** — the target repo's `docs/agents/afk-fleet.md` (schema:
-   [references/config-template.md](references/config-template.md)). Missing → offer to create it from
-   the template and stop; never run on guessed settings.
+1. **Load config** — `afk config --file <target repo>/docs/agents/afk-fleet.md` parses + validates
+   the file against the one schema (unknown key or wrong shape → **error, with you present — fix the
+   file, don't guess**) and returns the **canonical config JSON**: every key present, defaults
+   filled (ADR-0009). That JSON is what the launcher holds and injects into every tick — nothing
+   downstream re-parses YAML or re-applies defaults. Missing file → offer to create it from the
+   template ([references/config-template.md](references/config-template.md)) and stop; never run on
+   guessed settings.
 2. **Establish this fleet instance** — mint a short unique **instance id** (this launcher run's
    identity, held only in the launcher and injected into every tick, exactly like the authorization
    below). Probe the claim namespace with `afk probe`; if it reports `blocked` (an org ruleset forbids
@@ -89,11 +93,11 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
 Repeat until you stop it:
 
 1. **Gate the cycle** (if `fingerprint_gate`) — run `afk fingerprint --repo <repo> --last
-   <last_fingerprint> --skips <skips> --force-after <force_tick_after_skips>`. It gathers what a
+   <last_fingerprint> --skips <skips> --config <config>`. It gathers what a
    tick's Rebuild would observe (issues+labels, PRs+checks, claim refs) **inside the tool** — the
    raw JSON never enters the launcher — and returns only `{fingerprint, action, reason, skips}`.
    On `"action": "skip"`: spawn nothing this cycle; if the last summary shows `in_flight > 0`,
-   refresh the lease directly with `afk heartbeat --instance <id> --ttl <claim_lease_ttl>` (the one
+   refresh the lease directly with `afk heartbeat --instance <id> --config <config>` (the one
    coordination-adjacent call the launcher makes itself, precisely so a skipped cycle can never
    lapse a lease), then go to **Pace**. On `"action": "tick"` (changed / forced / first), continue.
 2. **Spawn a tick** — call the [Agent] tool (fresh context) to run one reconciliation pass, passing
@@ -131,15 +135,21 @@ prose each pass (ADR-0004). Each prints one JSON object. Pure verdicts live in `
 
 | Subcommand | Does | Kind |
 |---|---|---|
-| `afk rebuild --repo <r> --instance <id> --ttl <s>` | **one read-only call → the whole working set**: frontier (dispatch+excluded), `mine` subclassified with PR/checks/attempt-labels, `peer_live`, `stale` (with the sha reclaim needs), fingerprint (ADR-0008) | effect gather + pure assembly |
+| `afk config --file <path>` | parse + validate the repo config → **canonical JSON** (every key, defaults filled; unknown key → error). `--defaults` prints the one defaults table (ADR-0009) | pure (file read) |
+| `afk rebuild --repo <r> --instance <id> --config <json>` | **one read-only call → the whole working set**: frontier (dispatch+excluded), `mine` subclassified with PR/checks/attempt-labels, `peer_live`, `stale` (with the sha reclaim needs), fingerprint (ADR-0008) | effect gather + pure assembly |
 | `afk claim <n> --instance <id>` | atomic create-or-lose the claim ref → `{won}` | effect |
 | `afk reclaim <n> --instance <id> --expect-sha <sha>` | `--force-with-lease` takeover of a stale claim → `{won}` | effect |
 | `afk release <n>` | delete a claim ref (idempotent) | effect |
-| `afk heartbeat --instance <id> --ttl <s>` | refresh my heartbeat if due → `{refreshed}` | effect |
-| `afk next-attempt --labels <csv> --retry <n>` | retry-or-escalate from `afk-attempt/*` | pure |
+| `afk heartbeat --instance <id> --config <json>` | refresh my heartbeat if due → `{refreshed}` | effect |
+| `afk next-attempt --labels <csv> --config <json>` | retry-or-escalate from `afk-attempt/*` | pure |
 | `afk pace --summary <json> --config <json>` | next launcher sleep, with the `ttl/2` cap | pure |
-| `afk fingerprint --repo <r> --last <fp> --skips <k> --force-after <N>` | digest observable state → skip-or-tick for the launcher's cycle gate (same gatherer as `rebuild`) | effect gather + pure verdict |
+| `afk fingerprint --repo <r> --last <fp> --skips <k> --config <json>` | digest observable state → skip-or-tick for the launcher's cycle gate (same gatherer as `rebuild`) | effect gather + pure verdict |
 | `afk status <n> --repo <r> --state <json>` | upsert the human-facing progress **status board** comment, idempotently | pure render + effect |
+
+Every config-consuming subcommand takes the **same canonical `--config` JSON** the launcher got from
+`afk config` — passed verbatim, never re-derived; explicit flags (`--ttl`, `--retry`, …) remain as
+overrides for tests and hand-debugging. Resolution is one order everywhere:
+flag → `--config` → the defaults table (ADR-0009).
 
 (The verdicts `rebuild` absorbed — `frontier`, `scan`, `classify-claims`, `subclassify` — still exist
 as undocumented debug surfaces over the same pure core; a tick never calls them.)
@@ -157,8 +167,7 @@ spawns).
 
 1. **Rebuild the working set from GitHub** (never from memory) — **one read-only call** (ADR-0008):
    ```bash
-   python3 <skill>/scripts/afk.py rebuild --repo <repo> --instance <id> --ttl <claim_lease_ttl> \
-       --ready-label "<ready_label>" --epic-labels "<epic_labels csv>"
+   python3 <skill>/scripts/afk.py rebuild --repo <repo> --instance <id> --config '<config json>'
    ```
    It gathers issues + PRs + claim/heartbeat refs once (the same gatherer the launcher's fingerprint
    gate reads through — the raw 200-issue JSON lives and dies inside the tool) and returns the whole
@@ -194,7 +203,7 @@ spawns).
      wait for the agent (`orca terminal wait --for tui-idle`), and deliver the prompt (`orca terminal
      send`). Do **not** wait for the worker. (`--name` comes from `branch_pattern` — a name hint only;
      orca sets the branch.)
-   - **Heartbeat** — `afk heartbeat --instance <id> --ttl <claim_lease_ttl>`; it refreshes only if due
+   - **Heartbeat** — `afk heartbeat --instance <id> --config <config>`; it refreshes only if due
      and only matters while I hold ≥1 claim. Cheap, stateless (it reads the old ts from the ref itself).
    - **Render progress** (if `progress_comment`) — for each of my claims, upsert the human-facing
      **status board** so a person reading the issue sees how far along it is (esp. the otherwise-invisible
@@ -292,8 +301,8 @@ human-gated step — never done here.
 Per issue, on any of {worker failed, gate red, adversarial refute, unresolvable rebase conflict}:
 
 1. **Retry up to `retry` times** (default 2). The attempt count lives as an **`afk-attempt/<n>`
-   label** on the issue (not in tick memory). `afk next-attempt --labels <the issue's labels> --retry
-   <retry>` reads it and returns the verdict: on `{"action":"retry", "to_label":…}`, swap the label,
+   label** on the issue (not in tick memory). `afk next-attempt --labels <the issue's labels>
+   --config <config>` reads it and returns the verdict: on `{"action":"retry", "to_label":…}`, swap the label,
    tear down the worktree (`orca worktree rm --worktree issue:<n> --force`), and re-dispatch —
    **keeping the claim ref** (you still own the issue). The
    failure reason handed to the new worker is **re-read from where it already lives** — the PR's CI

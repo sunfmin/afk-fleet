@@ -8,10 +8,11 @@ Every subcommand prints one JSON object to stdout. Exit 0 = ran (a lost claim ra
 is `{"won": false}`, still exit 0); exit 3 = an operational/git error.
 
 Two layers:
-  - pure verdicts (`frontier`, `pace`, `next-attempt`, `subclassify`, and the
-    decision halves of `rebuild`, `classify-claims`, and `fingerprint`) come
-    from afk_decide.py — no I/O, fixture-tested; time is always injected, never
-    read here.
+  - pure verdicts (`config`, `frontier`, `pace`, `next-attempt`, `subclassify`,
+    and the decision halves of `rebuild`, `classify-claims`, and `fingerprint`)
+    come from afk_decide.py — no I/O, fixture-tested; time is always injected,
+    never read here. Config resolution is one order everywhere:
+    flag → `--config` JSON → CONFIG_DEFAULTS (ADR-0009).
   - effectful ops (`scan`, `claim`, `reclaim`, `release`, `heartbeat`, `probe`)
     drive git refs / gh. Their real test is a scratch-repo integration suite
     (tracked separately) — here they are correct-by-construction and smoke-tested.
@@ -152,7 +153,8 @@ def cmd_classify_claims(a):
     else:
         claims, heartbeats = _scan(a.remote, a.ns)
     now = a.now if a.now is not None else int(time.time())
-    result = afk_decide.classify_claims(claims, heartbeats, a.instance, now, a.ttl)
+    ttl = a.ttl if a.ttl is not None else _cfg(a)["claim_lease_ttl_seconds"]
+    result = afk_decide.classify_claims(claims, heartbeats, a.instance, now, ttl)
     result["now"] = now
     return result
 
@@ -197,15 +199,38 @@ def cmd_heartbeat(a):
     _, hb_ns = _ns_paths(a.ns)
     ref = f"{hb_ns}/{a.instance}"
     now = a.now if a.now is not None else int(time.time())
+    ttl = a.ttl if a.ttl is not None else _cfg(a)["claim_lease_ttl_seconds"]
     cur = _read_marker(a.remote, ref)
     last = cur.get("ts") if cur else None
-    if not afk_decide.heartbeat_due(last, now, a.ttl):
+    if not afk_decide.heartbeat_due(last, now, ttl):
         return {"refreshed": False, "reason": "not due", "ts": last, "ref": ref}
     sha = _marker_commit(_marker_text("afk-heartbeat", a.instance, now))
     p = _git(["push", a.remote, "--force", f"{sha}:{ref}"], check=False)
     if p.returncode != 0:
         raise RuntimeError(p.stderr.strip())
     return {"refreshed": True, "ts": now, "ref": ref}
+
+
+def _cfg(a):
+    """The effective config for a subcommand: `--config` JSON (canonical or
+    partial — resolved through CONFIG_DEFAULTS either way; ADR-0009), else pure
+    defaults. Individual flags override on top: flag → config → defaults."""
+    partial = json.loads(a.config) if getattr(a, "config", None) else {}
+    return afk_decide.resolve_config(partial)
+
+
+def cmd_config(a):
+    """One home for config (ADR-0009): read the target repo's config file (the
+    ```yaml block in docs/agents/afk-fleet.md), validate every key against the
+    schema (unknown key / wrong shape → error — with the human present at
+    bootstrap), fill defaults, and print the canonical JSON the launcher
+    injects into every tick. `--defaults` prints the pure defaults table."""
+    if a.defaults:
+        return afk_decide.resolve_config({})
+    if not a.file:
+        raise ValueError("--file <path to docs/agents/afk-fleet.md> is required unless --defaults")
+    with open(a.file) as f:
+        return afk_decide.resolve_config(afk_decide.parse_config_yaml(f.read()))
 
 
 def _gather(repo, remote, ns):
@@ -236,7 +261,8 @@ def cmd_fingerprint(a):
         issues, prs, claims, _ = _gather(a.repo, a.remote, a.ns)  # heartbeats deliberately
         # unused — see afk_decide.fingerprint
     fp = afk_decide.fingerprint(issues, prs, claims)
-    verdict = afk_decide.fingerprint_gate(a.last, fp, a.skips, a.force_after)
+    force_after = a.force_after if a.force_after is not None else _cfg(a)["force_tick_after_skips"]
+    verdict = afk_decide.fingerprint_gate(a.last, fp, a.skips, force_after)
     return {"fingerprint": fp, **verdict}
 
 
@@ -246,7 +272,10 @@ def cmd_rebuild(a):
     counts for just those candidates, then assemble. The per-issue blocked_by
     read is paid only by issues that pass every cheaper eligibility check.
     Strictly observation: nothing here writes a ref, a comment, or a PR."""
-    epic = a.epic_labels.split(",")
+    cfg = _cfg(a)
+    ready = a.ready_label or cfg["ready_label"]
+    epic = a.epic_labels.split(",") if a.epic_labels else cfg["epic_labels"]
+    ttl = a.ttl if a.ttl is not None else cfg["claim_lease_ttl_seconds"]
     if a.state_json is not None:               # test-injected — no gh/git
         st = json.loads(a.state_json)
         issues, prs = st.get("issues", []), st.get("prs", [])
@@ -262,7 +291,7 @@ def cmd_rebuild(a):
         prov = afk_decide.select_frontier(
             [{**i, "claimed": i.get("number") in claimed,
               "has_open_pr": i.get("number") in pr_nums, "open_blockers": 0}
-             for i in issues], a.ready_label, epic)
+             for i in issues], ready, epic)
         blocked = {}
         for n in prov["dispatch"]:
             v = _gh(["api", f"repos/{a.repo}/issues/{n}",
@@ -270,7 +299,7 @@ def cmd_rebuild(a):
             blocked[n] = 0 if v in ("", "null") else int(v)
     now = a.now if a.now is not None else int(time.time())
     return afk_decide.assemble_working_set(issues, prs, claims, heartbeats, blocked,
-                                           a.instance, now, a.ttl, a.ready_label, epic)
+                                           a.instance, now, ttl, ready, epic)
 
 
 def _find_status_comment(repo, number):
@@ -338,8 +367,10 @@ def _issues_in(a):
 
 def cmd_frontier(a):
     issues = _issues_in(a)
-    return afk_decide.select_frontier(issues, a.ready_label,
-                                      [s for s in a.epic_labels.split(",")])
+    cfg = _cfg(a)
+    ready = a.ready_label or cfg["ready_label"]
+    epic = a.epic_labels.split(",") if a.epic_labels else cfg["epic_labels"]
+    return afk_decide.select_frontier(issues, ready, epic)
 
 
 def cmd_pace(a):
@@ -351,7 +382,8 @@ def cmd_pace(a):
 def cmd_next_attempt(a):
     labels = json.loads(sys.stdin.read()) if a.stdin else \
         [s for s in (a.labels or "").split(",") if s]
-    return afk_decide.next_attempt(labels, a.retry)
+    retry = a.retry if a.retry is not None else _cfg(a)["retry"]
+    return afk_decide.next_attempt(labels, retry)
 
 
 def cmd_subclassify(a):
@@ -370,12 +402,24 @@ def build_parser():
         p.add_argument("--remote", default="origin")
         p.add_argument("--ns", default="refs/afk", help="claim base namespace (or refs/heads fallback)")
 
+    def add_cfg(p):
+        p.add_argument("--config", default=None,
+                       help="canonical config JSON from `afk config` (individual flags override; "
+                            "omitted values fall back to the one defaults table — ADR-0009)")
+
+    # config — one home for every key and default (ADR-0009)
+    p = sub.add_parser("config", help="parse + validate the repo config file → canonical JSON")
+    p.add_argument("--file", default=None, help="path to the target repo's docs/agents/afk-fleet.md")
+    p.add_argument("--defaults", action="store_true", help="print the pure defaults table")
+    p.set_defaults(fn=cmd_config)
+
     # frontier
     p = sub.add_parser("frontier", help="dispatchable set (pure)")
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--fixture"); src.add_argument("--stdin", action="store_true")
-    p.add_argument("--ready-label", default="ready-for-agent")
-    p.add_argument("--epic-labels", default="epic,prd,wayfinder:map")
+    add_cfg(p)
+    p.add_argument("--ready-label", default=None)
+    p.add_argument("--epic-labels", default=None)
     p.set_defaults(fn=cmd_frontier)
 
     # scan
@@ -384,9 +428,9 @@ def build_parser():
 
     # classify-claims
     p = sub.add_parser("classify-claims", help="partition claims into mine/peer_live/stale")
-    add_ns(p)
+    add_ns(p); add_cfg(p)
     p.add_argument("--instance", required=True)
-    p.add_argument("--ttl", type=int, required=True)
+    p.add_argument("--ttl", type=int, default=None)
     p.add_argument("--now", type=int, default=None, help="epoch override (tests)")
     p.add_argument("--claims-json", default=None, help="inject claims, skip git (tests)")
     p.add_argument("--heartbeats-json", default=None)
@@ -413,9 +457,9 @@ def build_parser():
 
     # heartbeat
     p = sub.add_parser("heartbeat", help="refresh my heartbeat if due (effectful)")
-    add_ns(p)
+    add_ns(p); add_cfg(p)
     p.add_argument("--instance", required=True)
-    p.add_argument("--ttl", type=int, required=True)
+    p.add_argument("--ttl", type=int, default=None)
     p.add_argument("--now", type=int, default=None)
     p.set_defaults(fn=cmd_heartbeat)
 
@@ -435,12 +479,12 @@ def build_parser():
 
     # rebuild — one read-only call returns the tick's whole working set (ADR-0008)
     p = sub.add_parser("rebuild", help="gather + assemble the tick's working set (read-only)")
-    add_ns(p)
+    add_ns(p); add_cfg(p)
     p.add_argument("--repo", default=None, help="owner/name (for gh; required unless --state-json)")
     p.add_argument("--instance", required=True)
-    p.add_argument("--ttl", type=int, required=True)
-    p.add_argument("--ready-label", default="ready-for-agent")
-    p.add_argument("--epic-labels", default="epic,prd,wayfinder:map")
+    p.add_argument("--ttl", type=int, default=None)
+    p.add_argument("--ready-label", default=None)
+    p.add_argument("--epic-labels", default=None)
     p.add_argument("--now", type=int, default=None, help="epoch override (tests)")
     p.add_argument("--state-json", default=None,
                    help='inject {"issues","prs","claims","heartbeats","blocked_by"}, skip gh/git (tests)')
@@ -448,11 +492,11 @@ def build_parser():
 
     # fingerprint — the launcher's zero-LLM cycle gate (ADR-0007)
     p = sub.add_parser("fingerprint", help="digest observable state; skip-or-tick verdict for the launcher")
-    add_ns(p)
+    add_ns(p); add_cfg(p)
     p.add_argument("--repo", default=None, help="owner/name (for gh; required unless --state-json)")
     p.add_argument("--last", default="", help="the previous cycle's digest (empty on the first cycle)")
     p.add_argument("--skips", type=int, default=0, help="consecutive skipped cycles so far")
-    p.add_argument("--force-after", type=int, default=6, help="full tick at least every N skips")
+    p.add_argument("--force-after", type=int, default=None, help="full tick at least every N skips")
     p.add_argument("--state-json", default=None,
                    help='inject {"issues":[…],"prs":[…],"claims":[…]}, skip gh/git (tests)')
     p.set_defaults(fn=cmd_fingerprint)
@@ -468,7 +512,8 @@ def build_parser():
     p = sub.add_parser("next-attempt", help="retry-or-escalate from afk-attempt labels (pure)")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--labels", help="comma-separated label names"); g.add_argument("--stdin", action="store_true")
-    p.add_argument("--retry", type=int, default=2)
+    add_cfg(p)
+    p.add_argument("--retry", type=int, default=None)
     p.set_defaults(fn=cmd_next_attempt)
 
     # subclassify
