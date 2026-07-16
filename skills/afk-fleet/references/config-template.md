@@ -57,6 +57,12 @@ idle_ticks_before_sleep: 3             # this many empty ticks (frontier empty +
 claim_lease_ttl_seconds: 4500          # a claim is live while its owner's heartbeat is this fresh (~75 min,
                                       #   3× idle). A peer may reclaim only a staler claim; while holding a
                                       #   claim the launcher never sleeps past ttl/2 so the lease can't lapse.
+fingerprint_gate: true                 # each wake-up the launcher runs `afk fingerprint` (code, zero LLM
+                                      #   tokens) and spawns a tick only when the digest of observable
+                                      #   state (issues+labels, PRs+checks, claim refs) moved (ADR-0007)
+force_tick_after_skips: 6              # safety net: a full tick at least every N skipped cycles — time-
+                                      #   driven events (a peer's lease expiring) are invisible to any
+                                      #   state hash. 1 disables skipping entirely.
 ```
 
 ## Notes
@@ -66,6 +72,10 @@ claim_lease_ttl_seconds: 4500          # a claim is live while its owner's heart
   earliest issues have stood up CI.
 - **Adversarial verify** is the pluggable, domain-specific half. Leave it `false` for plain software
   repos; turn it on for content/correctness repos where a machine gate can't catch a wrong answer.
+- **Fingerprint gate.** On a skipped cycle the launcher spawns no tick — its only cost is the tool
+  call — and, while holding claims, refreshes the lease itself (`afk heartbeat`), so skipping never
+  lapses a lease. Correctness never depends on the gate: a missed change waits at most
+  `force_tick_after_skips` cycles (ADR-0007).
 - **Deploy is out of scope.** The fleet's mandate ends at a green merge to `merge.target`. Deploying
   (secrets, live infra) is never done by the fleet.
 - **Reserved labels, refs & the status comment.** The fleet manages, durably in GitHub, the

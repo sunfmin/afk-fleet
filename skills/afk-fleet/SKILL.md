@@ -38,6 +38,10 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
   hoped-for compaction.
 - The **launcher** does no coordination itself; it only ingests a compact per-tick summary, so its
   own growth is a tiny constant per cycle (and auto-compaction is the safety net).
+- **A cycle whose observable state is unchanged spawns no tick at all** — the launcher's
+  `afk fingerprint` gate (pure code, zero LLM tokens) proves the no-op before any LLM context is
+  created, and a forced full tick every `force_tick_after_skips` cycles backstops what a state hash
+  can't see (ADR-0007). Idle days cost tool calls, not contexts.
 - **All durable state lives in GitHub**, so any fresh tick reconstructs the exact working set:
   `afk-claim/<n>` ref = claim (owned by a **fleet instance**) · PR (`Closes #n`) = result · issue
   comment = blocker · `afk-attempt/<n>` label = retry count · `afk-heartbeat/<id>` ref = owner
@@ -84,19 +88,30 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
 
 Repeat until you stop it:
 
-1. **Spawn a tick** — call the [Agent] tool (fresh context) to run one reconciliation pass, passing
+1. **Gate the cycle** (if `fingerprint_gate`) — run `afk fingerprint --repo <repo> --last
+   <last_fingerprint> --skips <skips> --force-after <force_tick_after_skips>`. It gathers what a
+   tick's Rebuild would observe (issues+labels, PRs+checks, claim refs) **inside the tool** — the
+   raw JSON never enters the launcher — and returns only `{fingerprint, action, reason, skips}`.
+   On `"action": "skip"`: spawn nothing this cycle; if the last summary shows `in_flight > 0`,
+   refresh the lease directly with `afk heartbeat --instance <id> --ttl <claim_lease_ttl>` (the one
+   coordination-adjacent call the launcher makes itself, precisely so a skipped cycle can never
+   lapse a lease), then go to **Pace**. On `"action": "tick"` (changed / forced / first), continue.
+2. **Spawn a tick** — call the [Agent] tool (fresh context) to run one reconciliation pass, passing
    only `{repo, config, authorized: true, instance_id}`. Constrain its return with a schema:
    `{merged:[…], escalated:[…], dispatched:[…], reclaimed:[…], in_flight:N, frontier_remaining:N, note}`.
-2. **Ingest the summary** — keep that one line; discard everything else. Surface a short progress
-   line to the user.
-3. **Pace adaptively** (`ScheduleWakeup`): if the last tick merged/dispatched/reclaimed anything or has
+3. **Ingest the summary** — keep that one line; discard everything else. Surface a short progress
+   line to the user. The launcher's whole inter-cycle state is three small values: the last summary,
+   the last `fingerprint`, and the `skips` streak.
+4. **Pace adaptively** (`ScheduleWakeup`): if the last tick merged/dispatched/reclaimed anything or has
    in-flight PRs pending, wake again in `busy_interval` (~1–2 min) so green PRs merge promptly; if
    idle, `idle_interval` (~25 min). After `idle_ticks_before_sleep` consecutive empty ticks (frontier
    empty **and** no in-flight), drop to the long idle cadence. **While the fleet holds any claim
    (`in_flight > 0`), never sleep past `claim_lease_ttl`/2** — the heartbeat (refreshed inside the
    tick) must not lapse, or a peer will reclaim live work. `afk pace --summary <last summary> --config
    <config>` encodes exactly these rules (including the `ttl/2` cap) and returns the seconds.
-4. **Stop** on the user's word: run one final **drain** tick that `afk release <n>`s claims with no PR
+   A skipped cycle paces off the **previous** summary — the cadence question ("busy or idle?") is
+   unchanged by a cycle that proved nothing moved.
+5. **Stop** on the user's word: run one final **drain** tick that `afk release <n>`s claims with no PR
    yet and retains those with an open PR (see [Cooperative multi-fleet](#cooperative-multi-fleet)), then
    spawn no more ticks. In-flight workers finish on their own; their PRs are inherited and merged by a
    peer (or a later run) once the lease expires; escalated issues stay labelled for the human.
@@ -126,6 +141,7 @@ prose each pass (ADR-0004). Each prints one JSON object. Pure verdicts live in `
 | `afk next-attempt --labels <csv> --retry <n>` | retry-or-escalate from `afk-attempt/*` | pure |
 | `afk subclassify --pr <s> --checks <s>` | a claim's PR state → awaiting-merge/CI/failure/no-PR | pure |
 | `afk pace --summary <json> --config <json>` | next launcher sleep, with the `ttl/2` cap | pure |
+| `afk fingerprint --repo <r> --last <fp> --skips <k> --force-after <N>` | digest observable state → skip-or-tick for the launcher's cycle gate | effect gather + pure verdict |
 | `afk status <n> --repo <r> --state <json>` | upsert the human-facing progress **status board** comment, idempotently | pure render + effect |
 
 Judgment stays with the tick and is **not** a tool: is the implementation correct (the gate),
