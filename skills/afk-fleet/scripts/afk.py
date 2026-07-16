@@ -9,9 +9,9 @@ is `{"won": false}`, still exit 0); exit 3 = an operational/git error.
 
 Two layers:
   - pure verdicts (`frontier`, `pace`, `next-attempt`, `subclassify`, and the
-    decision halves of `classify-claims` and `fingerprint`) come from
-    afk_decide.py — no I/O, fixture-tested; time is always injected, never read
-    here.
+    decision halves of `rebuild`, `classify-claims`, and `fingerprint`) come
+    from afk_decide.py — no I/O, fixture-tested; time is always injected, never
+    read here.
   - effectful ops (`scan`, `claim`, `reclaim`, `release`, `heartbeat`, `probe`)
     drive git refs / gh. Their real test is a scratch-repo integration suite
     (tracked separately) — here they are correct-by-construction and smoke-tested.
@@ -208,25 +208,69 @@ def cmd_heartbeat(a):
     return {"refreshed": True, "ts": now, "ref": ref}
 
 
+def _gather(repo, remote, ns):
+    """The ONE gatherer of the observable fleet inputs (ADR-0008): open issues,
+    open PRs, and the claim/heartbeat ref scan. Both `rebuild` and the
+    launcher's `fingerprint` gate read through here, so their views cannot
+    drift. Raw JSON lives and dies in this process; fields beyond what the
+    digest canonicalizes are harmless — afk_decide.fingerprint ignores them."""
+    issues = json.loads(_gh(["issue", "list", "--repo", repo, "--state", "open",
+                             "--limit", "200", "--json", "number,title,labels,updatedAt"]).stdout)
+    prs = json.loads(_gh(["pr", "list", "--repo", repo, "--state", "open",
+                          "--json",
+                          "number,headRefOid,updatedAt,statusCheckRollup,closingIssuesReferences"]).stdout)
+    claims, heartbeats = _scan(remote, ns)
+    return issues, prs, claims, heartbeats
+
+
 def cmd_fingerprint(a):
-    """The launcher's zero-LLM cycle gate (ADR-0007): gather what a tick's
-    Rebuild would observe, digest it, and return skip-or-tick. Gathering is
-    generous — the raw issue/PR/claim JSON lives and dies inside this process;
-    only the digest + verdict ever reach a context."""
+    """The launcher's zero-LLM cycle gate (ADR-0007): digest what `rebuild`
+    would observe (same gatherer, no blocked_by reads — updatedAt covers those)
+    and return skip-or-tick. Only the digest + verdict ever reach a context."""
     if a.state_json is not None:               # test-injected — no gh/git
         st = json.loads(a.state_json)
         issues, prs, claims = st.get("issues", []), st.get("prs", []), st.get("claims", [])
     else:
         if not a.repo:
             raise ValueError("--repo owner/name is required unless --state-json")
-        issues = json.loads(_gh(["issue", "list", "--repo", a.repo, "--state", "open",
-                                 "--limit", "200", "--json", "number,labels,updatedAt"]).stdout)
-        prs = json.loads(_gh(["pr", "list", "--repo", a.repo, "--state", "open",
-                              "--json", "number,headRefOid,updatedAt,statusCheckRollup"]).stdout)
-        claims, _ = _scan(a.remote, a.ns)      # heartbeats deliberately unused — see afk_decide.fingerprint
+        issues, prs, claims, _ = _gather(a.repo, a.remote, a.ns)  # heartbeats deliberately
+        # unused — see afk_decide.fingerprint
     fp = afk_decide.fingerprint(issues, prs, claims)
     verdict = afk_decide.fingerprint_gate(a.last, fp, a.skips, a.force_after)
     return {"fingerprint": fp, **verdict}
+
+
+def cmd_rebuild(a):
+    """One read-only call → the tick's whole working set (ADR-0008). Gather,
+    run a provisional frontier with blockers assumed 0, fetch open-blocker
+    counts for just those candidates, then assemble. The per-issue blocked_by
+    read is paid only by issues that pass every cheaper eligibility check.
+    Strictly observation: nothing here writes a ref, a comment, or a PR."""
+    epic = a.epic_labels.split(",")
+    if a.state_json is not None:               # test-injected — no gh/git
+        st = json.loads(a.state_json)
+        issues, prs = st.get("issues", []), st.get("prs", [])
+        claims, heartbeats = st.get("claims", []), st.get("heartbeats", {})
+        blocked = {int(k): v for k, v in (st.get("blocked_by") or {}).items()}
+    else:
+        if not a.repo:
+            raise ValueError("--repo owner/name is required unless --state-json")
+        issues, prs, claims, heartbeats = _gather(a.repo, a.remote, a.ns)
+        claimed = {c.get("number") for c in claims}
+        pr_nums = {r.get("number") for p in prs
+                   for r in (p.get("closingIssuesReferences") or [])}
+        prov = afk_decide.select_frontier(
+            [{**i, "claimed": i.get("number") in claimed,
+              "has_open_pr": i.get("number") in pr_nums, "open_blockers": 0}
+             for i in issues], a.ready_label, epic)
+        blocked = {}
+        for n in prov["dispatch"]:
+            v = _gh(["api", f"repos/{a.repo}/issues/{n}",
+                     "--jq", ".issue_dependencies_summary.blocked_by"]).stdout.strip()
+            blocked[n] = 0 if v in ("", "null") else int(v)
+    now = a.now if a.now is not None else int(time.time())
+    return afk_decide.assemble_working_set(issues, prs, claims, heartbeats, blocked,
+                                           a.instance, now, a.ttl, a.ready_label, epic)
 
 
 def _find_status_comment(repo, number):
@@ -388,6 +432,19 @@ def build_parser():
     p.add_argument("--print", dest="print_only", action="store_true",
                    help="render the body only, do not touch GitHub")
     p.set_defaults(fn=cmd_status)
+
+    # rebuild — one read-only call returns the tick's whole working set (ADR-0008)
+    p = sub.add_parser("rebuild", help="gather + assemble the tick's working set (read-only)")
+    add_ns(p)
+    p.add_argument("--repo", default=None, help="owner/name (for gh; required unless --state-json)")
+    p.add_argument("--instance", required=True)
+    p.add_argument("--ttl", type=int, required=True)
+    p.add_argument("--ready-label", default="ready-for-agent")
+    p.add_argument("--epic-labels", default="epic,prd,wayfinder:map")
+    p.add_argument("--now", type=int, default=None, help="epoch override (tests)")
+    p.add_argument("--state-json", default=None,
+                   help='inject {"issues","prs","claims","heartbeats","blocked_by"}, skip gh/git (tests)')
+    p.set_defaults(fn=cmd_rebuild)
 
     # fingerprint — the launcher's zero-LLM cycle gate (ADR-0007)
     p = sub.add_parser("fingerprint", help="digest observable state; skip-or-tick verdict for the launcher")

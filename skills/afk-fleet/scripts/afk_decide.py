@@ -397,3 +397,119 @@ def fingerprint_gate(last, current, skips, force_after):
     if skips + 1 >= int(force_after):
         return {"action": "tick", "reason": "forced", "skips": 0}
     return {"action": "skip", "reason": "unchanged", "skips": skips + 1}
+
+
+# --------------------------------------------------------------------------- #
+# Working-set assembly — the Rebuild's deterministic half (ADR-0008)           #
+# --------------------------------------------------------------------------- #
+#
+# One pure function turns the raw observables (issues, PRs, claim/heartbeat
+# refs, open-blocker counts) into the tick's whole working set — the join the
+# SKILL.md prose used to make every fresh tick re-derive (graft three fields,
+# match each claim to its PR, partition mine/peer_live/stale). The gh/git
+# gather lives in afk.py; the orphan-vs-alive read of a `no_pr` claim (the
+# liveness probe) is deliberately NOT here — that is tick judgment.
+
+_CHECK_RED = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED",
+              "STARTUP_FAILURE", "ERROR"}
+_CHECK_OK = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+
+
+def pr_checks_state(rollup):
+    """Collapse a gh statusCheckRollup into "green" | "red" | "pending" | None.
+    None = no checks at all — the progressive gate's "no CI yet" case, which the
+    tick judges. Accepts CheckRun rows (status/conclusion) and StatusContext
+    rows (state). Any red conclusion wins; anything not conclusively ok
+    (running, PENDING, STALE, unknown) holds the verdict at pending."""
+    if not rollup:
+        return None
+    state = "green"
+    for c in rollup:
+        concl = (c.get("conclusion") or c.get("state") or "").upper()
+        if concl in _CHECK_RED:
+            return "red"
+        if concl not in _CHECK_OK:
+            state = "pending"
+    return state
+
+
+def _closing_pr_map(prs):
+    """issue number → the open PR that closes it. When several do, the highest
+    PR number wins — the latest attempt is the live one."""
+    m = {}
+    for p in prs:
+        for ref in p.get("closingIssuesReferences") or []:
+            n = ref.get("number") if isinstance(ref, dict) else ref
+            if n is None:
+                continue
+            cur = m.get(n)
+            if cur is None or (p.get("number") or 0) > (cur.get("number") or 0):
+                m[n] = p
+    return m
+
+
+def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, ttl,
+                         ready_label, epic_labels):
+    """
+    The tick's whole working set from the raw observables. Pure — afk.py's
+    `rebuild` gathers, this assembles, and a fixture pins the join.
+
+      issues:      gh issue list rows (number, title, labels, updatedAt)
+      prs:         gh pr list rows (number, headRefOid, updatedAt,
+                   statusCheckRollup, closingIssuesReferences)
+      claims:      [{"number","instance","sha",...}]  (ref-scan shape)
+      heartbeats:  {instance: last_ts}
+      blocked_by:  {issue number: open blocker count}; missing → 0. Only
+                   frontier candidates need real counts — every other issue
+                   already fails a cheaper eligibility check first.
+      me/now/ttl:  as classify_claims
+      ready_label/epic_labels: the dispatch contract
+
+    Returns:
+      {"frontier": {"dispatch": [{"number","title"}...], "excluded": [...]},
+       "mine": [{"number","title","status","pr","checks","attempt_labels"}...],
+       "peer_live": [{"number","instance"}...],
+       "stale": [{"number","instance","sha"}...],   # sha feeds reclaim --expect-sha
+       "fingerprint": <digest of the same observables the gate hashes>,
+       "now": now}
+
+    `status` is subclassify_pr's verdict (awaiting_merge / awaiting_ci /
+    failure / no_pr); whether a no_pr claim is an orphan needs the liveness
+    probe and stays with the tick.
+    """
+    by_num = {i.get("number"): i for i in issues}
+    claimed = {c.get("number") for c in claims}
+    pr_for = _closing_pr_map(prs)
+
+    enriched = [{**i,
+                 "claimed": i.get("number") in claimed,
+                 "has_open_pr": i.get("number") in pr_for,
+                 "open_blockers": int(blocked_by.get(i.get("number"), 0))}
+                for i in issues]
+    frontier = select_frontier(enriched, ready_label, epic_labels)
+    frontier["dispatch"] = [{"number": n, "title": by_num.get(n, {}).get("title")}
+                            for n in frontier["dispatch"]]
+
+    part = classify_claims(claims, heartbeats, me, now, ttl)
+    by_claim = {c.get("number"): c for c in claims}
+
+    mine = []
+    for n in part["mine"]:
+        pr = pr_for.get(n)
+        checks = pr_checks_state(pr.get("statusCheckRollup")) if pr else None
+        issue = by_num.get(n, {})
+        mine.append({"number": n, "title": issue.get("title"),
+                     "status": subclassify_pr("open" if pr else "none", checks),
+                     "pr": pr.get("number") if pr else None, "checks": checks,
+                     "attempt_labels": [lb for lb in _label_names(issue)
+                                        if lb.startswith("afk-attempt/")]})
+
+    return {"frontier": frontier,
+            "mine": mine,
+            "peer_live": [{"number": n, "instance": by_claim.get(n, {}).get("instance")}
+                          for n in part["peer_live"]],
+            "stale": [{"number": n, "instance": by_claim.get(n, {}).get("instance"),
+                       "sha": by_claim.get(n, {}).get("sha")}
+                      for n in part["stale"]],
+            "fingerprint": fingerprint(issues, prs, claims),
+            "now": now}

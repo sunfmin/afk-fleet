@@ -131,18 +131,18 @@ prose each pass (ADR-0004). Each prints one JSON object. Pure verdicts live in `
 
 | Subcommand | Does | Kind |
 |---|---|---|
-| `afk frontier --stdin` | dispatchable set (the published contract; `--plan` and live agree) | pure |
-| `afk scan` | read all `afk-claim/*` + `afk-heartbeat/*` refs → `{claims, heartbeats}` | effect |
-| `afk classify-claims --instance <id> --ttl <s>` | partition claims → `{mine, peer_live, stale}` | pure core |
+| `afk rebuild --repo <r> --instance <id> --ttl <s>` | **one read-only call → the whole working set**: frontier (dispatch+excluded), `mine` subclassified with PR/checks/attempt-labels, `peer_live`, `stale` (with the sha reclaim needs), fingerprint (ADR-0008) | effect gather + pure assembly |
 | `afk claim <n> --instance <id>` | atomic create-or-lose the claim ref → `{won}` | effect |
 | `afk reclaim <n> --instance <id> --expect-sha <sha>` | `--force-with-lease` takeover of a stale claim → `{won}` | effect |
 | `afk release <n>` | delete a claim ref (idempotent) | effect |
 | `afk heartbeat --instance <id> --ttl <s>` | refresh my heartbeat if due → `{refreshed}` | effect |
 | `afk next-attempt --labels <csv> --retry <n>` | retry-or-escalate from `afk-attempt/*` | pure |
-| `afk subclassify --pr <s> --checks <s>` | a claim's PR state → awaiting-merge/CI/failure/no-PR | pure |
 | `afk pace --summary <json> --config <json>` | next launcher sleep, with the `ttl/2` cap | pure |
-| `afk fingerprint --repo <r> --last <fp> --skips <k> --force-after <N>` | digest observable state → skip-or-tick for the launcher's cycle gate | effect gather + pure verdict |
+| `afk fingerprint --repo <r> --last <fp> --skips <k> --force-after <N>` | digest observable state → skip-or-tick for the launcher's cycle gate (same gatherer as `rebuild`) | effect gather + pure verdict |
 | `afk status <n> --repo <r> --state <json>` | upsert the human-facing progress **status board** comment, idempotently | pure render + effect |
+
+(The verdicts `rebuild` absorbed — `frontier`, `scan`, `classify-claims`, `subclassify` — still exist
+as undocumented debug surfaces over the same pure core; a tick never calls them.)
 
 Judgment stays with the tick and is **not** a tool: is the implementation correct (the gate),
 adversarial verify, resolving a rebase conflict, the orphan-vs-alive read of a liveness probe, wording
@@ -155,34 +155,28 @@ workers it dispatches. In `--plan` mode it stops after step 1 (**Rebuild**) and 
 instead of acting — same rebuild, zero side effects (this is what the launcher's bootstrap preview
 spawns).
 
-1. **Rebuild the working set from GitHub** (never from memory):
-   - **Frontier** — the dispatchable set: `open` + `ready_label` + no `epic_labels` + **unclaimed** +
-     **no open linked PR** + zero open `blocked_by`. In an **ephemeral sub-read** (the 200-issue JSON
-     stays there), gather the candidates and hand them to `afk frontier`, which returns only
-     `{dispatch:[…], excluded:[…]}`:
-     ```bash
-     gh issue list --repo <repo> --state open --limit 200 --json number,title,labels \
-       | python3 <skill>/scripts/afk.py frontier --stdin \
-           --ready-label "<ready_label>" --epic-labels "<epic_labels csv>"
-     ```
-     Three fields aren't in `gh issue list`; set each on the candidates before selecting:
-     - `claimed` ← the claimed-set from `afk scan` (`.claims[].number`). This — not the assignee — is
-       "already taken."
-     - `has_open_pr` ← issues named by open PRs' closing refs:
-       `gh pr list --repo <repo> --state open --json number,closingIssuesReferences`.
-     - `open_blockers` ← for each candidate `gh api repos/<owner>/<repo>/issues/<n> --jq
-       '.issue_dependencies_summary.blocked_by'` (native `blocked_by`, open only).
-   - **In-flight** — run `afk classify-claims --instance <id> --ttl <claim_lease_ttl>` (it calls `scan`
-     internally) → `{mine, peer_live, stale}`. For each of **`mine`**, get its status from `afk
-     subclassify` on the issue's PR + checks: *awaiting_merge* → merge; *awaiting_ci* → leave;
-     *failure* → failure handling; *no_pr* → probe the worker's **liveness** via orca-cli (bounded,
-     never a transcript read) — alive → still implementing, leave it; no live worker → **orphaned
-     claim**, reconcile (tear down any stale worktree with `orca worktree rm --worktree issue:<n>
-     --force` and re-dispatch, or `afk release <n>`).
-   - **Stale peer claims** — the **`stale`** list from `classify-claims` (a peer owns it and its
-     `afk-heartbeat/<id>` is expired past `claim_lease_ttl`) is the only foreign claim I may take:
-     `afk reclaim <n> --instance <id> --expect-sha <the sha scan reported>` (atomic — fails if it moved),
-     then treat as my own in-flight. **`peer_live`** is left strictly alone.
+1. **Rebuild the working set from GitHub** (never from memory) — **one read-only call** (ADR-0008):
+   ```bash
+   python3 <skill>/scripts/afk.py rebuild --repo <repo> --instance <id> --ttl <claim_lease_ttl> \
+       --ready-label "<ready_label>" --epic-labels "<epic_labels csv>"
+   ```
+   It gathers issues + PRs + claim/heartbeat refs once (the same gatherer the launcher's fingerprint
+   gate reads through — the raw 200-issue JSON lives and dies inside the tool) and returns the whole
+   working set: `{frontier: {dispatch, excluded}, mine: [{number, status, pr, checks,
+   attempt_labels}…], peer_live, stale: [{number, sha}…], fingerprint, now}`. Then act on it:
+   - **Frontier** — `frontier.dispatch` is the dispatchable set (`open` + `ready_label` + no
+     `epic_labels` + **unclaimed** + **no open linked PR** + zero open `blocked_by`) — the published
+     contract; `--plan` and live agree because both are this one code path.
+   - **In-flight** — each of **`mine`** arrives subclassified: *awaiting_merge* → merge;
+     *awaiting_ci* → leave; *failure* → failure handling; *no_pr* → probe the worker's **liveness**
+     via orca-cli (bounded, never a transcript read) — alive → still implementing, leave it; no live
+     worker → **orphaned claim**, reconcile (tear down any stale worktree with `orca worktree rm
+     --worktree issue:<n> --force` and re-dispatch, or `afk release <n>`). The probe and the
+     orphan-vs-alive verdict are judgment — deliberately not inside `rebuild`.
+   - **Stale peer claims** — **`stale`** (a peer owns it and its `afk-heartbeat/<id>` is expired past
+     `claim_lease_ttl`) is the only foreign claim I may take: `afk reclaim <n> --instance <id>
+     --expect-sha <the sha rebuild reported>` (atomic — fails if it moved), then treat as my own
+     in-flight. **`peer_live`** is left strictly alone.
 2. **Act**, in this order:
    - **Merge** every green in-flight PR (serialized — see below). `afk release <n>` on each merged issue.
    - **Escalate** any retry-exhausted issue (see failure handling).
@@ -237,9 +231,9 @@ each one runs is shown so the mechanism is legible, but the tick calls the tool.
   sha=$(git commit-tree $(git hash-object -t tree /dev/null) -m "afk-claim instance=$ID host=$(hostname)")
   git push origin "$sha:refs/afk/claim/$n"    # nonzero exit ⇒ lost the race, back off
   ```
-- **Owner check → `afk scan` / `afk classify-claims`.** `scan` lists every `afk-claim/*` ref with its
-  parsed marker; `classify-claims --instance <id> --ttl <s>` partitions them into `mine` / `peer_live`
-  / `stale` (in-flight = `mine`).
+- **Owner check → rides in `afk rebuild`.** The ref scan reads every `afk-claim/*` marker, and the
+  working set arrives already partitioned into `mine` / `peer_live` / `stale` (in-flight = `mine`).
+  (`afk scan` / `afk classify-claims` remain as standalone debug surfaces over the same core.)
 - **Heartbeat (the lease) → `afk heartbeat --instance <id> --ttl <s>`.** One ref `afk-heartbeat/<id>`
   carries a timestamp; the tool refreshes it **only if due** (`now - ts > ttl/3`) by force-pushing a
   new marker (it reads the old ts itself, so this stays stateless). **Per instance, not per claim**

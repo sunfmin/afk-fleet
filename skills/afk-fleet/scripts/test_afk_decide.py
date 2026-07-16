@@ -189,6 +189,68 @@ def test_fingerprint_gate():
     assert d.fingerprint_gate("aaa", "aaa", 0, 1) == {"action": "tick", "reason": "forced", "skips": 0}
 
 
+def test_pr_checks_state():
+    assert d.pr_checks_state(None) is None and d.pr_checks_state([]) is None  # no CI yet → tick judges
+    assert d.pr_checks_state([{"status": "COMPLETED", "conclusion": "SUCCESS"},
+                              {"state": "SUCCESS"}]) == "green"
+    assert d.pr_checks_state([{"conclusion": "SKIPPED"}, {"conclusion": "NEUTRAL"}]) == "green"
+    assert d.pr_checks_state([{"conclusion": "SUCCESS"}, {"conclusion": "FAILURE"}]) == "red"
+    assert d.pr_checks_state([{"state": "ERROR"}]) == "red"
+    assert d.pr_checks_state([{"status": "IN_PROGRESS", "conclusion": None},
+                              {"conclusion": "SUCCESS"}]) == "pending"
+    assert d.pr_checks_state([{"state": "PENDING"}]) == "pending"
+    assert d.pr_checks_state([{"conclusion": "STALE"}]) == "pending"   # not conclusively ok → never green
+
+
+def test_assemble_working_set():
+    now = 100_000
+    issues = [
+        {"number": 1, "title": "ready", "labels": ["ready-for-agent"], "updatedAt": "T1"},
+        {"number": 2, "title": "blocked", "labels": ["ready-for-agent"], "updatedAt": "T2"},
+        {"number": 3, "title": "mine green", "labels": ["ready-for-agent"], "updatedAt": "T3"},
+        {"number": 4, "title": "mine coding", "labels": ["afk-attempt/1"], "updatedAt": "T4"},
+        {"number": 5, "title": "peer live", "labels": ["ready-for-agent"], "updatedAt": "T5"},
+        {"number": 6, "title": "peer dead", "labels": [], "updatedAt": "T6"},
+    ]
+    prs = [{"number": 30, "headRefOid": "aaa", "updatedAt": "T7",
+            "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+            "closingIssuesReferences": [{"number": 3}]}]
+    claims = [
+        {"number": 3, "instance": "me", "sha": "s3"},
+        {"number": 4, "instance": "me", "sha": "s4"},
+        {"number": 5, "instance": "peerA", "sha": "s5"},
+        {"number": 6, "instance": "peerB", "sha": "s6"},
+    ]
+    heartbeats = {"me": now - 10, "peerA": now - 100, "peerB": now - TTL - 999}
+    ws = d.assemble_working_set(issues, prs, claims, heartbeats, {2: 1},
+                                "me", now, TTL, "ready-for-agent", ["epic", "prd"])
+
+    # frontier: the join (claimed / has_open_pr / blockers) grafted in code, titles ride along
+    assert ws["frontier"]["dispatch"] == [{"number": 1, "title": "ready"}]
+    reasons = {e["number"]: e["reason"] for e in ws["frontier"]["excluded"]}
+    assert "1 open blocker" in reasons[2]
+    assert "already claimed" in reasons[3] and "already claimed" in reasons[5]
+
+    # mine: subclassified with PR + checks + attempt labels — Act consumes this directly
+    mine = {m["number"]: m for m in ws["mine"]}
+    assert mine[3]["status"] == "awaiting_merge" and mine[3]["pr"] == 30 and mine[3]["checks"] == "green"
+    assert mine[4]["status"] == "no_pr" and mine[4]["pr"] is None
+    assert mine[4]["attempt_labels"] == ["afk-attempt/1"]
+
+    # peers: live one identified and left alone; stale one carries the sha reclaim needs
+    assert ws["peer_live"] == [{"number": 5, "instance": "peerA"}]
+    assert ws["stale"] == [{"number": 6, "instance": "peerB", "sha": "s6"}]
+
+    # the digest is the SAME function over the SAME observables the gate hashes
+    assert ws["fingerprint"] == d.fingerprint(issues, prs, claims)
+    assert ws["now"] == now
+
+    # missing blocked_by entries default to 0 — safe: only frontier candidates need real counts
+    ws2 = d.assemble_working_set(issues, prs, claims, heartbeats, {},
+                                 "me", now, TTL, "ready-for-agent", ["epic", "prd"])
+    assert {e["number"] for e in ws2["frontier"]["dispatch"]} == {1, 2}
+
+
 def run():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
