@@ -1,9 +1,12 @@
 # afk-fleet config (per-repo)
 
-Copy this into the **target repo** at `docs/agents/afk-fleet.md`. The fleet reads it on startup.
-Everything is repo-specific here; the skill core is repo-agnostic. Anything omitted uses the
-default shown. `authorize` is intentionally NOT a config key — push+auto-merge is confirmed
-interactively at launcher startup for the whole run (each tick inherits it), never pre-armed in a file.
+Copy this into the **target repo** at `docs/agents/afk-fleet.md`. The fleet reads it at bootstrap
+through `afk config --file …`, which validates every key against the schema (an unknown key or
+wrong shape is an **error**, caught with the human present) and emits the canonical JSON every tick
+and tool consumes (ADR-0009). Everything is repo-specific here; the skill core is repo-agnostic.
+Anything omitted uses the default shown. `authorize` is intentionally NOT a config key — push+auto-merge
+is confirmed interactively at launcher startup for the whole run (each tick inherits it), never
+pre-armed in a file (the validator refuses it by construction).
 
 ```yaml
 # --- dispatch contract ---
@@ -67,6 +70,10 @@ force_tick_after_skips: 6              # safety net: a full tick at least every 
 
 ## Notes
 
+- **This template is pinned to the code.** The defaults table in `afk_decide.py`
+  (`CONFIG_DEFAULTS`) is the single source of truth; a fixture test parses this file's yaml block
+  and fails if any value here drifts from that table (ADR-0009). Edit defaults there, then mirror
+  them here.
 - **Progressive gate.** Before the repo has a build/test/CI, the gate degrades to "the issue's own
   acceptance criteria + whatever build/test exists." `gate.ci: required` starts enforcing once the
   earliest issues have stood up CI.

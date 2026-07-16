@@ -21,6 +21,170 @@ import hashlib
 import json
 
 # --------------------------------------------------------------------------- #
+# Config — one home for every key and default (ADR-0009)                       #
+# --------------------------------------------------------------------------- #
+#
+# THE single source of truth for the config schema: every key the fleet knows,
+# with its default and (via the default's type) its shape. The template in
+# references/config-template.md is the human-facing rendering of this table —
+# a fixture test keeps the two equal, so a hand-edit that drifts turns the
+# suite red. `authorize` and the instance id are deliberately NOT keys here:
+# they are per-run, launcher-held facts, and the unknown-key error below is
+# what keeps them out of files.
+
+CONFIG_DEFAULTS = {
+    # dispatch contract
+    "ready_label": "ready-for-agent",
+    "epic_labels": ["epic", "prd", "wayfinder:map"],
+    "claim": "ref",
+    "dependencies": "native",
+    # workers
+    "base_branch": "main",
+    "branch_pattern": "issue-{number}-{slug}",
+    "worker": "orca",
+    "concurrency": 3,
+    "worktree_cleanup": True,
+    # completion gate
+    "gate": {
+        "ci": "required",
+        "local_command": "",
+        "adversarial_verify": False,
+        "adversarial_verify_prompt": "",
+    },
+    # merge
+    "merge": {
+        "strategy": "squash",
+        "target": "main",
+        "rebase_before_merge": True,
+        "delete_branch": True,
+    },
+    # failure handling
+    "retry": 2,
+    "escalate_label": "ready-for-human",
+    "escalate_comment": True,
+    # progress (human-facing)
+    "progress_comment": True,
+    # loop (launcher pacing)
+    "busy_interval_seconds": 90,
+    "idle_interval_seconds": 1500,
+    "idle_ticks_before_sleep": 3,
+    "claim_lease_ttl_seconds": 4500,
+    "fingerprint_gate": True,
+    "force_tick_after_skips": 6,
+}
+
+
+def _yaml_block(text):
+    """The first ```yaml fence's body if `text` is a markdown file, else the
+    text itself (already a bare block)."""
+    if "```yaml" in text:
+        return text.split("```yaml", 1)[1].split("```", 1)[0]
+    return text
+
+
+def _strip_comment(line):
+    """Cut an unquoted trailing `# …` comment; quotes are respected."""
+    out, quote = [], None
+    for ch in line:
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+            out.append(ch)
+        elif ch == "#":
+            break
+        else:
+            out.append(ch)
+    return "".join(out).strip()
+
+
+def _coerce(key, raw, default):
+    """One scalar, typed by its default: bool, int, [a, b] list, or string."""
+    if isinstance(default, bool):
+        if raw in ("true", "True"):
+            return True
+        if raw in ("false", "False"):
+            return False
+        raise ValueError(f"config key {key!r}: expected true/false, got {raw!r}")
+    if isinstance(default, int):
+        try:
+            return int(raw)
+        except ValueError:
+            raise ValueError(f"config key {key!r}: expected an integer, got {raw!r}")
+    if isinstance(default, list):
+        if not (raw.startswith("[") and raw.endswith("]")):
+            raise ValueError(f"config key {key!r}: expected [a, b, ...], got {raw!r}")
+        return [i.strip().strip("'\"") for i in raw[1:-1].split(",") if i.strip()]
+    return raw.strip("'\"")
+
+
+def parse_config_yaml(text):
+    """
+    Read the per-repo config — the ```yaml block in docs/agents/afk-fleet.md
+    (a whole markdown file or a bare block both work). Schema-aware, zero-dep:
+    it parses only the dialect this schema uses (`key: value` scalars, one
+    inline `[a, b]` list, one-level `gate:`/`merge:` sections), and every key
+    and type is checked against CONFIG_DEFAULTS — so parsing IS validation. An
+    unknown key raises (a typo silently ignored would be a config that lies to
+    its author, and `authorize:` in a file is refused by construction); so does
+    a wrong shape. Returns the PARTIAL config — only the keys present.
+    """
+    partial = {}
+    section = None
+    for ln in _yaml_block(text).splitlines():
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        indented = ln[0] in " \t"
+        s = _strip_comment(ln)
+        if not s:
+            continue
+        if ":" not in s:
+            raise ValueError(f"config: unparseable line {ln.strip()!r}")
+        key, _, raw = s.partition(":")
+        key, raw = key.strip(), raw.strip()
+        if indented:
+            if section is None:
+                raise ValueError(f"config: indented key {key!r} outside a gate:/merge: section")
+            sub = CONFIG_DEFAULTS[section]
+            if key not in sub:
+                raise ValueError(f"config: unknown key {section}.{key}")
+            partial.setdefault(section, {})[key] = _coerce(f"{section}.{key}", raw, sub[key])
+        else:
+            if key not in CONFIG_DEFAULTS:
+                raise ValueError(f"config: unknown key {key!r} (note: authorize/instance "
+                                 f"are per-run facts, never config keys)")
+            default = CONFIG_DEFAULTS[key]
+            if isinstance(default, dict):
+                if raw:
+                    raise ValueError(f"config key {key!r} is a section — write `{key}:` "
+                                     f"with indented keys")
+                section = key
+                partial.setdefault(key, {})
+            else:
+                section = None
+                partial[key] = _coerce(key, raw, default)
+    return partial
+
+
+def resolve_config(partial):
+    """Partial config → the complete canonical config: every key present,
+    defaults filled from CONFIG_DEFAULTS (one level deep for gate/merge).
+    Idempotent — resolving an already-canonical config is a no-op."""
+    out = {}
+    for k, dv in CONFIG_DEFAULTS.items():
+        if isinstance(dv, dict):
+            merged = dict(dv)
+            merged.update(partial.get(k) or {})
+            out[k] = merged
+        elif k in partial:
+            out[k] = partial[k]
+        else:
+            out[k] = list(dv) if isinstance(dv, list) else dv
+    return out
+
+# --------------------------------------------------------------------------- #
 # Dispatch eligibility — "can a worker take this issue right now?"             #
 # (migrated from the former select_frontier.py; unchanged contract)           #
 # --------------------------------------------------------------------------- #
@@ -309,11 +473,16 @@ def pace(summary, config):
     - else stay busy until `idle_ticks_before_sleep` empty ticks, then idle interval;
     - HARD CAP: while holding any claim (in_flight>0), never exceed ttl/2, so the
       per-instance heartbeat cannot lapse and get a live claim reclaimed (ADR-0003).
+
+    `config` may be partial — it is resolved through CONFIG_DEFAULTS, so an
+    omitted key defaults rather than crashing, and the ttl/2 cap can never be
+    silently disabled by a missing key (ADR-0009).
     """
+    config = resolve_config(config)
     busy = int(config["busy_interval_seconds"])
     idle = int(config["idle_interval_seconds"])
-    threshold = int(config.get("idle_ticks_before_sleep", 3))
-    ttl = config.get("claim_lease_ttl_seconds")
+    threshold = int(config["idle_ticks_before_sleep"])
+    ttl = int(config["claim_lease_ttl_seconds"])
 
     did_work = bool(summary.get("merged") or summary.get("dispatched") or summary.get("reclaimed"))
     in_flight = int(summary.get("in_flight", 0))
@@ -326,8 +495,8 @@ def pace(summary, config):
     else:
         interval = busy  # recently active — stay responsive for stragglers
 
-    if in_flight > 0 and ttl:
-        interval = min(interval, int(ttl) // 2)
+    if in_flight > 0:
+        interval = min(interval, ttl // 2)
     return int(interval)
 
 
@@ -397,3 +566,119 @@ def fingerprint_gate(last, current, skips, force_after):
     if skips + 1 >= int(force_after):
         return {"action": "tick", "reason": "forced", "skips": 0}
     return {"action": "skip", "reason": "unchanged", "skips": skips + 1}
+
+
+# --------------------------------------------------------------------------- #
+# Working-set assembly — the Rebuild's deterministic half (ADR-0008)           #
+# --------------------------------------------------------------------------- #
+#
+# One pure function turns the raw observables (issues, PRs, claim/heartbeat
+# refs, open-blocker counts) into the tick's whole working set — the join the
+# SKILL.md prose used to make every fresh tick re-derive (graft three fields,
+# match each claim to its PR, partition mine/peer_live/stale). The gh/git
+# gather lives in afk.py; the orphan-vs-alive read of a `no_pr` claim (the
+# liveness probe) is deliberately NOT here — that is tick judgment.
+
+_CHECK_RED = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED",
+              "STARTUP_FAILURE", "ERROR"}
+_CHECK_OK = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+
+
+def pr_checks_state(rollup):
+    """Collapse a gh statusCheckRollup into "green" | "red" | "pending" | None.
+    None = no checks at all — the progressive gate's "no CI yet" case, which the
+    tick judges. Accepts CheckRun rows (status/conclusion) and StatusContext
+    rows (state). Any red conclusion wins; anything not conclusively ok
+    (running, PENDING, STALE, unknown) holds the verdict at pending."""
+    if not rollup:
+        return None
+    state = "green"
+    for c in rollup:
+        concl = (c.get("conclusion") or c.get("state") or "").upper()
+        if concl in _CHECK_RED:
+            return "red"
+        if concl not in _CHECK_OK:
+            state = "pending"
+    return state
+
+
+def _closing_pr_map(prs):
+    """issue number → the open PR that closes it. When several do, the highest
+    PR number wins — the latest attempt is the live one."""
+    m = {}
+    for p in prs:
+        for ref in p.get("closingIssuesReferences") or []:
+            n = ref.get("number") if isinstance(ref, dict) else ref
+            if n is None:
+                continue
+            cur = m.get(n)
+            if cur is None or (p.get("number") or 0) > (cur.get("number") or 0):
+                m[n] = p
+    return m
+
+
+def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, ttl,
+                         ready_label, epic_labels):
+    """
+    The tick's whole working set from the raw observables. Pure — afk.py's
+    `rebuild` gathers, this assembles, and a fixture pins the join.
+
+      issues:      gh issue list rows (number, title, labels, updatedAt)
+      prs:         gh pr list rows (number, headRefOid, updatedAt,
+                   statusCheckRollup, closingIssuesReferences)
+      claims:      [{"number","instance","sha",...}]  (ref-scan shape)
+      heartbeats:  {instance: last_ts}
+      blocked_by:  {issue number: open blocker count}; missing → 0. Only
+                   frontier candidates need real counts — every other issue
+                   already fails a cheaper eligibility check first.
+      me/now/ttl:  as classify_claims
+      ready_label/epic_labels: the dispatch contract
+
+    Returns:
+      {"frontier": {"dispatch": [{"number","title"}...], "excluded": [...]},
+       "mine": [{"number","title","status","pr","checks","attempt_labels"}...],
+       "peer_live": [{"number","instance"}...],
+       "stale": [{"number","instance","sha"}...],   # sha feeds reclaim --expect-sha
+       "fingerprint": <digest of the same observables the gate hashes>,
+       "now": now}
+
+    `status` is subclassify_pr's verdict (awaiting_merge / awaiting_ci /
+    failure / no_pr); whether a no_pr claim is an orphan needs the liveness
+    probe and stays with the tick.
+    """
+    by_num = {i.get("number"): i for i in issues}
+    claimed = {c.get("number") for c in claims}
+    pr_for = _closing_pr_map(prs)
+
+    enriched = [{**i,
+                 "claimed": i.get("number") in claimed,
+                 "has_open_pr": i.get("number") in pr_for,
+                 "open_blockers": int(blocked_by.get(i.get("number"), 0))}
+                for i in issues]
+    frontier = select_frontier(enriched, ready_label, epic_labels)
+    frontier["dispatch"] = [{"number": n, "title": by_num.get(n, {}).get("title")}
+                            for n in frontier["dispatch"]]
+
+    part = classify_claims(claims, heartbeats, me, now, ttl)
+    by_claim = {c.get("number"): c for c in claims}
+
+    mine = []
+    for n in part["mine"]:
+        pr = pr_for.get(n)
+        checks = pr_checks_state(pr.get("statusCheckRollup")) if pr else None
+        issue = by_num.get(n, {})
+        mine.append({"number": n, "title": issue.get("title"),
+                     "status": subclassify_pr("open" if pr else "none", checks),
+                     "pr": pr.get("number") if pr else None, "checks": checks,
+                     "attempt_labels": [lb for lb in _label_names(issue)
+                                        if lb.startswith("afk-attempt/")]})
+
+    return {"frontier": frontier,
+            "mine": mine,
+            "peer_live": [{"number": n, "instance": by_claim.get(n, {}).get("instance")}
+                          for n in part["peer_live"]],
+            "stale": [{"number": n, "instance": by_claim.get(n, {}).get("instance"),
+                       "sha": by_claim.get(n, {}).get("sha")}
+                      for n in part["stale"]],
+            "fingerprint": fingerprint(issues, prs, claims),
+            "now": now}

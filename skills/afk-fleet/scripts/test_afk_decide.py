@@ -189,6 +189,152 @@ def test_fingerprint_gate():
     assert d.fingerprint_gate("aaa", "aaa", 0, 1) == {"action": "tick", "reason": "forced", "skips": 0}
 
 
+def test_pr_checks_state():
+    assert d.pr_checks_state(None) is None and d.pr_checks_state([]) is None  # no CI yet → tick judges
+    assert d.pr_checks_state([{"status": "COMPLETED", "conclusion": "SUCCESS"},
+                              {"state": "SUCCESS"}]) == "green"
+    assert d.pr_checks_state([{"conclusion": "SKIPPED"}, {"conclusion": "NEUTRAL"}]) == "green"
+    assert d.pr_checks_state([{"conclusion": "SUCCESS"}, {"conclusion": "FAILURE"}]) == "red"
+    assert d.pr_checks_state([{"state": "ERROR"}]) == "red"
+    assert d.pr_checks_state([{"status": "IN_PROGRESS", "conclusion": None},
+                              {"conclusion": "SUCCESS"}]) == "pending"
+    assert d.pr_checks_state([{"state": "PENDING"}]) == "pending"
+    assert d.pr_checks_state([{"conclusion": "STALE"}]) == "pending"   # not conclusively ok → never green
+
+
+def test_assemble_working_set():
+    now = 100_000
+    issues = [
+        {"number": 1, "title": "ready", "labels": ["ready-for-agent"], "updatedAt": "T1"},
+        {"number": 2, "title": "blocked", "labels": ["ready-for-agent"], "updatedAt": "T2"},
+        {"number": 3, "title": "mine green", "labels": ["ready-for-agent"], "updatedAt": "T3"},
+        {"number": 4, "title": "mine coding", "labels": ["afk-attempt/1"], "updatedAt": "T4"},
+        {"number": 5, "title": "peer live", "labels": ["ready-for-agent"], "updatedAt": "T5"},
+        {"number": 6, "title": "peer dead", "labels": [], "updatedAt": "T6"},
+    ]
+    prs = [{"number": 30, "headRefOid": "aaa", "updatedAt": "T7",
+            "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+            "closingIssuesReferences": [{"number": 3}]}]
+    claims = [
+        {"number": 3, "instance": "me", "sha": "s3"},
+        {"number": 4, "instance": "me", "sha": "s4"},
+        {"number": 5, "instance": "peerA", "sha": "s5"},
+        {"number": 6, "instance": "peerB", "sha": "s6"},
+    ]
+    heartbeats = {"me": now - 10, "peerA": now - 100, "peerB": now - TTL - 999}
+    ws = d.assemble_working_set(issues, prs, claims, heartbeats, {2: 1},
+                                "me", now, TTL, "ready-for-agent", ["epic", "prd"])
+
+    # frontier: the join (claimed / has_open_pr / blockers) grafted in code, titles ride along
+    assert ws["frontier"]["dispatch"] == [{"number": 1, "title": "ready"}]
+    reasons = {e["number"]: e["reason"] for e in ws["frontier"]["excluded"]}
+    assert "1 open blocker" in reasons[2]
+    assert "already claimed" in reasons[3] and "already claimed" in reasons[5]
+
+    # mine: subclassified with PR + checks + attempt labels — Act consumes this directly
+    mine = {m["number"]: m for m in ws["mine"]}
+    assert mine[3]["status"] == "awaiting_merge" and mine[3]["pr"] == 30 and mine[3]["checks"] == "green"
+    assert mine[4]["status"] == "no_pr" and mine[4]["pr"] is None
+    assert mine[4]["attempt_labels"] == ["afk-attempt/1"]
+
+    # peers: live one identified and left alone; stale one carries the sha reclaim needs
+    assert ws["peer_live"] == [{"number": 5, "instance": "peerA"}]
+    assert ws["stale"] == [{"number": 6, "instance": "peerB", "sha": "s6"}]
+
+    # the digest is the SAME function over the SAME observables the gate hashes
+    assert ws["fingerprint"] == d.fingerprint(issues, prs, claims)
+    assert ws["now"] == now
+
+    # missing blocked_by entries default to 0 — safe: only frontier candidates need real counts
+    ws2 = d.assemble_working_set(issues, prs, claims, heartbeats, {},
+                                 "me", now, TTL, "ready-for-agent", ["epic", "prd"])
+    assert {e["number"] for e in ws2["frontier"]["dispatch"]} == {1, 2}
+
+
+def test_parse_config_yaml():
+    text = """
+# leading comment
+ready_label: ready-for-agent          # trailing comment
+epic_labels: [epic, prd]
+concurrency: 5
+worktree_cleanup: false
+branch_pattern: "issue-{number}-{slug}"   # quoted value with a # inside comment
+gate:
+  ci: required
+  adversarial_verify: true
+merge:
+  strategy: rebase
+retry: 3
+"""
+    p = d.parse_config_yaml(text)
+    assert p["ready_label"] == "ready-for-agent"
+    assert p["epic_labels"] == ["epic", "prd"]
+    assert p["concurrency"] == 5 and p["worktree_cleanup"] is False
+    assert p["branch_pattern"] == "issue-{number}-{slug}"
+    assert p["gate"] == {"ci": "required", "adversarial_verify": True}
+    assert p["merge"] == {"strategy": "rebase"}
+    assert p["retry"] == 3          # top-level scalar after a section closes it
+
+    # a whole markdown file: the first ```yaml fence is the config
+    assert d.parse_config_yaml("intro\n```yaml\nretry: 1\n```\nnotes") == {"retry": 1}
+
+    # parsing IS validation: typo'd keys, wrong shapes, and file-armed
+    # authorize are all refused, never silently ignored
+    for bad in ("readylabel: x",            # unknown top-level key
+                "gate:\n  cii: x",          # unknown nested key
+                "retry: soon",              # wrong type
+                "gate: on",                 # scalar for a section
+                "  ci: required",           # indented key outside a section
+                "authorize: true"):         # never a config key
+        try:
+            d.parse_config_yaml(bad)
+            assert False, f"expected ValueError for {bad!r}"
+        except ValueError:
+            pass
+
+
+def test_resolve_config():
+    full = d.resolve_config({})
+    assert full["concurrency"] == 3 and full["gate"]["ci"] == "required"
+    r = d.resolve_config({"concurrency": 5, "gate": {"adversarial_verify": True}})
+    assert r["concurrency"] == 5
+    # deep-merge keeps sibling defaults; untouched sections stay whole
+    assert r["gate"]["adversarial_verify"] is True and r["gate"]["ci"] == "required"
+    assert r["merge"]["strategy"] == "squash"
+    # idempotent: resolving canonical config is a no-op
+    assert d.resolve_config(r) == r
+
+
+def test_pace_omission_is_uniform():
+    # pace resolves partial config through the one defaults table (ADR-0009):
+    # omission defaults instead of crashing, and the ttl/2 cap can no longer
+    # be silently disabled by a missing claim_lease_ttl_seconds.
+    assert d.pace({"in_flight": 0, "empty_streak": 9}, {}) == 1500
+    assert d.pace({"in_flight": 1, "empty_streak": 0}, {"busy_interval_seconds": 999999}) == TTL // 2
+
+
+def test_template_matches_defaults():
+    # the gate on the one unavoidable hand-sync (ADR-0009): the shipped
+    # template must parse clean, and every value it shows must BE the default —
+    # a drifted hand-edit turns this red.
+    import os
+    tpl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "..", "references", "config-template.md")
+    with open(tpl) as f:
+        parsed = d.parse_config_yaml(f.read())
+    full = d.resolve_config({})
+    for k, v in parsed.items():
+        if isinstance(v, dict):
+            for sk, sv in v.items():
+                assert full[k][sk] == sv, f"template drifted at {k}.{sk}: {sv!r}"
+        else:
+            assert full[k] == v, f"template drifted at {k}: {v!r}"
+    # and the template shows every key the schema knows (nothing undocumented)
+    assert set(parsed) == set(d.CONFIG_DEFAULTS)
+    for k in ("gate", "merge"):
+        assert set(parsed[k]) == set(d.CONFIG_DEFAULTS[k]), f"template missing keys in {k}:"
+
+
 def run():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

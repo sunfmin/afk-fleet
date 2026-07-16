@@ -103,7 +103,9 @@ The bounded pass, run at the top of every tick, that re-derives the whole workin
 state: recompute the frontier, and reconstruct the in-flight set (the `afk-claim/<n>` refs owned by
 this instance, sub-classified from each issue's PR + checks). Any tick — a fresh one or a later one — produces the
 same working set from the same GitHub; this equivalence is the re-entrancy invariant that makes
-disposable ticks safe.
+disposable ticks safe. Its deterministic half is one read-only tool call — `afk rebuild`, which
+gathers and assembles the working set (plus its fingerprint digest) in code; only the
+orphan-vs-alive reconciliation of `no_pr` claims (the liveness probe) stays tick judgment (ADR-0008).
 _Avoid_: refresh, resync, reload
 
 **Orphaned claim**:
