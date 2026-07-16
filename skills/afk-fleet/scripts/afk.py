@@ -9,8 +9,9 @@ is `{"won": false}`, still exit 0); exit 3 = an operational/git error.
 
 Two layers:
   - pure verdicts (`frontier`, `pace`, `next-attempt`, `subclassify`, and the
-    classification half of `classify-claims`) come from afk_decide.py — no I/O,
-    fixture-tested; time is always injected, never read here.
+    decision halves of `classify-claims` and `fingerprint`) come from
+    afk_decide.py — no I/O, fixture-tested; time is always injected, never read
+    here.
   - effectful ops (`scan`, `claim`, `reclaim`, `release`, `heartbeat`, `probe`)
     drive git refs / gh. Their real test is a scratch-repo integration suite
     (tracked separately) — here they are correct-by-construction and smoke-tested.
@@ -207,6 +208,27 @@ def cmd_heartbeat(a):
     return {"refreshed": True, "ts": now, "ref": ref}
 
 
+def cmd_fingerprint(a):
+    """The launcher's zero-LLM cycle gate (ADR-0007): gather what a tick's
+    Rebuild would observe, digest it, and return skip-or-tick. Gathering is
+    generous — the raw issue/PR/claim JSON lives and dies inside this process;
+    only the digest + verdict ever reach a context."""
+    if a.state_json is not None:               # test-injected — no gh/git
+        st = json.loads(a.state_json)
+        issues, prs, claims = st.get("issues", []), st.get("prs", []), st.get("claims", [])
+    else:
+        if not a.repo:
+            raise ValueError("--repo owner/name is required unless --state-json")
+        issues = json.loads(_gh(["issue", "list", "--repo", a.repo, "--state", "open",
+                                 "--limit", "200", "--json", "number,labels,updatedAt"]).stdout)
+        prs = json.loads(_gh(["pr", "list", "--repo", a.repo, "--state", "open",
+                              "--json", "number,headRefOid,updatedAt,statusCheckRollup"]).stdout)
+        claims, _ = _scan(a.remote, a.ns)      # heartbeats deliberately unused — see afk_decide.fingerprint
+    fp = afk_decide.fingerprint(issues, prs, claims)
+    verdict = afk_decide.fingerprint_gate(a.last, fp, a.skips, a.force_after)
+    return {"fingerprint": fp, **verdict}
+
+
 def _find_status_comment(repo, number):
     """Find the fleet's existing status-board comment by its marker.
     Returns (comment_id, body), or (None, None) if there isn't one yet."""
@@ -366,6 +388,17 @@ def build_parser():
     p.add_argument("--print", dest="print_only", action="store_true",
                    help="render the body only, do not touch GitHub")
     p.set_defaults(fn=cmd_status)
+
+    # fingerprint — the launcher's zero-LLM cycle gate (ADR-0007)
+    p = sub.add_parser("fingerprint", help="digest observable state; skip-or-tick verdict for the launcher")
+    add_ns(p)
+    p.add_argument("--repo", default=None, help="owner/name (for gh; required unless --state-json)")
+    p.add_argument("--last", default="", help="the previous cycle's digest (empty on the first cycle)")
+    p.add_argument("--skips", type=int, default=0, help="consecutive skipped cycles so far")
+    p.add_argument("--force-after", type=int, default=6, help="full tick at least every N skips")
+    p.add_argument("--state-json", default=None,
+                   help='inject {"issues":[…],"prs":[…],"claims":[…]}, skip gh/git (tests)')
+    p.set_defaults(fn=cmd_fingerprint)
 
     # pace
     p = sub.add_parser("pace", help="next launcher sleep in seconds (pure)")

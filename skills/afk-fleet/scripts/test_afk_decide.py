@@ -143,6 +143,52 @@ def test_pace():
     assert d.pace({"in_flight": 1, "empty_streak": 0}, {**cap_cfg, "busy_interval_seconds": 999999}) == TTL // 2
 
 
+def test_fingerprint():
+    issues = [
+        {"number": 1, "labels": [{"name": "ready-for-agent"}], "updatedAt": "2026-07-01T00:00:00Z"},
+        {"number": 2, "labels": ["epic"], "updatedAt": "2026-07-02T00:00:00Z"},
+    ]
+    prs = [{"number": 7, "headRefOid": "abc", "updatedAt": "2026-07-03T00:00:00Z",
+            "statusCheckRollup": [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}]}]
+    claims = [{"number": 1, "instance": "me", "sha": "s1"}]
+    fp = d.fingerprint(issues, prs, claims)
+
+    # canonical: row order and label representation (gh dicts vs fixture strings) never move it
+    assert fp == d.fingerprint(list(reversed(issues)), prs, claims)
+    assert fp == d.fingerprint(
+        [{"number": 1, "labels": ["ready-for-agent"], "updatedAt": "2026-07-01T00:00:00Z"}, issues[1]],
+        prs, claims)
+
+    # every decision-relevant change moves it
+    assert fp != d.fingerprint(issues[:1], prs, claims)                       # an issue closed
+    relabeled = [{**issues[0], "labels": []}, issues[1]]
+    assert fp != d.fingerprint(relabeled, prs, claims)                        # ready label pulled
+    touched = [{**issues[0], "updatedAt": "2026-07-09T00:00:00Z"}, issues[1]]
+    assert fp != d.fingerprint(touched, prs, claims)                          # blocker comment posted
+    ci_red = [{**prs[0], "statusCheckRollup": [{"name": "ci", "status": "COMPLETED", "conclusion": "FAILURE"}]}]
+    assert fp != d.fingerprint(issues, ci_red, claims)                        # CI finished red
+    pushed = [{**prs[0], "headRefOid": "def"}]
+    assert fp != d.fingerprint(issues, pushed, claims)                        # worker pushed
+    assert fp != d.fingerprint(issues, prs, [{"number": 1, "instance": "peer", "sha": "s2"}])  # reclaimed
+    # heartbeats are not an input at all — the launcher's own skip-cycle refresh
+    # can't move the digest (that is what keeps the gate from defeating itself).
+
+
+def test_fingerprint_gate():
+    # first cycle: no baseline → always tick
+    assert d.fingerprint_gate("", "aaa", 0, 6) == {"action": "tick", "reason": "first", "skips": 0}
+    assert d.fingerprint_gate(None, "aaa", 4, 6) == {"action": "tick", "reason": "first", "skips": 0}
+    # changed → tick, streak resets
+    assert d.fingerprint_gate("aaa", "bbb", 3, 6) == {"action": "tick", "reason": "changed", "skips": 0}
+    # unchanged → skip, streak grows
+    assert d.fingerprint_gate("aaa", "aaa", 0, 6) == {"action": "skip", "reason": "unchanged", "skips": 1}
+    assert d.fingerprint_gate("aaa", "aaa", 4, 6) == {"action": "skip", "reason": "unchanged", "skips": 5}
+    # the safety net: the Nth consecutive skip becomes a forced full tick
+    assert d.fingerprint_gate("aaa", "aaa", 5, 6) == {"action": "tick", "reason": "forced", "skips": 0}
+    # force_after=1 disables skipping entirely
+    assert d.fingerprint_gate("aaa", "aaa", 0, 1) == {"action": "tick", "reason": "forced", "skips": 0}
+
+
 def run():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

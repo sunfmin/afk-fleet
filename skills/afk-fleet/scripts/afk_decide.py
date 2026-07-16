@@ -17,6 +17,8 @@ stolen live claim double-works it). Those get the hardest fixtures.
 None of these functions read the clock — `now` is always an argument — so a fixture
 pins behaviour deterministically.
 """
+import hashlib
+import json
 
 # --------------------------------------------------------------------------- #
 # Dispatch eligibility — "can a worker take this issue right now?"             #
@@ -327,3 +329,71 @@ def pace(summary, config):
     if in_flight > 0 and ttl:
         interval = min(interval, int(ttl) // 2)
     return int(interval)
+
+
+# --------------------------------------------------------------------------- #
+# Fingerprint gate — skip ticks code can prove are no-ops (ADR-0007)           #
+# --------------------------------------------------------------------------- #
+#
+# A tick is a fresh LLM context; spawning one just to conclude "still waiting"
+# is the fleet's main steady-state token spend. The gate collapses everything a
+# tick's Rebuild observes into a short digest; the launcher spawns a tick only
+# when the digest moved (or a forced full pass is due). A false "changed" costs
+# one tick — today's behaviour; a missed change waits at most `force_after`
+# cycles. Correctness never depends on the gate.
+
+def fingerprint(issues, prs, claims):
+    """
+    Digest the observable fleet inputs — open issues (number + labels +
+    updatedAt, so label churn, closes, and fresh blocker comments all move it),
+    open PRs (number + head sha + updatedAt + per-check status/conclusion, so
+    pushes and CI finishing move it), and claim refs (number + sha, so peer
+    claims/releases/reclaims move it).
+
+    Heartbeats are deliberately NOT an input: the launcher refreshes its own
+    lease on skipped cycles, which would move the digest every cycle and defeat
+    the gate — and a lease *expiring* is a time-driven event no state hash can
+    see anyway. The forced tick covers those.
+
+    Accepts gh-shaped or fixture-shaped rows; canonicalizes (sorts, keeps only
+    the fields above) so row order and representation never move the digest.
+    Returns a 16-hex digest.
+    """
+    def check_row(c):
+        return [c.get("name") or c.get("context") or "",
+                c.get("status") or "",
+                c.get("conclusion") or c.get("state") or ""]
+
+    canon = {
+        "issues": sorted([i.get("number"), sorted(_label_names(i)), i.get("updatedAt") or ""]
+                         for i in issues),
+        "prs": sorted([p.get("number"), p.get("headRefOid") or "", p.get("updatedAt") or "",
+                       sorted(check_row(c) for c in (p.get("statusCheckRollup") or []))]
+                      for p in prs),
+        "claims": sorted([c.get("number"), c.get("sha") or ""] for c in claims),
+    }
+    blob = json.dumps(canon, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def fingerprint_gate(last, current, skips, force_after):
+    """
+    Skip-or-tick verdict for one launcher cycle.
+
+      last:        the previous cycle's digest ("" / None on the first cycle)
+      current:     the digest just computed
+      skips:       consecutive skipped cycles so far
+      force_after: run a full tick at least every N skips (>= 1; 1 disables
+                   skipping entirely)
+
+    Returns {"action": "tick"|"skip", "reason": "first"|"changed"|"forced"|
+    "unchanged", "skips": <new streak>} — the launcher carries `skips` (and the
+    digest) forward, exactly like the last tick summary.
+    """
+    if not last:
+        return {"action": "tick", "reason": "first", "skips": 0}
+    if current != last:
+        return {"action": "tick", "reason": "changed", "skips": 0}
+    if skips + 1 >= int(force_after):
+        return {"action": "tick", "reason": "forced", "skips": 0}
+    return {"action": "skip", "reason": "unchanged", "skips": skips + 1}
