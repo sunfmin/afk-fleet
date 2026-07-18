@@ -43,9 +43,10 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
   created, and a forced full tick every `force_tick_after_skips` cycles backstops what a state hash
   can't see (ADR-0007). Idle days cost tool calls, not contexts.
 - **All durable state lives in GitHub**, so any fresh tick reconstructs the exact working set:
-  `afk-claim/<n>` ref = claim (owned by a **fleet instance**) · PR (`Closes #n`) = result · issue
-  comment = blocker · `afk-attempt/<n>` label = retry count · `afk-heartbeat/<id>` ref = owner
-  liveness. Nothing is remembered between ticks. (The human-facing **status board** comment is a
+  `afk-claim/<n>` ref = claim (owned by a **fleet instance**) · PR (`Closes #n`) = result · an
+  `afk:verdict` marker comment = a worker's machine-readable reason for opening **no** PR
+  (already-satisfied / blocked / giving-up) · `afk-attempt/<n>` label = retry count ·
+  `afk-heartbeat/<id>` ref = owner liveness. Nothing is remembered between ticks. (The human-facing **status board** comment is a
   *derived projection* of this state onto the issue surface, re-rendered each tick — never itself a
   source of truth, and never read back by a tick.)
 
@@ -137,6 +138,9 @@ prose each pass (ADR-0004). Each prints one JSON object. Pure verdicts live in `
 |---|---|---|
 | `afk config --file <path>` | parse + validate the repo config → **canonical JSON** (every key, defaults filled; unknown key → error). `--defaults` prints the one defaults table (ADR-0009) | pure (file read) |
 | `afk rebuild --repo <r> --instance <id> --config <json>` | **one read-only call → the whole working set**: frontier (dispatch+excluded), `mine` subclassified with PR/checks/attempt-labels, `peer_live`, `stale` (with the sha reclaim needs), fingerprint (ADR-0008) | effect gather + pure assembly |
+| `afk worker-status --worktree <path> --base <branch>` | a `no_pr` worker's git **progress** in its worktree → `{commits_ahead, dirty, last_commit_ts, worktree_mtime_ts}` — the decisive coding-vs-finished signal, independent of terminal chrome (git only, no gh) | effect (git) |
+| `afk verdict --repo <r> --issue <n>` | the LATEST parsed `afk:verdict` marker the worker left → `{found, phase, blocked_by, reason, comment_url}` — its machine-readable reason for opening no PR | effect gather + pure parse |
+| `afk classify-no-pr --terminal <busy\|idle\|none> --progress <json> --verdict <json> --config <json>` | the **5-way `no_pr` verdict** from those signals → `{outcome, action}` (coding / idle_done / idle_blocked / idle_failed / dead) | pure |
 | `afk claim <n> --instance <id>` | atomic create-or-lose the claim ref → `{won}` | effect |
 | `afk reclaim <n> --instance <id> --expect-sha <sha>` | `--force-with-lease` takeover of a stale claim → `{won}` | effect |
 | `afk release <n>` | delete a claim ref (idempotent) | effect |
@@ -177,11 +181,31 @@ spawns).
      `epic_labels` + **unclaimed** + **no open linked PR** + zero open `blocked_by`) — the published
      contract; `--plan` and live agree because both are this one code path.
    - **In-flight** — each of **`mine`** arrives subclassified: *awaiting_merge* → merge;
-     *awaiting_ci* → leave; *failure* → failure handling; *no_pr* → probe the worker's **liveness**
-     via orca-cli (bounded, never a transcript read) — alive → still implementing, leave it; no live
-     worker → **orphaned claim**, reconcile (tear down any stale worktree with `orca worktree rm
-     --worktree issue:<n> --force` and re-dispatch, or `afk release <n>`). The probe and the
-     orphan-vs-alive verdict are judgment — deliberately not inside `rebuild`.
+     *awaiting_ci* → leave; *failure* → failure handling; *no_pr* → **disambiguate finished-from-coding
+     with three signals, never terminal chrome alone.** A worker that ran to completion, concluded there
+     was no PR to open, posted its reason, and went idle looks *identical* to one still coding — both
+     are "a connected terminal with a title" — so a binary liveness probe parks the claim forever.
+     `rebuild` stays git+gh-only and machine-independent (ADR-0008), so the tick gathers these per
+     `no_pr` claim itself (the narrow set only): **(a)** git **progress** — `afk worker-status
+     --worktree <path> --base <base_branch>` (the worktree path is orca's — from `orca worktree list`
+     or the create result); **(b)** the worker's declared reason — `afk verdict --repo <repo> --issue
+     <n>`; **(c)** the orca **liveness** probe (bounded, never a transcript read) for terminal
+     busy / idle / none. Feed all three to `afk classify-no-pr --terminal <busy|idle|none> --idle-seconds
+     <s> --progress <…> --verdict <…> [--blocked-by-open] --config <config>`, which returns one of five
+     `{outcome, action}`:
+       - **coding** (terminal busy, OR `commits_ahead>0`/dirty, OR activity within
+         `worker_idle_grace_seconds`) → still implementing, **leave it**;
+       - **idle_done** (idle + zero progress past grace + verdict `already-satisfied`) → **verify the
+         empty diff vs base**, then close the issue and `afk release <n>`;
+       - **idle_blocked** (verdict `blocked`) → re-check each `blocked_by` issue: all now closed/merged →
+         **re-dispatch** (keep the claim; not a retry); any still open → **escalate the DAG gap** (add
+         `escalate_label`, comment the unmet dependency — pass `--blocked-by-open`);
+       - **idle_failed** (verdict `giving-up`, OR **no verdict at all** after grace) → **failure
+         handling** (`afk next-attempt`: retry → escalate);
+       - **dead** (no live worker/terminal at all) → **orphaned claim**: tear down any stale worktree
+         (`orca worktree rm --worktree issue:<n> --force`) and re-dispatch, or `afk release <n>`.
+     The liveness probe, the empty-diff verification, and the orphan-vs-alive read stay judgment —
+     deliberately not inside `rebuild`.
    - **Stale peer claims** — **`stale`** (a peer owns it and its `afk-heartbeat/<id>` is expired past
      `claim_lease_ttl`) is the only foreign claim I may take: `afk reclaim <n> --instance <id>
      --expect-sha <the sha rebuild reported>` (atomic — fails if it moved), then treat as my own
@@ -298,7 +322,9 @@ human-gated step — never done here.
 
 ## Failure handling — bounded retry → escalate, never silently drop
 
-Per issue, on any of {worker failed, gate red, adversarial refute, unresolvable rebase conflict}:
+Per issue, on any of {worker failed, gate red, adversarial refute, unresolvable rebase conflict, a
+`no_pr` claim classified **idle_failed** — a `giving-up` verdict, or a worker gone idle with **no
+verdict at all** after grace}:
 
 1. **Retry up to `retry` times** (default 2). The attempt count lives as an **`afk-attempt/<n>`
    label** on the issue (not in tick memory). `afk next-attempt --labels <the issue's labels>
@@ -314,6 +340,14 @@ Per issue, on any of {worker failed, gate red, adversarial refute, unresolvable 
    `escalate_comment`) comment the stuck-point with PR + log links — the status board points a reader
    here. Then move on — never silently drop or silently merge bad work.
 
+**`no_pr` idle routing (not all of it is a failure).** Only **idle_failed** enters the retry ladder
+above. A **idle_blocked** claim (a `blocked` verdict) skips retry accounting entirely: if its
+`blocked_by` issues have all resolved it is simply **re-dispatched** (a transient DAG-ordering miss,
+not a failure); if any remain open it is **escalated as a DAG gap** — comment the unmet dependency and
+add `escalate_label`, a decomposition error only a human can fix. An **idle_done** claim
+(`already-satisfied`) is not a failure either: verify the empty diff vs base, close the issue, `afk
+release <n>`.
+
 ## Concurrency
 
 `concurrency` (default 3) bounds parallel workers. Semantic ordering is the backlog's dependency DAG
@@ -327,8 +361,11 @@ touch shared root config are naturally throttled by the DAG — chain them with 
   auto-merge without an injected run authorization.
 - **Never** deploy, touch secrets, or push anywhere but worker branches + the merge to `merge.target`.
 - **Never** dispatch an epic/PRD issue. If the frontier is all epics, report "nothing decomposed yet."
-- **Never** read a worker's terminal for its result (only a bounded liveness probe); results are PRs,
-  blockers are issue comments. A full transcript must never enter a tick or the launcher.
+- **Never** read a worker's terminal for its result (only a bounded liveness probe) — and the probe
+  **alone cannot tell finished-and-idle from still-coding**, so for a `no_pr` claim combine it with
+  `afk worker-status` git progress and the `afk verdict` marker (see In-flight). Results are PRs; a
+  not-going-to-PR outcome is the worker's `afk:verdict` marker comment; blockers are issue comments. A
+  full transcript must never enter a tick or the launcher.
 - **Claim before work** (create the `afk-claim/<n>` ref; if the create is rejected, a peer owns it —
   never proceed). **Release on every terminal transition** (merge, escalate, orphan-release) by
   deleting the ref — a leaked ref is a phantom lock. Reconcile only **your own** claims; take a peer's
@@ -336,5 +373,6 @@ touch shared root config are naturally throttled by the DAG — chain them with 
 - **A human reserves an issue by removing `ready_label`**, not by assigning it — the fleet no longer
   reads the assignee. Keep the tracker honest so a peer fleet or a human never double-takes.
 - Reserved: the fleet manages `afk-attempt/<n>` labels, **the `refs/afk/*` ref namespace**
-  (`afk-claim/*`, `afk-heartbeat/*`), and the single status-board comment tagged `<!--afk:status-->`
-  — don't hand-edit them or reuse those prefixes / that marker.
+  (`afk-claim/*`, `afk-heartbeat/*`), the single status-board comment tagged `<!--afk:status-->`, and
+  the worker-authored `<!--afk:verdict …-->` marker comments (the fleet parses these) — don't
+  hand-edit them or reuse those prefixes / those markers.

@@ -25,6 +25,10 @@ worker: orca                           # the only supported backend: orca create
                                       #   and spawns a real Claude Code in it, in one step (ADR-0005)
 concurrency: 3                         # max workers running at once
 worktree_cleanup: true                 # after merge/escalate, remove via `orca worktree rm issue:<n>`
+worker_idle_grace_seconds: 300         # a no-PR worker that went idle is judged "finished" only after
+                                      #   this much quiet (no commits, clean tree, no recent file activity);
+                                      #   inside the window it's assumed still working between steps, so a
+                                      #   finished-and-idle worker is never mistaken for one still coding
 
 # --- completion gate ---
 gate:

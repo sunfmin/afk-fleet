@@ -19,6 +19,7 @@ pins behaviour deterministically.
 """
 import hashlib
 import json
+import re
 
 # --------------------------------------------------------------------------- #
 # Config — one home for every key and default (ADR-0009)                       #
@@ -44,6 +45,7 @@ CONFIG_DEFAULTS = {
     "worker": "orca",
     "concurrency": 3,
     "worktree_cleanup": True,
+    "worker_idle_grace_seconds": 300,
     # completion gate
     "gate": {
         "ci": "required",
@@ -335,6 +337,153 @@ def subclassify_pr(pr_state, checks_state):
     if checks_state == "red":
         return "failure"
     return "awaiting_ci"
+
+
+# --------------------------------------------------------------------------- #
+# no_pr reconciliation — disambiguating a FINISHED worker from a CODING one    #
+# --------------------------------------------------------------------------- #
+#
+# `subclassify_pr` only says a claim has no PR yet; deciding *why* used to be a
+# binary the tick did with an orca liveness probe alone (connected terminal +
+# active-looking title). That is blind: a worker that ran to completion, decided
+# there was no PR to open, posted its reason, and went idle looks IDENTICAL to
+# one still coding — both are "a connected terminal with a title" — so the claim
+# is parked forever. Three signals disambiguate, none of them terminal chrome:
+#   1. git PROGRESS in the worktree (commits ahead of base / dirty tree / recent
+#      file activity) — the decisive coding-vs-finished signal (afk worker-status);
+#   2. the worker's explicit VERDICT marker on the issue (afk verdict) — the
+#      single machine-readable source of truth for *why* it opened no PR;
+#   3. terminal idle-vs-busy from the orca probe — still the tick's judgment.
+# `classify_no_pr` is the pure join of the three (fixture-tested); parsing the
+# marker is pure too. Whether to TRUST the marker stays the tick's call.
+
+VERDICT_MARKER = "<!--afk:verdict"
+
+# The closed set of reasons a worker may declare for opening no PR. `already-satisfied`
+# = the issue is already done in base (empty diff); `blocked` = a runtime dependency
+# gap (see blocked_by); `giving-up` = a genuine failure the worker could not resolve.
+VERDICT_PHASES = ("already-satisfied", "blocked", "giving-up")
+
+_VERDICT_MARKER_RE = re.compile(r"<!--\s*afk:verdict\b(.*?)-->", re.DOTALL)
+
+
+def parse_verdict_marker(body):
+    """
+    Parse the FIRST afk:verdict marker in one comment body → a verdict dict, or
+    None if the body carries no marker. The marker (worker-prompt.md, LAYER 1) is:
+
+      <!--afk:verdict n=<issue> phase=<already-satisfied|blocked|giving-up> \
+          [blocked_by=<csv of issue numbers>] [reason=<short>]-->
+
+    Deterministic and LENIENT — a marker with a missing/unknown field still parses
+    ({"found": True, "phase": None|<raw>}); whether to trust it, and what an
+    unrecognised phase means, is the tick's / `classify_no_pr`'s call, never this
+    parser's. `reason` (if present) must be the last field — it captures to the end
+    of the marker so a short human phrase with spaces survives. Returns:
+      {"found": True, "n": int|None, "phase": str|None, "blocked_by": [int], "reason": str|None}
+    """
+    if not body:
+        return None
+    m = _VERDICT_MARKER_RE.search(body)
+    if not m:
+        return None
+    attrs = m.group(1)
+    reason = None
+    rm = re.search(r"\breason=(.*)$", attrs, re.DOTALL)
+    if rm:
+        reason = rm.group(1).strip() or None
+        attrs = attrs[:rm.start()]        # keep reason from swallowing nothing else
+
+    def _grab(pat):
+        mm = re.search(pat, attrs)
+        return mm.group(1) if mm else None
+
+    n_raw = _grab(r"\bn=(\d+)")
+    bb_raw = _grab(r"\bblocked_by=([0-9,\s]*)")
+    return {"found": True,
+            "n": int(n_raw) if n_raw else None,
+            "phase": _grab(r"\bphase=([A-Za-z][\w-]*)"),
+            "blocked_by": [int(x) for x in re.split(r"[,\s]+", (bb_raw or "").strip()) if x],
+            "reason": reason}
+
+
+def latest_verdict(comments):
+    """
+    The LATEST afk:verdict across an issue's comments (multiple markers → latest
+    wins). `comments` is expected oldest-first (the gh default), each a
+    {"body","comment_url"/"html_url"/"url","created_at"} dict or a bare body
+    string; the last marker-bearing comment in that order is the live verdict.
+    Pure — afk.py's `verdict` fetches, this parses. Returns:
+      {"found": bool, "phase": str|None, "blocked_by": [int], "reason": str|None,
+       "comment_url": str|None}
+    """
+    result = {"found": False, "phase": None, "blocked_by": [],
+              "reason": None, "comment_url": None}
+    for c in comments or []:
+        if isinstance(c, str):
+            body, url = c, None
+        else:
+            body = c.get("body") or ""
+            url = c.get("comment_url") or c.get("html_url") or c.get("url")
+        parsed = parse_verdict_marker(body)
+        if parsed:
+            result = {"found": True, "phase": parsed["phase"],
+                      "blocked_by": parsed["blocked_by"], "reason": parsed["reason"],
+                      "comment_url": url}
+    return result
+
+
+def classify_no_pr(progress, terminal_idle, idle_seconds, verdict, blocked_by_open,
+                   grace_seconds):
+    """
+    The 5-way verdict for one of MY `no_pr` claims — the fix for the finished-vs-coding
+    blind spot. Pure join of the three disambiguating signals; the tick gathers them
+    (`afk worker-status`, `afk verdict`, the orca liveness probe) and calls this.
+
+      progress:        {"commits_ahead": int, "dirty": bool, "last_commit_ts": …,
+                        "worktree_mtime_ts": …} from `afk worker-status` ({} if unknown).
+      terminal_idle:   False = orca probe found a BUSY worker; True = a connected but
+                       IDLE worker; None = NO live worker/terminal at all.
+      idle_seconds:    seconds since the worker's last observable activity (max of
+                       last_commit_ts / worktree_mtime_ts / terminal activity); None = unknown.
+      verdict:         the `latest_verdict` dict (or None) — the worker's declared reason.
+      blocked_by_open: True iff any issue in verdict.blocked_by is still open (the tick
+                       re-checks each; only consulted for a `blocked` verdict).
+      grace_seconds:   `worker_idle_grace_seconds` — quiet window before "idle" is trusted.
+
+    Returns {"outcome": <str>, "action": <str>}:
+      coding       leave         — busy, OR real git progress, OR activity within grace.
+      idle_done    close_release — idle+zero-progress past grace + phase already-satisfied:
+                                   the tick verifies the empty diff, then closes + releases.
+      idle_blocked redispatch    — …+ phase blocked, and every blocked_by is now closed:
+                                   the DAG cleared, re-dispatch (keep the claim).
+      idle_blocked escalate      — …+ phase blocked, but a blocked_by is still open:
+                                   a real DAG gap — escalate (add escalate_label, comment it).
+      idle_failed  next_attempt  — …+ phase giving-up, an unknown phase, or NO verdict at
+                                   all after grace → failure handling (`afk next-attempt`).
+      dead         orphan        — no live worker/terminal → existing orphan path.
+    """
+    progress = progress or {}
+    made_progress = int(progress.get("commits_ahead") or 0) > 0 or bool(progress.get("dirty"))
+
+    # dead first: no worker means it cannot be "coding", whatever it left behind.
+    if terminal_idle is None:
+        return {"outcome": "dead", "action": "orphan"}
+
+    # coding: any positive sign of life wins over the idle+verdict path.
+    within_grace = (idle_seconds is not None and grace_seconds is not None
+                    and idle_seconds < grace_seconds)
+    if terminal_idle is False or made_progress or within_grace:
+        return {"outcome": "coding", "action": "leave"}
+
+    # idle + zero progress past grace: route on the declared reason.
+    phase = verdict.get("phase") if (verdict and verdict.get("found")) else None
+    if phase == "already-satisfied":
+        return {"outcome": "idle_done", "action": "close_release"}
+    if phase == "blocked":
+        return {"outcome": "idle_blocked",
+                "action": "escalate" if blocked_by_open else "redispatch"}
+    return {"outcome": "idle_failed", "action": "next_attempt"}
 
 
 # --------------------------------------------------------------------------- #
