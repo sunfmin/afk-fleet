@@ -78,6 +78,103 @@ def test_subclassify_pr():
     assert d.subclassify_pr("open", None) == "awaiting_ci"
 
 
+def test_parse_verdict_marker():
+    # valid, every field; reason (last) keeps its spaces
+    body = ("<!--afk:verdict n=12 phase=blocked blocked_by=3,4 reason=needs pages from #3-->\n"
+            "Blocked on #3 and #4 — no PRs there yet.")
+    p = d.parse_verdict_marker(body)
+    assert p["found"] is True and p["n"] == 12 and p["phase"] == "blocked"
+    assert p["blocked_by"] == [3, 4]
+    assert p["reason"] == "needs pages from #3"
+
+    # already-satisfied, no blocked_by / reason
+    p = d.parse_verdict_marker("<!--afk:verdict n=7 phase=already-satisfied-->\nEmpty diff vs base.")
+    assert p["phase"] == "already-satisfied" and p["blocked_by"] == [] and p["reason"] is None
+
+    # giving-up, tolerant of extra whitespace around the marker + tokens
+    assert d.parse_verdict_marker("<!--  afk:verdict   phase=giving-up  -->")["phase"] == "giving-up"
+
+    # missing marker → None (a plain human comment is not a verdict)
+    assert d.parse_verdict_marker("just a normal comment, no marker") is None
+    assert d.parse_verdict_marker("") is None
+    assert d.parse_verdict_marker(None) is None
+
+    # malformed: marker present but no phase → found True, phase None. Parse is
+    # lenient by design; classify_no_pr treats a None/unknown phase as failed, and
+    # whether to trust the marker at all stays the tick's call.
+    p = d.parse_verdict_marker("<!--afk:verdict n=9-->")
+    assert p["found"] is True and p["phase"] is None and p["blocked_by"] == []
+
+
+def test_latest_verdict():
+    empty = {"found": False, "phase": None, "blocked_by": [], "reason": None, "comment_url": None}
+    assert d.latest_verdict([]) == empty
+    assert d.latest_verdict(None) == empty
+    assert d.latest_verdict(["hello", "world — no markers here"]) == empty
+
+    # multiple markers across comments → the LAST (chronological, gh's default order) wins,
+    # and its comment_url rides along
+    comments = [
+        {"body": "<!--afk:verdict n=5 phase=blocked blocked_by=2-->", "comment_url": "u1"},
+        {"body": "some human chatter in between"},
+        {"body": "<!--afk:verdict n=5 phase=giving-up-->", "comment_url": "u2"},
+    ]
+    r = d.latest_verdict(comments)
+    assert r["found"] is True and r["phase"] == "giving-up" and r["comment_url"] == "u2"
+
+    # bare strings and html_url/url fallbacks both accepted
+    assert d.latest_verdict(["<!--afk:verdict phase=already-satisfied-->"])["phase"] == "already-satisfied"
+    assert d.latest_verdict([{"body": "<!--afk:verdict phase=blocked-->", "html_url": "h"}])["comment_url"] == "h"
+    assert d.latest_verdict([{"body": "<!--afk:verdict phase=blocked-->", "url": "u"}])["comment_url"] == "u"
+
+
+def test_classify_no_pr():
+    GRACE = 300
+    zero = {"commits_ahead": 0, "dirty": False, "last_commit_ts": None, "worktree_mtime_ts": None}
+
+    def v(phase, blocked_by=None):
+        return {"found": True, "phase": phase, "blocked_by": blocked_by or [],
+                "reason": None, "comment_url": "u"}
+
+    # coding — terminal busy: left alone even with a giving-up verdict + zero progress
+    assert d.classify_no_pr(zero, False, 9999, v("giving-up"), False, GRACE) == \
+        {"outcome": "coding", "action": "leave"}
+    # coding — idle but commits_ahead>0: real progress beats idle+verdict
+    assert d.classify_no_pr({**zero, "commits_ahead": 2}, True, 9999,
+                            v("already-satisfied"), False, GRACE)["outcome"] == "coding"
+    # coding — idle but dirty worktree
+    assert d.classify_no_pr({**zero, "dirty": True}, True, 9999, None, False, GRACE)["outcome"] == "coding"
+    # coding — idle, zero progress, but activity within the grace window (a worker between steps)
+    assert d.classify_no_pr(zero, True, 120, None, False, GRACE)["outcome"] == "coding"
+
+    # idle_done — idle, zero progress, past grace, verdict already-satisfied → close + release
+    assert d.classify_no_pr(zero, True, 600, v("already-satisfied"), False, GRACE) == \
+        {"outcome": "idle_done", "action": "close_release"}
+
+    # idle_blocked — dep now closed → re-dispatch (keep the claim)
+    assert d.classify_no_pr(zero, True, 600, v("blocked", [42]), False, GRACE) == \
+        {"outcome": "idle_blocked", "action": "redispatch"}
+    # idle_blocked — a dep still open → escalate the DAG gap
+    assert d.classify_no_pr(zero, True, 600, v("blocked", [42]), True, GRACE) == \
+        {"outcome": "idle_blocked", "action": "escalate"}
+
+    # idle_failed — verdict giving-up
+    assert d.classify_no_pr(zero, True, 600, v("giving-up"), False, GRACE) == \
+        {"outcome": "idle_failed", "action": "next_attempt"}
+    # idle_failed — NO verdict at all after grace (the worker just stopped, no marker)
+    assert d.classify_no_pr(zero, True, 600, None, False, GRACE) == \
+        {"outcome": "idle_failed", "action": "next_attempt"}
+    assert d.classify_no_pr(zero, True, 600, {"found": False}, False, GRACE)["outcome"] == "idle_failed"
+    # idle_failed — unknown/garbage phase after grace → failed (safe default, not silently trusted)
+    assert d.classify_no_pr(zero, True, 600, v("weird-phase"), False, GRACE)["outcome"] == "idle_failed"
+    # idle_failed — idle_seconds unknown (None) is NOT treated as within grace
+    assert d.classify_no_pr(zero, True, None, None, False, GRACE)["outcome"] == "idle_failed"
+
+    # dead — no live worker/terminal at all → orphan path, even with leftover commits
+    assert d.classify_no_pr({**zero, "commits_ahead": 3}, None, 600, None, False, GRACE) == \
+        {"outcome": "dead", "action": "orphan"}
+
+
 def test_next_attempt():
     assert d.next_attempt([], 2) == {"action": "retry", "from_label": None, "to_label": "afk-attempt/1"}
     assert d.next_attempt(["afk-attempt/1", "ready-for-agent"], 2) == \

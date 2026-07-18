@@ -9,13 +9,14 @@ is `{"won": false}`, still exit 0); exit 3 = an operational/git error.
 
 Two layers:
   - pure verdicts (`config`, `frontier`, `pace`, `next-attempt`, `subclassify`,
-    and the decision halves of `rebuild`, `classify-claims`, and `fingerprint`)
-    come from afk_decide.py — no I/O, fixture-tested; time is always injected,
-    never read here. Config resolution is one order everywhere:
-    flag → `--config` JSON → CONFIG_DEFAULTS (ADR-0009).
-  - effectful ops (`scan`, `claim`, `reclaim`, `release`, `heartbeat`, `probe`)
-    drive git refs / gh. Their real test is a scratch-repo integration suite
-    (tracked separately) — here they are correct-by-construction and smoke-tested.
+    `classify-no-pr`, and the decision halves of `rebuild`, `classify-claims`,
+    `verdict`, and `fingerprint`) come from afk_decide.py — no I/O, fixture-tested;
+    time is always injected, never read here. Config resolution is one order
+    everywhere: flag → `--config` JSON → CONFIG_DEFAULTS (ADR-0009).
+  - effectful ops (`scan`, `claim`, `reclaim`, `release`, `heartbeat`, `probe`,
+    `worker-status`, `verdict`) drive git refs / worktree git / gh. Their real
+    test is a scratch-repo integration suite (tracked separately) — here they are
+    correct-by-construction and smoke-tested.
 
 Invoked as:  python3 <skill>/scripts/afk.py <subcommand> [flags]
 """
@@ -110,6 +111,23 @@ def _read_marker(remote, refname):
 def _issue_num_from_ref(refname):
     tail = refname.rstrip("/").rsplit("/", 1)[-1]
     return int(tail) if tail.isdigit() else None
+
+
+def _newest_mtime(root):
+    """The newest file/dir mtime anywhere under `root`, excluding .git — a
+    filesystem-level 'when did this worktree last change' independent of git
+    (catches edits a worker hasn't committed). None on an empty/missing tree."""
+    newest = None
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        for name in (*dirnames, *filenames):
+            try:
+                mt = os.lstat(os.path.join(dirpath, name)).st_mtime
+            except OSError:
+                continue
+            if newest is None or mt > newest:
+                newest = mt
+    return int(newest) if newest is not None else None
 
 
 # --------------------------------------------------------------------------- #
@@ -365,6 +383,43 @@ def cmd_probe(a):
     return {"namespace": "refs/afk", "hidden": True, "ci_on_push": False, "blocked": False}
 
 
+def cmd_worker_status(a):
+    """The decisive PROGRESS signal for a `no_pr` claim, read straight from the
+    worker's worktree with git only (no gh, no orca) — independent of terminal
+    chrome, so it disambiguates a worker still coding from one that finished and
+    went idle. Returns {commits_ahead, dirty, last_commit_ts, worktree_mtime_ts};
+    the tick feeds it to `afk classify-no-pr`."""
+    wt = a.worktree
+    if not os.path.isdir(wt):
+        raise ValueError(f"worktree not found: {wt}")
+    base = a.base or _cfg(a)["base_branch"]
+    ahead = _git(["-C", wt, "rev-list", "--count", f"{base}..HEAD"], check=False).stdout.strip()
+    dirty = _git(["-C", wt, "status", "--porcelain"], check=False).stdout.strip()
+    ct = _git(["-C", wt, "log", "-1", "--format=%ct"], check=False).stdout.strip()
+    return {"commits_ahead": int(ahead) if ahead.isdigit() else 0,
+            "dirty": bool(dirty),
+            "last_commit_ts": int(ct) if ct.isdigit() else None,
+            "worktree_mtime_ts": _newest_mtime(wt)}
+
+
+def cmd_verdict(a):
+    """Fetch an issue's comments and return the LATEST parsed afk:verdict marker
+    (afk_decide.latest_verdict) — the worker's machine-readable reason for opening
+    no PR, the single source of truth the `no_pr` classification routes on. gh
+    fetch here, deterministic parse in afk_decide. `--comments-json` injects
+    comments to skip gh (tests)."""
+    if a.comments_json is not None:                # test-injected — no gh
+        comments = json.loads(a.comments_json)
+    else:
+        if not a.repo:
+            raise ValueError("--repo owner/name is required unless --comments-json")
+        jq = '.[] | {body: .body, comment_url: .html_url, created_at: .created_at}'
+        p = _gh(["api", "--paginate", f"repos/{a.repo}/issues/{a.number}/comments",
+                 "--jq", jq], check=True)
+        comments = [json.loads(ln) for ln in p.stdout.splitlines() if ln.strip()]
+    return afk_decide.latest_verdict(comments)
+
+
 # --------------------------------------------------------------------------- #
 # pure passthroughs                                                           #
 # --------------------------------------------------------------------------- #
@@ -400,6 +455,21 @@ def cmd_next_attempt(a):
 
 def cmd_subclassify(a):
     return {"status": afk_decide.subclassify_pr(a.pr, a.checks)}
+
+
+def cmd_classify_no_pr(a):
+    """The 5-way verdict for one of my `no_pr` claims (coding / idle_done /
+    idle_blocked / idle_failed / dead), from the three disambiguating signals the
+    tick gathered: git progress (`afk worker-status`), the declared verdict (`afk
+    verdict`), and the orca liveness probe. `--terminal busy|idle|none` maps to the
+    pure function's `terminal_idle` (False / True / None). Grace resolves flag →
+    --config worker_idle_grace_seconds → default."""
+    progress = json.loads(a.progress) if a.progress else {}
+    verdict = json.loads(a.verdict) if a.verdict else None
+    grace = a.grace if a.grace is not None else _cfg(a)["worker_idle_grace_seconds"]
+    terminal_idle = {"busy": False, "idle": True, "none": None}[a.terminal]
+    return afk_decide.classify_no_pr(progress, terminal_idle, a.idle_seconds,
+                                     verdict, a.blocked_by_open, grace)
 
 
 # --------------------------------------------------------------------------- #
@@ -535,6 +605,34 @@ def build_parser():
     p.add_argument("--pr", default="none", help='"open" if an open PR closes it, else none')
     p.add_argument("--checks", default=None, help="green|red|pending")
     p.set_defaults(fn=cmd_subclassify)
+
+    # worker-status — the decisive git PROGRESS signal for a no_pr claim (effectful, git-only)
+    p = sub.add_parser("worker-status", help="read a worker worktree's git progress (effectful, git-only)")
+    add_cfg(p)  # for the base_branch fallback
+    p.add_argument("--worktree", required=True, help="path to the worker's worktree")
+    p.add_argument("--base", default=None, help="base branch to count commits ahead of (default: config base_branch)")
+    p.set_defaults(fn=cmd_worker_status)
+
+    # verdict — the worker's declared reason for opening no PR (effect gather + pure parse)
+    p = sub.add_parser("verdict", help="latest parsed afk:verdict marker on an issue (effectful)")
+    p.add_argument("--repo", default=None, help="owner/name (for gh api; required unless --comments-json)")
+    p.add_argument("--issue", dest="number", type=int, required=True)
+    p.add_argument("--comments-json", default=None, help="inject issue comments, skip gh (tests)")
+    p.set_defaults(fn=cmd_verdict)
+
+    # classify-no-pr — the 5-way no_pr verdict (pure) from the tick's gathered signals
+    p = sub.add_parser("classify-no-pr", help="5-way no_pr verdict: coding/idle_done/idle_blocked/idle_failed/dead (pure)")
+    add_cfg(p)
+    p.add_argument("--progress", default=None, help="JSON from `afk worker-status` ({} if unknown)")
+    p.add_argument("--terminal", choices=["busy", "idle", "none"], required=True,
+                   help="orca liveness probe: busy | idle | none (no live worker)")
+    p.add_argument("--idle-seconds", type=int, default=None,
+                   help="seconds since the worker's last observable activity")
+    p.add_argument("--verdict", default=None, help="JSON from `afk verdict` (omit if none)")
+    p.add_argument("--blocked-by-open", action="store_true",
+                   help="set iff any blocked_by issue is still open (blocked verdict only)")
+    p.add_argument("--grace", type=int, default=None, help="worker_idle_grace_seconds override")
+    p.set_defaults(fn=cmd_classify_no_pr)
 
     return ap
 
