@@ -51,6 +51,15 @@ def _ns_paths(base):
     return base + "/claim", base + "/heartbeat"
 
 
+def _remote(a):
+    """The git push/fetch target. `--repo owner/name` → its GitHub URL, so any ref
+    op works from anywhere the gh commands do — no clone-with-the-right-origin
+    required (falls back to the named `--remote`, default origin). One repo handle,
+    whether git or gh reads it."""
+    repo = getattr(a, "repo", None)
+    return f"https://github.com/{repo}.git" if repo else a.remote
+
+
 def _git(args, check=True):
     p = subprocess.run(["git", *args], capture_output=True, text=True, env=_GIT_ENV)
     if check and p.returncode != 0:
@@ -142,7 +151,7 @@ def _scan(remote, base):
 
 
 def cmd_scan(a):
-    claims, heartbeats = _scan(a.remote, a.ns)
+    claims, heartbeats = _scan(_remote(a), a.ns)
     return {"claims": claims, "heartbeats": heartbeats}
 
 
@@ -151,7 +160,7 @@ def cmd_classify_claims(a):
         claims = json.loads(a.claims_json)
         heartbeats = json.loads(a.heartbeats_json or "{}")
     else:
-        claims, heartbeats = _scan(a.remote, a.ns)
+        claims, heartbeats = _scan(_remote(a), a.ns)
     now = a.now if a.now is not None else int(time.time())
     ttl = a.ttl if a.ttl is not None else _cfg(a)["claim_lease_ttl_seconds"]
     result = afk_decide.classify_claims(claims, heartbeats, a.instance, now, ttl)
@@ -162,13 +171,14 @@ def cmd_classify_claims(a):
 def cmd_claim(a):
     claim_ns, _ = _ns_paths(a.ns)
     ref = f"{claim_ns}/{a.number}"
+    rem = _remote(a)
     now = a.now if a.now is not None else int(time.time())
     sha = _marker_commit(_marker_text("afk-claim", a.instance, now, host=a.host))
     # Create-only: the server rejects a ref that already exists → that is the CAS.
-    p = _git(["push", a.remote, f"{sha}:{ref}"], check=False)
+    p = _git(["push", rem, f"{sha}:{ref}"], check=False)
     if p.returncode == 0:
         return {"won": True, "issue": a.number, "ref": ref, "sha": sha, "instance": a.instance}
-    owner = _read_marker(a.remote, ref)  # who beat us
+    owner = _read_marker(rem, ref)  # who beat us
     return {"won": False, "issue": a.number, "ref": ref,
             "owner": owner, "detail": p.stderr.strip()}
 
@@ -179,7 +189,7 @@ def cmd_reclaim(a):
     now = a.now if a.now is not None else int(time.time())
     sha = _marker_commit(_marker_text("afk-claim", a.instance, now, host=a.host))
     # Atomic takeover: rejected unless the ref still points at the sha we read.
-    p = _git(["push", a.remote,
+    p = _git(["push", _remote(a),
               f"--force-with-lease={ref}:{a.expect_sha}", f"{sha}:{ref}"], check=False)
     if p.returncode == 0:
         return {"won": True, "issue": a.number, "ref": ref, "sha": sha, "instance": a.instance}
@@ -189,7 +199,7 @@ def cmd_reclaim(a):
 def cmd_release(a):
     claim_ns, _ = _ns_paths(a.ns)
     ref = f"{claim_ns}/{a.number}"
-    p = _git(["push", a.remote, "--delete", ref], check=False)
+    p = _git(["push", _remote(a), "--delete", ref], check=False)
     # Already gone counts as released — idempotent cleanup.
     ok = p.returncode == 0 or "remote ref does not exist" in p.stderr or "deleted" in p.stderr
     return {"released": bool(ok), "issue": a.number, "ref": ref, "detail": p.stderr.strip()}
@@ -198,14 +208,15 @@ def cmd_release(a):
 def cmd_heartbeat(a):
     _, hb_ns = _ns_paths(a.ns)
     ref = f"{hb_ns}/{a.instance}"
+    rem = _remote(a)
     now = a.now if a.now is not None else int(time.time())
     ttl = a.ttl if a.ttl is not None else _cfg(a)["claim_lease_ttl_seconds"]
-    cur = _read_marker(a.remote, ref)
+    cur = _read_marker(rem, ref)
     last = cur.get("ts") if cur else None
     if not afk_decide.heartbeat_due(last, now, ttl):
         return {"refreshed": False, "reason": "not due", "ts": last, "ref": ref}
     sha = _marker_commit(_marker_text("afk-heartbeat", a.instance, now))
-    p = _git(["push", a.remote, "--force", f"{sha}:{ref}"], check=False)
+    p = _git(["push", rem, "--force", f"{sha}:{ref}"], check=False)
     if p.returncode != 0:
         raise RuntimeError(p.stderr.strip())
     return {"refreshed": True, "ts": now, "ref": ref}
@@ -233,18 +244,18 @@ def cmd_config(a):
         return afk_decide.resolve_config(afk_decide.parse_config_yaml(f.read()))
 
 
-def _gather(repo, remote, ns):
+def _gather(a):
     """The ONE gatherer of the observable fleet inputs (ADR-0008): open issues,
     open PRs, and the claim/heartbeat ref scan. Both `rebuild` and the
     launcher's `fingerprint` gate read through here, so their views cannot
     drift. Raw JSON lives and dies in this process; fields beyond what the
     digest canonicalizes are harmless — afk_decide.fingerprint ignores them."""
-    issues = json.loads(_gh(["issue", "list", "--repo", repo, "--state", "open",
+    issues = json.loads(_gh(["issue", "list", "--repo", a.repo, "--state", "open",
                              "--limit", "200", "--json", "number,title,labels,updatedAt"]).stdout)
-    prs = json.loads(_gh(["pr", "list", "--repo", repo, "--state", "open",
+    prs = json.loads(_gh(["pr", "list", "--repo", a.repo, "--state", "open",
                           "--json",
                           "number,headRefOid,updatedAt,statusCheckRollup,closingIssuesReferences"]).stdout)
-    claims, heartbeats = _scan(remote, ns)
+    claims, heartbeats = _scan(_remote(a), a.ns)
     return issues, prs, claims, heartbeats
 
 
@@ -258,7 +269,7 @@ def cmd_fingerprint(a):
     else:
         if not a.repo:
             raise ValueError("--repo owner/name is required unless --state-json")
-        issues, prs, claims, _ = _gather(a.repo, a.remote, a.ns)  # heartbeats deliberately
+        issues, prs, claims, _ = _gather(a)  # heartbeats deliberately
         # unused — see afk_decide.fingerprint
     fp = afk_decide.fingerprint(issues, prs, claims)
     force_after = a.force_after if a.force_after is not None else _cfg(a)["force_tick_after_skips"]
@@ -284,7 +295,7 @@ def cmd_rebuild(a):
     else:
         if not a.repo:
             raise ValueError("--repo owner/name is required unless --state-json")
-        issues, prs, claims, heartbeats = _gather(a.repo, a.remote, a.ns)
+        issues, prs, claims, heartbeats = _gather(a)
         claimed = {c.get("number") for c in claims}
         pr_nums = {r.get("number") for p in prs
                    for r in (p.get("closingIssuesReferences") or [])}
@@ -344,12 +355,13 @@ def cmd_probe(a):
     """Decide the claim namespace: can we push under refs/afk/*? Else fall back to
     branches (refs/heads/afk-claim/*) and flag that on:push CI will fire."""
     ref = f"{a.ns}/probe"
+    rem = _remote(a)
     sha = _marker_commit(_marker_text("afk-probe", "probe", a.now if a.now is not None else int(time.time())))
-    p = _git(["push", a.remote, f"{sha}:{ref}"], check=False)
+    p = _git(["push", rem, f"{sha}:{ref}"], check=False)
     if p.returncode != 0:
         return {"namespace": "refs/heads", "hidden": False, "ci_on_push": True,
                 "blocked": True, "detail": p.stderr.strip()}
-    _git(["push", a.remote, "--delete", ref], check=False)
+    _git(["push", rem, "--delete", ref], check=False)
     return {"namespace": "refs/afk", "hidden": True, "ci_on_push": False, "blocked": False}
 
 
@@ -399,6 +411,10 @@ def build_parser():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def add_ns(p):
+        p.add_argument("--repo", default=None,
+                       help="owner/name of the target repo — the one repo handle: git-ref ops "
+                            "push/fetch to its GitHub URL, gh ops read it directly "
+                            "(falls back to --remote, default origin)")
         p.add_argument("--remote", default="origin")
         p.add_argument("--ns", default="refs/afk", help="claim base namespace (or refs/heads fallback)")
 
@@ -479,8 +495,7 @@ def build_parser():
 
     # rebuild — one read-only call returns the tick's whole working set (ADR-0008)
     p = sub.add_parser("rebuild", help="gather + assemble the tick's working set (read-only)")
-    add_ns(p); add_cfg(p)
-    p.add_argument("--repo", default=None, help="owner/name (for gh; required unless --state-json)")
+    add_ns(p); add_cfg(p)  # --repo (required here unless --state-json) comes from add_ns
     p.add_argument("--instance", required=True)
     p.add_argument("--ttl", type=int, default=None)
     p.add_argument("--ready-label", default=None)
@@ -492,8 +507,7 @@ def build_parser():
 
     # fingerprint — the launcher's zero-LLM cycle gate (ADR-0007)
     p = sub.add_parser("fingerprint", help="digest observable state; skip-or-tick verdict for the launcher")
-    add_ns(p); add_cfg(p)
-    p.add_argument("--repo", default=None, help="owner/name (for gh; required unless --state-json)")
+    add_ns(p); add_cfg(p)  # --repo (required here unless --state-json) comes from add_ns
     p.add_argument("--last", default="", help="the previous cycle's digest (empty on the first cycle)")
     p.add_argument("--skips", type=int, default=0, help="consecutive skipped cycles so far")
     p.add_argument("--force-after", type=int, default=None, help="full tick at least every N skips")
