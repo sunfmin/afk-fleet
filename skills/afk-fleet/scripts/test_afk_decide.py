@@ -386,6 +386,10 @@ def test_find_orca_worktree():
     assert d.find_orca_worktree(None, 9)["found"] is False
     # archived leftovers are not recoverable progress
     assert d.find_orca_worktree([{**rows[1], "isArchived": True}], 9, "o/r")["found"] is False
+    # the issue number is compared numerically, not by identity: a str/int drift at
+    # orca's JSON boundary would silently downgrade every tier-1 recovery
+    assert d.find_orca_worktree([{**rows[1], "linkedIssue": "9"}], 9, "o/r")["path"] == "/wt/old-9"
+    assert d.find_orca_worktree([{**rows[1], "linkedIssue": "nine"}], 9, "o/r")["found"] is False
 
 
 def test_select_recovery():

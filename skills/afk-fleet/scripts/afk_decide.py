@@ -780,7 +780,14 @@ def find_orca_worktree(worktrees, number, repo=None):
     """
     hits = []
     for w in worktrees or []:
-        if w.get("linkedIssue") != number:
+        # `linkedIssue` is an int in orca's JSON today; compared numerically anyway,
+        # because a str/int drift at this boundary would silently downgrade every
+        # tier-1 recovery to tier 2/3 — i.e. quietly lose the uncommitted work that
+        # tier 1 exists to save.
+        try:
+            if int(w.get("linkedIssue")) != int(number):
+                continue
+        except (TypeError, ValueError):
             continue
         if w.get("isMainWorktree") or w.get("isArchived"):
             continue
