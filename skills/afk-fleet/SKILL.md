@@ -81,10 +81,15 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
    guessed settings.
 2. **Establish this fleet instance** — mint a short unique **instance id** (this launcher run's
    identity, held only in the launcher and injected into every tick, exactly like the authorization
-   below). Probe the claim namespace with `afk probe`; if it reports `blocked` (an org ruleset forbids
-   `refs/afk/*`), pass its fallback `--ns refs/heads` to every later `afk` call and **warn** that claim
-   refs are then ordinary branches that may trigger `on: push` CI. See
-   [Cooperative multi-fleet](#cooperative-multi-fleet).
+   below). Then `afk probe --repo <repo> --config '<config>'`, which answers two compatibility questions:
+   - **Claim namespace** — if it reports `blocked` (an org ruleset forbids `refs/afk/*`), pass its
+     fallback `--ns refs/heads` to every later `afk` call and **warn** that claim refs are then ordinary
+     branches that may trigger `on: push` CI. See [Cooperative multi-fleet](#cooperative-multi-fleet).
+   - **Branch protection** (only when `gate.ci: local`) — `protection.verdict == "error"` means
+     `merge.target` **requires status checks**, so `gh pr merge` would be rejected however green the
+     local gate is: **stop here, with the human present** — drop the required checks on that branch or
+     switch to `gate.ci: required`. (`gh pr merge --admin` is not an option: it bypasses human review
+     too.) A `"warn"` verdict (the read was inconclusive — no admin rights) is reported and continues.
 3. **Settle the worker launch command** — `afk worker-command`. Workers start in a *fresh login shell*
    that inherits none of this session's environment, so a launcher running on a custom provider
    (`ckimi`, `csk`, a direnv, a wrapper script) would otherwise dispatch workers that silently fall
@@ -208,7 +213,7 @@ prose each pass (ADR-0004). Each prints one JSON object. Pure verdicts live in `
 |---|---|---|
 | `afk config --file <path>` | parse + validate the repo config → **canonical JSON** (every key, defaults filled; unknown key → error). `--defaults` prints the one defaults table (ADR-0009) | pure (file read) |
 | `afk worker-command [--check <cmd>]` | settle the string every worker is started with: ask-or-not (stock launcher → never asked) + the login shell's Claude-starting aliases to offer; `--check` resolves an answer's first word and flags a missing unattended flag (ADR-0010) | effect (login shell) + pure verdict |
-| `afk rebuild --repo <r> --instance <id> --config <json>` | **one read-only call → the whole working set**: frontier (dispatch+excluded), `mine` subclassified with PR/checks/attempt-labels, `peer_live`, `stale` (with the sha reclaim needs), fingerprint (ADR-0008) | effect gather + pure assembly |
+| `afk rebuild --repo <r> --instance <id> --config <json>` | **one read-only call → the whole working set**: frontier (dispatch+excluded), `mine` subclassified with PR/checks/attempt-labels, `peer_live`, `stale` (with the sha reclaim needs), fingerprint (ADR-0008). In `gate.ci: local` an open PR is `awaiting_merge` outright — no checks are read (ADR-0012) | effect gather + pure assembly |
 | `afk worker-status --worktree <path> --base <branch>` | a `no_pr` worker's git **progress** in its worktree → `{commits_ahead, dirty, last_commit_ts, worktree_mtime_ts}` — the decisive coding-vs-finished signal, independent of terminal chrome (git only, no gh) | effect (git) |
 | `afk recovery --issue <n> --repo <r> --config <json>` | a **dead** claim's recoverable progress → the tiered **continuation** verdict `{tier, action, prompt, worktree, branch}` (worktree still here? branch ahead of base?) — ADR-0011 | effect gather + pure verdict |
 | `afk verdict --repo <r> --issue <n>` | the LATEST parsed `afk:verdict` marker the worker left → `{found, phase, blocked_by, reason, comment_url}` — its machine-readable reason for opening no PR | effect gather + pure parse |
@@ -221,6 +226,7 @@ prose each pass (ADR-0004). Each prints one JSON object. Pure verdicts live in `
 | `afk next-attempt --labels <csv> --config <json>` | retry-or-escalate from `afk-attempt/*` | pure |
 | `afk pace --summary <json> --config <json>` | next launcher sleep, with the `ttl/2` cap | pure |
 | `afk fingerprint --repo <r> --last <fp> --skips <k> --config <json>` | digest observable state → skip-or-tick for the launcher's cycle gate (same gatherer as `rebuild`) | effect gather + pure verdict |
+| `afk gate-run --worktree <p> --config <json>` | run `gate.local_command` in a worktree → `{status, excerpt, exit_code, timed_out}` — the **merge-time completion gate** in `gate.ci: local`, mirroring the ephemeral CI-log sub-read (ADR-0012) | effect + pure verdict |
 | `afk status <n> --repo <r> --state <json>` | upsert the human-facing progress **status board** comment, idempotently | pure render + effect |
 
 Every config-consuming subcommand takes the **same canonical `--config` JSON** the launcher got from
@@ -232,8 +238,8 @@ flag → `--config` → the defaults table (ADR-0009).
 as undocumented debug surfaces over the same pure core; a tick never calls them.)
 
 Judgment stays with the tick and is **not** a tool: is the implementation correct (the gate),
-adversarial verify, resolving a rebase conflict, the orphan-vs-alive read of a liveness probe, wording
-an escalation, the human authorization.
+adversarial verify, resolving a sync conflict, the orphan-vs-alive read of a liveness probe, whether a
+recovered worktree is sane to build on, wording an escalation, the human authorization.
 
 ## A tick (`--tick`) — one reconciliation pass
 
@@ -254,7 +260,9 @@ spawns).
      `epic_labels` + **unclaimed** + **no open linked PR** + zero open `blocked_by`) — the published
      contract; `--plan` and live agree because both are this one code path.
    - **In-flight** — each of **`mine`** arrives subclassified: *awaiting_merge* → merge;
-     *awaiting_ci* → leave; *failure* → failure handling; *no_pr* → **disambiguate finished-from-coding
+     *awaiting_ci* → leave; *failure* → failure handling; *no_pr* → see below. (In `gate.ci: local`
+     only *awaiting_merge* and *no_pr* occur — no checks are read, and the gate runs inside the merge
+     sequence instead; ADR-0012.) For *no_pr*, **disambiguate finished-from-coding
      with three signals, never terminal chrome alone.** A worker that ran to completion, concluded there
      was no PR to open, posted its reason, and went idle looks *identical* to one still coding — both
      are "a connected terminal with a title" — so a binary liveness probe parks the claim forever.
@@ -422,12 +430,29 @@ attempt is precisely the thing that failed, so starting from base is deliberate.
 
 ## Completion gate
 
-A PR may merge only when **all** configured gates are green:
+A PR may merge only when **all** configured gates are green. Which **machine gate** applies is
+`gate.ci` ([ADR-0012](../../docs/adr/0012-local-completion-gate.md)):
 
-- **CI machine gate** — wait for the PR's GitHub checks. Read the checks (and, on red, the failing-log
-  excerpt) in an **ephemeral sub-read** that returns only `{status: green|red, reason}`; raw logs
-  never enter the tick. Progressive: before CI exists, the gate is the issue's acceptance criteria +
-  whatever local build/test exists.
+- **`required` (default) — the CI machine gate.** Wait for the PR's GitHub checks. Read the checks
+  (and, on red, the failing-log excerpt) in an **ephemeral sub-read** that returns only
+  `{status: green|red, reason}`; raw logs never enter the tick. Progressive: before CI exists, the gate
+  is the issue's acceptance criteria + whatever local build/test exists.
+- **`local` — `gate.local_command` *is* the completion gate.** GitHub checks are **never read** in this
+  mode (`rebuild` reports every open PR as `awaiting_merge`: gating is an **action taken at merge
+  time**, not an observation waited on). It runs twice in a PR's life — the **worker** runs it after its
+  pre-PR sync, and the **tick re-runs it at merge time** in the branch's worktree — because the worker's
+  pass tested pre-sync code, and two PRs can each be locally green yet conflict semantically. The
+  invariant both runs serve: *what lands on the target branch was tested in the form it lands.* One
+  call, deliberately the same compact shape as the CI sub-read, so a raw log never enters the tick:
+  ```bash
+  python3 <skill>/scripts/afk.py gate-run --worktree <path> --config '<config json>'
+  # → {status: green|red, exit_code, excerpt, omitted_lines, timed_out}
+  ```
+  A red run's `excerpt` is **posted as a PR comment** before the retry ladder, so the next attempt
+  re-reads the failure from where it lives rather than from a dead tick's context. Adopting this mode is
+  the repo's claim that its command is CI-equivalent, and it is expected to scope remote CI away from
+  worker branches; bootstrap **hard-errors** when `merge.target` requires status checks (see
+  [Bootstrap](#bootstrap-once-with-the-human-present) step 2).
 - **Independent adversarial verification** (if `gate.adversarial_verify`) — a *separate* agent (not
   the author, doesn't see its reasoning) re-derives the result and tries to **refute** it (e.g.
   re-solve and assert `final == official answer:`, audit the derivation). Refute-first: any
@@ -437,10 +462,26 @@ A PR may merge only when **all** configured gates are green:
 ## Merge (serialized)
 
 Within a tick, merges are **strictly serialized** — one PR at a time — so parallel workers never
-corrupt `main`:
+corrupt the target branch:
 
-1. Rebase the branch onto latest `merge.target` (`rebase_before_merge`). A conflict → failure handling.
-2. Re-confirm the gate is still green after the rebase.
+1. **Sync** the branch up to latest `merge.target` (`sync_before_merge`) — by **merging, never
+   rebasing**:
+   ```bash
+   git -C <worktree> fetch origin <target>
+   git -C <worktree> merge origin/<target>      # NOT rebase
+   git -C <worktree> push origin HEAD
+   ```
+   One verb at both ends of a PR's life (the worker syncs the same way pre-PR). Rebase is **retired from
+   the merge path**: it drops the merge commits the worker's own sync and checkpoints created, re-igniting
+   the conflicts already resolved inside them — while squash-merge makes the target-branch history
+   identical either way (ADR-0012). An unresolvable conflict → failure handling.
+   **No worktree here?** (a `--takeover` from another machine, a stray cleanup.) Recreate one at the
+   pushed branch tip — the [continuation](#recovery-by-continuation-a-dead-claim-is-continued-never-restarted)
+   tier-2 move — and dispose of it after the merge.
+2. **Re-confirm the gate after the sync**, against the exact tree that will land:
+   - `gate.ci: required` → the PR's checks are green again;
+   - `gate.ci: local` → `afk gate-run --worktree <path> --config '<config>'`. On red, post the `excerpt`
+     as a PR comment and route to failure handling as **gate red** — the existing category, not a new one.
 3. `gh pr merge <n> --squash --delete-branch` (per `merge.strategy`). The issue auto-closes via
    `Closes #<n>`.
    If `progress_comment`, upsert the terminal board now (`afk status <n> --repo <repo> --state
@@ -455,9 +496,9 @@ human-gated step — never done here.
 
 ## Failure handling — bounded retry → escalate, never silently drop
 
-Per issue, on any of {worker failed, gate red, adversarial refute, unresolvable rebase conflict, a
-`no_pr` claim classified **idle_failed** — a `giving-up` verdict, or a worker gone idle with **no
-verdict at all** after grace}:
+Per issue, on any of {worker failed, gate red — the PR's CI checks *or* a red merge-time
+`afk gate-run` — adversarial refute, unresolvable **sync** conflict, a `no_pr` claim classified
+**idle_failed** — a `giving-up` verdict, or a worker gone idle with **no verdict at all** after grace}:
 
 1. **Retry up to `retry` times** (default 2). The attempt count lives as an **`afk-attempt/<n>`
    label** on the issue (not in tick memory). `afk next-attempt --labels <the issue's labels>
@@ -465,7 +506,8 @@ verdict at all** after grace}:
    tear down the worktree (`orca worktree rm --worktree issue:<n> --force`), and re-dispatch —
    **keeping the claim ref** (you still own the issue). The
    failure reason handed to the new worker is **re-read from where it already lives** — the PR's CI
-   checks, the verifier's PR review comment, or the reproduced rebase conflict — never carried in context.
+   checks, the merge-time gate excerpt posted as a PR comment, the verifier's PR review comment, or the
+   reproduced sync conflict — never carried in context.
 2. **On `{"action":"escalate"}`:** (if `progress_comment`, upsert the terminal board
    `--state '{"phase":"escalated",…}'` **before** releasing, while it's still my claim), then `afk
    release <n>` (delete the claim), remove
@@ -485,7 +527,7 @@ release <n>`.
 
 `concurrency` (default 3) bounds parallel workers. Semantic ordering is the backlog's dependency DAG
 (your responsibility when decomposing); textual conflicts between parallel PRs are caught by the
-serialized rebase-before-merge and routed through failure handling. Early machinery issues that all
+serialized sync-before-merge and routed through failure handling. Early machinery issues that all
 touch shared root config are naturally throttled by the DAG — chain them with `blocked_by`.
 
 ## Guardrails

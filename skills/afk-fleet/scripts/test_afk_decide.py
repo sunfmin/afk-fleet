@@ -77,6 +77,91 @@ def test_subclassify_pr():
     assert d.subclassify_pr("open", "pending") == "awaiting_ci"
     assert d.subclassify_pr("open", None) == "awaiting_ci"
 
+    # gate.ci: local — there are no checks to WAIT on, because gating is an action
+    # the tick takes at merge time (ADR-0012). Any open PR is awaiting_merge, and a
+    # red remote run (the repo's own on:push CI, which the fleet does not gate on)
+    # must never park the claim in `failure` forever.
+    for checks in ("green", "red", "pending", None):
+        assert d.subclassify_pr("open", checks, "local") == "awaiting_merge", checks
+    assert d.subclassify_pr("none", None, "local") == "no_pr"      # no PR is still no PR
+    # the default is unchanged for every existing repo
+    assert d.subclassify_pr("open", "red") == d.subclassify_pr("open", "red", "required")
+
+
+def test_validate_config():
+    ok = d.resolve_config({})
+    assert d.validate_config(ok) is ok                    # returns it, unchanged
+
+    # local mode with a real command is fine
+    d.validate_config(d.resolve_config({"gate": {"ci": "local", "local_command": "make test"}}))
+
+    # the illegal state made unrepresentable: local mode IS the local command, so an
+    # empty one would merge every PR unverified
+    for bad_gate in ({"ci": "local"},                       # local_command defaults to ""
+                     {"ci": "local", "local_command": "   "}):
+        try:
+            d.validate_config(d.resolve_config({"gate": bad_gate}))
+            assert False, f"expected ValueError for {bad_gate}"
+        except ValueError as e:
+            assert "local_command" in str(e)
+
+    # an unknown mode is refused, never treated as "required"
+    try:
+        d.validate_config(d.resolve_config({"gate": {"ci": "optional"}}))
+        assert False, "expected ValueError for an unknown gate.ci"
+    except ValueError as e:
+        assert "gate.ci" in str(e) and "required" in str(e)
+
+
+def test_gate_verdict():
+    log = "\n".join(f"line {i}" for i in range(1, 101))
+
+    # ONLY exit 0 is green — the one thing that could quietly poison a merge
+    assert d.gate_verdict(0, "all good")["status"] == "green"
+    for rc in (1, 2, 127, -9):
+        assert d.gate_verdict(rc, "boom")["status"] == "red", rc
+
+    # the excerpt is the TAIL (where runners put the failure summary), bounded
+    r = d.gate_verdict(1, log, max_lines=10)
+    assert r["excerpt"].splitlines() == [f"line {i}" for i in range(91, 101)]
+    assert r["omitted_lines"] == 90 and r["exit_code"] == 1
+    # a short log is kept whole, and nothing is reported as omitted
+    r = d.gate_verdict(0, "one\ntwo\n")
+    assert r["excerpt"] == "one\ntwo" and r["omitted_lines"] == 0
+    assert d.gate_verdict(0, "")["excerpt"] == ""
+    assert d.gate_verdict(0, None)["excerpt"] == ""
+
+    # a timed-out run is RED, never green-by-default, whatever it exited with
+    r = d.gate_verdict(0, "hung", timed_out=True)
+    assert r["status"] == "red" and r["timed_out"] is True
+
+
+def test_protection_verdict():
+    checks_required = {"required_status_checks": {"strict": True, "contexts": ["ci/build"]}}
+
+    # gate.ci: local + a target that requires checks → merges would be rejected
+    # outright, and --admin (the only bypass) would override human review too.
+    r = d.protection_verdict("local", checks_required)
+    assert r["verdict"] == "error" and r["required_checks"] == ["ci/build"]
+    assert "gate.ci: required" in r["detail"]
+    # the newer `checks: [{context}]` shape is read too, and de-duplicated
+    r = d.protection_verdict("local", {"required_status_checks": {
+        "contexts": ["ci/build"], "checks": [{"context": "ci/build"}, {"context": "ci/lint"}]}})
+    assert r["required_checks"] == ["ci/build", "ci/lint"]
+
+    # local mode is fine when nothing is required, protected or not
+    assert d.protection_verdict("local", None)["verdict"] == "ok"
+    assert d.protection_verdict("local", {"required_status_checks": {"contexts": []}})["verdict"] == "ok"
+    assert d.protection_verdict("local", {"required_pull_request_reviews": {}})["verdict"] == "ok"
+
+    # an inconclusive read WARNS — never a guess in either direction
+    r = d.protection_verdict("local", None, unavailable="HTTP 403: needs admin rights")
+    assert r["verdict"] == "warn" and "403" in r["detail"]
+
+    # in required mode, required checks are the gate itself — never an obstacle
+    assert d.protection_verdict("required", checks_required)["verdict"] == "ok"
+    assert d.protection_verdict("required", None, unavailable="boom")["verdict"] == "ok"
+
 
 def test_parse_verdict_marker():
     # valid, every field; reason (last) keeps its spaces
@@ -512,6 +597,18 @@ def test_assemble_working_set():
                                  "me", now, TTL, "ready-for-agent", ["epic", "prd"])
     assert {e["number"] for e in ws2["frontier"]["dispatch"]} == {1, 2}
 
+    # gate.ci: local — a PR whose remote checks are RED is still awaiting_merge,
+    # because those checks are not the gate; the tick re-runs the local one at merge
+    # time instead (ADR-0012). Everything else about the working set is unchanged.
+    red = [{**prs[0], "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "FAILURE"}]}]
+    strict = d.assemble_working_set(issues, red, claims, heartbeats, {2: 1}, "me", now, TTL,
+                                    "ready-for-agent", ["epic", "prd"])
+    local = d.assemble_working_set(issues, red, claims, heartbeats, {2: 1}, "me", now, TTL,
+                                   "ready-for-agent", ["epic", "prd"], "local")
+    assert {m["number"]: m["status"] for m in strict["mine"]} == {3: "failure", 4: "no_pr"}
+    assert {m["number"]: m["status"] for m in local["mine"]} == {3: "awaiting_merge", 4: "no_pr"}
+    assert local["frontier"] == strict["frontier"] and local["stale"] == strict["stale"]
+
 
 def test_parse_config_yaml():
     text = """
@@ -553,6 +650,16 @@ retry: 3
             assert False, f"expected ValueError for {bad!r}"
         except ValueError:
             pass
+
+    # a RENAMED key fails loudly with its migration note — never silently defaulted,
+    # which would leave a config file quietly lying to its author (ADR-0009/ADR-0012)
+    try:
+        d.parse_config_yaml("merge:\n  rebase_before_merge: true")
+        assert False, "expected ValueError for the retired rebase_before_merge key"
+    except ValueError as e:
+        assert "merge.sync_before_merge" in str(e) and "ADR-0012" in str(e)
+    assert d.parse_config_yaml("merge:\n  sync_before_merge: false") == \
+        {"merge": {"sync_before_merge": False}}
 
 
 def test_resolve_config():

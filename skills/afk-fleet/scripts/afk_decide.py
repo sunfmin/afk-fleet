@@ -57,7 +57,7 @@ CONFIG_DEFAULTS = {
     "merge": {
         "strategy": "squash",
         "target": "main",
-        "rebase_before_merge": True,
+        "sync_before_merge": True,
         "delete_branch": True,
     },
     # failure handling
@@ -74,6 +74,51 @@ CONFIG_DEFAULTS = {
     "fingerprint_gate": True,
     "force_tick_after_skips": 6,
 }
+
+
+# The completion gate's two modes (ADR-0012). `required` waits for the PR's GitHub
+# checks; `local` never reads them and makes `gate.local_command` the gate, re-run
+# at merge time against the exact tree that lands.
+GATE_CI_MODES = ("required", "local")
+
+# Keys that were renamed, and why. A file still carrying the old name must fail
+# LOUDLY with the migration note rather than be silently defaulted — a config that
+# lies to its author is the failure mode ADR-0009 exists to prevent.
+CONFIG_RENAMED = {
+    "merge.rebase_before_merge": (
+        "merge.sync_before_merge",
+        "the merge path now MERGES origin/<base> into the branch instead of rebasing it "
+        "(ADR-0012) — a rebase drops merge commits and re-ignites the conflicts already "
+        "resolved inside them. Rename the key; its meaning and default (true) are unchanged."),
+}
+
+
+def _renamed(dotted):
+    """The migration error text for a renamed key, or None if it isn't one."""
+    hit = CONFIG_RENAMED.get(dotted)
+    if not hit:
+        return None
+    new, why = hit
+    return f"config: {dotted!r} was renamed to {new!r} — {why}"
+
+
+def validate_config(cfg):
+    """
+    The semantic checks a per-key type cannot express, run on the CANONICAL config
+    at load time (`afk config`) — i.e. at bootstrap, with the human present, where
+    a bad combination can still be fixed instead of surfacing mid-run inside a
+    tick. Raises ValueError; returns `cfg` unchanged so it can be used inline.
+    """
+    gate = cfg.get("gate") or {}
+    ci = gate.get("ci")
+    if ci not in GATE_CI_MODES:
+        raise ValueError(f"config gate.ci: expected one of "
+                         f"{' | '.join(GATE_CI_MODES)}, got {ci!r}")
+    if ci == "local" and not (gate.get("local_command") or "").strip():
+        raise ValueError("config gate.ci: 'local' requires a non-empty gate.local_command — in "
+                         "local mode that command IS the completion gate (ADR-0012), so an empty "
+                         "one would merge every PR unverified")
+    return cfg
 
 
 def _yaml_block(text):
@@ -151,12 +196,14 @@ def parse_config_yaml(text):
                 raise ValueError(f"config: indented key {key!r} outside a gate:/merge: section")
             sub = CONFIG_DEFAULTS[section]
             if key not in sub:
-                raise ValueError(f"config: unknown key {section}.{key}")
+                raise ValueError(_renamed(f"{section}.{key}")
+                                 or f"config: unknown key {section}.{key}")
             partial.setdefault(section, {})[key] = _coerce(f"{section}.{key}", raw, sub[key])
         else:
             if key not in CONFIG_DEFAULTS:
-                raise ValueError(f"config: unknown key {key!r} (note: authorize/instance "
-                                 f"are per-run facts, never config keys)")
+                raise ValueError(_renamed(key)
+                                 or f"config: unknown key {key!r} (note: authorize/instance "
+                                    f"are per-run facts, never config keys)")
             default = CONFIG_DEFAULTS[key]
             if isinstance(default, dict):
                 if raw:
@@ -320,7 +367,7 @@ def classify_claims(claims, heartbeats, me, now, ttl):
     return {"mine": sorted(mine), "peer_live": sorted(peer_live), "stale": sorted(stale)}
 
 
-def subclassify_pr(pr_state, checks_state):
+def subclassify_pr(pr_state, checks_state, ci_mode="required"):
     """
     Classify one of MY in-flight claims from its PR + checks. Whether a "no_pr"
     claim is an *orphan* needs the worker liveness probe (orca-cli) — that stays
@@ -328,15 +375,101 @@ def subclassify_pr(pr_state, checks_state):
 
       pr_state:     "open" if an open PR closes the issue, else anything (→ no_pr)
       checks_state: "green" | "red" | "pending" | None
+      ci_mode:      gate.ci — "required" reads the checks; "local" never does
     Returns: "awaiting_merge" | "failure" | "awaiting_ci" | "no_pr".
+
+    In `local` mode (ADR-0012) an open PR is always *awaiting_merge*: there are no
+    checks to wait on, because gating is an **action the tick takes at merge time**
+    (sync → re-run the local gate → merge), not an observation it waits for. A red
+    remote run — the repo's own `on: push` workflow, which the fleet does not gate
+    on — must not park the claim in `failure` forever.
     """
     if pr_state != "open":
         return "no_pr"
+    if ci_mode == "local":
+        return "awaiting_merge"
     if checks_state == "green":
         return "awaiting_merge"
     if checks_state == "red":
         return "failure"
     return "awaiting_ci"
+
+
+# --------------------------------------------------------------------------- #
+# The local completion gate + its bootstrap compatibility probe (ADR-0012)     #
+# --------------------------------------------------------------------------- #
+#
+# In `gate.ci: local` the repo-local build/test command IS the completion gate:
+# the worker runs it after its pre-PR sync, and the tick re-runs it at merge time,
+# after the merge-time sync, in the branch's worktree. The invariant both runs
+# serve: *what lands on the target branch was tested in the form it lands.* The
+# verdict shape below is deliberately the SAME {status, excerpt} the ephemeral
+# CI-log sub-read returns in `required` mode, so the tick has one gate branch, and
+# a raw log never enters its context either way.
+
+GATE_EXCERPT_LINES = 40
+
+
+def gate_verdict(exit_code, output, max_lines=GATE_EXCERPT_LINES, timed_out=False):
+    """
+    One local-gate run → `{status, exit_code, excerpt, omitted_lines, timed_out}`.
+
+    Pure so the one thing that could quietly poison a merge — "which exit code
+    counts as green" — is fixture-pinned: ONLY 0 is green, and a run that timed out
+    is red, never green-by-default. The excerpt is the LAST `max_lines` lines
+    (where build/test runners put the failure summary), bounded so a 50k-line log
+    reaches the PR comment as a readable tail instead of flooding it.
+    """
+    lines = [ln.rstrip() for ln in (output or "").splitlines()]
+    tail = lines[-max_lines:] if max_lines and max_lines > 0 else lines
+    return {"status": "green" if (int(exit_code) == 0 and not timed_out) else "red",
+            "exit_code": int(exit_code),
+            "timed_out": bool(timed_out),
+            "excerpt": "\n".join(tail).strip(),
+            "omitted_lines": max(0, len(lines) - len(tail))}
+
+
+def protection_verdict(ci_mode, protection, unavailable=None):
+    """
+    Is the merge target's branch protection compatible with the configured gate?
+    Read at bootstrap, with the human present (ADR-0012).
+
+      ci_mode:     gate.ci ("required" | "local")
+      protection:  the target branch's protection object, or None if it has none
+      unavailable: why protection could not be read (no admin rights, an API
+                   error); None when the read succeeded
+
+    Returns {"verdict": "ok"|"error"|"warn", "required_checks": [...], "detail"}.
+
+      error  `ci: local` + the target REQUIRES status checks. `gh pr merge` is
+             rejected no matter how green the local gate is, and the only bypass —
+             `--admin` — also overrides human review, far too much power for an
+             unattended fleet. So this is a hard error at bootstrap, not a
+             surprise on the first merge.
+      warn   the probe itself was inconclusive: continue, but say so.
+      ok     nothing incompatible. In `required` mode required checks are exactly
+             what the fleet waits for, so they are never a problem.
+    """
+    if ci_mode != "local":
+        return {"verdict": "ok", "required_checks": [],
+                "detail": f"gate.ci is {ci_mode!r} — required checks are the gate, not an obstacle"}
+    if unavailable:
+        return {"verdict": "warn", "required_checks": [],
+                "detail": f"could not read branch protection ({unavailable}) — if the target "
+                          f"requires status checks, merges will be rejected"}
+    rsc = (protection or {}).get("required_status_checks") or {}
+    checks = list(rsc.get("contexts") or [])
+    for c in rsc.get("checks") or []:
+        name = c.get("context") if isinstance(c, dict) else c
+        if name and name not in checks:
+            checks.append(name)
+    if checks:
+        return {"verdict": "error", "required_checks": sorted(checks),
+                "detail": "gate.ci is 'local' but the target branch requires status checks "
+                          f"({', '.join(sorted(checks))}) — every merge would be rejected. Either "
+                          f"drop the required checks on that branch or use gate.ci: required."}
+    return {"verdict": "ok", "required_checks": [],
+            "detail": "target branch requires no status checks — a local gate can merge"}
 
 
 # --------------------------------------------------------------------------- #
@@ -1124,7 +1257,7 @@ def _closing_pr_map(prs):
 
 
 def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, ttl,
-                         ready_label, epic_labels):
+                         ready_label, epic_labels, ci_mode="required"):
     """
     The tick's whole working set from the raw observables. Pure — afk.py's
     `rebuild` gathers, this assembles, and a fixture pins the join.
@@ -1139,6 +1272,9 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, t
                    already fails a cheaper eligibility check first.
       me/now/ttl:  as classify_claims
       ready_label/epic_labels: the dispatch contract
+      ci_mode:     gate.ci — in `local` mode an open PR is awaiting_merge outright,
+                   since the gate is a merge-time action, not an observation
+                   (ADR-0012)
 
     Returns:
       {"frontier": {"dispatch": [{"number","title"}...], "excluded": [...]},
@@ -1174,7 +1310,7 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, t
         checks = pr_checks_state(pr.get("statusCheckRollup")) if pr else None
         issue = by_num.get(n, {})
         mine.append({"number": n, "title": issue.get("title"),
-                     "status": subclassify_pr("open" if pr else "none", checks),
+                     "status": subclassify_pr("open" if pr else "none", checks, ci_mode),
                      "pr": pr.get("number") if pr else None, "checks": checks,
                      "attempt_labels": [lb for lb in _label_names(issue)
                                         if lb.startswith("afk-attempt/")]})

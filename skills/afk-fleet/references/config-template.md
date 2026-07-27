@@ -40,8 +40,15 @@ worker_idle_grace_seconds: 300         # a no-PR worker that went idle is judged
 
 # --- completion gate ---
 gate:
-  ci: required                         # wait for GitHub checks green on the PR
-  local_command: ""                    # optional pre-PR local gate the worker runs (e.g. "pnpm build && pnpm test")
+  ci: required                         # required | local  (ADR-0012)
+                                      #   required — wait for the PR's GitHub checks to go green
+                                      #   local    — never read GitHub checks: local_command IS the gate,
+                                      #              run by the worker pre-PR and RE-RUN by the tick at
+                                      #              merge time against the exact tree that lands.
+                                      #              Requires a non-empty local_command (load-time error).
+  local_command: ""                    # the repo's build/test command (e.g. "pnpm build && pnpm test").
+                                      #   In `required` mode: the worker's pre-PR filter. In `local` mode:
+                                      #   the completion gate itself, at both ends.
   adversarial_verify: false            # set true for content repos: an independent agent re-derives
                                        # the result and refutes wrong output before merge (refute-first)
   adversarial_verify_prompt: ""        # what the verifier checks (e.g. "re-solve; assert final == official answer:")
@@ -50,7 +57,10 @@ gate:
 merge:
   strategy: squash                     # squash | merge | rebase
   target: main                         # fleet stops here; deploy is a separate human-gated step
-  rebase_before_merge: true            # serialized: rebase onto latest target, re-gate, then merge
+  sync_before_merge: true              # serialized: MERGE origin/<target> into the branch (never rebase —
+                                      #   a rebase drops merge commits and re-ignites the conflicts already
+                                      #   resolved inside them), re-gate, then merge. Renamed from
+                                      #   rebase_before_merge in ADR-0012; the old key is a load-time error.
   delete_branch: true
 
 # --- failure handling ---
@@ -95,6 +105,20 @@ force_tick_after_skips: 6              # safety net: a full tick at least every 
   a retry: a red CI gate tears the worker down and a *fresh* worker re-reads the issue, the docs,
   and the failure from scratch. A local `build && test` gate catches most failures inside the same
   worker session — a few fix-up edits instead of a full re-spawn plus a CI round-trip.
+- **`gate.ci: local` — when to switch, and what the repo owes it (ADR-0012).** Workers push after
+  every completed step (progress preservation), so on `required` every one of those pushes fires the
+  repo's `on: push` / `on: pull_request` workflows while the fleet reads only the last run — and then
+  the serialized merge path waits for yet another full run. In `local` mode the local command is the
+  whole gate, run twice: by the worker after its pre-PR **sync**, and by the tick at merge time after
+  the merge-time sync. Three obligations come with it:
+  - **Scope remote CI away from worker branches** (e.g. trigger `on: push` for the target branch only,
+    and drop `on: pull_request`). The fleet cannot edit your workflows — if you leave them broad you
+    keep paying the congestion, you just stop reading it.
+  - **Do not require status checks on `merge.target`.** `gh pr merge` would be rejected however green
+    the local gate is, and the only bypass (`--admin`) also overrides human review, so the fleet
+    refuses to use it. Bootstrap probes the protection and **hard-errors** on this combination.
+  - **Own the environment parity.** `ci: local` is a claim that `local_command` is CI-equivalent. If
+    your CI needs a Linux-only toolchain, service containers, or secrets, stay on `required`.
 - **Fingerprint gate.** On a skipped cycle the launcher spawns no tick — its only cost is the tool
   call — and, while holding claims, refreshes the lease itself (`afk heartbeat`), so skipping never
   lapses a lease. Correctness never depends on the gate: a missed change waits at most

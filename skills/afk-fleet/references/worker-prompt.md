@@ -57,7 +57,7 @@ worktree is lost. So make progress durable as you go, not just at the end:
   ```bash
   git add -A && git commit -m "<what this step did>" && git push origin HEAD
   ```
-- **Always** commit + push *before* you run the local gate (step 4) and before starting any
+- **Always** commit + push *before* the pre-PR sync + gate (step 4) and before starting any
   long-running operation.
 
 Your branch already exists on GitHub (orca created it, `<user>/…`), so `git push origin HEAD` needs no
@@ -77,15 +77,31 @@ anyway (ADR-0011).
    — do not drift to synonyms it marks *Avoid*.
 2. **Implement** the issue's acceptance criteria. Match surrounding code's conventions. Checkpoint —
    commit + push your branch (see "Publish progress as you go") — after each completed step, and
-   always before the gate.
+   always before the sync + gate.
 3. **Do NOT invent shared prerequisites.** If the issue needs a shared entity/module/decision that
    doesn't exist yet, STOP and post a **`phase=blocked` verdict marker** comment (see "outcome" above),
    `blocked_by=` the issue(s) that must land first, saying what's missing — instead of creating it
    yourself (that belongs upstream, not duplicated here). Do not open a PR.
    Likewise, if you find the issue is **already implemented** in `{base_branch}` (empty diff vs base),
    post a **`phase=already-satisfied`** verdict marker and open no PR.
-4. **Gate locally before the PR.** Run `{local_command}` if set; fix until green. If a prior attempt
-   is being retried, the failure reason / refutation / conflict is included below — address it directly.
+4. **Sync, push, then gate — in that order, before the PR.** Catch your branch up with the base and
+   prove the *combined* tree is good:
+   ```bash
+   git fetch origin {base_branch}
+   git merge origin/{base_branch}      # MERGE — never rebase
+   # resolve any conflict HERE, in this session
+   git push origin HEAD
+   {local_command}                     # if set: fix until green, committing + pushing each fix
+   ```
+   **Merge, never rebase:** a rebase replays your commits and drops the merge commits, re-igniting
+   conflicts whose resolutions lived only inside them; and because the coordinator squash-merges, the
+   target branch's history is identical either way (ADR-0012). **Resolve integration conflicts here**
+   — you are the author, your context is loaded, and the fix is cheap. The only other venue is the
+   coordinator's serialized merge point, where you are gone, the queue is blocked, and it costs a
+   retry. Note the coordinator re-runs this same `{local_command}` at merge time against the tree that
+   actually lands, and in `gate.ci: local` repos that run is the *only* machine gate there is — so
+   leave it genuinely green, not green-if-you-squint. If a prior attempt is being retried, the failure
+   reason / refutation / conflict is included below — address it directly.
 5. **Open the PR:** `gh pr create --base {base_branch} --head {branch} --title "..." --body "Closes #{n}
    ..."`. Body: what you changed, how you verified, any follow-ups.
 6. **Report done:** your PR is the result. Emit the PR URL and "done", then stop — do not merge, do
@@ -131,6 +147,6 @@ substitutions and change nothing else:
    > Then read the ground truth as below, and continue from the first step that is not yet done.
 
 A continuing worker checkpoints exactly like a fresh one (commit + push after each completed step and
-before the gate), so its own progress is durable for any *further* continuation. The "you MUST end
+before the sync + gate), so its own progress is durable for any *further* continuation. The "you MUST end
 with exactly ONE machine-readable outcome (a PR with `Closes #{n}`, or an `afk:verdict` marker)" hard
 rule applies unchanged — continuing is not an excuse to idle without an outcome.

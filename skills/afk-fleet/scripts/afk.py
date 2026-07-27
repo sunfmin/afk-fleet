@@ -10,13 +10,15 @@ is `{"won": false}`, still exit 0); exit 3 = an operational/git error.
 Two layers:
   - pure verdicts (`config`, `frontier`, `pace`, `next-attempt`, `subclassify`,
     `classify-no-pr`, and the decision halves of `rebuild`, `classify-claims`,
-    `verdict`, `worker-command`, and `fingerprint`) come from afk_decide.py — no
-    I/O, fixture-tested; time is always injected, never read here. Config resolution
-    is one order everywhere: flag → `--config` JSON → CONFIG_DEFAULTS (ADR-0009).
+    `recovery`, `takeover`, `gate-run`, `probe`, `verdict`, `worker-command`, and
+    `fingerprint`) come from afk_decide.py — no I/O, fixture-tested; time is always
+    injected, never read here. Config resolution is one order everywhere:
+    flag → `--config` JSON → CONFIG_DEFAULTS (ADR-0009).
   - effectful ops (`scan`, `claim`, `reclaim`, `release`, `heartbeat`, `probe`,
-    `worker-status`, `verdict`, `worker-command`) drive git refs / worktree git /
-    gh / the login shell. Their real test is a scratch-repo integration suite
-    (tracked separately) — here they are correct-by-construction and smoke-tested.
+    `takeover`, `worker-status`, `recovery`, `gate-run`, `verdict`,
+    `worker-command`) drive git refs / worktree git / gh / orca / the login shell.
+    Their real test is a scratch-repo integration suite (tracked separately) — here
+    they are correct-by-construction and smoke-tested.
 
 Invoked as:  python3 <skill>/scripts/afk.py <subcommand> [flags]
 """
@@ -387,7 +389,11 @@ def cmd_config(a):
     if not a.file:
         raise ValueError("--file <path to docs/agents/afk-fleet.md> is required unless --defaults")
     with open(a.file) as f:
-        return afk_decide.resolve_config(afk_decide.parse_config_yaml(f.read()))
+        cfg = afk_decide.resolve_config(afk_decide.parse_config_yaml(f.read()))
+    # Load time is the ONE place semantic validation runs (ADR-0009/ADR-0012): the
+    # human is present here, so `gate.ci: local` with no local_command is refused
+    # where it can be fixed — not discovered by a tick about to merge unverified.
+    return afk_decide.validate_config(cfg)
 
 
 def _gather(a):
@@ -456,7 +462,8 @@ def cmd_rebuild(a):
             blocked[n] = 0 if v in ("", "null") else int(v)
     now = a.now if a.now is not None else int(time.time())
     return afk_decide.assemble_working_set(issues, prs, claims, heartbeats, blocked,
-                                           a.instance, now, ttl, ready, epic)
+                                           a.instance, now, ttl, ready, epic,
+                                           a.ci or cfg["gate"]["ci"])
 
 
 def _find_status_comment(repo, number):
@@ -541,18 +548,90 @@ def cmd_worker_command(a):
     return result
 
 
+def _branch_protection(repo, branch):
+    """One branch's protection → (protection|None, unavailable_detail|None). A
+    branch with NO protection is a successful read of "nothing", not an error —
+    only a read that genuinely failed (no admin rights, an API error) is
+    inconclusive, and `protection_verdict` warns rather than guesses on those."""
+    p = _gh(["api", f"repos/{repo}/branches/{branch}/protection"], check=False)
+    if p.returncode == 0:
+        try:
+            return json.loads(p.stdout), None
+        except json.JSONDecodeError:
+            return None, "unparseable branch-protection response"
+    err = ((p.stderr or "") + (p.stdout or "")).strip()
+    if "Branch not protected" in err:
+        return None, None
+    return None, err or f"gh exited {p.returncode}"
+
+
 def cmd_probe(a):
-    """Decide the claim namespace: can we push under refs/afk/*? Else fall back to
-    branches (refs/heads/afk-claim/*) and flag that on:push CI will fire."""
+    """The bootstrap compatibility probe — two questions, both answered with the
+    human present so a misfit is fixed here rather than mid-run (ADR-0009's tradition):
+
+    1. **Claim namespace** — can we push under `refs/afk/*`? Else fall back to
+       branches (`refs/heads/afk-claim/*`) and flag that `on: push` CI will fire.
+    2. **Branch protection** (only when `gate.ci: local`, ADR-0012) — does the merge
+       target REQUIRE status checks? Then `gh pr merge` is rejected however green the
+       local gate is, so that combination is a hard `error` at bootstrap; an
+       inconclusive read is a `warn`."""
     ref = f"{a.ns}/probe"
     rem = _remote(a)
     sha = _marker_commit(_marker_text("afk-probe", "probe", a.now if a.now is not None else int(time.time())))
     p = _git(["push", rem, f"{sha}:{ref}"], check=False)
-    if p.returncode != 0:
-        return {"namespace": "refs/heads", "hidden": False, "ci_on_push": True,
-                "blocked": True, "detail": p.stderr.strip()}
-    _git(["push", rem, "--delete", ref], check=False)
-    return {"namespace": "refs/afk", "hidden": True, "ci_on_push": False, "blocked": False}
+    if p.returncode == 0:
+        _git(["push", rem, "--delete", ref], check=False)
+        result = {"namespace": "refs/afk", "hidden": True, "ci_on_push": False, "blocked": False}
+    else:
+        result = {"namespace": "refs/heads", "hidden": False, "ci_on_push": True,
+                  "blocked": True, "detail": p.stderr.strip()}
+
+    cfg = _cfg(a)
+    ci_mode = cfg["gate"]["ci"]
+    if ci_mode == "local":
+        target = a.target or cfg["merge"]["target"]
+        if not a.repo:
+            result["protection"] = {"branch": target, "verdict": "warn", "required_checks": [],
+                                    "detail": "gate.ci is 'local' but --repo was not given, so "
+                                              "branch protection could not be checked"}
+        else:
+            prot, unavailable = _branch_protection(a.repo, target)
+            result["protection"] = {"branch": target,
+                                    **afk_decide.protection_verdict(ci_mode, prot, unavailable)}
+    return result
+
+
+def cmd_gate_run(a):
+    """Run the configured local gate in a worktree → `{status, excerpt}` — the
+    completion gate itself in `gate.ci: local` mode, re-run at MERGE time against
+    the exact tree that lands (ADR-0012). Deliberately the same compact shape as the
+    ephemeral CI-log sub-read `required` mode uses: the tick gets a verdict and a
+    bounded excerpt, never a raw log in its context.
+
+    Mechanics all the way down (ADR-0004): *what* to run is config, *where* is the
+    branch's worktree, and *whether it passed* is an exit code — no judgment. A run
+    that times out is red, never green-by-default."""
+    cfg = _cfg(a)
+    cmd = a.command or cfg["gate"]["local_command"]
+    if not (cmd or "").strip():
+        raise ValueError("no gate command to run: pass --command, or set gate.local_command "
+                         "(required whenever gate.ci is 'local')")
+    if not os.path.isdir(a.worktree):
+        raise ValueError(f"worktree not found: {a.worktree}")
+
+    def _text(s):
+        return s.decode("utf-8", "replace") if isinstance(s, bytes) else (s or "")
+
+    timed_out, rc = False, 0
+    try:
+        p = subprocess.run(cmd, shell=True, cwd=a.worktree, capture_output=True,
+                           text=True, timeout=a.timeout, env=_GIT_ENV)
+        out, rc = _text(p.stdout) + _text(p.stderr), p.returncode
+    except subprocess.TimeoutExpired as e:
+        out = _text(e.stdout) + _text(e.stderr) + f"\n[afk] gate timed out after {a.timeout}s"
+        timed_out, rc = True, 124
+    return {**afk_decide.gate_verdict(rc, out, a.excerpt_lines, timed_out),
+            "command": cmd, "worktree": a.worktree}
 
 
 def cmd_worker_status(a):
@@ -676,7 +755,7 @@ def cmd_next_attempt(a):
 
 
 def cmd_subclassify(a):
-    return {"status": afk_decide.subclassify_pr(a.pr, a.checks)}
+    return {"status": afk_decide.subclassify_pr(a.pr, a.checks, a.ci or _cfg(a)["gate"]["ci"])}
 
 
 def cmd_classify_no_pr(a):
@@ -782,9 +861,27 @@ def build_parser():
                    help="override the launcher's ANTHROPIC_BASE_URL (tests)")
     p.set_defaults(fn=cmd_worker_command)
 
-    # probe
-    p = sub.add_parser("probe", help="pick the claim namespace (effectful)")
-    add_ns(p); p.add_argument("--now", type=int, default=None); p.set_defaults(fn=cmd_probe)
+    # probe — claim namespace + (in local-gate mode) target branch protection
+    p = sub.add_parser("probe", help="bootstrap probe: claim namespace, and target-branch "
+                                     "protection when gate.ci is local (effectful)")
+    add_ns(p); add_cfg(p)
+    p.add_argument("--target", default=None,
+                   help="branch whose protection to check (default: config merge.target)")
+    p.add_argument("--now", type=int, default=None)
+    p.set_defaults(fn=cmd_probe)
+
+    # gate-run — the local completion gate, run at merge time (ADR-0012)
+    p = sub.add_parser("gate-run", help="run the configured local gate in a worktree → "
+                                        "{status, excerpt} (effectful)")
+    add_cfg(p)
+    p.add_argument("--worktree", required=True, help="worktree to run the gate in")
+    p.add_argument("--command", default=None,
+                   help="override the command (default: config gate.local_command)")
+    p.add_argument("--timeout", type=int, default=1800,
+                   help="seconds before the run is called red (default 1800)")
+    p.add_argument("--excerpt-lines", type=int, default=afk_decide.GATE_EXCERPT_LINES,
+                   help="how many trailing log lines the excerpt keeps")
+    p.set_defaults(fn=cmd_gate_run)
 
     # status — human-facing progress board (effectful, idempotent; ADR-0006)
     p = sub.add_parser("status", help="upsert the human-facing progress status board comment (effectful, idempotent)")
@@ -803,6 +900,9 @@ def build_parser():
     p.add_argument("--ttl", type=int, default=None)
     p.add_argument("--ready-label", default=None)
     p.add_argument("--epic-labels", default=None)
+    p.add_argument("--ci", default=None, choices=list(afk_decide.GATE_CI_MODES),
+                   help="gate.ci override: in 'local' an open PR is awaiting_merge outright, "
+                        "since gating is a merge-time action, not an observation (ADR-0012)")
     p.add_argument("--now", type=int, default=None, help="epoch override (tests)")
     p.add_argument("--state-json", default=None,
                    help='inject {"issues","prs","claims","heartbeats","blocked_by"}, skip gh/git (tests)')
@@ -835,8 +935,11 @@ def build_parser():
 
     # subclassify
     p = sub.add_parser("subclassify", help="classify one of my claims from its PR + checks (pure)")
+    add_cfg(p)
     p.add_argument("--pr", default="none", help='"open" if an open PR closes it, else none')
     p.add_argument("--checks", default=None, help="green|red|pending")
+    p.add_argument("--ci", default=None, choices=list(afk_decide.GATE_CI_MODES),
+                   help="gate.ci (default: from --config) — 'local' never reads checks")
     p.set_defaults(fn=cmd_subclassify)
 
     # worker-status — the decisive git PROGRESS signal for a no_pr claim (effectful, git-only)
