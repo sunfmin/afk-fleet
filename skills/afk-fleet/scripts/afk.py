@@ -42,6 +42,7 @@ _GIT_ENV = {
 }
 
 _LOCAL_SCAN = "refs/afk-scan"  # where `scan` mirrors remote refs, read-only, disposable
+_LOCAL_RECOVERY = "refs/afk-recovery"  # ditto for `recovery`'s branch-vs-base compare
 
 
 def _ns_paths(base):
@@ -106,6 +107,77 @@ def _read_marker(remote, refname):
         return None
     subject = _git(["log", "-1", "--format=%s", "FETCH_HEAD"], check=False).stdout.strip()
     return _parse_marker(subject)
+
+
+def _orca_worktree_rows(injected=None):
+    """The `result.worktrees` rows of `orca worktree list --json`, or [] when orca
+    can't be reached. SOFT by design: the worktree signal is one input to a tiered
+    recovery whose last tier needs no orca at all, so a machine without orca (or a
+    momentarily unhappy one) must degrade to "no local worktree", never abort a
+    recovery. `injected` accepts the whole doc, its `result`, or the bare rows."""
+    doc = injected
+    if doc is None:
+        try:
+            p = subprocess.run(["orca", "worktree", "list", "--json"],
+                               capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return []
+        if p.returncode != 0:
+            return []
+        try:
+            doc = json.loads(p.stdout)
+        except json.JSONDecodeError:
+            return []
+    if isinstance(doc, list):
+        return doc
+    if not isinstance(doc, dict):
+        return []
+    inner = doc.get("result") if isinstance(doc.get("result"), dict) else doc
+    rows = inner.get("worktrees")
+    return rows if isinstance(rows, list) else []
+
+
+def _worktree_progress(wt, base):
+    """One worktree's git progress: commits ahead of `base`, dirty tree, last
+    commit + newest file mtime. `commits_ahead` is None when the count could not be
+    read at all (a missing base ref, a broken worktree) — unreadable is NOT zero,
+    and `select_recovery` relies on the difference."""
+    ahead = _git(["-C", wt, "rev-list", "--count", f"{base}..HEAD"], check=False).stdout.strip()
+    dirty = _git(["-C", wt, "status", "--porcelain"], check=False).stdout.strip()
+    ct = _git(["-C", wt, "log", "-1", "--format=%ct"], check=False).stdout.strip()
+    return {"commits_ahead": int(ahead) if ahead.isdigit() else None,
+            "dirty": bool(dirty),
+            "last_commit_ts": int(ct) if ct.isdigit() else None,
+            "worktree_mtime_ts": _newest_mtime(wt)}
+
+
+def _remote_heads(remote):
+    """Every branch name on the remote (one `ls-remote`), or None if it failed."""
+    p = _git(["ls-remote", "--heads", remote], check=False)
+    if p.returncode != 0:
+        return None
+    heads = []
+    for line in p.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].startswith("refs/heads/"):
+            heads.append(parts[1][len("refs/heads/"):])
+    return heads
+
+
+def _branch_ahead(remote, branch, base):
+    """How many commits `branch` is ahead of `base` ON THE REMOTE — the tier-2
+    signal. git only (no gh), mirrored into a disposable local namespace, so it
+    reads the same whether the remote is a GitHub URL or a bare path.
+    Returns (count|None, detail)."""
+    p = _git(["fetch", "--force", remote,
+              f"{branch}:{_LOCAL_RECOVERY}/branch",
+              f"{base}:{_LOCAL_RECOVERY}/base"], check=False)
+    if p.returncode != 0:
+        return None, p.stderr.strip()
+    out = _git(["rev-list", "--count",
+                f"{_LOCAL_RECOVERY}/base..{_LOCAL_RECOVERY}/branch"],
+               check=False).stdout.strip()
+    return (int(out) if out.isdigit() else None), ""
 
 
 def _issue_num_from_ref(refname):
@@ -437,13 +509,63 @@ def cmd_worker_status(a):
     if not os.path.isdir(wt):
         raise ValueError(f"worktree not found: {wt}")
     base = a.base or _cfg(a)["base_branch"]
-    ahead = _git(["-C", wt, "rev-list", "--count", f"{base}..HEAD"], check=False).stdout.strip()
-    dirty = _git(["-C", wt, "status", "--porcelain"], check=False).stdout.strip()
-    ct = _git(["-C", wt, "log", "-1", "--format=%ct"], check=False).stdout.strip()
-    return {"commits_ahead": int(ahead) if ahead.isdigit() else 0,
-            "dirty": bool(dirty),
-            "last_commit_ts": int(ct) if ct.isdigit() else None,
-            "worktree_mtime_ts": _newest_mtime(wt)}
+    return _worktree_progress(wt, base)
+
+
+def cmd_recovery(a):
+    """Per DEAD claim: does recoverable progress exist, and where? → the tiered
+    continuation verdict (ADR-0011). This is what makes an orphaned-claim
+    reconciliation, a stale-claim reclaim, and a takeover *continue* the dead
+    worker's work instead of restarting it.
+
+    Two signals, both mechanics: (1) is a worktree for this issue still on THIS
+    machine — asked of `orca worktree list` (soft: no orca → "no worktree", never
+    an abort), overridable with `--worktree`/`--no-worktree`; (2) is the issue's
+    branch ahead of base on the remote — the branch is recognised from
+    `branch_pattern` (the claim ref records the issue, not the branch) and the
+    compare is plain git. `afk_decide.select_recovery` then picks the tier.
+
+    Both signals are always gathered, even when the worktree already settles the
+    tier: a *pristine* worktree over a branch that carries pushed commits still has
+    something to continue, and the honest prompt depends on knowing that."""
+    cfg = _cfg(a)
+    base = a.base or cfg["base_branch"]
+    rem = _remote(a)
+
+    # --- tier-1 signal: a worktree for this issue, still on this machine ---
+    path, branch = a.worktree, a.branch
+    if path is None and not a.no_worktree:
+        hit = afk_decide.find_orca_worktree(_orca_worktree_rows(
+            json.loads(a.orca_json) if a.orca_json is not None else None), a.number, a.repo)
+        path = hit["path"]
+        branch = branch or hit["branch"]
+    worktree = {"present": False, "path": path, "commits_ahead": None,
+                "dirty": False, "last_commit_ts": None, "worktree_mtime_ts": None}
+    if path and os.path.isdir(path):
+        worktree = {"present": True, "path": path, **_worktree_progress(path, base)}
+
+    # --- tier-2 signal: the branch the dead worker pushed ---
+    candidates = []
+    if not branch:
+        candidates = afk_decide.branch_candidates(_remote_heads(rem),
+                                                  cfg["branch_pattern"], a.number)
+    ahead, detail = None, ""
+    if branch:
+        ahead, detail = _branch_ahead(rem, branch, base)
+    elif candidates:
+        # Several branches can match one issue (an earlier attempt left one behind):
+        # take the one furthest ahead of base, ties by name (candidates are sorted).
+        for cand in candidates:
+            n, d = _branch_ahead(rem, cand, base)
+            if branch is None or (n or 0) > (ahead or 0):
+                branch, ahead, detail = cand, n, d
+    else:
+        detail = "no branch on the remote matches this issue"
+    branch_sig = {"name": branch, "commits_ahead": ahead, "candidates": candidates,
+                  "detail": detail}
+
+    return {"issue": a.number, "base": base, "worktree": worktree, "branch": branch_sig,
+            **afk_decide.select_recovery(worktree, branch_sig)}
 
 
 def cmd_verdict(a):
@@ -667,6 +789,23 @@ def build_parser():
     p.add_argument("--worktree", required=True, help="path to the worker's worktree")
     p.add_argument("--base", default=None, help="base branch to count commits ahead of (default: config base_branch)")
     p.set_defaults(fn=cmd_worker_status)
+
+    # recovery — the tiered continuation verdict for one DEAD claim (ADR-0011)
+    p = sub.add_parser("recovery",
+                       help="does a dead claim have recoverable progress, and where? → the "
+                            "tiered continuation verdict (effectful: orca list + git)")
+    add_ns(p); add_cfg(p)
+    p.add_argument("--issue", dest="number", type=int, required=True)
+    p.add_argument("--base", default=None, help="base branch (default: config base_branch)")
+    p.add_argument("--branch", default=None,
+                   help="the issue's work branch, when already known (skips discovery)")
+    p.add_argument("--worktree", default=None,
+                   help="path to the issue's worktree, when already known (skips the orca read)")
+    p.add_argument("--no-worktree", action="store_true",
+                   help="assert no local worktree survives (skips the orca read)")
+    p.add_argument("--orca-json", default=None,
+                   help="inject `orca worktree list --json` (tests / no orca)")
+    p.set_defaults(fn=cmd_recovery)
 
     # verdict — the worker's declared reason for opening no PR (effect gather + pure parse)
     p = sub.add_parser("verdict", help="latest parsed afk:verdict marker on an issue (effectful)")

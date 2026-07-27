@@ -163,6 +163,7 @@ prose each pass (ADR-0004). Each prints one JSON object. Pure verdicts live in `
 | `afk worker-command [--check <cmd>]` | settle the string every worker is started with: ask-or-not (stock launcher → never asked) + the login shell's Claude-starting aliases to offer; `--check` resolves an answer's first word and flags a missing unattended flag (ADR-0010) | effect (login shell) + pure verdict |
 | `afk rebuild --repo <r> --instance <id> --config <json>` | **one read-only call → the whole working set**: frontier (dispatch+excluded), `mine` subclassified with PR/checks/attempt-labels, `peer_live`, `stale` (with the sha reclaim needs), fingerprint (ADR-0008) | effect gather + pure assembly |
 | `afk worker-status --worktree <path> --base <branch>` | a `no_pr` worker's git **progress** in its worktree → `{commits_ahead, dirty, last_commit_ts, worktree_mtime_ts}` — the decisive coding-vs-finished signal, independent of terminal chrome (git only, no gh) | effect (git) |
+| `afk recovery --issue <n> --repo <r> --config <json>` | a **dead** claim's recoverable progress → the tiered **continuation** verdict `{tier, action, prompt, worktree, branch}` (worktree still here? branch ahead of base?) — ADR-0011 | effect gather + pure verdict |
 | `afk verdict --repo <r> --issue <n>` | the LATEST parsed `afk:verdict` marker the worker left → `{found, phase, blocked_by, reason, comment_url}` — its machine-readable reason for opening no PR | effect gather + pure parse |
 | `afk classify-no-pr --terminal <busy\|idle\|none> --progress <json> --verdict <json> --config <json>` | the **5-way `no_pr` verdict** from those signals → `{outcome, action}` (coding / idle_done / idle_blocked / idle_failed / dead) | pure |
 | `afk claim <n> --instance <id>` | atomic create-or-lose the claim ref → `{won}` | effect |
@@ -226,14 +227,19 @@ spawns).
          `escalate_label`, comment the unmet dependency — pass `--blocked-by-open`);
        - **idle_failed** (verdict `giving-up`, OR **no verdict at all** after grace) → **failure
          handling** (`afk next-attempt`: retry → escalate);
-       - **dead** (no live worker/terminal at all) → **orphaned claim**: tear down any stale worktree
-         (`orca worktree rm --worktree issue:<n> --force`) and re-dispatch, or `afk release <n>`.
+       - **dead** (no live worker/terminal at all) → **orphaned claim**: recover it by
+         **continuation** — `afk recovery --issue <n>` returns tier 1/2/3 and only tier 3 tears the
+         worktree down (see [Recovery by continuation](#recovery-by-continuation-a-dead-claim-is-continued-never-restarted)).
+         Keep the claim; or `afk release <n>` if the issue should go back to the frontier instead.
      The liveness probe, the empty-diff verification, and the orphan-vs-alive read stay judgment —
      deliberately not inside `rebuild`.
    - **Stale peer claims** — **`stale`** (a peer owns it and its `afk-heartbeat/<id>` is expired past
-     `claim_lease_ttl`) is the only foreign claim I may take: `afk reclaim <n> --instance <id>
-     --expect-sha <the sha rebuild reported>` (atomic — fails if it moved), then treat as my own
-     in-flight. **`peer_live`** is left strictly alone.
+     `claim_lease_ttl`) is the only foreign claim I may take *unattended*: `afk reclaim <n> --instance
+     <id> --expect-sha <the sha rebuild reported>` (atomic — fails if it moved), then treat as my own
+     in-flight and recover it by **continuation** — a reclaimed claim's worker is dead by definition, so
+     it goes straight through the tiers (tier 1 applies when the dead peer ran on *this* box).
+     **`peer_live`** is left strictly alone. The human-gated, lease-skipping sibling of this reclaim is
+     [`--takeover`](#takeover-mode---takeover).
 2. **Act**, in this order:
    - **Merge** every green in-flight PR (serialized — see below). `afk release <n>` on each merged issue.
    - **Escalate** any retry-exhausted issue (see failure handling).
@@ -307,15 +313,64 @@ each one runs is shown so the mechanism is legible, but the tick calls the tool.
   git push origin --force-with-lease="refs/afk/claim/$n:$sha_i_read" "$my_sha:refs/afk/claim/$n"
   ```
   A peer with a *fresh* heartbeat is left strictly alone — it reconciles its own dead workers locally.
+  A reclaimed claim is then recovered by **continuation**, not restarted (ADR-0011). The
+  lease-skipping, human-authorized sibling is [`--takeover`](#takeover-mode---takeover).
 - **Release / cleanup → `afk release <n>`** (idempotent) on **merge**, **escalate**, and
   **orphan-release**. On **graceful stop**, the drain tick releases claims with **no PR yet** and
-  **retains** those with an open PR (a peer inherits and merges the finished PR once the lease expires).
+  **retains** those with an open PR (a peer inherits it once the lease expires — merging it if it is
+  finished, **continuing** it if it is not).
   The **open-PR guard** — an issue with an open linked PR is never in the frontier — is what makes
   releasing safe: a still-finishing orphan's PR is never re-dispatched, and a human's PR is left alone.
   A skipped delete is a **phantom lock** that silently starves an issue.
 - **Namespace fallback** — if bootstrap's probe shows an org ruleset forbids `refs/afk/*`, fall back to
   `refs/heads/afk-claim/*` + `refs/heads/afk-heartbeat/*` and warn that `on: push` CI fires on claim
   churn.
+
+## Recovery by continuation (a dead claim is continued, never restarted)
+
+A claim whose worker died — an **orphaned claim** of mine, a **stale claim** reclaimed from a dead
+peer, or one inherited through a **takeover** — is recovered *from its durable progress*, never
+re-dispatched from base while progress exists. Workers push after every completed step (see
+[worker-prompt](references/worker-prompt.md)), so that progress is real and reachable: the local
+worktree if it is still on this machine, else the branch tip on GitHub ([ADR-0011](../../docs/adr/0011-takeover-and-progress-preservation.md)).
+
+One call decides which, per dead claim:
+
+```bash
+python3 <skill>/scripts/afk.py recovery --issue <n> --repo <repo> --config '<config json>'
+```
+
+It asks `orca worktree list` whether a worktree for this issue is still here, recognises the issue's
+branch on the remote from `branch_pattern` (the claim ref records the issue, not the branch), compares
+it against `base_branch`, and returns `{tier, action, prompt, worktree, branch, reason}`. It is
+deliberately a **separate call, not part of `rebuild`**: `rebuild` is the one machine-independent
+observation the launcher's fingerprint gate shares (ADR-0008), while this asks *this machine* what it
+still has — and only a dead claim ever needs asking.
+
+| tier | action | what the tick does | prompt |
+|---|---|---|---|
+| **1** | `reuse_worktree` | The worktree is still on this machine: **do not `orca worktree rm` it.** Start a new worker *inside it*, on the same branch — `orca terminal create --worktree issue:<n> --command "<worker_command>"`. Lossless: even uncommitted work survives. | continue |
+| **2** | `recreate_at_tip` | No local worktree, but the branch is ahead of base: recreate one at the **branch tip** (`orca worktree create … --base-branch <that branch>`) and continue there. Loss is bounded to "since the last push". | continue |
+| **3** | `dispatch_fresh` | Nothing survived: today's behaviour — tear down any leftover (`orca worktree rm --worktree issue:<n> --force`) and dispatch from base. **The only tier that tears anything down.** | fresh |
+
+`prompt` names the [worker-prompt](references/worker-prompt.md) variant to deliver: its
+**continue-mode variant** (inspect the existing progress first, treat it as partial work toward the
+*same* acceptance criteria) or the fresh one. A surviving worktree with provably nothing in it gets the
+fresh prompt — tier 1 is about never destroying a worktree, not about pretending there is progress.
+
+**Keep the claim** throughout (you already own the issue), and note that the `afk-attempt/<n>` counter
+is neither read nor incremented: continuation answers *"did the **worker** die?"*, the retry ladder
+answers *"is this **work** failing?"* — different axes (ADR-0011). Because progress accumulates across
+continuations, a claim recovered repeatedly *converges* instead of looping.
+
+**Judgment stays with the tick.** The tier selection is mechanics; whether the recovered state is sane
+to build on is your read, exactly like orphan-vs-alive. If it plainly is not (a wrecked tree, a branch
+carrying a wrong approach), fall back to tier 3 by hand.
+
+**This is not the retry path.** A red gate / adversarial refute / `giving-up` verdict still tears the
+worktree down and re-dispatches *fresh* with the failure reason (see
+[Failure handling](#failure-handling--bounded-retry--escalate-never-silently-drop)) — there the previous
+attempt is precisely the thing that failed, so starting from base is deliberate.
 
 ## Completion gate
 
@@ -404,7 +459,11 @@ touch shared root config are naturally throttled by the DAG — chain them with 
 - **Claim before work** (create the `afk-claim/<n>` ref; if the create is rejected, a peer owns it —
   never proceed). **Release on every terminal transition** (merge, escalate, orphan-release) by
   deleting the ref — a leaked ref is a phantom lock. Reconcile only **your own** claims; take a peer's
-  only when its heartbeat is expired (**stale claim**), never while it is fresh.
+  only when its heartbeat is expired (**stale claim**), never while it is fresh — the one exception
+  being an explicit human [`--takeover`](#takeover-mode---takeover).
+- **Never discard a dead worker's progress.** Recover a dead claim by **continuation** (`afk recovery`
+  → tier 1/2), and tear a worktree down only when the tool says tier 3. An `orca worktree rm` on a
+  worktree that still holds work is unrecoverable — nothing else in the fleet is.
 - **A human reserves an issue by removing `ready_label`**, not by assigning it — the fleet no longer
   reads the assignee. Keep the tracker honest so a peer fleet or a human never double-takes.
 - Reserved: the fleet manages `afk-attempt/<n>` labels, **the `refs/afk/*` ref namespace**

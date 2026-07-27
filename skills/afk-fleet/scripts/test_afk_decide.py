@@ -175,6 +175,97 @@ def test_classify_no_pr():
         {"outcome": "dead", "action": "orphan"}
 
 
+def test_branch_regex_and_candidates():
+    heads = [
+        "master",
+        "sunfmin/issue-9-continuation",          # orca's real shape: <user>/ prefix
+        "issue-9-continuation-second-try",       # no prefix, same issue
+        "sunfmin/issue-90-calibration",          # a DIFFERENT issue that starts with 9
+        "sunfmin/issue-10-takeover",
+        "sunfmin/feature/issue-9-nope",          # slug never spans a slash
+    ]
+    got = d.branch_candidates(heads, "issue-{number}-{slug}", 9)
+    assert got == ["issue-9-continuation-second-try", "sunfmin/issue-9-continuation"], got
+
+    # the number is the one field that is NOT a wildcard: 9 never matches 90
+    assert d.branch_candidates(heads, "issue-{number}-{slug}", 90) == \
+        ["sunfmin/issue-90-calibration"]
+    assert d.branch_candidates(heads, "issue-{number}-{slug}", 11) == []
+    assert d.branch_candidates(None, "issue-{number}-{slug}", 9) == []
+
+    # a pattern with regex metacharacters in its literal part is matched literally
+    assert d.branch_regex("wip.{number}", 9).match("wip.9")
+    assert not d.branch_regex("wip.{number}", 9).match("wipX9")
+    # a pattern with no {slug} still works, and a bare {number} needs the whole name
+    assert d.branch_candidates(["afk/9", "afk/91"], "afk/{number}", 9) == ["afk/9"]
+
+
+def test_find_orca_worktree():
+    rows = [
+        {"linkedIssue": None, "path": "/main", "branch": "refs/heads/master",
+         "projectId": "github:o/r", "isMainWorktree": True, "lastActivityAt": 99},
+        {"linkedIssue": 9, "path": "/wt/old-9", "branch": "refs/heads/sunfmin/issue-9-a",
+         "projectId": "github:o/r", "isMainWorktree": False, "lastActivityAt": 100},
+        {"linkedIssue": 9, "path": "/wt/new-9", "branch": "refs/heads/sunfmin/issue-9-b",
+         "projectId": "github:o/r", "isMainWorktree": False, "lastActivityAt": 200},
+        {"linkedIssue": 9, "path": "/wt/other-repo-9", "branch": "refs/heads/x",
+         "projectId": "github:o/other", "isMainWorktree": False, "lastActivityAt": 999},
+        {"linkedIssue": 7, "path": "/wt/7", "branch": "refs/heads/sunfmin/issue-7",
+         "projectId": "github:o/r", "isMainWorktree": False, "lastActivityAt": 300},
+    ]
+    # several worktrees for one issue → the most recently active; refs/heads/ stripped
+    r = d.find_orca_worktree(rows, 9, "o/r")
+    assert r == {"found": True, "path": "/wt/new-9", "branch": "sunfmin/issue-9-b"}, r
+
+    # a same-numbered issue in ANOTHER repo is never mistaken for this one
+    assert d.find_orca_worktree(rows, 9, "o/other")["path"] == "/wt/other-repo-9"
+    # no repo filter → any project may match (single-repo machines)
+    assert d.find_orca_worktree(rows, 7)["path"] == "/wt/7"
+    # the main worktree is never a worker's, and a missing issue is simply not found
+    assert d.find_orca_worktree(rows, 42, "o/r") == {"found": False, "path": None, "branch": None}
+    assert d.find_orca_worktree([], 9)["found"] is False
+    assert d.find_orca_worktree(None, 9)["found"] is False
+    # archived leftovers are not recoverable progress
+    assert d.find_orca_worktree([{**rows[1], "isArchived": True}], 9, "o/r")["found"] is False
+
+
+def test_select_recovery():
+    # tier 1 — a worktree is still HERE: reuse it, continue-mode prompt. Never torn down.
+    r = d.select_recovery({"present": True, "commits_ahead": 3, "dirty": False},
+                          {"name": "b", "commits_ahead": 3})
+    assert (r["tier"], r["action"], r["prompt"]) == (1, "reuse_worktree", "continue")
+    # tier 1 — uncommitted-only work still counts (this is what makes tier 1 lossless)
+    r = d.select_recovery({"present": True, "commits_ahead": 0, "dirty": True}, None)
+    assert (r["tier"], r["prompt"]) == (1, "continue")
+    # tier 1 — provably pristine: reuse the worktree, but the FRESH prompt (nothing to continue)
+    r = d.select_recovery({"present": True, "commits_ahead": 0, "dirty": False},
+                          {"name": "b", "commits_ahead": 0})
+    assert (r["tier"], r["action"], r["prompt"]) == (1, "reuse_worktree", "fresh")
+    # tier 1 — clean worktree but the branch carries pushed commits → still continue
+    r = d.select_recovery({"present": True, "commits_ahead": 0, "dirty": False},
+                          {"name": "b", "commits_ahead": 2})
+    assert (r["tier"], r["prompt"]) == (1, "continue") and "pushed" in r["reason"]
+    # tier 1 — unreadable progress is NOT pristine: never hand a fresh prompt over it
+    r = d.select_recovery({"present": True, "commits_ahead": None, "dirty": False}, None)
+    assert (r["tier"], r["prompt"]) == (1, "continue")
+
+    # tier 2 — no worktree, but the dead worker pushed → recreate at the branch tip
+    r = d.select_recovery({"present": False}, {"name": "sunfmin/issue-9-a", "commits_ahead": 4})
+    assert (r["tier"], r["action"], r["prompt"]) == (2, "recreate_at_tip", "continue")
+    assert "sunfmin/issue-9-a" in r["reason"] and "4 commit" in r["reason"]
+
+    # tier 3 — nothing survived: the old tear-down-and-re-dispatch, now the fallback only
+    for wt, br in (({"present": False}, {"name": "b", "commits_ahead": 0}),
+                   ({"present": False}, {"name": None, "commits_ahead": None}),
+                   (None, None),
+                   ({}, {})):
+        r = d.select_recovery(wt, br)
+        assert (r["tier"], r["action"], r["prompt"]) == (3, "dispatch_fresh", "fresh"), (wt, br, r)
+
+    # a branch we could not measure is not evidence of progress (never a silent tier 2)
+    assert d.select_recovery({"present": False}, {"name": "b", "commits_ahead": None})["tier"] == 3
+
+
 def test_next_attempt():
     assert d.next_attempt([], 2) == {"action": "retry", "from_label": None, "to_label": "afk-attempt/1"}
     assert d.next_attempt(["afk-attempt/1", "ready-for-agent"], 2) == \

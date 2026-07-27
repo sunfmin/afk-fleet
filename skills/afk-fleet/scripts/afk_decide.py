@@ -487,6 +487,145 @@ def classify_no_pr(progress, terminal_idle, idle_seconds, verdict, blocked_by_op
 
 
 # --------------------------------------------------------------------------- #
+# Continuation — recovering a dead claim FROM ITS PROGRESS (ADR-0011)          #
+# --------------------------------------------------------------------------- #
+#
+# When a claim's worker has died — an *orphaned claim* reconciled locally, or a
+# *stale claim* reclaimed from a peer — the fleet used to tear the worktree down
+# and re-dispatch from a fresh base, discarding every bit of partial work. The
+# default is now CONTINUATION: recover the claim from its durable progress,
+# tiered by what actually survived the death. The selection below is pure
+# mechanics — deterministic from two signals the effectful layer gathers (is a
+# worktree for this issue still on THIS machine, and is its branch ahead of base
+# on the remote) — while "is this recovered state sane to build on" stays tick
+# judgment, exactly like the orphan-vs-alive read.
+#
+# Only tier 3 tears anything down; that is the whole point of ADR-0011.
+
+_PLACEHOLDER_RE = re.compile(r"\{(number|slug)\}")
+
+
+def branch_regex(branch_pattern, number):
+    """
+    `branch_pattern` + an issue number → the regex that matches the branch orca
+    ACTUALLY created for it. Two things are wildcards, by construction: orca
+    prefixes the branch with `<user>/` (ADR-0005 — the fleet reads the name back
+    rather than dictating it), and the slug is whatever the dispatching tick
+    passed. The number is not: it is the one field that identifies the issue.
+    """
+    out, pos = [], 0
+    pattern = branch_pattern or ""
+    for m in _PLACEHOLDER_RE.finditer(pattern):
+        out.append(re.escape(pattern[pos:m.start()]))
+        out.append(str(number) if m.group(1) == "number" else "[^/]*")
+        pos = m.end()
+    out.append(re.escape(pattern[pos:]))
+    return re.compile(r"^(?:[^/]+/)?" + "".join(out) + r"$")
+
+
+def branch_candidates(heads, branch_pattern, number):
+    """The remote branch names that could be issue <number>'s work branch, sorted.
+    Used when NO local worktree survived: the claim ref records the issue, not the
+    branch, so tier 2 has to recognise the branch by its name."""
+    rx = branch_regex(branch_pattern, number)
+    return sorted(h for h in (heads or []) if h and rx.match(h))
+
+
+def find_orca_worktree(worktrees, number, repo=None):
+    """
+    The orca worktree belonging to issue <number> on THIS machine, from
+    `orca worktree list --json`'s `result.worktrees` rows — the tier-1 signal.
+    Pure so the shape of orca's JSON is fixture-pinned rather than re-derived.
+
+      worktrees: rows carrying {linkedIssue, path, branch, projectId,
+                 isMainWorktree, isArchived, lastActivityAt}
+      repo:      "owner/name" — when given, a row must belong to it (orca's
+                 `projectId` is `github:owner/name`), so a same-numbered issue in
+                 another repo's worktree is never mistaken for this one.
+
+    Returns {"found": bool, "path": str|None, "branch": str|None}. Several
+    matches (a stale leftover plus a live one) → the most recently active.
+    """
+    hits = []
+    for w in worktrees or []:
+        if w.get("linkedIssue") != number:
+            continue
+        if w.get("isMainWorktree") or w.get("isArchived"):
+            continue
+        if repo and (w.get("projectId") or "") not in (f"github:{repo}", repo):
+            continue
+        hits.append(w)
+    if not hits:
+        return {"found": False, "path": None, "branch": None}
+    best = max(hits, key=lambda w: int(w.get("lastActivityAt") or 0))
+    branch = best.get("branch") or None
+    if branch and branch.startswith("refs/heads/"):
+        branch = branch[len("refs/heads/"):]
+    return {"found": True, "path": best.get("path") or None, "branch": branch}
+
+
+RECOVERY_ACTIONS = ("reuse_worktree", "recreate_at_tip", "dispatch_fresh")
+
+
+def select_recovery(worktree, branch):
+    """
+    How to recover ONE claim whose worker has died — the continue-vs-fresh
+    selection of ADR-0011, tiered by what survived. Pure: `afk recovery` gathers
+    the two signals, this decides, and a fixture pins every tier.
+
+      worktree: this machine's worktree for the issue (None / {} if there is none)
+                {"present": bool, "commits_ahead": int|None, "dirty": bool}
+      branch:   the issue's branch on the remote (None / {} if unknown)
+                {"name": str|None, "commits_ahead": int|None}   (ahead of base)
+
+    Returns {"tier", "action", "prompt", "reason"}:
+      1  reuse_worktree   a worktree is still HERE → spawn the new worker inside
+                          it, on the same branch, and do NOT `orca worktree rm`
+                          it. Lossless: it carries even uncommitted work.
+      2  recreate_at_tip  no local worktree, but the dead worker pushed → recreate
+                          one at the branch tip and continue there. Loss is
+                          bounded to "since the last push".
+      3  dispatch_fresh   nothing survived → the old behaviour, re-dispatch from
+                          base. The ONLY tier that tears down.
+
+    `prompt` picks the worker-prompt variant: `continue` (inspect the existing
+    progress first) or `fresh`. A surviving worktree that is *provably* pristine
+    — zero commits ahead, a clean tree, and nothing pushed on its branch either —
+    gets the fresh prompt: there is nothing to continue, and telling a worker
+    otherwise sends it looking for work that isn't there. Unreadable progress
+    (`commits_ahead: None`) is NOT pristine: we never hand out a fresh prompt over
+    a worktree we could not read.
+    """
+    wt, br = worktree or {}, branch or {}
+    pushed = int(br.get("commits_ahead") or 0)
+    if wt.get("present"):
+        ahead = wt.get("commits_ahead")
+        known = ahead is not None
+        pristine = known and int(ahead) == 0 and not bool(wt.get("dirty")) and pushed == 0
+        if pristine:
+            reason = "local worktree present but pristine — reuse it, nothing to continue"
+        elif not known:
+            reason = "local worktree present, progress unreadable — reuse it and inspect"
+        elif int(ahead) == 0 and not wt.get("dirty"):
+            reason = (f"local worktree present and clean, but its branch carries {pushed} "
+                      f"pushed commit(s) ahead of base — reuse it and continue from them")
+        else:
+            reason = (f"local worktree present with {int(ahead)} commit(s) ahead"
+                      + (" and uncommitted changes" if wt.get("dirty") else ""))
+        return {"tier": 1, "action": "reuse_worktree",
+                "prompt": "fresh" if pristine else "continue", "reason": reason}
+
+    name, ahead = br.get("name"), br.get("commits_ahead")
+    if name and ahead is not None and int(ahead) > 0:
+        return {"tier": 2, "action": "recreate_at_tip", "prompt": "continue",
+                "reason": f"no local worktree; branch {name} is {int(ahead)} commit(s) "
+                          f"ahead of base — recreate at its tip"}
+    return {"tier": 3, "action": "dispatch_fresh", "prompt": "fresh",
+            "reason": "no local worktree and nothing pushed ahead of base — "
+                      "re-dispatch from base"}
+
+
+# --------------------------------------------------------------------------- #
 # Human-facing progress status board — render only (ADR-0006)                  #
 # --------------------------------------------------------------------------- #
 #
