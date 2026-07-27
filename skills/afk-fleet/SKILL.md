@@ -342,7 +342,7 @@ an issue), so ownership lives in atomic **git refs** under the hidden `refs/afk/
 liveness in a **per-instance lease**. See
 [ADR-0003](../../docs/adr/0003-cooperative-multi-fleet-claims.md).
 
-All of the mechanics below are `afk.py` subcommands (see [Tools](#tools-scriptsafkpy)); the raw git
+All of the mechanics below are `afk.py` subcommands (see [Tools](#tools-scriptsafkpy--the-deterministic-muscle)); the raw git
 each one runs is shown so the mechanism is legible, but the tick calls the tool.
 
 - **Instance id** — minted once per launcher run at bootstrap, injected into every tick. It stamps
