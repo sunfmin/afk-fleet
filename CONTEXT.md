@@ -53,6 +53,10 @@ worktree create` / `orca worktree rm`), the only supported backend — never by 
 worktree`; orca also names the branch (a `<user>/…` prefix), and the tick **reads that back** rather
 than dictating it (ADR-0005). It is started by running the **worker launch command** in the
 worktree's first terminal, so it runs on the same provider as the **launcher** that dispatched it.
+It publishes its progress as it goes — incrementally pushing its own branch after each completed
+step, and always before the local gate or any long-running operation — so a hard stop loses at most
+the in-flight step; that pushed branch tip is the durable progress a later **continuation** resumes
+from when this worker's machine is gone (ADR-0011).
 _Avoid_: agent (too generic), subagent, child
 
 **Worker launch command**:
@@ -128,16 +132,52 @@ _Avoid_: refresh, resync, reload
 
 **Orphaned claim**:
 One of **my own** claims (an `afk-claim/<n>` owned by this instance) with no PR and no live worker — a
-claim whose worker crashed or never started. Reconciled *locally* on every rebuild (torn down and
-re-dispatched, or released), never assumed still-running. Contrast **Stale claim**, which is a peer's.
+claim whose worker crashed or never started. Reconciled *locally* on every rebuild by **continuation**
+— recovered from its durable progress (the local worktree if still present, else the pushed branch)
+and only re-dispatched fresh when nothing survives, or released — never assumed still-running.
+Contrast **Stale claim**, which is a peer's.
 _Avoid_: stuck issue, dead worker, zombie
 
 **Stale claim**:
 A **peer's** claim whose owner's **heartbeat** has expired past `claim_lease_ttl` — evidence the owning
-instance died mid-flight. It is the only claim a fleet may take from another: reclaimed by an atomic
-`git push --force-with-lease` takeover of the ref, and only then. A live peer's claim is never touched
-— that is what keeps cooperating fleets from cannibalising each other's in-flight work.
+instance died mid-flight. It is the only claim a fleet may take from another *unattended*: reclaimed
+by an atomic `git push --force-with-lease` takeover of the ref, and only then, then recovered by
+**continuation**. A live peer's claim is never touched — that is what keeps cooperating fleets from
+cannibalising each other's in-flight work. The lease-bypassing, human-authorized sibling of this
+reclaim is the **Takeover**.
 _Avoid_: dead claim, abandoned claim, orphaned claim (that is one's *own* worker-less claim)
+
+**Takeover**:
+The **human-authorized**, **immediate** reclaim of a dead **fleet instance**'s claims — the
+lease-bypassing sibling of **stale-claim** reclaim. Where a stale reclaim is unattended and waits for
+the owner's **heartbeat** to expire past `claim_lease_ttl` (the only machine-visible proof of death),
+a takeover is initiated by a present human who *is* the proof of death — the oracle that knows, before
+the lease lapses, that the fleet hard-stopped (quota exhausted, process killed). It is a **launcher**
+bootstrap variant (`afk-fleet --takeover`): the new instance runs the full bootstrap (config, instance
+id, **worker launch command**, the one push+auto-merge authorization), then lists the instances
+discoverable in the claim markers and heartbeat refs and, on the human's selection, force-takes the
+chosen instance's claims with the *same* atomic `--force-with-lease` push as a stale reclaim — only
+skipping the staleness gate. A target whose heartbeat is still fresh prompts an explicit confirm,
+since the human may be wrong. Thereafter it is an ordinary standing fleet whose opening working set is
+the dead peer's claims plus the **frontier**. Claims taken are recovered by **continuation**, and a
+takeover never counts as a **retry** (ADR-0011).
+_Avoid_: failover (implies automatic), rescue (it seeds a standing fleet, not a bounded mission),
+stale reclaim (that is the unattended, lease-gated path)
+
+**Continuation**:
+The fleet's default way of recovering a claim whose **worker** died mid-flight — recovering it *from
+its durable progress* rather than re-dispatching fresh. It is tiered by what survived the death:
+first the worker's local worktree, if it is still on this machine (resumed in place — lossless,
+capturing even uncommitted/unpushed work); else the branch the worker incrementally pushed to GitHub
+(a new worktree recreated at its tip); and only when nothing survives, a fresh re-dispatch from base
+(the old behaviour). It is what makes a **takeover** and a **stale-claim** reclaim actually *continue*
+work instead of restarting it, and bounds a hard-stop's loss to "since the last push." Because
+progress accumulates across continuations, a claim taken over repeatedly converges rather than loops —
+which is why a takeover is kept orthogonal to the retry ladder. It is a *recovery behaviour* of the
+existing rebuild path, not a mode (ADR-0011).
+_Avoid_: resume (too narrow — covers only the in-place worktree tier), re-dispatch (that is the fresh
+last tier), checkpoint restore (the fleet does not model checkpoints as objects; the branch tip is the
+progress)
 
 **Status board** (a.k.a. progress comment):
 The human-facing projection of an issue's lifecycle onto the issue surface: a **single** comment the
