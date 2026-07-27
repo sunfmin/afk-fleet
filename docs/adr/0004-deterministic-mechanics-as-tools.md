@@ -65,8 +65,11 @@ removing the judgment.
 - Runtime deps unchanged in spirit: `python3` (already required) + `git`/`gh` (already used).
 - **Purity discipline**: `afk_decide.py` never reads the clock — `now` is always an argument — so
   fixtures pin behaviour. Time and all I/O live only in `afk.py`.
-- **Test split**: pure verdicts are fixture-tested now (fast, offline); the effectful ref ops are
-  correct-by-construction + locally smoke-tested, with a scratch-repo **multi-fleet concurrency**
-  integration suite tracked as [issue #1](https://github.com/sunfmin/afk-fleet/issues/1) (dogfood).
-- The tick's judgment steps stay prose and are *not* tools: the gate, adversarial verify, rebase-conflict
-  resolution, the liveness-probe read, escalation wording, and the human authorization.
+- **Test split**: pure verdicts are fixture-tested in `scripts/test_afk_decide.py`; the effectful **ref
+  ops** are covered by `scripts/test_afk_refs.py` — a bare git repo on local disk standing in for
+  GitHub, so the races that matter (concurrent claim, replayed `--force-with-lease`) are asserted
+  offline, with no gh and no network (`GIT_ALLOW_PROTOCOL=file` enforces that). Both suites are
+  ordinary `test_*` files, so one `pytest scripts` runs everything.
+- The tick's judgment steps stay prose and are *not* tools: the gate, adversarial verify, sync-conflict
+  resolution, the liveness-probe read, whether a recovered worktree is sane to build on, escalation
+  wording, and the human authorization.

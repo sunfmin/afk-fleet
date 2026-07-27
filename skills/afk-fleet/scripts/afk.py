@@ -17,8 +17,9 @@ Two layers:
   - effectful ops (`scan`, `claim`, `reclaim`, `release`, `heartbeat`, `probe`,
     `takeover`, `worker-status`, `recovery`, `gate-run`, `verdict`,
     `worker-command`) drive git refs / worktree git / gh / orca / the login shell.
-    Their real test is a scratch-repo integration suite (tracked separately) — here
-    they are correct-by-construction and smoke-tested.
+    The ref ops among them (`scan`/`claim`/`reclaim`/`release`/`heartbeat`/`probe`/
+    `takeover`/`recovery`) are covered by `test_afk_refs.py` — a bare local repo
+    standing in for GitHub, so the races are asserted offline, without gh.
 
 Invoked as:  python3 <skill>/scripts/afk.py <subcommand> [flags]
 """
@@ -581,7 +582,8 @@ def cmd_probe(a):
     p = _git(["push", rem, f"{sha}:{ref}"], check=False)
     if p.returncode == 0:
         _git(["push", rem, "--delete", ref], check=False)
-        result = {"namespace": "refs/afk", "hidden": True, "ci_on_push": False, "blocked": False}
+        hidden = a.ns != "refs/heads"          # report the namespace actually probed
+        result = {"namespace": a.ns, "hidden": hidden, "ci_on_push": not hidden, "blocked": False}
     else:
         result = {"namespace": "refs/heads", "hidden": False, "ci_on_push": True,
                   "blocked": True, "detail": p.stderr.strip()}
