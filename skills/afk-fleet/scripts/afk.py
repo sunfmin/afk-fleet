@@ -167,18 +167,18 @@ def _remote_heads(remote):
     return heads
 
 
-def _branch_ahead(remote, branch, base):
+def _branch_ahead(remote, branch, base, slot):
     """How many commits `branch` is ahead of `base` ON THE REMOTE — the tier-2
     signal. git only (no gh), mirrored into a disposable local namespace, so it
-    reads the same whether the remote is a GitHub URL or a bare path.
-    Returns (count|None, detail)."""
+    reads the same whether the remote is a GitHub URL or a bare path. `slot` (the
+    issue number) keeps those temp refs per-issue, so two recoveries sharing one
+    clone cannot read each other's mirror. Returns (count|None, detail)."""
+    ours = f"{_LOCAL_RECOVERY}/{slot}"
     p = _git(["fetch", "--force", remote,
-              f"{branch}:{_LOCAL_RECOVERY}/branch",
-              f"{base}:{_LOCAL_RECOVERY}/base"], check=False)
+              f"{branch}:{ours}/branch", f"{base}:{ours}/base"], check=False)
     if p.returncode != 0:
         return None, p.stderr.strip()
-    out = _git(["rev-list", "--count",
-                f"{_LOCAL_RECOVERY}/base..{_LOCAL_RECOVERY}/branch"],
+    out = _git(["rev-list", "--count", f"{ours}/base..{ours}/branch"],
                check=False).stdout.strip()
     return (int(out) if out.isdigit() else None), ""
 
@@ -688,12 +688,12 @@ def cmd_recovery(a):
                                                   cfg["branch_pattern"], a.number)
     ahead, detail = None, ""
     if branch:
-        ahead, detail = _branch_ahead(rem, branch, base)
+        ahead, detail = _branch_ahead(rem, branch, base, a.number)
     elif candidates:
         # Several branches can match one issue (an earlier attempt left one behind):
         # take the one furthest ahead of base, ties by name (candidates are sorted).
         for cand in candidates:
-            n, d = _branch_ahead(rem, cand, base)
+            n, d = _branch_ahead(rem, cand, base, a.number)
             if branch is None or (n or 0) > (ahead or 0):
                 branch, ahead, detail = cand, n, d
     else:
