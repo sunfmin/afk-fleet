@@ -650,6 +650,125 @@ def pace(summary, config):
 
 
 # --------------------------------------------------------------------------- #
+# Worker launch command — launcher/worker provider parity (ADR-0010)           #
+# --------------------------------------------------------------------------- #
+#
+# A launcher started through a provider wrapper (`ckimi`, `csk`, a direnv, a
+# script) carries that provider only in its ENV — the wrapper's NAME is gone by
+# the time the process exists, and its argv is byte-identical to a stock
+# `claude`. A worker orca starts in a fresh login shell inherits none of that
+# env, so it silently falls back to stock Anthropic and runs that way,
+# unattended, for days.
+#
+# What travels is therefore an OPAQUE command string the fleet never parses and
+# never composes — supplied by the human at the bootstrap gate they are already
+# standing at. That choice is what keeps the credential out of the fleet
+# entirely: no env is copied, nothing is written to disk, no argv carries a key,
+# and the fleet is coupled to no particular secret manager. What code *can*
+# settle, it does: whether to ask at all (a stock launcher is never asked), which
+# wrappers exist to offer, and whether the answer resolves to something runnable.
+
+WORKER_COMMAND_DEFAULT = "claude --dangerously-skip-permissions"
+
+# orca's per-agent unattended flags. Used ONLY to warn: a worker started without
+# one parks on a permission prompt forever, and the fleet reads that as a silent
+# no-PR claim. Checked against the RESOLVED text (an alias hides its own flags).
+YOLO_FLAGS = ("--dangerously-skip-permissions", "--dangerously-bypass-approvals-and-sandbox",
+              "--yolo", "--yes-always", "--dangerously-allow-all", "--trust-all-tools",
+              "--unrestricted", "--auto-approve")
+
+_ALIAS_RE = re.compile(r"^(?:alias\s+)?([^=\s]+)=(.*)$")
+
+
+def first_word(command):
+    """The token whose resolvability decides whether the command can run at all."""
+    parts = (command or "").strip().split()
+    return parts[0] if parts else ""
+
+
+def parse_aliases(text):
+    """Shell `alias` output → {name: expansion}. Accepts both zsh's `n='v'` and
+    bash's `alias n='v'`. Quotes are stripped; the expansion is only ever shown
+    to a human or substring-searched, never executed by the fleet."""
+    out = {}
+    for line in (text or "").splitlines():
+        m = _ALIAS_RE.match(line.strip())
+        if not m:
+            continue
+        name, val = m.group(1), m.group(2).strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "'\"":
+            val = val[1:-1]
+        out[name] = val
+    return out
+
+
+def launch_candidates(aliases):
+    """The shell aliases that start a Claude Code, as {name, expansion, wraps_env}
+    — what the bootstrap offers the human. `wraps_env` marks the ones that do more
+    than run `claude` bare, i.e. the ones that could carry a provider; a stock
+    launcher's own alias is listed too, and marked False, rather than guessed at.
+    Deliberately NOT a mapping from the launcher's provider to one alias: inferring
+    that means executing each wrapper's env prefix, which would decrypt every
+    provider's credentials to answer a question a human answers in one word."""
+    out = []
+    for name, exp in sorted((aliases or {}).items()):
+        if "claude" not in exp:
+            continue
+        bare = exp.split()[0] == "claude" if exp.split() else False
+        out.append({"name": name, "expansion": exp, "wraps_env": not bare})
+    return out
+
+
+def resolve_worker_command(base_url, supplied=None, resolved=None):
+    """
+    Settle the one string every worker is started with.
+
+      base_url: the launcher's own ANTHROPIC_BASE_URL (None/"" = stock Anthropic).
+      supplied: the human's answer, verbatim, or None if they haven't been asked.
+      resolved: what the shell says `first_word(supplied)` is — the `type` output
+                (an alias's full expansion, a function body, a path), or None if
+                it resolves to nothing. Only meaningful when `supplied` is given.
+
+    Returns {status, command, base_url, first_word, yolo, detail}. `command` is
+    non-null only when the run may proceed — every other status is the launcher's
+    cue to ask (again), never to quietly fall back to stock.
+
+      stock       no custom provider and nothing supplied → the default command,
+                  and the human is not asked at all.
+      confirmed   a supplied command whose first word resolves → use it verbatim.
+      unresolved  a supplied command whose first word resolves to nothing (the
+                  typo case: `ckim`). Left unchecked this starts no worker, so the
+                  claim goes PR-less into the retry ladder and escalates — three
+                  issues burnt on a missing letter.
+      ask         a custom provider and no answer yet.
+
+    `yolo` is advisory, not a gate: True if an unattended flag is visible in the
+    resolved text, False if it plainly is not, None when the resolution can't show
+    it (a script path). A False is worth a warning — a worker that stops on a
+    permission prompt is indistinguishable to the fleet from one that finished.
+    """
+    fw = first_word(supplied) if supplied else ""
+
+    def out(status, command=None, yolo=None, detail=""):
+        return {"status": status, "command": command, "base_url": base_url or None,
+                "first_word": fw or None, "yolo": yolo, "detail": detail}
+
+    if supplied:
+        if not resolved:
+            return out("unresolved", detail=f"{fw!r} resolves to nothing in an interactive shell")
+        # An alias resolution shows its whole expansion and `claude` is its own
+        # whole story, so a missing flag there is a fact. A path or a function in
+        # another file could carry the flag inside — that is unknown, not absent.
+        seen_whole = " is an alias for " in resolved or fw == "claude"
+        visible = f"{supplied}\n{resolved}"
+        yolo = True if any(f in visible for f in YOLO_FLAGS) else (False if seen_whole else None)
+        return out("confirmed", command=supplied.strip(), yolo=yolo, detail=resolved.strip())
+    if not (base_url or "").strip():
+        return out("stock", command=WORKER_COMMAND_DEFAULT, yolo=True)
+    return out("ask", detail=f"launcher is on a custom provider ({base_url})")
+
+
+# --------------------------------------------------------------------------- #
 # Fingerprint gate — skip ticks code can prove are no-ops (ADR-0007)           #
 # --------------------------------------------------------------------------- #
 #

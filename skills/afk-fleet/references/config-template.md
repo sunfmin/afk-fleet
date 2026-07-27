@@ -4,9 +4,16 @@ Copy this into the **target repo** at `docs/agents/afk-fleet.md`. The fleet read
 through `afk config --file …`, which validates every key against the schema (an unknown key or
 wrong shape is an **error**, caught with the human present) and emits the canonical JSON every tick
 and tool consumes (ADR-0009). Everything is repo-specific here; the skill core is repo-agnostic.
-Anything omitted uses the default shown. `authorize` is intentionally NOT a config key — push+auto-merge
-is confirmed interactively at launcher startup for the whole run (each tick inherits it), never
-pre-armed in a file (the validator refuses it by construction).
+Anything omitted uses the default shown. Two things are intentionally NOT config keys, and the
+validator refuses both by construction:
+
+- **`authorize`** — push+auto-merge is confirmed interactively at launcher startup for the whole run
+  (each tick inherits it), never pre-armed in a file.
+- **the worker launch command** — the string workers are started with (`ckimi`, `direnv exec . claude`,
+  …) is *machine-local*, while this file is checked into the target repo and shared with the team: on a
+  teammate's machine it is `command not found`, or worse, a same-named alias pointing at a different
+  provider. It is settled at bootstrap by `afk worker-command` + one confirmation, and held only by the
+  launcher (ADR-0010).
 
 ```yaml
 # --- dispatch contract ---
@@ -22,7 +29,8 @@ base_branch: main
 branch_pattern: "issue-{number}-{slug}"   # worktree-NAME hint passed to `orca worktree create --name`;
                                       #   orca sets the real branch (prefixed <user>/…) — ADR-0005
 worker: orca                           # the only supported backend: orca creates the worktree + branch
-                                      #   and spawns a real Claude Code in it, in one step (ADR-0005)
+                                      #   (ADR-0005), then the fleet starts a real Claude Code in it with
+                                      #   the run's worker launch command — NOT a key here (ADR-0010)
 concurrency: 3                         # max workers running at once
 worktree_cleanup: true                 # after merge/escalate, remove via `orca worktree rm issue:<n>`
 worker_idle_grace_seconds: 300         # a no-PR worker that went idle is judged "finished" only after

@@ -410,6 +410,77 @@ def test_pace_omission_is_uniform():
     assert d.pace({"in_flight": 1, "empty_streak": 0}, {"busy_interval_seconds": 999999}) == TTL // 2
 
 
+KIMI = "https://api.kimi.com/coding/"
+
+# real `alias` output, both dialects
+ALIAS_TEXT = """\
+cc='claude --dangerously-skip-permissions'
+ckimi='(eval "$(mytokens env kimi)" && claude --dangerously-skip-permissions)'
+cdx='codex -a never -s danger-full-access'
+alias ll='ls -lah'
+alias cwrap="direnv exec . claude"
+"""
+
+
+def test_parse_aliases_and_candidates():
+    al = d.parse_aliases(ALIAS_TEXT)
+    assert al["cc"] == "claude --dangerously-skip-permissions"
+    assert al["ll"] == "ls -lah"                       # bash's `alias n='v'` form too
+    assert al["cwrap"] == "direnv exec . claude"
+
+    got = {c["name"]: c["wraps_env"] for c in d.launch_candidates(al)}
+    assert set(got) == {"cc", "ckimi", "cwrap"}        # codex/ll are not Claude Code
+    assert got["ckimi"] is True and got["cwrap"] is True
+    assert got["cc"] is False                          # bare `claude` carries no provider
+
+
+def test_resolve_worker_command_asks_only_when_it_matters():
+    # stock launcher: never asked, and the worker gets the stock command
+    r = d.resolve_worker_command(None)
+    assert (r["status"], r["command"], r["yolo"]) == \
+        ("stock", "claude --dangerously-skip-permissions", True)
+    assert d.resolve_worker_command("   ")["status"] == "stock"   # blank is not custom
+
+    # custom provider, no answer yet → ask; NEVER silently fall back to stock
+    r = d.resolve_worker_command(KIMI)
+    assert (r["status"], r["command"]) == ("ask", None)
+    assert KIMI in r["detail"]
+
+
+def test_resolve_worker_command_checks_the_answer():
+    alias_type = 'ckimi is an alias for (eval "$(mytokens env kimi)" && claude --dangerously-skip-permissions)'
+
+    # the answer is used verbatim — never parsed, never appended to
+    r = d.resolve_worker_command(KIMI, "ckimi", alias_type)
+    assert (r["status"], r["command"], r["yolo"]) == ("confirmed", "ckimi", True)
+    assert r["first_word"] == "ckimi"
+
+    # the typo case: unchecked, this starts no worker at all, so the claim goes
+    # PR-less into the retry ladder and escalates — on a missing letter
+    r = d.resolve_worker_command(KIMI, "ckim", "")
+    assert (r["status"], r["command"]) == ("unresolved", None)
+    assert "ckim" in r["detail"]
+
+    # an opaque command is honoured whatever it is — no coupling to any wrapper
+    r = d.resolve_worker_command(KIMI, "direnv exec . claude --dangerously-skip-permissions",
+                                 "direnv is /opt/homebrew/bin/direnv")
+    assert (r["status"], r["first_word"], r["yolo"]) == ("confirmed", "direnv", True)
+
+
+def test_worker_command_yolo_is_advisory_and_honest():
+    # definitely missing: `claude` is its own whole story and the flag is absent
+    r = d.resolve_worker_command(None, "claude", "claude is /Users/me/.local/bin/claude")
+    assert (r["status"], r["yolo"]) == ("confirmed", False)
+
+    # an alias resolution shows its whole expansion, so absence there is a fact too
+    r = d.resolve_worker_command(KIMI, "cplain", "cplain is an alias for (eval x && claude)")
+    assert r["yolo"] is False
+
+    # a script could carry the flag inside — unknown, never accused of missing it
+    r = d.resolve_worker_command(KIMI, "mywrap", "mywrap is /opt/bin/mywrap")
+    assert r["yolo"] is None
+
+
 def test_template_matches_defaults():
     # the gate on the one unavoidable hand-sync (ADR-0009): the shipped
     # template must parse clean, and every value it shows must BE the default —

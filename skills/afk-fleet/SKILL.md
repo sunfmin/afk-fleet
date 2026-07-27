@@ -23,7 +23,7 @@ context-bounded:
 |---|---|---|
 | **launcher** | The interactive session you invoke `/afk-fleet` in. It authorizes once, then loops: spawn a tick → ingest a one-line summary → pace → repeat. | Long-lived, but only accumulates ~one compact summary per tick (auto-compaction keeps it flat). |
 | **tick** | A **fresh-context [Agent] subagent** that does exactly **one reconciliation pass** against GitHub, then returns a compact structured summary and dies. | Short. Its bulky context is discarded on return. |
-| **worker** | A fire-and-forget autonomous Claude Code spawned by orca — which creates its worktree, branch, and agent terminal in one step — one per issue. Communicates only through GitHub (its PR, and issue comments). | Independent of the coordinator — never read by it. |
+| **worker** | A fire-and-forget autonomous Claude Code, one per issue: orca creates its worktree + branch, then starts it with the run's **worker launch command** so it runs on the same provider as the launcher. Communicates only through GitHub (its PR, and issue comments). | Independent of the coordinator — never read by it. |
 
 **This skill only *consumes* a backlog.** It does not decompose a PRD/epic into issues — that is
 upstream work, and epics are explicitly excluded from dispatch. Assume the issues already exist,
@@ -79,15 +79,38 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
    `refs/afk/*`), pass its fallback `--ns refs/heads` to every later `afk` call and **warn** that claim
    refs are then ordinary branches that may trigger `on: push` CI. See
    [Cooperative multi-fleet](#cooperative-multi-fleet).
-3. **Preview** — spawn a **plan tick** (a `--tick` in plan mode) as an [Agent] subagent and show the
+3. **Settle the worker launch command** — `afk worker-command`. Workers start in a *fresh login shell*
+   that inherits none of this session's environment, so a launcher running on a custom provider
+   (`ckimi`, `csk`, a direnv, a wrapper script) would otherwise dispatch workers that silently fall
+   back to stock Anthropic and stay there for days (ADR-0010). The tool reports:
+   - `"status": "stock"` — no `ANTHROPIC_BASE_URL`; take its `command` and **ask nothing**.
+   - `"status": "ask"` — a custom provider. Show the `base_url` and the `candidates` it found (the
+     login shell's Claude-starting aliases, `wraps_env: true` marking the ones that carry a provider),
+     ask *"which command should workers start with?"*, then **verify the answer**:
+     `afk worker-command --check "<their answer>"`. `unresolved` → say what didn't resolve and re-ask
+     (an unresolvable command starts no worker at all: the claim goes PR-less into the retry ladder
+     and escalates, on a typo). `confirmed` with `"yolo": false` → warn that it carries no unattended
+     flag, so a worker will park on a permission prompt — indistinguishable to the fleet from one that
+     finished. `"yolo": null` just means the resolution couldn't show it.
+
+   Hold the resulting `command` **verbatim** and inject it into every tick. It is **opaque** — never
+   parse it, never compose one yourself, never append flags to it (appending to an alias that expands
+   to a subshell isn't even valid syntax). This is what keeps every credential inside the wrapper the
+   human already trusts: the fleet copies no environment, writes no file, and puts no key on any
+   command line.
+4. **Preview** — spawn a **plan tick** (a `--tick` in plan mode) as an [Agent] subagent and show the
    dispatch plan it returns (which issues, order, concurrency, gate steps, merge target). The frontier
    is computed **inside the subagent, never in the launcher's own context**; the launcher only ingests
    the returned plan (ADR-0002).
-4. **Authorize (the one gate)** — state plainly: *"I will push worker branches and **auto-merge**
+5. **Authorize (the one gate)** — state plainly: *"I will push worker branches and **auto-merge**
    green PRs to `<target>` in `<repo>` unattended — this overrides the standing 'never push without
    asking' rule, for this repo, for this run. Confirm?"* Get an explicit yes. This authorization is
    **for the whole run**, held only in the launcher (never a config key); every tick inherits it via
    its spawn prompt, and it dies when you stop the launcher.
+
+The instance id, the run authorization, and the worker launch command are the run's **three
+launcher-held facts**: settled once with you present, carried in every tick's spawn prompt, never
+written to a file, gone when the launcher stops.
 
 ### Loop
 
@@ -102,7 +125,7 @@ Repeat until you stop it:
    coordination-adjacent call the launcher makes itself, precisely so a skipped cycle can never
    lapse a lease), then go to **Pace**. On `"action": "tick"` (changed / forced / first), continue.
 2. **Spawn a tick** — call the [Agent] tool (fresh context) to run one reconciliation pass, passing
-   only `{repo, config, authorized: true, instance_id}`. Constrain its return with a schema:
+   only `{repo, config, authorized: true, instance_id, worker_command}`. Constrain its return with a schema:
    `{merged:[…], escalated:[…], dispatched:[…], reclaimed:[…], in_flight:N, frontier_remaining:N, note}`.
 3. **Ingest the summary** — keep that one line; discard everything else. Surface a short progress
    line to the user. The launcher's whole inter-cycle state is three small values: the last summary,
@@ -137,6 +160,7 @@ prose each pass (ADR-0004). Each prints one JSON object. Pure verdicts live in `
 | Subcommand | Does | Kind |
 |---|---|---|
 | `afk config --file <path>` | parse + validate the repo config → **canonical JSON** (every key, defaults filled; unknown key → error). `--defaults` prints the one defaults table (ADR-0009) | pure (file read) |
+| `afk worker-command [--check <cmd>]` | settle the string every worker is started with: ask-or-not (stock launcher → never asked) + the login shell's Claude-starting aliases to offer; `--check` resolves an answer's first word and flags a missing unattended flag (ADR-0010) | effect (login shell) + pure verdict |
 | `afk rebuild --repo <r> --instance <id> --config <json>` | **one read-only call → the whole working set**: frontier (dispatch+excluded), `mine` subclassified with PR/checks/attempt-labels, `peer_live`, `stale` (with the sha reclaim needs), fingerprint (ADR-0008) | effect gather + pure assembly |
 | `afk worker-status --worktree <path> --base <branch>` | a `no_pr` worker's git **progress** in its worktree → `{commits_ahead, dirty, last_commit_ts, worktree_mtime_ts}` — the decisive coding-vs-finished signal, independent of terminal chrome (git only, no gh) | effect (git) |
 | `afk verdict --repo <r> --issue <n>` | the LATEST parsed `afk:verdict` marker the worker left → `{found, phase, blocked_by, reason, comment_url}` — its machine-readable reason for opening no PR | effect gather + pure parse |
@@ -220,13 +244,19 @@ spawns).
      ```bash
      git fetch origin <base_branch> --quiet     # the worker must start from the latest base
      orca worktree create --repo id:<repo-id> --name issue-<n>-<slug> --no-parent \
-          --base-branch <base_branch> --issue <n> --agent claude --json
+          --base-branch <base_branch> --issue <n> --json          # NO --agent
+     orca terminal create --worktree issue:<n> --command "<worker_command>" --json
      ```
+     `--agent` is deliberately **not** used: the worker must start with the run's **worker launch
+     command** so it runs on the same provider as this fleet (ADR-0010). Pass that string **verbatim**
+     — it is opaque; never rebuild it, never append flags. (Cost of dropping `--agent`: orca's
+     unattended-flag default goes with it, which is why bootstrap warns on a command with no such flag.)
+
      Then read the create result for the **actual branch** (orca prefixes `<user>/…`) and the worktree
      path, fill [references/worker-prompt.md](references/worker-prompt.md) with that real branch + path,
-     wait for the agent (`orca terminal wait --for tui-idle`), and deliver the prompt (`orca terminal
-     send`). Do **not** wait for the worker. (`--name` comes from `branch_pattern` — a name hint only;
-     orca sets the branch.)
+     wait for the agent on the handle `terminal create` returned (`orca terminal wait --for tui-idle`),
+     and deliver the prompt (`orca terminal send`). Do **not** wait for the worker. (`--name` comes from
+     `branch_pattern` — a name hint only; orca sets the branch.)
    - **Heartbeat** — `afk heartbeat --instance <id> --config <config>`; it refreshes only if due
      and only matters while I hold ≥1 claim. Cheap, stateless (it reads the old ts from the ref itself).
    - **Render progress** (if `progress_comment`) — for each of my claims, upsert the human-facing
@@ -360,6 +390,11 @@ touch shared root config are naturally throttled by the DAG — chain them with 
 - **Never** run the launcher without the bootstrap authorization; **never** let a cold `--tick`
   auto-merge without an injected run authorization.
 - **Never** deploy, touch secrets, or push anywhere but worker branches + the merge to `merge.target`.
+  In particular, **never carry a credential to a worker**: don't copy `ANTHROPIC_*` (or any env) into a
+  spawn command, don't write an env file, don't read a token out of a secret manager. The **worker
+  launch command** is opaque precisely so the wrapper the human named does that in the worker's own
+  shell (ADR-0010). Copying the launcher's env would also break the fleet outright — `ORCA_TERMINAL_HANDLE`
+  and friends would make every worker report status as the launcher's terminal, collapsing the liveness probe.
 - **Never** dispatch an epic/PRD issue. If the frontier is all epics, report "nothing decomposed yet."
 - **Never** read a worker's terminal for its result (only a bounded liveness probe) — and the probe
   **alone cannot tell finished-and-idle from still-coding**, so for a `no_pr` claim combine it with

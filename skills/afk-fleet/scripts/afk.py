@@ -10,13 +10,13 @@ is `{"won": false}`, still exit 0); exit 3 = an operational/git error.
 Two layers:
   - pure verdicts (`config`, `frontier`, `pace`, `next-attempt`, `subclassify`,
     `classify-no-pr`, and the decision halves of `rebuild`, `classify-claims`,
-    `verdict`, and `fingerprint`) come from afk_decide.py — no I/O, fixture-tested;
-    time is always injected, never read here. Config resolution is one order
-    everywhere: flag → `--config` JSON → CONFIG_DEFAULTS (ADR-0009).
+    `verdict`, `worker-command`, and `fingerprint`) come from afk_decide.py — no
+    I/O, fixture-tested; time is always injected, never read here. Config resolution
+    is one order everywhere: flag → `--config` JSON → CONFIG_DEFAULTS (ADR-0009).
   - effectful ops (`scan`, `claim`, `reclaim`, `release`, `heartbeat`, `probe`,
-    `worker-status`, `verdict`) drive git refs / worktree git / gh. Their real
-    test is a scratch-repo integration suite (tracked separately) — here they are
-    correct-by-construction and smoke-tested.
+    `worker-status`, `verdict`, `worker-command`) drive git refs / worktree git /
+    gh / the login shell. Their real test is a scratch-repo integration suite
+    (tracked separately) — here they are correct-by-construction and smoke-tested.
 
 Invoked as:  python3 <skill>/scripts/afk.py <subcommand> [flags]
 """
@@ -369,6 +369,50 @@ def cmd_status(a):
     return {"action": "updated", "issue": a.number, "comment_id": cid}
 
 
+def _login_shell(script, timeout=20):
+    """Run `script` in the user's INTERACTIVE login shell — the only place aliases
+    and rc-defined functions exist, and exactly the shell orca gives a worker
+    (verified: orca terminals run `zsh -l` with `-i` set). Never raises: a shell
+    that is missing, slow, or noisy must degrade to "unknown", not abort bootstrap.
+
+    Empty on a NON-ZERO exit, which is the whole point for `type`: zsh prints
+    "ckim not found" on **stdout** and exits 1, so trusting stdout alone would
+    wave the one typo this check exists to catch straight through to dispatch."""
+    shell = os.environ.get("SHELL") or "/bin/zsh"
+    try:
+        p = subprocess.run([shell, "-ic", script], capture_output=True, text=True,
+                           timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return p.stdout if p.returncode == 0 else ""
+
+
+def cmd_worker_command(a):
+    """Settle the one command every worker is started with, so a launcher on a
+    custom provider does not dispatch workers that silently fall back to stock
+    Anthropic (ADR-0010).
+
+    Bare: read this launcher's own ANTHROPIC_BASE_URL and report `stock` (nothing
+    to ask) or `ask` — with the Claude-starting aliases found in the user's login
+    shell, so the human picks rather than types. `--check "<cmd>"` resolves the
+    human's answer's first word in that same shell and reports whether it runs at
+    all, plus whether an unattended flag is visible in the resolution.
+
+    The command is OPAQUE: never parsed, never composed, never appended to. That is
+    what keeps every credential inside whatever wrapper the human already trusts —
+    the fleet copies no env, writes no file, and puts no key on any command line."""
+    base = a.base_url if a.base_url is not None else os.environ.get("ANTHROPIC_BASE_URL")
+    if a.check:
+        fw = afk_decide.first_word(a.check)
+        resolved = _login_shell(f"type -- {fw}") if fw else ""
+        return afk_decide.resolve_worker_command(base, a.check, resolved)
+    result = afk_decide.resolve_worker_command(base)
+    if result["status"] == "ask":
+        aliases = afk_decide.parse_aliases(_login_shell("alias"))
+        result["candidates"] = afk_decide.launch_candidates(aliases)
+    return result
+
+
 def cmd_probe(a):
     """Decide the claim namespace: can we push under refs/afk/*? Else fall back to
     branches (refs/heads/afk-claim/*) and flag that on:push CI will fire."""
@@ -548,6 +592,17 @@ def build_parser():
     p.add_argument("--ttl", type=int, default=None)
     p.add_argument("--now", type=int, default=None)
     p.set_defaults(fn=cmd_heartbeat)
+
+    # worker-command — launcher/worker provider parity (ADR-0010)
+    p = sub.add_parser("worker-command",
+                       help="settle the command workers are started with: ask-or-not + candidates, "
+                            "or --check a human's answer")
+    p.add_argument("--check", default=None,
+                   help="a candidate command: resolve its first word in the login shell "
+                        "and report whether it runs (and looks unattended)")
+    p.add_argument("--base-url", default=None,
+                   help="override the launcher's ANTHROPIC_BASE_URL (tests)")
+    p.set_defaults(fn=cmd_worker_command)
 
     # probe
     p = sub.add_parser("probe", help="pick the claim namespace (effectful)")

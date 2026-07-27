@@ -1,6 +1,9 @@
 # Worker dispatch: orca owns the worktree; the tick never touches `git worktree`
 
 **Status:** accepted — refines the dispatch step of [ADR-0002](0002-launcher-and-disposable-ticks.md).
+Worktree ownership stands; the `--agent claude` spawn shown below was **amended by
+[ADR-0010](0010-worker-launch-command.md)** — orca still makes the worktree, but the worker is started
+by a separate `orca terminal create --command "<worker launch command>"`.
 
 ## Decision
 

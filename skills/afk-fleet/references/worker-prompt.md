@@ -1,10 +1,11 @@
 # Worker prompt template
 
-A **tick** spawns one worker per dispatched issue via orca (`orca worktree create --agent claude`),
-which creates the worktree and branch. Fill `{n}`, `{title}`, `{repo}`, `{base_branch}`,
-`{local_command}` from config + the issue; fill `{branch}` and `{worktree_path}` with the **actual**
-values orca returned from `create` — orca names the branch `<user>/…`, so do not assume `branch_pattern`
-(ADR-0005).
+A **tick** spawns one worker per dispatched issue: `orca worktree create` (no `--agent`) makes the
+worktree and branch (ADR-0005), then `orca terminal create --command "<worker launch command>"` starts
+the Claude Code on the same provider as the launcher (ADR-0010). Fill `{n}`, `{title}`, `{repo}`,
+`{base_branch}`, `{local_command}` from config + the issue; fill `{branch}` and `{worktree_path}` with
+the **actual** values orca returned from `create` — orca names the branch `<user>/…`, so do not assume
+`branch_pattern`.
 
 ---
 

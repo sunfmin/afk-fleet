@@ -21,9 +21,11 @@ orchestrator, manager, main agent
 
 **Fleet instance**:
 One launcher run and everything it owns — the ticks it spawns, the workers they dispatch, and the
-**claims** it holds — identified by an id minted at bootstrap and injected into every tick (like the
-run authorization). Its liveness is published as a **heartbeat**; when it stops or dies its claims
-are released or reclaimed. Distinct instances (even on one GitHub account) are the unit of
+**claims** it holds — identified by an id minted at bootstrap and injected into every tick. That id,
+the run authorization, and the **worker launch command** are the run's three launcher-held facts:
+settled once with the human present, carried in every tick's spawn prompt, never written to a file,
+and gone when the launcher stops. Its liveness is published as a **heartbeat**; when it stops or dies
+its claims are released or reclaimed. Distinct instances (even on one GitHub account) are the unit of
 cooperative concurrency across machines.
 _Avoid_: node, worker (that is the per-issue Claude Code), coordinator
 
@@ -49,8 +51,24 @@ issue, opens a PR, and reports done via GitHub. It never merges, and its termina
 its result. Its worktree is created and later torn down by the **worker backend** — orca (`orca
 worktree create` / `orca worktree rm`), the only supported backend — never by the tick with raw `git
 worktree`; orca also names the branch (a `<user>/…` prefix), and the tick **reads that back** rather
-than dictating it (ADR-0005).
+than dictating it (ADR-0005). It is started by running the **worker launch command** in the
+worktree's first terminal, so it runs on the same provider as the **launcher** that dispatched it.
 _Avoid_: agent (too generic), subagent, child
+
+**Worker launch command**:
+The one shell string that starts every **worker** of a run — held by the **fleet instance**, injected
+into each **tick**, and handed to orca verbatim. It is **opaque**: the fleet never parses it, composes
+it, or appends to it, so it can be a provider alias (`ckimi`), a wrapper (`direnv exec . claude`), or
+a script, and no credential ever enters the fleet. It exists because a launcher's provider lives only
+in its environment — the wrapper's name is gone by the time the process exists, and its argv is
+identical to a stock `claude` — while a worker starts in a fresh login shell that inherits none of it
+and would otherwise fall back to stock Anthropic, silently, for days. Undetectable by construction, it
+is therefore **confirmed by the human at the same bootstrap gate as the run authorization** — but only
+when it can matter: a launcher with no custom provider is never asked. Code still settles everything
+around the answer: which wrappers exist to offer, whether the answer resolves to something runnable,
+and whether an unattended flag is visible in it (ADR-0010).
+_Avoid_: worker command (ambiguous with what the worker itself runs), agent command, provider profile
+(the fleet deliberately does not model the provider — only the command), launch wrapper
 
 **Mechanics vs judgment**:
 The line that divides the fleet's work into what code owns and what the LLM owns. **Mechanics** are
