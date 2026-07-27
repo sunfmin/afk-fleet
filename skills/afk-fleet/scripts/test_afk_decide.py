@@ -175,6 +175,80 @@ def test_classify_no_pr():
         {"outcome": "dead", "action": "orphan"}
 
 
+def _takeover_state(now):
+    claims = [
+        {"number": 3, "instance": "dead-1", "host": "macbook", "sha": "s3"},
+        {"number": 1, "instance": "dead-1", "host": "macbook", "sha": "s1"},
+        {"number": 7, "instance": "live-2", "host": "studio", "sha": "s7"},
+        {"number": 9, "instance": "me", "host": "macbook", "sha": "s9"},
+        {"number": 11, "instance": None, "host": None, "sha": "s11"},   # malformed marker
+    ]
+    heartbeats = {"dead-1": now - TTL - 600,   # long expired — the quota hard stop
+                  "live-2": now - 30,          # beating
+                  "me": now - 5,
+                  "drained-3": now - 60}       # alive, holds nothing (stopped cleanly)
+    return claims, heartbeats
+
+
+def test_group_instances():
+    now = 1_000_000
+    claims, heartbeats = _takeover_state(now)
+    rows = d.group_instances(claims, heartbeats, "me", now, TTL)
+    by = {r["instance"]: r for r in rows}
+
+    # the dead fleet is discoverable from its markers alone, with what it holds
+    assert by["dead-1"]["claims"] == [1, 3] and by["dead-1"]["claim_count"] == 2
+    assert by["dead-1"]["host"] == "macbook"
+    assert by["dead-1"]["fresh"] is False and by["dead-1"]["heartbeat_age"] == TTL + 600
+    # a live peer and my own fleet are both marked, never takeover candidates by accident
+    assert by["live-2"]["fresh"] is True and by["live-2"]["is_me"] is False
+    assert by["me"]["is_me"] is True
+    # an instance with a heartbeat but no claims is still listed (drained ≠ died mid-flight)
+    assert by["drained-3"]["claims"] == [] and by["drained-3"]["fresh"] is True
+    # a claim whose marker names nobody shows up as null — already reclaimable as stale
+    assert by[None]["claims"] == [11] and by[None]["heartbeat_ts"] is None
+    # ordering is stable and useful: most claims first, then by id
+    assert [r["instance"] for r in rows] == ["dead-1", "live-2", "me", None, "drained-3"], rows
+    assert d.group_instances([], {}, "me", now, TTL) == []
+
+
+def test_plan_takeover():
+    now = 1_000_000
+    claims, heartbeats = _takeover_state(now)
+
+    # the ordinary case: a dead fleet's claims, with the sha each push needs
+    r = d.plan_takeover(claims, heartbeats, "dead-1", "me", now, TTL)
+    assert r["action"] == "take" and r["fresh"] is False
+    assert r["claims"] == [{"number": 1, "sha": "s1", "host": "macbook"},
+                           {"number": 3, "sha": "s3", "host": "macbook"}], r
+
+    # a FRESH heartbeat is a warning, not a refusal: confirm first, take nothing yet
+    r = d.plan_takeover(claims, heartbeats, "live-2", "me", now, TTL)
+    assert r["action"] == "confirm" and r["fresh"] is True
+    assert "looks ALIVE" in r["detail"] and r["claims"] == [{"number": 7, "sha": "s7", "host": "studio"}]
+    # …and an informed human may override it — atomic underneath either way
+    assert d.plan_takeover(claims, heartbeats, "live-2", "me", now, TTL, confirmed=True)["action"] == "take"
+    # confirmation is irrelevant when the target is already dead
+    assert d.plan_takeover(claims, heartbeats, "dead-1", "me", now, TTL, confirmed=True)["action"] == "take"
+
+    # never take from myself — my own claims are reconciled, not taken
+    r = d.plan_takeover(claims, heartbeats, "me", "me", now, TTL, confirmed=True)
+    assert r["action"] == "error" and "own instance id" in r["detail"]
+
+    # nothing to take: an unknown id, and a live-but-claimless instance
+    assert d.plan_takeover(claims, heartbeats, "typo-9", "me", now, TTL)["action"] == "none"
+    r = d.plan_takeover(claims, heartbeats, "drained-3", "me", now, TTL)
+    assert r["action"] == "none" and "holds no claims" in r["detail"]
+
+    # a dead instance that never beat at all is takeable (missing heartbeat = stale)
+    r = d.plan_takeover([{"number": 4, "instance": "ghost", "sha": "s4"}], {}, "ghost-target",
+                        "me", now, TTL)
+    assert r["action"] == "none"                     # …but only under its real id
+    r = d.plan_takeover([{"number": 4, "instance": "ghost", "sha": "s4"}], {}, "ghost",
+                        "me", now, TTL)
+    assert r["action"] == "take" and r["fresh"] is False and r["heartbeat_age"] is None
+
+
 def test_branch_regex_and_candidates():
     heads = [
         "master",

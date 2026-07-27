@@ -273,17 +273,73 @@ def cmd_claim(a):
             "owner": owner, "detail": p.stderr.strip()}
 
 
+def _force_take(rem, ns, number, expect_sha, instance, now, host):
+    """The atomic re-stamp of ONE existing claim ref to `instance`: rejected unless
+    the ref still points at the sha we read. The single mechanism behind both an
+    unattended stale reclaim and a human-authorized takeover — they differ only in
+    what gates the *choice* of claim (an expired lease vs a present human), never
+    in the push, so a takeover is exactly as safe against a live peer."""
+    ref = f"{ns}/{number}"
+    sha = _marker_commit(_marker_text("afk-claim", instance, now, host=host))
+    p = _git(["push", rem, f"--force-with-lease={ref}:{expect_sha}", f"{sha}:{ref}"], check=False)
+    if p.returncode == 0:
+        return {"won": True, "issue": number, "ref": ref, "sha": sha, "instance": instance}
+    return {"won": False, "issue": number, "ref": ref, "detail": p.stderr.strip()}
+
+
 def cmd_reclaim(a):
     claim_ns, _ = _ns_paths(a.ns)
-    ref = f"{claim_ns}/{a.number}"
     now = a.now if a.now is not None else int(time.time())
-    sha = _marker_commit(_marker_text("afk-claim", a.instance, now, host=a.host))
-    # Atomic takeover: rejected unless the ref still points at the sha we read.
-    p = _git(["push", _remote(a),
-              f"--force-with-lease={ref}:{a.expect_sha}", f"{sha}:{ref}"], check=False)
-    if p.returncode == 0:
-        return {"won": True, "issue": a.number, "ref": ref, "sha": sha, "instance": a.instance}
-    return {"won": False, "issue": a.number, "ref": ref, "detail": p.stderr.strip()}
+    return _force_take(_remote(a), claim_ns, a.number, a.expect_sha, a.instance, now, a.host)
+
+
+def cmd_takeover(a):
+    """The human-authorized, lease-skipping reclaim of a DEAD fleet instance's
+    claims (ADR-0011). Two shapes:
+
+      --list                  every instance GitHub still remembers — from the claim
+                              markers (`instance=<id> host=<host>`) and the heartbeat
+                              refs — with heartbeat age, host and claim count. A
+                              launcher forgets its own id when it dies; the repo does
+                              not, so the human need not have written it down.
+      --instance <dead-id>    force-take that instance's claims with the SAME atomic
+                              --force-with-lease push a stale reclaim uses, only
+                              skipping the staleness gate, re-stamping each with
+                              `--as <my-id>`. A target whose heartbeat is still fresh
+                              returns `confirm` and takes nothing until `--yes`.
+
+    NOTE the flag asymmetry, unique to this subcommand: `--instance` is the
+    instance being taken FROM (the dead one), `--as` is mine. Takeover neither
+    reads nor increments `afk-attempt/<n>`: it answers "did the fleet die?", not
+    "is this work failing?". What each taken claim then *does* is continuation
+    (`afk recovery`), not a fresh re-dispatch."""
+    claim_ns, _ = _ns_paths(a.ns)
+    rem = _remote(a)
+    claims, heartbeats = _scan(rem, a.ns)
+    now = a.now if a.now is not None else int(time.time())
+    ttl = a.ttl if a.ttl is not None else _cfg(a)["claim_lease_ttl_seconds"]
+
+    if a.list:
+        return {"instances": afk_decide.group_instances(claims, heartbeats, a.me, now, ttl),
+                "me": a.me, "now": now, "ttl": ttl}
+    if not a.instance:
+        raise ValueError("--instance <dead instance id> is required unless --list")
+    if not a.me:
+        raise ValueError("--as <my instance id> is required: every taken claim is re-stamped with it")
+
+    plan = afk_decide.plan_takeover(claims, heartbeats, a.instance, a.me, now, ttl, a.yes)
+    if plan["action"] != "take":
+        return {**plan, "taken": [], "lost": []}
+
+    taken, lost = [], []
+    for c in plan["claims"]:
+        r = _force_take(rem, claim_ns, c["number"], c["sha"], a.me, now, a.host)
+        (taken if r["won"] else lost).append(r)
+    return {**plan, "action": "taken", "as": a.me,
+            "taken": [t["issue"] for t in taken], "lost": lost,
+            "detail": f"took {len(taken)}/{len(plan['claims'])} claim(s) from {a.instance}"
+                      + ("; a lost one means that fleet is not dead — its ref moved under us"
+                         if lost else "")}
 
 
 def cmd_release(a):
@@ -789,6 +845,26 @@ def build_parser():
     p.add_argument("--worktree", required=True, help="path to the worker's worktree")
     p.add_argument("--base", default=None, help="base branch to count commits ahead of (default: config base_branch)")
     p.set_defaults(fn=cmd_worker_status)
+
+    # takeover — the human-authorized, lease-skipping reclaim of a dead fleet (ADR-0011)
+    p = sub.add_parser("takeover",
+                       help="list the fleet instances GitHub remembers, or force-take a dead "
+                            "one's claims (skips the staleness gate; effectful)")
+    add_ns(p); add_cfg(p)
+    p.add_argument("--list", action="store_true",
+                   help="show every discoverable instance: heartbeat age, host, claim count")
+    p.add_argument("--instance", default=None,
+                   help="the instance to take FROM (the dead one). NOTE: every other subcommand's "
+                        "--instance is your own id; here yours is --as")
+    p.add_argument("--as", dest="me", default=None,
+                   help="my instance id — every taken claim is re-stamped with it")
+    p.add_argument("--yes", action="store_true",
+                   help="confirm a takeover of an instance whose heartbeat is still FRESH "
+                        "(it looks alive; you are asserting you know it is dead)")
+    p.add_argument("--host", default=socket.gethostname())
+    p.add_argument("--ttl", type=int, default=None)
+    p.add_argument("--now", type=int, default=None)
+    p.set_defaults(fn=cmd_takeover)
 
     # recovery — the tiered continuation verdict for one DEAD claim (ADR-0011)
     p = sub.add_parser("recovery",

@@ -487,6 +487,105 @@ def classify_no_pr(progress, terminal_idle, idle_seconds, verdict, blocked_by_op
 
 
 # --------------------------------------------------------------------------- #
+# Takeover — the human-authorized, lease-skipping reclaim (ADR-0011)           #
+# --------------------------------------------------------------------------- #
+#
+# The lease (above) is the *unattended* line between "dead" and "alive but slow":
+# a peer may reclaim a claim only once its owner's heartbeat has expired past
+# `claim_lease_ttl` (~75 min). But a fleet dies wholesale, from a quota hard stop,
+# with a human watching — and that human IS the oracle for "it is really dead".
+# Takeover is their fast path: list the instances GitHub still remembers (the
+# launcher forgot its own id when it died; the claim markers and heartbeat refs
+# did not), pick one, and force-take its claims with the *same* atomic
+# --force-with-lease push as a stale reclaim, only skipping the staleness gate.
+# Still atomic against a not-actually-dead fleet — the second pusher is rejected.
+# The lease is untouched (ADR-0011 rejected shortening the TTL for a rare event),
+# and a takeover never counts as a retry: it answers "did the FLEET die?", not
+# "is this WORK failing?".
+
+def group_instances(claims, heartbeats, me, now, ttl):
+    """
+    Every fleet instance discoverable in fleet state, with what it holds and how
+    stale its lease is — the takeover picker's input (`afk takeover --list`).
+
+      claims:     [{"number","instance","host","sha"}...] (the ref scan)
+      heartbeats: {instance: last_ts}
+      me:         my own instance id (marked, never a takeover target)
+
+    Returns rows [{"instance","host","claims","claim_count","heartbeat_ts",
+    "heartbeat_age","fresh","is_me"}...], the ones holding most claims first
+    (then by id, so the listing is stable). An instance with a heartbeat but no
+    claims is still listed — that is a fleet that drained cleanly or is idle, and
+    seeing it is how a human tells it apart from the one that died mid-flight. A
+    claim whose marker names no instance appears under `instance: null`; it needs
+    no takeover, being already reclaimable as stale.
+    """
+    by = {}
+    for c in claims or []:
+        inst = c.get("instance")
+        row = by.setdefault(inst, {"instance": inst, "host": None, "claims": []})
+        row["claims"].append(c.get("number"))
+        row["host"] = row["host"] or c.get("host")
+    for inst in (heartbeats or {}):
+        by.setdefault(inst, {"instance": inst, "host": None, "claims": []})
+
+    out = []
+    for inst, row in by.items():
+        ts = (heartbeats or {}).get(inst)
+        nums = sorted(n for n in row["claims"] if n is not None)
+        out.append({"instance": inst, "host": row["host"], "claims": nums,
+                    "claim_count": len(nums),
+                    "heartbeat_ts": ts,
+                    "heartbeat_age": None if ts is None else int(now) - int(ts),
+                    "fresh": ts is not None and not is_stale(ts, now, ttl),
+                    "is_me": inst is not None and inst == me})
+    out.sort(key=lambda r: (-r["claim_count"], r["instance"] is None, str(r["instance"])))
+    return out
+
+
+def plan_takeover(claims, heartbeats, target, me, now, ttl, confirmed=False):
+    """
+    Whether `afk takeover --instance <target>` may proceed, and over which claims.
+    Pure: the effectful layer scans the refs, this decides, then it pushes.
+
+    Returns {"action", "instance", "claims", "fresh", "detail"} where `claims` is
+    [{"number","sha","host"}...] (the sha each force-with-lease push needs):
+
+      take     go — force-take these claims, skipping the staleness gate.
+      confirm  the target's heartbeat is still FRESH: taking it steals live work if
+               the human is wrong, so an explicit confirmation is required first.
+               Surfaced as a warning rather than a refusal — the human may
+               legitimately know better (a wedged process, a heartbeat written by a
+               now-dead tick), and the push stays atomic underneath (ADR-0011).
+      none     nothing to take: no such instance, or it holds no claims.
+      error    the target is THIS fleet — its claims are already mine.
+    """
+    rows = sorted(({"number": c.get("number"), "sha": c.get("sha"), "host": c.get("host")}
+                   for c in claims or [] if c.get("instance") == target),
+                  key=lambda r: (r["number"] is None, r["number"]))
+    ts = (heartbeats or {}).get(target)
+    fresh = ts is not None and not is_stale(ts, now, ttl)
+    known = ts is not None or bool(rows)
+
+    def out(action, detail):
+        return {"action": action, "instance": target, "claims": rows,
+                "fresh": fresh, "heartbeat_age": None if ts is None else int(now) - int(ts),
+                "detail": detail}
+
+    if target is not None and target == me:
+        return out("error", "that is this fleet's own instance id — its claims are already mine")
+    if not rows:
+        return out("none", "no instance by that id holds any claim" if not known
+                           else "that instance holds no claims (nothing to take)")
+    if fresh and not confirmed:
+        return out("confirm",
+                   f"that fleet's heartbeat is only {int(now) - int(ts)}s old (lease {int(ttl)}s) — "
+                   f"it looks ALIVE; forcing a takeover steals its live work if you are wrong")
+    return out("take", f"taking {len(rows)} claim(s) from {target}"
+                       + (" (fresh heartbeat, human-confirmed)" if fresh else ""))
+
+
+# --------------------------------------------------------------------------- #
 # Continuation — recovering a dead claim FROM ITS PROGRESS (ADR-0011)          #
 # --------------------------------------------------------------------------- #
 #

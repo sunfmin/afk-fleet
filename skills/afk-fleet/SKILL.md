@@ -9,8 +9,10 @@ description: >-
   ready issue, gates each on CI + optional independent adversarial verification, auto-merges green
   PRs to main, and retries-then-escalates failures — so it runs for days with context bounded by
   construction. Reads per-repo config and requires an explicit push+auto-merge authorization before
-  running; supports --plan dry-run and --tick single-pass. NOT for decomposing a PRD/epic into
-  issues, implementing a single named issue by hand, or reviewing a PR.
+  running; supports --plan dry-run, --tick single-pass, and --takeover to inherit and continue a
+  dead fleet's claims when a run hard-stopped (quota) and you don't want to wait out its lease.
+  NOT for decomposing a PRD/epic into issues, implementing a single named issue by hand, or
+  reviewing a PR.
 ---
 
 # afk-fleet
@@ -61,6 +63,10 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
   launcher spawns each cycle (and what you'd run headless). It auto-merges only under the run
   authorization its launcher injects; invoked cold without it, it dispatches + gates but holds
   merges.
+- `/afk-fleet --takeover` — a **launcher bootstrap variant** for when a fleet hard-stopped (quota) and
+  you will not wait ~75 min for its lease to lapse: the *full* bootstrap, then the opening working set
+  is seeded from a dead peer's claims instead of the frontier alone. Thereafter an ordinary standing
+  fleet. See [Takeover mode](#takeover-mode---takeover).
 
 ## Launcher (default mode)
 
@@ -111,6 +117,47 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
 The instance id, the run authorization, and the worker launch command are the run's **three
 launcher-held facts**: settled once with you present, carried in every tick's spawn prompt, never
 written to a file, gone when the launcher stops.
+
+### Takeover mode (`--takeover`)
+
+For when a fleet **hard-stopped** — its provider quota ran out, its process was killed — and you are
+standing right there. The lease will hand its claims to a peer, but only after `claim_lease_ttl`
+(~75 min), because a heartbeat is the only *machine-visible* line between "dead" and "alive but slow".
+The present human is the oracle that knows *now*; the dying fleet cannot help, since a hard stop runs no
+code at all (no drain, no release) — [ADR-0011](../../docs/adr/0011-takeover-and-progress-preservation.md).
+
+Run the **full** [Bootstrap](#bootstrap-once-with-the-human-present) above — config, a *new* instance id,
+the worker launch command, the one push+auto-merge authorization — so this is a real fleet instance. Only
+the opening working set differs:
+
+1. **List what GitHub still remembers.** The dead launcher forgot its own id; the claim markers
+   (`instance=<id> host=<host>`) and heartbeat refs did not:
+   ```bash
+   python3 <skill>/scripts/afk.py takeover --list --repo <repo> --as <my instance id> --config '<config json>'
+   ```
+   Show the human each instance's id, host, claim count and heartbeat age, and ask which to take. Rows
+   are flagged so the wrong answer is visible: `fresh: true` (looks alive), `claim_count: 0` (drained
+   cleanly — nothing to take), `is_me: true` (this run).
+2. **Force-take the selection:**
+   ```bash
+   python3 <skill>/scripts/afk.py takeover --instance <dead id> --as <my instance id> --repo <repo> --config '<config json>'
+   ```
+   The *same* atomic `--force-with-lease` push a stale reclaim uses, only skipping the staleness gate —
+   so a fleet that is not actually dead still wins the race and the result reports it under `lost`.
+   (Careful: here `--instance` is the instance taken **from**; yours is `--as`.) On
+   `"action": "confirm"` — the target's heartbeat is still fresh — relay the warning **verbatim**, get an
+   explicit yes, then re-run with `--yes`; on `"error"`/`"none"`, show it and continue as an ordinary
+   launcher run.
+3. **Then it is an ordinary standing fleet.** Enter the [Loop](#loop) unchanged: the first tick sees the
+   taken claims as `mine` and recovers each by
+   [continuation](#recovery-by-continuation-a-dead-claim-is-continued-never-restarted) — tier 1 when the
+   dead fleet ran on *this* box, since its worktrees are still here — **and** works the frontier up to
+   `concurrency`, until you stop it.
+
+A takeover **is not a retry** (it never reads or increments `afk-attempt/<n>`) and **does not shorten the
+lease** — the unattended safety net stays exactly as wide; this is only the human-gated fast path across
+it. Because continuation makes each take start further along, repeatedly taking one claim converges
+rather than loops.
 
 ### Loop
 
@@ -168,6 +215,7 @@ prose each pass (ADR-0004). Each prints one JSON object. Pure verdicts live in `
 | `afk classify-no-pr --terminal <busy\|idle\|none> --progress <json> --verdict <json> --config <json>` | the **5-way `no_pr` verdict** from those signals → `{outcome, action}` (coding / idle_done / idle_blocked / idle_failed / dead) | pure |
 | `afk claim <n> --instance <id>` | atomic create-or-lose the claim ref → `{won}` | effect |
 | `afk reclaim <n> --instance <id> --expect-sha <sha>` | `--force-with-lease` takeover of a stale claim → `{won}` | effect |
+| `afk takeover --list` / `--instance <dead id> --as <my id>` | the fleet instances GitHub remembers (claim markers + heartbeat refs) with heartbeat age / host / claim count — or force-take a dead one's claims: same atomic push as `reclaim`, staleness gate skipped, a fresh-heartbeat target held back until `--yes` (ADR-0011) | effect + pure verdict |
 | `afk release <n>` | delete a claim ref (idempotent) | effect |
 | `afk heartbeat --instance <id> --config <json>` | refresh my heartbeat if due → `{refreshed}` | effect |
 | `afk next-attempt --labels <csv> --config <json>` | retry-or-escalate from `afk-attempt/*` | pure |
@@ -464,6 +512,10 @@ touch shared root config are naturally throttled by the DAG — chain them with 
 - **Never discard a dead worker's progress.** Recover a dead claim by **continuation** (`afk recovery`
   → tier 1/2), and tear a worktree down only when the tool says tier 3. An `orca worktree rm` on a
   worktree that still holds work is unrecoverable — nothing else in the fleet is.
+- **Never `afk takeover --instance` on your own initiative.** It is the one operation that can take a
+  claim from a fleet whose lease has *not* lapsed, so it runs only on a human's explicit selection from
+  `--list`, and `--yes` only after relaying the fresh-heartbeat warning and getting an explicit yes.
+  Unattended, the lease is the only path — never `--yes` to make a tick's life easier.
 - **A human reserves an issue by removing `ready_label`**, not by assigning it — the fleet no longer
   reads the assignee. Keep the tracker honest so a peer fleet or a human never double-takes.
 - Reserved: the fleet manages `afk-attempt/<n>` labels, **the `refs/afk/*` ref namespace**
