@@ -74,6 +74,30 @@ and whether an unattended flag is visible in it (ADR-0010).
 _Avoid_: worker command (ambiguous with what the worker itself runs), agent command, provider profile
 (the fleet deliberately does not model the provider — only the command), launch wrapper
 
+**Local gate**:
+The repo-local build/test command (`gate.local_command`) that, in `gate.ci: local` mode, *is* the
+completion gate — promoted from the worker's optional pre-PR filter to the only machine verification
+a PR must pass (ADR-0012). It runs twice in a PR's life: the **worker** runs it after its pre-PR
+**sync**, so it tests "my code + current base"; and the **tick** re-runs it at merge time, after the
+merge-time **sync**, in the branch's worktree (recreated from the branch tip when none survives
+locally — the **continuation** tier-2 move). The invariant both runs serve: *what lands on the target
+branch was tested in the form it lands.* GitHub checks are never read in this mode — the repo is
+expected to scope remote CI away from worker branches, and a target branch whose protection requires
+checks is rejected at bootstrap. A red run's log excerpt is posted as a PR comment, so the retry
+ladder re-reads the failure from where it lives, never from a dead tick's context.
+_Avoid_: local CI (it substitutes for CI; it is not CI), pre-push check, local build
+
+**Sync**:
+The one way a worker branch catches up with its base: merging `origin/<base>` into the branch —
+never rebasing (ADR-0012). It happens twice in a PR's life: the **worker** syncs and pushes right
+before its pre-PR **local gate**, so integration conflicts surface inside the worker's own session,
+where they are cheapest to fix; and the **tick** syncs again at merge time (serialized), picking up
+whatever the base gained since the worker's sync. Merge rather than rebase because a rebase drops
+merge commits and re-ignites the conflicts already resolved inside them, and because squash-merging
+makes the target-branch history identical either way. Retires `rebase_before_merge` (the config key
+becomes `sync_before_merge`).
+_Avoid_: rebase (retired from the merge path), rebase onto latest, update branch
+
 **Mechanics vs judgment**:
 The line that divides the fleet's work into what code owns and what the LLM owns. **Mechanics** are
 the deterministic steps whose inputs uniquely fix the correct action, so a wrong result is a defect,
