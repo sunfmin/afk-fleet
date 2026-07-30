@@ -585,9 +585,10 @@ def classify_no_pr(progress, terminal_idle, idle_seconds, verdict, blocked_by_op
       grace_seconds:   `worker_idle_grace_seconds` — quiet window before "idle" is trusted.
 
     Returns {"outcome": <str>, "action": <str>}:
-      coding       leave         — busy, OR real git progress, OR activity within grace.
-      idle_done    close_release — idle+zero-progress past grace + phase already-satisfied:
-                                   the tick verifies the empty diff, then closes + releases.
+      coding       leave         — busy, OR activity within grace. **Not** "has commits":
+                                   see the standing-vs-live note below.
+      idle_done    close_release — idle past grace + phase already-satisfied + NO changes on
+                                   the branch: the tick verifies the empty diff, closes + releases.
       idle_blocked redispatch    — …+ phase blocked, and every blocked_by is now closed:
                                    the DAG cleared, re-dispatch (keep the claim).
       idle_blocked escalate      — …+ phase blocked, but a blocked_by is still open:
@@ -597,21 +598,39 @@ def classify_no_pr(progress, terminal_idle, idle_seconds, verdict, blocked_by_op
       dead         orphan        — no live worker/terminal → existing orphan path.
     """
     progress = progress or {}
-    made_progress = int(progress.get("commits_ahead") or 0) > 0 or bool(progress.get("dirty"))
+    # A STANDING fact ("this branch has work on it"), NOT a sign of life. Used only to
+    # contradict an `already-satisfied` verdict — never to prove the worker is alive.
+    has_changes = int(progress.get("commits_ahead") or 0) > 0 or bool(progress.get("dirty"))
 
     # dead first: no worker means it cannot be "coding", whatever it left behind.
     if terminal_idle is None:
         return {"outcome": "dead", "action": "orphan"}
 
-    # coding: any positive sign of life wins over the idle+verdict path.
+    # coding: only **live** signals count — a busy terminal, or observed activity inside the
+    # grace window (`idle_seconds` is already the max-recency of last_commit_ts /
+    # worktree_mtime_ts / terminal activity, so recent commits are covered here).
+    #
+    # `has_changes` deliberately does NOT appear. It is monotonic: once a worker has one
+    # commit, `commits_ahead > 0` stays true until the branch merges, and `dirty` stays true
+    # forever if the worker died mid-edit. Including it made the whole idle+verdict path
+    # unreachable for any worker that had ever committed — a worker that committed, went
+    # idle, and never opened a PR or left a verdict was re-classified `coding` on every
+    # future tick, holding its claim indefinitely and never reaching the retry ladder.
+    # Observed live: gaokaowiki #139 sat at commits_ahead=4, dirty=false, tui-idle, 33 min
+    # past its last commit, no PR, no verdict — and stayed `coding`. See ADR-0013.
     within_grace = (idle_seconds is not None and grace_seconds is not None
                     and idle_seconds < grace_seconds)
-    if terminal_idle is False or made_progress or within_grace:
+    if terminal_idle is False or within_grace:
         return {"outcome": "coding", "action": "leave"}
 
-    # idle + zero progress past grace: route on the declared reason.
+    # idle past grace: route on the declared reason.
     phase = verdict.get("phase") if (verdict and verdict.get("found")) else None
     if phase == "already-satisfied":
+        # "nothing needed doing" is refuted by work sitting on the branch. Trust the branch,
+        # not the claim: route it through failure handling instead of closing the issue on a
+        # diff the tick would then fail to verify as empty.
+        if has_changes:
+            return {"outcome": "idle_failed", "action": "next_attempt"}
         return {"outcome": "idle_done", "action": "close_release"}
     if phase == "blocked":
         return {"outcome": "idle_blocked",

@@ -224,13 +224,36 @@ def test_classify_no_pr():
     # coding — terminal busy: left alone even with a giving-up verdict + zero progress
     assert d.classify_no_pr(zero, False, 9999, v("giving-up"), False, GRACE) == \
         {"outcome": "coding", "action": "leave"}
-    # coding — idle but commits_ahead>0: real progress beats idle+verdict
-    assert d.classify_no_pr({**zero, "commits_ahead": 2}, True, 9999,
-                            v("already-satisfied"), False, GRACE)["outcome"] == "coding"
-    # coding — idle but dirty worktree
-    assert d.classify_no_pr({**zero, "dirty": True}, True, 9999, None, False, GRACE)["outcome"] == "coding"
+    # coding — recent commits: covered by idle_seconds (max-recency), not by commits_ahead
+    assert d.classify_no_pr({**zero, "commits_ahead": 2}, True, 120,
+                            None, False, GRACE)["outcome"] == "coding"
     # coding — idle, zero progress, but activity within the grace window (a worker between steps)
     assert d.classify_no_pr(zero, True, 120, None, False, GRACE)["outcome"] == "coding"
+
+    # ── ADR-0013: `has_changes` is standing, not live. It must NOT force `coding`. ──────
+    # The live regression (gaokaowiki #139): committed 4×, went tui-idle, no PR, no verdict,
+    # 33 min past the last commit. Under the old rule commits_ahead>0 short-circuited to
+    # `coding` on EVERY tick, so the claim was held forever and never retried.
+    assert d.classify_no_pr({**zero, "commits_ahead": 4}, True, 1992,
+                            None, False, GRACE) == \
+        {"outcome": "idle_failed", "action": "next_attempt"}
+    # same for a worker that died mid-edit: `dirty` is monotonic too
+    assert d.classify_no_pr({**zero, "dirty": True}, True, 9999,
+                            None, False, GRACE)["outcome"] == "idle_failed"
+    # a `blocked` verdict still routes on the DAG even with work on the branch
+    assert d.classify_no_pr({**zero, "commits_ahead": 4}, True, 9999,
+                            v("blocked", [42]), True, GRACE) == \
+        {"outcome": "idle_blocked", "action": "escalate"}
+    # `already-satisfied` is REFUTED by work on the branch → failure handling, not close
+    assert d.classify_no_pr({**zero, "commits_ahead": 2}, True, 9999,
+                            v("already-satisfied"), False, GRACE) == \
+        {"outcome": "idle_failed", "action": "next_attempt"}
+    # …but an honest already-satisfied (truly empty branch) still closes+releases
+    assert d.classify_no_pr(zero, True, 9999, v("already-satisfied"), False, GRACE) == \
+        {"outcome": "idle_done", "action": "close_release"}
+    # a busy terminal still wins regardless of what is on the branch
+    assert d.classify_no_pr({**zero, "commits_ahead": 4}, False, 9999,
+                            None, False, GRACE)["outcome"] == "coding"
 
     # idle_done — idle, zero progress, past grace, verdict already-satisfied → close + release
     assert d.classify_no_pr(zero, True, 600, v("already-satisfied"), False, GRACE) == \

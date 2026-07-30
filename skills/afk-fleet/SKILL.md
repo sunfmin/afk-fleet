@@ -274,10 +274,16 @@ spawns).
      busy / idle / none. Feed all three to `afk classify-no-pr --terminal <busy|idle|none> --idle-seconds
      <s> --progress <…> --verdict <…> [--blocked-by-open] --config <config>`, which returns one of five
      `{outcome, action}`:
-       - **coding** (terminal busy, OR `commits_ahead>0`/dirty, OR activity within
-         `worker_idle_grace_seconds`) → still implementing, **leave it**;
-       - **idle_done** (idle + zero progress past grace + verdict `already-satisfied`) → **verify the
-         empty diff vs base**, then close the issue and `afk release <n>`;
+       - **coding** (terminal busy, OR activity within `worker_idle_grace_seconds` — `idle_seconds`
+         is the max-recency of `last_commit_ts` / `worktree_mtime_ts` / terminal activity, so recent
+         commits count here) → still implementing, **leave it**. Note what is **not** in this list:
+         `commits_ahead>0`/`dirty`. Those are **standing** facts, not signs of life — they stay true
+         until the branch merges — and including them made every idle+verdict outcome unreachable for
+         any worker that had ever committed, holding its claim forever (ADR-0013);
+       - **idle_done** (idle past grace + verdict `already-satisfied` + **no** changes on the branch)
+         → **verify the empty diff vs base**, then close the issue and `afk release <n>`. Changes on
+         the branch refute an `already-satisfied` claim, so that combination routes to `idle_failed`
+         instead of closing the issue;
        - **idle_blocked** (verdict `blocked`) → re-check each `blocked_by` issue: all now closed/merged →
          **re-dispatch** (keep the claim; not a retry); any still open → **escalate the DAG gap** (add
          `escalate_label`, comment the unmet dependency — pass `--blocked-by-open`);
