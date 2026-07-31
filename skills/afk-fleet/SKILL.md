@@ -326,7 +326,13 @@ spawns).
      Then read the create result for the **actual branch** (orca prefixes `<user>/…`) and the worktree
      path, fill [references/worker-prompt.md](references/worker-prompt.md) with that real branch + path,
      wait for the agent on the handle `terminal create` returned (`orca terminal wait --for tui-idle`),
-     and deliver the prompt (`orca terminal send`). Do **not** wait for the worker. (`--name` comes from
+     and deliver the prompt — **`--enter` is mandatory**:
+     ```bash
+     orca terminal send --terminal <handle> --text "<filled worker prompt>" --enter
+     ```
+     Without `--enter`, orca types the prompt into the worker TUI's input box but never submits it: the
+     worker then sits idle forever with the prompt unsubmitted — indistinguishable, to the liveness probe,
+     from one that finished. Do **not** wait for the worker after sending. (`--name` comes from
      `branch_pattern` — a name hint only; orca sets the branch.)
    - **Heartbeat** — `afk heartbeat --instance <id> --config <config>`; it refreshes only if due
      and only matters while I hold ≥1 claim. Cheap, stateless (it reads the old ts from the ref itself).
