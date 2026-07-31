@@ -526,23 +526,34 @@ def _login_shell(script, timeout=20):
 def cmd_worker_command(a):
     """Settle the one command every worker is started with, so a launcher on a
     custom provider does not dispatch workers that silently fall back to stock
-    Anthropic (ADR-0010).
+    Anthropic (ADR-0010), and so a qoderclicn launcher dispatches qoderclicn
+    workers (ADR-0014).
 
-    Bare: read this launcher's own ANTHROPIC_BASE_URL and report `stock` (nothing
-    to ask) or `ask` — with the Claude-starting aliases found in the user's login
-    shell, so the human picks rather than types. `--check "<cmd>"` resolves the
-    human's answer's first word in that same shell and reports whether it runs at
-    all, plus whether an unattended flag is visible in the resolution.
+    Bare: detect the runtime (qoderclicn or claude) from the launcher's own
+    environment. qoderclicn is always stock (no wrapping, no custom provider) —
+    return its default and never ask. Claude: read ANTHROPIC_BASE_URL and report
+    `stock` (nothing to ask) or `ask` — with the Claude-starting aliases found in
+    the user's login shell, so the human picks rather than types. `--check
+    "<cmd>"` resolves the human's answer's first word in that same shell and
+    reports whether it runs at all, plus whether an unattended flag is visible.
 
     The command is OPAQUE: never parsed, never composed, never appended to. That is
     what keeps every credential inside whatever wrapper the human already trusts —
     the fleet copies no env, writes no file, and puts no key on any command line."""
+    runtime = afk_decide.detect_runtime(os.environ)
+    if runtime == "qoderclicn":
+        return {"status": "stock", "command": afk_decide.WORKER_COMMAND_DEFAULT_QODERCN,
+                "base_url": None, "first_word": "qoderclicn", "yolo": True,
+                "detail": "", "runtime": runtime}
     base = a.base_url if a.base_url is not None else os.environ.get("ANTHROPIC_BASE_URL")
     if a.check:
         fw = afk_decide.first_word(a.check)
         resolved = _login_shell(f"type -- {fw}") if fw else ""
-        return afk_decide.resolve_worker_command(base, a.check, resolved)
+        result = afk_decide.resolve_worker_command(base, a.check, resolved)
+        result["runtime"] = runtime
+        return result
     result = afk_decide.resolve_worker_command(base)
+    result["runtime"] = runtime
     if result["status"] == "ask":
         aliases = afk_decide.parse_aliases(_login_shell("alias"))
         result["candidates"] = afk_decide.launch_candidates(aliases)

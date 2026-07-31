@@ -27,7 +27,7 @@ settled once with the human present, carried in every tick's spawn prompt, never
 and gone when the launcher stops. Its liveness is published as a **heartbeat**; when it stops or dies
 its claims are released or reclaimed. Distinct instances (even on one GitHub account) are the unit of
 cooperative concurrency across machines.
-_Avoid_: node, worker (that is the per-issue Claude Code), coordinator
+_Avoid_: node, worker (that is the per-issue coding agent), coordinator
 
 **Tick**:
 One fresh-context, disposable reconciliation pass, run as an Agent subagent. It rebuilds the working
@@ -46,18 +46,30 @@ preview (spawned there as a subagent, so the launcher never computes a frontier 
 _Avoid_: dry run (that is its mode, not its name), preview pass
 
 **Worker**:
-A fire-and-forget, ephemeral Claude Code session, isolated in one git worktree, that owns exactly one
+A fire-and-forget, ephemeral coding-agent session (Claude Code or qoderclicn — the run's **runtime**),
+isolated in one git worktree, that owns exactly one
 issue, opens a PR, and reports done via GitHub. It never merges, and its terminal is never read for
 its result. Its worktree is created and later torn down by the **worker backend** — orca (`orca
 worktree create` / `orca worktree rm`), the only supported backend — never by the tick with raw `git
 worktree`; orca also names the branch (a `<user>/…` prefix), and the tick **reads that back** rather
 than dictating it (ADR-0005). It is started by running the **worker launch command** in the
-worktree's first terminal, so it runs on the same provider as the **launcher** that dispatched it.
+worktree's first terminal, so it runs on the same runtime as the **launcher** that dispatched it.
 It publishes its progress as it goes — incrementally pushing its own branch after each completed
 step, and always before the local gate or any long-running operation — so a hard stop loses at most
 the in-flight step; that pushed branch tip is the durable progress a later **continuation** resumes
 from when this worker's machine is gone (ADR-0011).
 _Avoid_: agent (too generic), subagent, child
+
+**Runtime**:
+The agent binary that executes a **worker** session. One **fleet instance** runs one runtime, detected
+at bootstrap from the launcher's own environment (`QODERCN_CLI=1` → `qoderclicn`; otherwise →
+`claude`). It determines the stock **worker launch command** default: `qoderclicn
+--dangerously-skip-permissions` or `claude --dangerously-skip-permissions`. A qoderclicn runtime is
+always stock (no custom provider, no wrapping — the ask flow is skipped entirely); the Claude runtime
+retains the full provider-parity machinery of ADR-0010. The runtime is a property of the fleet
+instance, not of individual workers — no mixing within a run (ADR-0014).
+_Avoid_: provider (that is the API backend, e.g. Anthropic), CLI (too generic), agent binary
+(implementation-level)
 
 **Worker launch command**:
 The one shell string that starts every **worker** of a run — held by the **fleet instance**, injected

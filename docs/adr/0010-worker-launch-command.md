@@ -1,6 +1,7 @@
 # The worker launch command: one opaque string, confirmed by the human, never composed
 
 **Status:** accepted — amends the dispatch step of [ADR-0005](0005-orca-owns-the-worktree.md).
+Amended by [ADR-0014](0014-runtime-detection.md) (runtime-generalized stock detection).
 
 ## Decision
 

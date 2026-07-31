@@ -5,7 +5,7 @@ description: >-
   user wants to autonomously / AFK implement a repo's ready issues, orchestrate a fleet of
   agents/workers against GitHub issues (e.g. with orca), "launch workers to do the issues", or keep
   picking up and merging ready issues until stopped. A thin launcher spawns a fresh disposable
-  reconciliation tick each cycle; each tick dispatches worktree-isolated Claude Code workers per
+  reconciliation tick each cycle; each tick dispatches worktree-isolated coding-agent workers per
   ready issue, gates each on CI + optional independent adversarial verification, auto-merges green
   PRs to main, and retries-then-escalates failures — so it runs for days with context bounded by
   construction. Reads per-repo config and requires an explicit push+auto-merge authorization before
@@ -25,7 +25,7 @@ context-bounded:
 |---|---|---|
 | **launcher** | The interactive session you invoke `/afk-fleet` in. It authorizes once, then loops: spawn a tick → ingest a one-line summary → pace → repeat. | Long-lived, but only accumulates ~one compact summary per tick (auto-compaction keeps it flat). |
 | **tick** | A **fresh-context [Agent] subagent** that does exactly **one reconciliation pass** against GitHub, then returns a compact structured summary and dies. | Short. Its bulky context is discarded on return. |
-| **worker** | A fire-and-forget autonomous Claude Code, one per issue: orca creates its worktree + branch, then starts it with the run's **worker launch command** so it runs on the same provider as the launcher. Communicates only through GitHub (its PR, and issue comments). | Independent of the coordinator — never read by it. |
+| **worker** | A fire-and-forget autonomous coding agent (Claude Code or qoderclicn — the run's **runtime**), one per issue: orca creates its worktree + branch, then starts it with the run's **worker launch command** so it runs on the same runtime as the launcher. Communicates only through GitHub (its PR, and issue comments). | Independent of the coordinator — never read by it. |
 
 **This skill only *consumes* a backlog.** It does not decompose a PRD/epic into issues — that is
 upstream work, and epics are explicitly excluded from dispatch. Assume the issues already exist,
@@ -90,10 +90,13 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
      local gate is: **stop here, with the human present** — drop the required checks on that branch or
      switch to `gate.ci: required`. (`gh pr merge --admin` is not an option: it bypasses human review
      too.) A `"warn"` verdict (the read was inconclusive — no admin rights) is reported and continues.
-3. **Settle the worker launch command** — `afk worker-command`. Workers start in a *fresh login shell*
-   that inherits none of this session's environment, so a launcher running on a custom provider
+3. **Settle the worker launch command** — `afk worker-command`. The tool first detects the
+   **runtime** (ADR-0014): `QODERCN_CLI=1` in the environment → `qoderclicn` (always stock — no
+   custom provider, no wrapping — returns its default and never asks); otherwise → `claude`, and
+   the existing provider-parity flow applies. Workers start in a *fresh login shell*
+   that inherits none of this session's environment, so a Claude launcher running on a custom provider
    (`ckimi`, `csk`, a direnv, a wrapper script) would otherwise dispatch workers that silently fall
-   back to stock Anthropic and stay there for days (ADR-0010). The tool reports:
+   back to stock Anthropic and stay there for days (ADR-0010). For the Claude runtime, the tool reports:
    - `"status": "stock"` — no `ANTHROPIC_BASE_URL`; take its `command` and **ask nothing**.
    - `"status": "ask"` — a custom provider. Show the `base_url` and the `candidates` it found (the
      login shell's Claude-starting aliases, `wraps_env: true` marking the ones that carry a provider),
@@ -316,7 +319,7 @@ spawns).
      orca terminal create --worktree issue:<n> --command "<worker_command>" --json
      ```
      `--agent` is deliberately **not** used: the worker must start with the run's **worker launch
-     command** so it runs on the same provider as this fleet (ADR-0010). Pass that string **verbatim**
+     command** so it runs on the same runtime as this fleet (ADR-0010, ADR-0014). Pass that string **verbatim**
      — it is opaque; never rebuild it, never append flags. (Cost of dropping `--agent`: orca's
      unattended-flag default goes with it, which is why bootstrap warns on a command with no such flag.)
 

@@ -19,6 +19,7 @@ pins behaviour deterministically.
 """
 import hashlib
 import json
+import os
 import re
 
 # --------------------------------------------------------------------------- #
@@ -1066,6 +1067,7 @@ def pace(summary, config):
 # wrappers exist to offer, and whether the answer resolves to something runnable.
 
 WORKER_COMMAND_DEFAULT = "claude --dangerously-skip-permissions"
+WORKER_COMMAND_DEFAULT_QODERCN = "qoderclicn --dangerously-skip-permissions"
 
 # orca's per-agent unattended flags. Used ONLY to warn: a worker started without
 # one parks on a permission prompt forever, and the fleet reads that as a silent
@@ -1073,6 +1075,17 @@ WORKER_COMMAND_DEFAULT = "claude --dangerously-skip-permissions"
 YOLO_FLAGS = ("--dangerously-skip-permissions", "--dangerously-bypass-approvals-and-sandbox",
               "--yolo", "--yes-always", "--dangerously-allow-all", "--trust-all-tools",
               "--unrestricted", "--auto-approve")
+
+
+def detect_runtime(env=None):
+    """The agent runtime this launcher runs under — 'qoderclicn' or 'claude'.
+    One fleet instance runs one runtime (ADR-0014). Detection is from the
+    launcher's own environment: qoderclicn sets QODERCN_CLI=1 in every child
+    process; its absence means Claude (the default)."""
+    e = env if env is not None else os.environ
+    if (e.get("QODERCN_CLI") or "").strip() in ("1", "true"):
+        return "qoderclicn"
+    return "claude"
 
 _ALIAS_RE = re.compile(r"^(?:alias\s+)?([^=\s]+)=(.*)$")
 

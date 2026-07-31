@@ -802,6 +802,32 @@ def test_template_matches_defaults():
         assert set(parsed[k]) == set(d.CONFIG_DEFAULTS[k]), f"template missing keys in {k}:"
 
 
+def test_detect_runtime_from_env():
+    assert d.detect_runtime({"QODERCN_CLI": "1"}) == "qoderclicn"
+    assert d.detect_runtime({"QODERCN_CLI": "true"}) == "qoderclicn"
+    assert d.detect_runtime({"QODERCN_CLI": " 1 "}) == "qoderclicn"
+    assert d.detect_runtime({}) == "claude"
+    assert d.detect_runtime({"QODERCN_CLI": ""}) == "claude"
+    assert d.detect_runtime({"QODERCN_CLI": "0"}) == "claude"
+    assert d.detect_runtime({"QODERCN_CLI": "false"}) == "claude"
+    assert d.detect_runtime({"ANTHROPIC_BASE_URL": "http://x"}) == "claude"
+
+
+def test_qoderclicn_stock_default():
+    assert d.WORKER_COMMAND_DEFAULT_QODERCN == "qoderclicn --dangerously-skip-permissions"
+    assert d.WORKER_COMMAND_DEFAULT == "claude --dangerously-skip-permissions"
+
+
+def test_launch_candidates_stays_claude_only():
+    al = {"cc": "claude --dangerously-skip-permissions",
+          "qc": "qoderclicn --dangerously-skip-permissions",
+          "unrelated": "vim"}
+    got = {c["name"] for c in d.launch_candidates(al)}
+    assert "cc" in got
+    assert "qc" not in got
+    assert "unrelated" not in got
+
+
 def run():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
