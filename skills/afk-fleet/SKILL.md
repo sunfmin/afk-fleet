@@ -313,11 +313,27 @@ spawns).
      **orca** — it owns worktree + branch + spawn in one step; the tick never runs raw `git worktree`
      ([ADR-0005](../../docs/adr/0005-orca-owns-the-worktree.md)):
      ```bash
-     git fetch origin <base_branch> --quiet     # the worker must start from the latest base
+     # Fast-forward the LOCAL base branch, not just origin/<base>. `orca --base-branch <base>`
+     # resolves the **local** ref, and a plain `git fetch origin <base>` never moves it — so a
+     # bare fetch silently dispatches the worker from a stale base (see the assertion below).
+     git fetch origin <base_branch>:<base_branch> --quiet
      orca worktree create --repo id:<repo-id> --name issue-<n>-<slug> --no-parent \
           --base-branch <base_branch> --issue <n> --json          # NO --agent
+     # The worker must start from the latest base — assert it, don't assume it.
+     git -C <worktree> merge-base --is-ancestor origin/<base_branch> HEAD \
+       || git -C <worktree> merge --ff-only origin/<base_branch>
      orca terminal create --worktree issue:<n> --command "<worker_command>" --json
      ```
+     **Why the refspec and the assertion, not just a fetch.** `git fetch origin <base>` updates only
+     `refs/remotes/origin/<base>`; the local `refs/heads/<base>` stays where it was. orca creates the
+     worktree from the **local** branch, so right after a merge to the target the very next dispatch
+     starts its worker one or more commits behind — the worker then does its whole pass against a stale
+     tree and only discovers it at merge-time sync. The `<base>:<base>` refspec moves the local branch;
+     the `merge-base --is-ancestor` line makes the guarantee **mechanism-independent** (it holds however
+     orca resolves the ref, and self-heals if the refspec fetch was refused). If the refspec fetch fails
+     with *"refusing to fetch into branch … checked out at …"*, that is the base branch being checked out
+     in some worktree: leave it alone and let the assertion's `--ff-only` do the work.
+
      `--agent` is deliberately **not** used: the worker must start with the run's **worker launch
      command** so it runs on the same runtime as this fleet (ADR-0010, ADR-0014). Pass that string **verbatim**
      — it is opaque; never rebuild it, never append flags. (Cost of dropping `--agent`: orca's

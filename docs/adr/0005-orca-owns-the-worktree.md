@@ -15,9 +15,11 @@ no raw `git worktree add` / `git worktree remove`. orca also decides the branch 
 
 ```bash
 afk claim <n> --instance <id>                 # win the claim first (compare-and-swap)
-git fetch origin <base_branch> --quiet        # guarantee the worker starts from latest base
+git fetch origin <base_branch>:<base_branch> --quiet   # move the LOCAL base ref — orca reads that one
 orca worktree create --repo id:<repo-id> --name issue-<n>-<slug> --no-parent \
      --base-branch <base_branch> --issue <n> --agent claude --json
+git -C <worktree> merge-base --is-ancestor origin/<base_branch> HEAD \
+  || git -C <worktree> merge --ff-only origin/<base_branch>   # assert latest base, don't assume it
 # → read result: the actual branch (e.g. sunfmin/issue-<n>-<slug>) and worktree path
 # → fill worker-prompt.md with that real branch + path, deliver it to the spawned worker
 ...
@@ -49,9 +51,24 @@ finds the PR by its `Closes #<n>` closing reference, and rebases/merges the PR's
 from `gh pr view` — never a branch name it assumed. So `branch_pattern` degrades to a *worktree-name
 hint* passed to `--name`, not a promise about the branch.
 
-`git fetch origin <base>` is kept explicitly before the create: orca is not assumed to fetch, and the
-"worker starts from the latest base" invariant is cheap insurance against avoidable rebase conflicts
-(the serialized rebase-before-merge is the backstop, not the first line of defence).
+A fetch is kept explicitly before the create: orca is not assumed to fetch, and the "worker starts from
+the latest base" invariant is cheap insurance against avoidable merge conflicts (the serialized
+sync-before-merge is the backstop, not the first line of defence).
+
+**It must be a refspec fetch, and it must be asserted.** The original `git fetch origin <base>` was
+*silently ineffective for this purpose*: it updates only `refs/remotes/origin/<base>`, while
+`orca --base-branch <base>` resolves the **local** `refs/heads/<base>`, which a bare fetch never moves.
+A real run (`gaokaowiki`, tick right after merging PR #180) caught it — `origin/staging` was at
+`ac56349`, the local `staging` still at `b1dca89`, and the freshly created worktree started one commit
+behind despite the fetch immediately preceding it. So the invariant this ADR claims to buy was not
+actually being bought.
+
+Two changes, deliberately belt-and-braces: `<base>:<base>` removes the cause (the local ref moves), and
+`merge-base --is-ancestor … || merge --ff-only` makes the guarantee **mechanism-independent** — it holds
+regardless of how orca resolves the ref, and self-heals when the refspec fetch is refused (which happens
+when the base branch is checked out in some worktree; leave that branch alone and let the `--ff-only` do
+it). A one-line assertion is what turns "cheap insurance" from a claim into a checked fact — the same
+move as every other gate here: don't trust, verify.
 
 ## Considered and rejected
 
