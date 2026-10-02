@@ -19,7 +19,6 @@ pins behaviour deterministically.
 """
 import hashlib
 import json
-import os
 import re
 
 # --------------------------------------------------------------------------- #
@@ -39,6 +38,7 @@ CONFIG_DEFAULTS = {
     "ready_label": "ready-for-agent",
     "epic_labels": ["epic", "prd", "wayfinder:map"],
     "claim": "ref",
+    "claim_namespace": "refs/afk",
     "dependencies": "native",
     # workers
     "base_branch": "main",
@@ -110,6 +110,10 @@ def validate_config(cfg):
     a bad combination can still be fixed instead of surfacing mid-run inside a
     tick. Raises ValueError; returns `cfg` unchanged so it can be used inline.
     """
+    ns = cfg.get("claim_namespace") or ""
+    if not ns.startswith("refs/") or ns.endswith("/"):
+        raise ValueError(f"config claim_namespace: expected a ref prefix like refs/afk or "
+                         f"refs/heads, got {ns!r}")
     gate = cfg.get("gate") or {}
     ci = gate.get("ci")
     if ci not in GATE_CI_MODES:
@@ -236,43 +240,24 @@ def resolve_config(partial):
 
 # --------------------------------------------------------------------------- #
 # Dispatch eligibility — "can a worker take this issue right now?"             #
-# (migrated from the former select_frontier.py; unchanged contract)           #
 # --------------------------------------------------------------------------- #
+#
+# Issues arrive from afk.py's gatherer as OPEN issues with `labels` already a
+# list of names; the three eligibility facts that are not on the issue itself
+# (claimed / has_open_pr / open_blockers) are grafted by `_eligibility_rows`.
 
-def _label_names(issue):
-    """Accept labels as [{"name": ...}] (gh) or ["..."] (fixture)."""
-    out = []
-    for lb in issue.get("labels", []) or []:
-        if isinstance(lb, dict):
-            name = lb.get("name")
-            if name:
-                out.append(name)
-        elif isinstance(lb, str):
-            out.append(lb)
-    return out
-
-
-def _claimed(issue):
-    """True iff an afk-claim/<n> lock ref exists (any owner). Single source of
-    truth for 'already taken' — not the assignee (ADR-0003)."""
-    return bool(issue.get("claimed", False))
-
-
-def _has_open_pr(issue):
-    """True iff an open PR already closes this issue — durable in-flight evidence
-    independent of the claim ref (the open-PR guard, ADR-0003)."""
-    return bool(issue.get("has_open_pr", False))
-
-
-def _open_blockers(issue):
-    """open_blockers given directly, or derived from a blocked_by list of
-    {"state": ...} objects (open ones count)."""
-    if "open_blockers" in issue and issue["open_blockers"] is not None:
-        return int(issue["open_blockers"])
-    bb = issue.get("blocked_by")
-    if isinstance(bb, list):
-        return sum(1 for b in bb if (b or {}).get("state", "open") == "open")
-    return 0
+def _eligibility_rows(issues, prs, claims, blocked_by):
+    """Each issue + the three eligibility facts `select_frontier` reads:
+    `claimed` (a claim ref exists, any owner — not the assignee, ADR-0003),
+    `has_open_pr` (an open PR closes it — the open-PR guard) and
+    `open_blockers` (from `blocked_by`, {issue number: count}; missing → 0)."""
+    claimed = {c.get("number") for c in claims}
+    pr_for = _closing_pr_map(prs)
+    return [{**i,
+             "claimed": i.get("number") in claimed,
+             "has_open_pr": i.get("number") in pr_for,
+             "open_blockers": int(blocked_by.get(i.get("number"), 0))}
+            for i in issues]
 
 
 def select_frontier(issues, ready_label, epic_labels):
@@ -280,9 +265,9 @@ def select_frontier(issues, ready_label, epic_labels):
     Decide which issues are dispatchable RIGHT NOW. Shared by `--plan` and the live
     tick, so both compute the identical frontier (a stable published contract).
 
-    An issue is dispatchable iff ALL hold:
-      state == "open" · has ready_label · no epic label · not claimed (no
-      afk-claim ref) · no open linked PR · zero open blocking dependencies.
+    `issues` are `_eligibility_rows`. One is dispatchable iff ALL hold: has
+    ready_label · no epic label · not claimed · no open linked PR · zero open
+    blocking dependencies.
 
     Returns {"dispatch": [num...], "excluded": [{"number","reason"}...]}.
     """
@@ -290,29 +275,31 @@ def select_frontier(issues, ready_label, epic_labels):
     dispatch, excluded = [], []
     for issue in issues:
         num = issue.get("number")
-        labels = set(_label_names(issue))
-        if issue.get("state", "open") != "open":
-            excluded.append({"number": num, "reason": "not open"})
-            continue
-        if ready_label not in labels:
-            excluded.append({"number": num, "reason": f"no {ready_label} label"})
-            continue
+        labels = set(issue.get("labels") or [])
         hit_epic = labels & epic_set
-        if hit_epic:
-            excluded.append({"number": num, "reason": f"epic label ({', '.join(sorted(hit_epic))})"})
+        if ready_label not in labels:
+            reason = f"no {ready_label} label"
+        elif hit_epic:
+            reason = f"epic label ({', '.join(sorted(hit_epic))})"
+        elif issue.get("claimed"):
+            reason = "already claimed (afk-claim ref exists)"
+        elif issue.get("has_open_pr"):
+            reason = "has an open linked PR"
+        elif issue.get("open_blockers"):
+            reason = f"{issue['open_blockers']} open blocker(s)"
+        else:
+            dispatch.append(num)
             continue
-        if _claimed(issue):
-            excluded.append({"number": num, "reason": "already claimed (afk-claim ref exists)"})
-            continue
-        if _has_open_pr(issue):
-            excluded.append({"number": num, "reason": "has an open linked PR"})
-            continue
-        ob = _open_blockers(issue)
-        if ob > 0:
-            excluded.append({"number": num, "reason": f"{ob} open blocker(s)"})
-            continue
-        dispatch.append(num)
+        excluded.append({"number": num, "reason": reason})
     return {"dispatch": dispatch, "excluded": excluded}
+
+
+def frontier_candidates(issues, prs, claims, ready_label, epic_labels):
+    """The issue numbers that pass every eligibility check EXCEPT open blockers —
+    the only ones whose blocker count is worth a per-issue API read. `afk rebuild`
+    fetches counts for exactly these, then `assemble_working_set` decides."""
+    return select_frontier(_eligibility_rows(issues, prs, claims, {}),
+                           ready_label, epic_labels)["dispatch"]
 
 
 # --------------------------------------------------------------------------- #
@@ -396,6 +383,20 @@ def subclassify_pr(pr_state, checks_state, ci_mode="required"):
     return "awaiting_ci"
 
 
+def board_phase(status, ci_mode="required"):
+    """The status-board phase a claim's `subclassify_pr` status renders as, while
+    its worker is alive and nothing terminal has happened (`merged` / `escalated`
+    are set by the merge and escalate steps themselves).
+
+    In `local` mode an open PR is `pr_open`, not `awaiting_merge`: its status says
+    "ready for the merge sequence", but the gate that sequence runs has not passed
+    yet, and the board must not show a green gate nobody has run."""
+    if status == "awaiting_merge" and ci_mode == "local":
+        return "pr_open"
+    return {"no_pr": "claimed", "awaiting_ci": "pr_open", "failure": "ci_failed",
+            "awaiting_merge": "awaiting_merge"}[status]
+
+
 # --------------------------------------------------------------------------- #
 # The local completion gate + its bootstrap compatibility probe (ADR-0012)     #
 # --------------------------------------------------------------------------- #
@@ -477,26 +478,15 @@ def protection_verdict(ci_mode, protection, unavailable=None):
 # no_pr reconciliation — disambiguating a FINISHED worker from a CODING one    #
 # --------------------------------------------------------------------------- #
 #
-# `subclassify_pr` only says a claim has no PR yet; deciding *why* used to be a
-# binary the tick did with an orca liveness probe alone (connected terminal +
-# active-looking title). That is blind: a worker that ran to completion, decided
-# there was no PR to open, posted its reason, and went idle looks IDENTICAL to
-# one still coding — both are "a connected terminal with a title" — so the claim
-# is parked forever. Three signals disambiguate, none of them terminal chrome:
-#   1. git PROGRESS in the worktree (commits ahead of base / dirty tree / recent
-#      file activity) — the decisive coding-vs-finished signal (afk worker-status);
-#   2. the worker's explicit VERDICT marker on the issue (afk verdict) — the
-#      single machine-readable source of truth for *why* it opened no PR;
-#   3. terminal idle-vs-busy from the orca probe — still the tick's judgment.
-# `classify_no_pr` is the pure join of the three (fixture-tested); parsing the
-# marker is pure too. Whether to TRUST the marker stays the tick's call.
-
-VERDICT_MARKER = "<!--afk:verdict"
-
-# The closed set of reasons a worker may declare for opening no PR. `already-satisfied`
-# = the issue is already done in base (empty diff); `blocked` = a runtime dependency
-# gap (see blocked_by); `giving-up` = a genuine failure the worker could not resolve.
-VERDICT_PHASES = ("already-satisfied", "blocked", "giving-up")
+# `subclassify_pr` only says a claim has no PR yet. A worker that finished
+# without one and went idle looks identical, to a terminal probe, to one still
+# coding, so three signals disambiguate (all gathered by `afk no-pr`):
+#   1. git PROGRESS in the worktree (commits ahead / dirty tree / last activity);
+#   2. the worker's VERDICT marker on the issue — its declared reason for opening
+#      no PR: `already-satisfied` (done in base, empty diff), `blocked` (a
+#      dependency gap, see blocked_by) or `giving-up` (a failure it could not fix);
+#   3. the terminal's busy / idle / none state from the orca probe.
+# `classify_no_pr` is the pure join. Whether to TRUST the marker stays the tick's call.
 
 _VERDICT_MARKER_RE = re.compile(r"<!--\s*afk:verdict\b(.*?)-->", re.DOTALL)
 
@@ -509,10 +499,9 @@ def parse_verdict_marker(body):
       <!--afk:verdict n=<issue> phase=<already-satisfied|blocked|giving-up> \
           [blocked_by=<csv of issue numbers>] [reason=<short>]-->
 
-    Deterministic and LENIENT — a marker with a missing/unknown field still parses
-    ({"found": True, "phase": None|<raw>}); whether to trust it, and what an
-    unrecognised phase means, is the tick's / `classify_no_pr`'s call, never this
-    parser's. `reason` (if present) must be the last field — it captures to the end
+    LENIENT — a marker with a missing/unknown field still parses
+    ({"found": True, "phase": None|<raw>}); what an unrecognised phase means is
+    `classify_no_pr`'s call. `reason` (if present) must be the last field — it captures to the end
     of the marker so a short human phrase with spaces survives. Returns:
       {"found": True, "n": int|None, "phase": str|None, "blocked_by": [int], "reason": str|None}
     """
@@ -544,117 +533,102 @@ def parse_verdict_marker(body):
 def latest_verdict(comments):
     """
     The LATEST afk:verdict across an issue's comments (multiple markers → latest
-    wins). `comments` is expected oldest-first (the gh default), each a
-    {"body","comment_url"/"html_url"/"url","created_at"} dict or a bare body
-    string; the last marker-bearing comment in that order is the live verdict.
-    Pure — afk.py's `verdict` fetches, this parses. Returns:
+    wins). `comments` are [{"body", "url"}...], oldest first (the gh default).
+    Returns:
       {"found": bool, "phase": str|None, "blocked_by": [int], "reason": str|None,
        "comment_url": str|None}
     """
     result = {"found": False, "phase": None, "blocked_by": [],
               "reason": None, "comment_url": None}
     for c in comments or []:
-        if isinstance(c, str):
-            body, url = c, None
-        else:
-            body = c.get("body") or ""
-            url = c.get("comment_url") or c.get("html_url") or c.get("url")
-        parsed = parse_verdict_marker(body)
+        parsed = parse_verdict_marker(c.get("body"))
         if parsed:
             result = {"found": True, "phase": parsed["phase"],
                       "blocked_by": parsed["blocked_by"], "reason": parsed["reason"],
-                      "comment_url": url}
+                      "comment_url": c.get("url")}
     return result
 
 
-def classify_no_pr(progress, terminal_idle, idle_seconds, verdict, blocked_by_open,
-                   grace_seconds):
+def classify_no_pr(progress, terminal, terminal_idle_seconds, verdict, blocker_states,
+                   now, grace_seconds):
     """
-    The 5-way verdict for one of MY `no_pr` claims — the fix for the finished-vs-coding
-    blind spot. Pure join of the three disambiguating signals; the tick gathers them
-    (`afk worker-status`, `afk verdict`, the orca liveness probe) and calls this.
+    The 5-way verdict for one of MY `no_pr` claims, from the raw signals.
 
-      progress:        {"commits_ahead": int, "dirty": bool, "last_commit_ts": …,
-                        "worktree_mtime_ts": …} from `afk worker-status` ({} if unknown).
-      terminal_idle:   False = orca probe found a BUSY worker; True = a connected but
-                       IDLE worker; None = NO live worker/terminal at all.
-      idle_seconds:    seconds since the worker's last observable activity (max of
-                       last_commit_ts / worktree_mtime_ts / terminal activity); None = unknown.
-      verdict:         the `latest_verdict` dict (or None) — the worker's declared reason.
-      blocked_by_open: True iff any issue in verdict.blocked_by is still open (the tick
-                       re-checks each; only consulted for a `blocked` verdict).
-      grace_seconds:   `worker_idle_grace_seconds` — quiet window before "idle" is trusted.
+      progress:        the worktree's git progress {"commits_ahead", "dirty",
+                       "last_commit_ts", "worktree_mtime_ts"}; {} / None if unreadable.
+      terminal:        the orca probe — "busy" | "idle" (connected, not working) |
+                       "none" (no live worker/terminal at all).
+      terminal_idle_seconds: seconds since the terminal last showed activity;
+                       None if the probe could not say.
+      verdict:         the `latest_verdict` dict (or None).
+      blocker_states:  {issue number: "open"|"closed"} for the verdict's blocked_by.
+                       Anything not provably "closed" counts as still open.
+      now, grace_seconds: epoch seconds / `worker_idle_grace_seconds`.
 
-    Returns {"outcome": <str>, "action": <str>}:
-      coding       leave         — busy, OR activity within grace. **Not** "has commits":
-                                   see the standing-vs-live note below.
-      idle_done    close_release — idle past grace + phase already-satisfied + NO changes on
-                                   the branch: the tick verifies the empty diff, closes + releases.
-      idle_blocked redispatch    — …+ phase blocked, and every blocked_by is now closed:
-                                   the DAG cleared, re-dispatch (keep the claim).
-      idle_blocked escalate      — …+ phase blocked, but a blocked_by is still open:
-                                   a real DAG gap — escalate (add escalate_label, comment it).
-      idle_failed  next_attempt  — …+ phase giving-up, an unknown phase, or NO verdict at
-                                   all after grace → failure handling (`afk next-attempt`).
-      dead         orphan        — no live worker/terminal → existing orphan path.
+    Returns {"outcome", "action", "idle_seconds", "open_blockers"}:
+      coding       leave         — busy, OR last activity within grace.
+      idle_done    close_release — idle past grace + `already-satisfied` + NO changes
+                                   on the branch: the tick verifies the empty diff,
+                                   closes + releases.
+      idle_blocked redispatch    — …+ `blocked`, and every blocked_by is now closed.
+      idle_blocked escalate      — …+ `blocked`, and a blocked_by is still open (or
+                                   the verdict names none, so nothing can ever clear).
+      idle_failed  next_attempt  — …+ `giving-up`, an unknown phase, or NO verdict at
+                                   all → failure handling (`afk next-attempt`).
+      dead         orphan        — no live worker/terminal → recovery by continuation.
+
+    `idle_seconds` is the time since the MOST RECENT sign of life (last commit,
+    newest file mtime, terminal activity); None when none is known, which is never
+    "within grace". `open_blockers` is the still-open subset of blocked_by.
     """
     progress = progress or {}
-    # A STANDING fact ("this branch has work on it"), NOT a sign of life. Used only to
-    # contradict an `already-satisfied` verdict — never to prove the worker is alive.
-    has_changes = int(progress.get("commits_ahead") or 0) > 0 or bool(progress.get("dirty"))
+    seen = [t for t in (progress.get("last_commit_ts"), progress.get("worktree_mtime_ts"))
+            if t is not None]
+    if terminal_idle_seconds is not None:
+        seen.append(int(now) - int(terminal_idle_seconds))
+    idle_seconds = max(0, int(now) - int(max(seen))) if seen else None
+
+    def out(outcome, action, open_blockers=()):
+        return {"outcome": outcome, "action": action, "idle_seconds": idle_seconds,
+                "open_blockers": list(open_blockers)}
 
     # dead first: no worker means it cannot be "coding", whatever it left behind.
-    if terminal_idle is None:
-        return {"outcome": "dead", "action": "orphan"}
+    if terminal == "none":
+        return out("dead", "orphan")
 
-    # coding: only **live** signals count — a busy terminal, or observed activity inside the
-    # grace window (`idle_seconds` is already the max-recency of last_commit_ts /
-    # worktree_mtime_ts / terminal activity, so recent commits are covered here).
-    #
-    # `has_changes` deliberately does NOT appear. It is monotonic: once a worker has one
-    # commit, `commits_ahead > 0` stays true until the branch merges, and `dirty` stays true
-    # forever if the worker died mid-edit. Including it made the whole idle+verdict path
-    # unreachable for any worker that had ever committed — a worker that committed, went
-    # idle, and never opened a PR or left a verdict was re-classified `coding` on every
-    # future tick, holding its claim indefinitely and never reaching the retry ladder.
-    # Observed live: gaokaowiki #139 sat at commits_ahead=4, dirty=false, tui-idle, 33 min
-    # past its last commit, no PR, no verdict — and stayed `coding`. See ADR-0013.
-    within_grace = (idle_seconds is not None and grace_seconds is not None
-                    and idle_seconds < grace_seconds)
-    if terminal_idle is False or within_grace:
-        return {"outcome": "coding", "action": "leave"}
+    # coding: only LIVE signals count. Commits ahead / a dirty tree are standing
+    # facts — true until the branch merges — never signs of life (ADR-0013).
+    if terminal == "busy" or (idle_seconds is not None and idle_seconds < grace_seconds):
+        return out("coding", "leave")
 
     # idle past grace: route on the declared reason.
-    phase = verdict.get("phase") if (verdict and verdict.get("found")) else None
+    verdict = verdict or {}
+    phase = verdict.get("phase") if verdict.get("found") else None
     if phase == "already-satisfied":
-        # "nothing needed doing" is refuted by work sitting on the branch. Trust the branch,
-        # not the claim: route it through failure handling instead of closing the issue on a
-        # diff the tick would then fail to verify as empty.
+        # "nothing needed doing" is refuted by work sitting on the branch.
+        has_changes = int(progress.get("commits_ahead") or 0) > 0 or bool(progress.get("dirty"))
         if has_changes:
-            return {"outcome": "idle_failed", "action": "next_attempt"}
-        return {"outcome": "idle_done", "action": "close_release"}
+            return out("idle_failed", "next_attempt")
+        return out("idle_done", "close_release")
     if phase == "blocked":
-        return {"outcome": "idle_blocked",
-                "action": "escalate" if blocked_by_open else "redispatch"}
-    return {"outcome": "idle_failed", "action": "next_attempt"}
+        named = verdict.get("blocked_by") or []
+        still_open = [n for n in named if (blocker_states or {}).get(n) != "closed"]
+        if still_open or not named:
+            return out("idle_blocked", "escalate", still_open)
+        return out("idle_blocked", "redispatch")
+    return out("idle_failed", "next_attempt")
 
 
 # --------------------------------------------------------------------------- #
 # Takeover — the human-authorized, lease-skipping reclaim (ADR-0011)           #
 # --------------------------------------------------------------------------- #
 #
-# The lease (above) is the *unattended* line between "dead" and "alive but slow":
-# a peer may reclaim a claim only once its owner's heartbeat has expired past
-# `claim_lease_ttl` (~75 min). But a fleet dies wholesale, from a quota hard stop,
-# with a human watching — and that human IS the oracle for "it is really dead".
-# Takeover is their fast path: list the instances GitHub still remembers (the
-# launcher forgot its own id when it died; the claim markers and heartbeat refs
-# did not), pick one, and force-take its claims with the *same* atomic
-# --force-with-lease push as a stale reclaim, only skipping the staleness gate.
-# Still atomic against a not-actually-dead fleet — the second pusher is rejected.
-# The lease is untouched (ADR-0011 rejected shortening the TTL for a rare event),
-# and a takeover never counts as a retry: it answers "did the FLEET die?", not
-# "is this WORK failing?".
+# The lease is the *unattended* line between "dead" and "alive but slow". A
+# human watching a fleet die is a faster oracle: takeover lists the instances
+# GitHub still remembers and force-takes one's claims with the same atomic
+# --force-with-lease push a stale reclaim uses, only skipping the staleness
+# gate. It never counts as a retry: it answers "did the FLEET die?", not "is
+# this WORK failing?".
 
 def group_instances(claims, heartbeats, me, now, ttl):
     """
@@ -742,17 +716,11 @@ def plan_takeover(claims, heartbeats, target, me, now, ttl, confirmed=False):
 # Continuation — recovering a dead claim FROM ITS PROGRESS (ADR-0011)          #
 # --------------------------------------------------------------------------- #
 #
-# When a claim's worker has died — an *orphaned claim* reconciled locally, or a
-# *stale claim* reclaimed from a peer — the fleet used to tear the worktree down
-# and re-dispatch from a fresh base, discarding every bit of partial work. The
-# default is now CONTINUATION: recover the claim from its durable progress,
-# tiered by what actually survived the death. The selection below is pure
-# mechanics — deterministic from two signals the effectful layer gathers (is a
-# worktree for this issue still on THIS machine, and is its branch ahead of base
-# on the remote) — while "is this recovered state sane to build on" stays tick
-# judgment, exactly like the orphan-vs-alive read.
-#
-# Only tier 3 tears anything down; that is the whole point of ADR-0011.
+# A claim whose worker died — an *orphaned claim*, or a *stale claim* reclaimed
+# from a peer — is recovered from its durable progress, tiered by what survived:
+# a worktree still on THIS machine, else the branch the worker pushed, else
+# nothing. The selection is mechanics; "is this recovered state sane to build
+# on" stays tick judgment. Only tier 3 tears anything down.
 
 _PLACEHOLDER_RE = re.compile(r"\{(number|slug)\}")
 
@@ -800,10 +768,8 @@ def find_orca_worktree(worktrees, number, repo=None):
     """
     hits = []
     for w in worktrees or []:
-        # `linkedIssue` is an int in orca's JSON today; compared numerically anyway,
-        # because a str/int drift at this boundary would silently downgrade every
-        # tier-1 recovery to tier 2/3 — i.e. quietly lose the uncommitted work that
-        # tier 1 exists to save.
+        # compared numerically: a str/int drift in orca's JSON would silently
+        # downgrade every tier-1 recovery and lose the uncommitted work it saves
         try:
             if int(w.get("linkedIssue")) != int(number):
                 continue
@@ -811,7 +777,7 @@ def find_orca_worktree(worktrees, number, repo=None):
             continue
         if w.get("isMainWorktree") or w.get("isArchived"):
             continue
-        if repo and (w.get("projectId") or "") not in (f"github:{repo}", repo):
+        if repo and w.get("projectId") != f"github:{repo}":
             continue
         hits.append(w)
     if not hits:
@@ -823,7 +789,12 @@ def find_orca_worktree(worktrees, number, repo=None):
     return {"found": True, "path": best.get("path") or None, "branch": branch}
 
 
-RECOVERY_ACTIONS = ("reuse_worktree", "recreate_at_tip", "dispatch_fresh")
+def furthest_ahead(ahead_by_branch):
+    """Of several remote branches matching one issue (an earlier attempt left one
+    behind), the one furthest ahead of base — ties, and unmeasurable counts
+    (None), go to the first by name. None when there is no candidate."""
+    names = sorted(ahead_by_branch)
+    return max(names, key=lambda b: ahead_by_branch[b] or 0) if names else None
 
 
 def select_recovery(worktree, branch):
@@ -844,8 +815,8 @@ def select_recovery(worktree, branch):
       2  recreate_at_tip  no local worktree, but the dead worker pushed → recreate
                           one at the branch tip and continue there. Loss is
                           bounded to "since the last push".
-      3  dispatch_fresh   nothing survived → the old behaviour, re-dispatch from
-                          base. The ONLY tier that tears down.
+      3  dispatch_fresh   nothing survived → re-dispatch from base. The ONLY
+                          tier that tears down.
 
     `prompt` picks the worker-prompt variant: `continue` (inspect the existing
     progress first) or `fresh`. A surviving worktree that is *provably* pristine
@@ -910,10 +881,13 @@ STATUS_PHASES = ("claimed", "pr_open", "ci_failed", "awaiting_merge", "merged", 
 # Happy-path milestones, in order — these are the task-list checkboxes.
 _STATUS_STEPS = (
     ("claimed",        "已认领 · worker 实现中"),
-    ("pr_open",        "PR 已开 · 等 CI"),
+    ("pr_open",        "PR 已开{pr} · 等 {gate}"),
     ("awaiting_merge", "门已绿 · 待合并"),
     ("merged",         "已合并"),
 )
+
+# What the board calls the machine gate, per gate.ci mode (ADR-0012).
+_GATE_NAME = {"required": "CI", "local": "本地门"}
 
 # How far along the happy path each phase has reached (index of the last DONE
 # step). escalated is a terminal give-up handled specially in `render_status_board`.
@@ -923,14 +897,14 @@ _PHASE_REACHED = {
 }
 
 
-def _status_current_line(phase, attempt, retry_max):
+def _status_current_line(phase, gate, attempt, retry_max):
     """The single ▸/✅/⚠️ 'where are we now' line under the checklist."""
     if phase == "claimed":
         return "▸ 当前:worker 实现中,尚无 PR"
     if phase == "pr_open":
-        return "▸ 当前:等 CI"
+        return f"▸ 当前:等 {gate}"
     if phase == "ci_failed":
-        return f"▸ 当前:CI 失败,修复重试中({attempt}/{retry_max}) —— 见下方 CI 与评论"
+        return f"▸ 当前:{gate} 失败,修复重试中({attempt}/{retry_max}) —— 见下方 {gate} 与评论"
     if phase == "awaiting_merge":
         return "▸ 当前:门已绿,待合并"
     if phase == "merged":
@@ -951,7 +925,8 @@ def render_status_board(state):
         "instance":  owning fleet-instance id (str, optional — shown in the header),
         "pr":        PR number (int) or None,
         "attempt":   current attempt n (int, default 0)  — shown only for ci_failed,
-        "retry_max": max retries (int, default 2)         — shown only for ci_failed,
+        "retry_max": max retries (int, default: config `retry`) — ditto,
+        "ci":        gate.ci mode (default "required") — names the gate being waited on,
       }
     Returns the full markdown body, led by STATUS_MARKER (the find-or-create anchor).
     """
@@ -960,7 +935,8 @@ def render_status_board(state):
         raise ValueError(f"unknown status phase: {phase!r}")
     pr = state.get("pr")
     attempt = int(state.get("attempt", 0) or 0)
-    retry_max = int(state.get("retry_max", 2) or 0)
+    retry_max = int(state.get("retry_max", CONFIG_DEFAULTS["retry"]) or 0)
+    gate = _GATE_NAME[state.get("ci") or "required"]
     inst = state.get("instance")
     reached = _PHASE_REACHED[phase]
     escalated = phase == "escalated"
@@ -973,11 +949,10 @@ def render_status_board(state):
     header = "**afk-fleet 进度**" + (f" · 认领方 `{inst}`" if inst else "")
     lines = [STATUS_MARKER, header, ""]
     for i, (key, label) in enumerate(_STATUS_STEPS):
-        if key == "pr_open" and pr:
-            label = f"PR 已开 (#{pr}) · 等 CI"
+        label = label.format(pr=f" (#{pr})" if pr else "", gate=gate)
         lines.append(f"- [{'x' if done(i, key) else ' '}] {label}")
     lines.append("")
-    lines.append(_status_current_line(phase, attempt, retry_max))
+    lines.append(_status_current_line(phase, gate, attempt, retry_max))
     return "\n".join(lines)
 
 
@@ -1077,15 +1052,15 @@ YOLO_FLAGS = ("--dangerously-skip-permissions", "--dangerously-bypass-approvals-
               "--unrestricted", "--auto-approve")
 
 
-def detect_runtime(env=None):
-    """The agent runtime this launcher runs under — 'qoderclicn' or 'claude'.
-    One fleet instance runs one runtime (ADR-0014). Detection is from the
-    launcher's own environment: qoderclicn sets QODERCN_CLI=1 in every child
-    process; its absence means Claude (the default)."""
-    e = env if env is not None else os.environ
-    if (e.get("QODERCN_CLI") or "").strip() in ("1", "true"):
+def detect_runtime(env):
+    """The agent runtime a launcher with environment `env` runs under —
+    'qoderclicn' or 'claude'. One fleet instance runs one runtime (ADR-0014):
+    qoderclicn sets QODERCN_CLI=1 in every child process; its absence means
+    Claude (the default)."""
+    if (env.get("QODERCN_CLI") or "").strip() in ("1", "true"):
         return "qoderclicn"
     return "claude"
+
 
 _ALIAS_RE = re.compile(r"^(?:alias\s+)?([^=\s]+)=(.*)$")
 
@@ -1129,17 +1104,20 @@ def launch_candidates(aliases):
     return out
 
 
-def resolve_worker_command(base_url, supplied=None, resolved=None):
+def resolve_worker_command(base_url, supplied=None, resolved=None, runtime="claude"):
     """
     Settle the one string every worker is started with.
 
+      runtime:  `detect_runtime`'s answer. qoderclicn has no custom providers, so
+                it is always `stock` with its own default — never asked, and a
+                supplied command is ignored (ADR-0014).
       base_url: the launcher's own ANTHROPIC_BASE_URL (None/"" = stock Anthropic).
       supplied: the human's answer, verbatim, or None if they haven't been asked.
       resolved: what the shell says `first_word(supplied)` is — the `type` output
                 (an alias's full expansion, a function body, a path), or None if
                 it resolves to nothing. Only meaningful when `supplied` is given.
 
-    Returns {status, command, base_url, first_word, yolo, detail}. `command` is
+    Returns {status, command, base_url, first_word, yolo, detail, runtime}. `command` is
     non-null only when the run may proceed — every other status is the launcher's
     cue to ask (again), never to quietly fall back to stock.
 
@@ -1157,12 +1135,17 @@ def resolve_worker_command(base_url, supplied=None, resolved=None):
     it (a script path). A False is worth a warning — a worker that stops on a
     permission prompt is indistinguishable to the fleet from one that finished.
     """
+    if runtime == "qoderclicn":
+        base_url, supplied = None, None
     fw = first_word(supplied) if supplied else ""
 
     def out(status, command=None, yolo=None, detail=""):
         return {"status": status, "command": command, "base_url": base_url or None,
-                "first_word": fw or None, "yolo": yolo, "detail": detail}
+                "first_word": fw or None, "yolo": yolo, "detail": detail, "runtime": runtime}
 
+    if runtime == "qoderclicn":
+        fw = "qoderclicn"
+        return out("stock", command=WORKER_COMMAND_DEFAULT_QODERCN, yolo=True)
     if supplied:
         if not resolved:
             return out("unresolved", detail=f"{fw!r} resolves to nothing in an interactive shell")
@@ -1186,7 +1169,7 @@ def resolve_worker_command(base_url, supplied=None, resolved=None):
 # is the fleet's main steady-state token spend. The gate collapses everything a
 # tick's Rebuild observes into a short digest; the launcher spawns a tick only
 # when the digest moved (or a forced full pass is due). A false "changed" costs
-# one tick — today's behaviour; a missed change waits at most `force_after`
+# one tick; a missed change waits at most `force_after`
 # cycles. Correctness never depends on the gate.
 
 def fingerprint(issues, prs, claims):
@@ -1202,9 +1185,8 @@ def fingerprint(issues, prs, claims):
     the gate — and a lease *expiring* is a time-driven event no state hash can
     see anyway. The forced tick covers those.
 
-    Accepts gh-shaped or fixture-shaped rows; canonicalizes (sorts, keeps only
-    the fields above) so row order and representation never move the digest.
-    Returns a 16-hex digest.
+    Canonicalizes (sorts, keeps only the fields above) so row order and extra
+    fields never move the digest. Returns a 16-hex digest.
     """
     def check_row(c):
         return [c.get("name") or c.get("context") or "",
@@ -1212,7 +1194,7 @@ def fingerprint(issues, prs, claims):
                 c.get("conclusion") or c.get("state") or ""]
 
     canon = {
-        "issues": sorted([i.get("number"), sorted(_label_names(i)), i.get("updatedAt") or ""]
+        "issues": sorted([i.get("number"), sorted(i.get("labels") or []), i.get("updatedAt") or ""]
                          for i in issues),
         "prs": sorted([p.get("number"), p.get("headRefOid") or "", p.get("updatedAt") or "",
                        sorted(check_row(c) for c in (p.get("statusCheckRollup") or []))]
@@ -1251,11 +1233,10 @@ def fingerprint_gate(last, current, skips, force_after):
 # --------------------------------------------------------------------------- #
 #
 # One pure function turns the raw observables (issues, PRs, claim/heartbeat
-# refs, open-blocker counts) into the tick's whole working set — the join the
-# SKILL.md prose used to make every fresh tick re-derive (graft three fields,
-# match each claim to its PR, partition mine/peer_live/stale). The gh/git
-# gather lives in afk.py; the orphan-vs-alive read of a `no_pr` claim (the
-# liveness probe) is deliberately NOT here — that is tick judgment.
+# refs, open-blocker counts) into the tick's whole working set: graft the
+# eligibility facts, match each claim to its PR, partition mine/peer_live/stale.
+# The gh/git gather lives in afk.py; why a `no_pr` claim has no PR is a separate,
+# machine-dependent question (`afk no-pr`).
 
 _CHECK_RED = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED",
               "STARTUP_FAILURE", "ERROR"}
@@ -1286,57 +1267,48 @@ def _closing_pr_map(prs):
     m = {}
     for p in prs:
         for ref in p.get("closingIssuesReferences") or []:
-            n = ref.get("number") if isinstance(ref, dict) else ref
-            if n is None:
-                continue
+            n = ref.get("number")
             cur = m.get(n)
             if cur is None or (p.get("number") or 0) > (cur.get("number") or 0):
                 m[n] = p
     return m
 
 
-def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, ttl,
-                         ready_label, epic_labels, ci_mode="required"):
+def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, config):
     """
     The tick's whole working set from the raw observables. Pure — afk.py's
     `rebuild` gathers, this assembles, and a fixture pins the join.
 
-      issues:      gh issue list rows (number, title, labels, updatedAt)
+      issues:      open issues {number, title, labels: [name...], updatedAt}
       prs:         gh pr list rows (number, headRefOid, updatedAt,
                    statusCheckRollup, closingIssuesReferences)
       claims:      [{"number","instance","sha",...}]  (ref-scan shape)
       heartbeats:  {instance: last_ts}
       blocked_by:  {issue number: open blocker count}; missing → 0. Only
-                   frontier candidates need real counts — every other issue
+                   `frontier_candidates` need real counts — every other issue
                    already fails a cheaper eligibility check first.
-      me/now/ttl:  as classify_claims
-      ready_label/epic_labels: the dispatch contract
-      ci_mode:     gate.ci — in `local` mode an open PR is awaiting_merge outright,
-                   since the gate is a merge-time action, not an observation
-                   (ADR-0012)
+      me, now:     my instance id / epoch seconds
+      config:      the canonical config — read for ready_label, epic_labels,
+                   claim_lease_ttl_seconds and gate.ci
 
     Returns:
       {"frontier": {"dispatch": [{"number","title"}...], "excluded": [...]},
-       "mine": [{"number","title","status","pr","checks","attempt_labels"}...],
+       "mine": [{"number","title","status","board_phase","pr","checks",
+                 "attempt_labels"}...],
        "peer_live": [{"number","instance"}...],
        "stale": [{"number","instance","sha"}...],   # sha feeds reclaim --expect-sha
        "fingerprint": <digest of the same observables the gate hashes>,
        "now": now}
 
     `status` is subclassify_pr's verdict (awaiting_merge / awaiting_ci /
-    failure / no_pr); whether a no_pr claim is an orphan needs the liveness
-    probe and stays with the tick.
+    failure / no_pr) and `board_phase` the status-board phase it renders as.
     """
+    ttl, ci_mode = config["claim_lease_ttl_seconds"], config["gate"]["ci"]
     by_num = {i.get("number"): i for i in issues}
-    claimed = {c.get("number") for c in claims}
     pr_for = _closing_pr_map(prs)
 
-    enriched = [{**i,
-                 "claimed": i.get("number") in claimed,
-                 "has_open_pr": i.get("number") in pr_for,
-                 "open_blockers": int(blocked_by.get(i.get("number"), 0))}
-                for i in issues]
-    frontier = select_frontier(enriched, ready_label, epic_labels)
+    frontier = select_frontier(_eligibility_rows(issues, prs, claims, blocked_by),
+                               config["ready_label"], config["epic_labels"])
     frontier["dispatch"] = [{"number": n, "title": by_num.get(n, {}).get("title")}
                             for n in frontier["dispatch"]]
 
@@ -1348,10 +1320,11 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, t
         pr = pr_for.get(n)
         checks = pr_checks_state(pr.get("statusCheckRollup")) if pr else None
         issue = by_num.get(n, {})
+        status = subclassify_pr("open" if pr else "none", checks, ci_mode)
         mine.append({"number": n, "title": issue.get("title"),
-                     "status": subclassify_pr("open" if pr else "none", checks, ci_mode),
+                     "status": status, "board_phase": board_phase(status, ci_mode),
                      "pr": pr.get("number") if pr else None, "checks": checks,
-                     "attempt_labels": [lb for lb in _label_names(issue)
+                     "attempt_labels": [lb for lb in issue.get("labels") or []
                                         if lb.startswith("afk-attempt/")]})
 
     return {"frontier": frontier,

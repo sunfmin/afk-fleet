@@ -13,13 +13,12 @@ TTL = 4500  # ~75 min, the default lease
 
 def test_select_frontier():
     issues = [
-        {"number": 101, "state": "open", "labels": ["ready-for-agent"], "claimed": False, "has_open_pr": False, "open_blockers": 0},
-        {"number": 102, "state": "open", "labels": ["ready-for-agent"], "open_blockers": 1},
-        {"number": 103, "state": "open", "labels": ["ready-for-agent", "epic"], "open_blockers": 0},
-        {"number": 104, "state": "open", "labels": ["ready-for-agent"], "claimed": True},
-        {"number": 105, "state": "open", "labels": ["ready-for-agent"], "has_open_pr": True},
-        {"number": 106, "state": "closed", "labels": ["ready-for-agent"]},
-        {"number": 107, "state": "open", "labels": []},
+        {"number": 101, "labels": ["ready-for-agent"], "claimed": False, "has_open_pr": False, "open_blockers": 0},
+        {"number": 102, "labels": ["ready-for-agent"], "open_blockers": 1},
+        {"number": 103, "labels": ["ready-for-agent", "epic"], "open_blockers": 0},
+        {"number": 104, "labels": ["ready-for-agent"], "claimed": True},
+        {"number": 105, "labels": ["ready-for-agent"], "has_open_pr": True},
+        {"number": 107, "labels": []},
     ]
     r = d.select_frontier(issues, "ready-for-agent", ["epic", "prd"])
     assert r["dispatch"] == [101], r
@@ -28,8 +27,28 @@ def test_select_frontier():
     assert "epic label (epic)" == reasons[103]
     assert "already claimed" in reasons[104]
     assert "open linked PR" in reasons[105]
-    assert reasons[106] == "not open"
     assert "no ready-for-agent label" == reasons[107]
+    # every issue lands in exactly one of the two lists
+    assert len(r["dispatch"]) + len(r["excluded"]) == len(issues)
+
+
+def test_frontier_candidates_are_everything_but_the_blocker_check():
+    # the cheap pre-pass `afk rebuild` runs to decide WHICH issues are worth a
+    # per-issue blocked_by read: every eligibility check except open blockers
+    issues = [{"number": n, "labels": ["ready-for-agent"]} for n in (1, 2, 3, 4)]
+    issues.append({"number": 5, "labels": ["ready-for-agent", "epic"]})
+    prs = [{"number": 30, "closingIssuesReferences": [{"number": 3}]}]
+    claims = [{"number": 2, "instance": "peer"}]
+    got = d.frontier_candidates(issues, prs, claims, "ready-for-agent", ["epic"])
+    assert got == [1, 4], got            # 2 claimed, 3 has an open PR, 5 is an epic
+
+    # …and it is the SAME rule the real frontier applies: with every candidate
+    # unblocked the two agree, and a blocked candidate drops out of only the latter
+    cfg = d.resolve_config({"epic_labels": ["epic"]})
+    ws = d.assemble_working_set(issues, prs, claims, {}, {}, "me", 0, cfg)
+    assert [i["number"] for i in ws["frontier"]["dispatch"]] == got
+    ws = d.assemble_working_set(issues, prs, claims, {}, {4: 2}, "me", 0, cfg)
+    assert [i["number"] for i in ws["frontier"]["dispatch"]] == [1]
 
 
 def test_is_stale_and_due():
@@ -104,6 +123,16 @@ def test_validate_config():
             assert False, f"expected ValueError for {bad_gate}"
         except ValueError as e:
             assert "local_command" in str(e)
+
+    # the claim namespace is a ref PREFIX: a branch name or a trailing slash would
+    # silently build refs no scan ever reads back
+    d.validate_config(d.resolve_config({"claim_namespace": "refs/heads"}))
+    for bad_ns in ("afk", "heads/afk", "refs/afk/", ""):
+        try:
+            d.validate_config(d.resolve_config({"claim_namespace": bad_ns}))
+            assert False, f"expected ValueError for claim_namespace {bad_ns!r}"
+        except ValueError as e:
+            assert "claim_namespace" in str(e)
 
     # an unknown mode is refused, never treated as "required"
     try:
@@ -195,92 +224,124 @@ def test_latest_verdict():
     empty = {"found": False, "phase": None, "blocked_by": [], "reason": None, "comment_url": None}
     assert d.latest_verdict([]) == empty
     assert d.latest_verdict(None) == empty
-    assert d.latest_verdict(["hello", "world — no markers here"]) == empty
+    assert d.latest_verdict([{"body": "hello", "url": "u"}, {"body": None, "url": "u"}]) == empty
 
     # multiple markers across comments → the LAST (chronological, gh's default order) wins,
-    # and its comment_url rides along
+    # and its comment url rides along
     comments = [
-        {"body": "<!--afk:verdict n=5 phase=blocked blocked_by=2-->", "comment_url": "u1"},
-        {"body": "some human chatter in between"},
-        {"body": "<!--afk:verdict n=5 phase=giving-up-->", "comment_url": "u2"},
+        {"body": "<!--afk:verdict n=5 phase=blocked blocked_by=2-->", "url": "u1"},
+        {"body": "some human chatter in between", "url": "u1b"},
+        {"body": "<!--afk:verdict n=5 phase=giving-up-->", "url": "u2"},
     ]
     r = d.latest_verdict(comments)
     assert r["found"] is True and r["phase"] == "giving-up" and r["comment_url"] == "u2"
-
-    # bare strings and html_url/url fallbacks both accepted
-    assert d.latest_verdict(["<!--afk:verdict phase=already-satisfied-->"])["phase"] == "already-satisfied"
-    assert d.latest_verdict([{"body": "<!--afk:verdict phase=blocked-->", "html_url": "h"}])["comment_url"] == "h"
-    assert d.latest_verdict([{"body": "<!--afk:verdict phase=blocked-->", "url": "u"}])["comment_url"] == "u"
+    assert r["blocked_by"] == []          # the superseded marker contributes nothing
 
 
-def test_classify_no_pr():
-    GRACE = 300
-    zero = {"commits_ahead": 0, "dirty": False, "last_commit_ts": None, "worktree_mtime_ts": None}
+NOW = 1_000_000
+GRACE = 300
+ZERO = {"commits_ahead": 0, "dirty": False, "last_commit_ts": None, "worktree_mtime_ts": None}
 
-    def v(phase, blocked_by=None):
-        return {"found": True, "phase": phase, "blocked_by": blocked_by or [],
-                "reason": None, "comment_url": "u"}
 
-    # coding — terminal busy: left alone even with a giving-up verdict + zero progress
-    assert d.classify_no_pr(zero, False, 9999, v("giving-up"), False, GRACE) == \
-        {"outcome": "coding", "action": "leave"}
-    # coding — recent commits: covered by idle_seconds (max-recency), not by commits_ahead
-    assert d.classify_no_pr({**zero, "commits_ahead": 2}, True, 120,
-                            None, False, GRACE)["outcome"] == "coding"
-    # coding — idle, zero progress, but activity within the grace window (a worker between steps)
-    assert d.classify_no_pr(zero, True, 120, None, False, GRACE)["outcome"] == "coding"
+def _verdict(phase, blocked_by=None):
+    return {"found": True, "phase": phase, "blocked_by": blocked_by or [],
+            "reason": None, "comment_url": "u"}
 
-    # ── ADR-0013: `has_changes` is standing, not live. It must NOT force `coding`. ──────
-    # The live regression (gaokaowiki #139): committed 4×, went tui-idle, no PR, no verdict,
-    # 33 min past the last commit. Under the old rule commits_ahead>0 short-circuited to
-    # `coding` on EVERY tick, so the claim was held forever and never retried.
-    assert d.classify_no_pr({**zero, "commits_ahead": 4}, True, 1992,
-                            None, False, GRACE) == \
-        {"outcome": "idle_failed", "action": "next_attempt"}
-    # same for a worker that died mid-edit: `dirty` is monotonic too
-    assert d.classify_no_pr({**zero, "dirty": True}, True, 9999,
-                            None, False, GRACE)["outcome"] == "idle_failed"
-    # a `blocked` verdict still routes on the DAG even with work on the branch
-    assert d.classify_no_pr({**zero, "commits_ahead": 4}, True, 9999,
-                            v("blocked", [42]), True, GRACE) == \
-        {"outcome": "idle_blocked", "action": "escalate"}
-    # `already-satisfied` is REFUTED by work on the branch → failure handling, not close
-    assert d.classify_no_pr({**zero, "commits_ahead": 2}, True, 9999,
-                            v("already-satisfied"), False, GRACE) == \
-        {"outcome": "idle_failed", "action": "next_attempt"}
-    # …but an honest already-satisfied (truly empty branch) still closes+releases
-    assert d.classify_no_pr(zero, True, 9999, v("already-satisfied"), False, GRACE) == \
-        {"outcome": "idle_done", "action": "close_release"}
-    # a busy terminal still wins regardless of what is on the branch
-    assert d.classify_no_pr({**zero, "commits_ahead": 4}, False, 9999,
-                            None, False, GRACE)["outcome"] == "coding"
 
-    # idle_done — idle, zero progress, past grace, verdict already-satisfied → close + release
-    assert d.classify_no_pr(zero, True, 600, v("already-satisfied"), False, GRACE) == \
-        {"outcome": "idle_done", "action": "close_release"}
+def _no_pr(progress, terminal, idle, verdict=None, blockers=None):
+    """classify_no_pr with the terminal as the only recency signal, `idle` s ago."""
+    r = d.classify_no_pr(progress, terminal, idle, verdict, blockers or {}, NOW, GRACE)
+    return r["outcome"], r["action"]
 
-    # idle_blocked — dep now closed → re-dispatch (keep the claim)
-    assert d.classify_no_pr(zero, True, 600, v("blocked", [42]), False, GRACE) == \
-        {"outcome": "idle_blocked", "action": "redispatch"}
-    # idle_blocked — a dep still open → escalate the DAG gap
-    assert d.classify_no_pr(zero, True, 600, v("blocked", [42]), True, GRACE) == \
-        {"outcome": "idle_blocked", "action": "escalate"}
 
-    # idle_failed — verdict giving-up
-    assert d.classify_no_pr(zero, True, 600, v("giving-up"), False, GRACE) == \
-        {"outcome": "idle_failed", "action": "next_attempt"}
-    # idle_failed — NO verdict at all after grace (the worker just stopped, no marker)
-    assert d.classify_no_pr(zero, True, 600, None, False, GRACE) == \
-        {"outcome": "idle_failed", "action": "next_attempt"}
-    assert d.classify_no_pr(zero, True, 600, {"found": False}, False, GRACE)["outcome"] == "idle_failed"
-    # idle_failed — unknown/garbage phase after grace → failed (safe default, not silently trusted)
-    assert d.classify_no_pr(zero, True, 600, v("weird-phase"), False, GRACE)["outcome"] == "idle_failed"
-    # idle_failed — idle_seconds unknown (None) is NOT treated as within grace
-    assert d.classify_no_pr(zero, True, None, None, False, GRACE)["outcome"] == "idle_failed"
+def test_classify_no_pr_coding_needs_a_live_signal():
+    # terminal busy: left alone even with a giving-up verdict + zero progress
+    assert _no_pr(ZERO, "busy", 9999, _verdict("giving-up")) == ("coding", "leave")
+    # idle, but activity within the grace window (a worker between steps)
+    assert _no_pr(ZERO, "idle", 120) == ("coding", "leave")
+    assert _no_pr({**ZERO, "commits_ahead": 2}, "idle", 120) == ("coding", "leave")
+    # the boundary: exactly `grace` seconds idle is no longer within grace
+    assert _no_pr(ZERO, "idle", GRACE - 1) == ("coding", "leave")
+    assert _no_pr(ZERO, "idle", GRACE) == ("idle_failed", "next_attempt")
 
-    # dead — no live worker/terminal at all → orphan path, even with leftover commits
-    assert d.classify_no_pr({**zero, "commits_ahead": 3}, None, 600, None, False, GRACE) == \
-        {"outcome": "dead", "action": "orphan"}
+    # ADR-0013: commits ahead / a dirty tree are STANDING facts, not signs of life.
+    # A worker that committed 4×, went idle 33 min ago, and left no PR and no verdict
+    # must reach failure handling — not be re-read as `coding` on every tick forever.
+    assert _no_pr({**ZERO, "commits_ahead": 4}, "idle", 1992) == ("idle_failed", "next_attempt")
+    assert _no_pr({**ZERO, "dirty": True}, "idle", 9999) == ("idle_failed", "next_attempt")
+    # …while a busy terminal still wins regardless of what is on the branch
+    assert _no_pr({**ZERO, "commits_ahead": 4}, "busy", 9999) == ("coding", "leave")
+
+
+def test_classify_no_pr_idle_seconds_is_the_most_recent_sign_of_life():
+    def idle(progress, terminal_idle):
+        return d.classify_no_pr(progress, "idle", terminal_idle, None, {}, NOW, GRACE)
+
+    # three clocks, the freshest wins — whichever one it is
+    r = idle({**ZERO, "last_commit_ts": NOW - 5000, "worktree_mtime_ts": NOW - 40}, 9000)
+    assert r["idle_seconds"] == 40 and r["outcome"] == "coding"       # an uncommitted edit
+    r = idle({**ZERO, "last_commit_ts": NOW - 60, "worktree_mtime_ts": NOW - 5000}, 9000)
+    assert r["idle_seconds"] == 60 and r["outcome"] == "coding"       # a fresh commit
+    r = idle({**ZERO, "last_commit_ts": NOW - 5000, "worktree_mtime_ts": NOW - 5000}, 10)
+    assert r["idle_seconds"] == 10 and r["outcome"] == "coding"       # terminal activity
+    # all three stale → idle past grace
+    r = idle({**ZERO, "last_commit_ts": NOW - 5000, "worktree_mtime_ts": NOW - 4000}, 3000)
+    assert r["idle_seconds"] == 3000 and r["outcome"] == "idle_failed"
+
+    # nothing known at all is NOT "within grace": unknown never keeps a claim parked
+    r = idle(ZERO, None)
+    assert r["idle_seconds"] is None and r["outcome"] == "idle_failed"
+    r = idle(None, None)                                              # unreadable worktree
+    assert r["idle_seconds"] is None and r["outcome"] == "idle_failed"
+    # a clock skewed into the future reads as "just now", never a negative age
+    assert idle({**ZERO, "worktree_mtime_ts": NOW + 30}, None)["idle_seconds"] == 0
+
+
+def test_classify_no_pr_routes_idle_workers_on_their_verdict():
+    # already-satisfied + a truly empty branch → close + release
+    assert _no_pr(ZERO, "idle", 600, _verdict("already-satisfied")) == ("idle_done", "close_release")
+    # …but work on the branch REFUTES it → failure handling, not a closed issue
+    assert _no_pr({**ZERO, "commits_ahead": 2}, "idle", 9999, _verdict("already-satisfied")) == \
+        ("idle_failed", "next_attempt")
+    assert _no_pr({**ZERO, "dirty": True}, "idle", 9999, _verdict("already-satisfied")) == \
+        ("idle_failed", "next_attempt")
+
+    # giving-up, no verdict at all, a not-found verdict, a garbage phase → failed
+    assert _no_pr(ZERO, "idle", 600, _verdict("giving-up")) == ("idle_failed", "next_attempt")
+    assert _no_pr(ZERO, "idle", 600, None) == ("idle_failed", "next_attempt")
+    assert _no_pr(ZERO, "idle", 600, {"found": False}) == ("idle_failed", "next_attempt")
+    assert _no_pr(ZERO, "idle", 600, _verdict("weird-phase")) == ("idle_failed", "next_attempt")
+
+    # dead: no live worker/terminal at all → orphan path, whatever it left behind
+    assert _no_pr({**ZERO, "commits_ahead": 3}, "none", 5, _verdict("blocked", [1])) == \
+        ("dead", "orphan")
+
+
+def test_classify_no_pr_blocked_routes_on_the_blockers_real_state():
+    def blocked(named, states, progress=ZERO):
+        return d.classify_no_pr(progress, "idle", 600, _verdict("blocked", named), states,
+                                NOW, GRACE)
+
+    # every named blocker closed → the DAG cleared: re-dispatch (keep the claim)
+    r = blocked([42, 43], {42: "closed", 43: "closed"})
+    assert (r["outcome"], r["action"], r["open_blockers"]) == ("idle_blocked", "redispatch", [])
+    # one still open → a real DAG gap: escalate, and say which
+    r = blocked([42, 43], {42: "closed", 43: "open"})
+    assert (r["outcome"], r["action"], r["open_blockers"]) == ("idle_blocked", "escalate", [43])
+    # a blocker whose state could not be read is NOT provably closed → still open
+    r = blocked([42, 43], {42: "closed", 43: None})
+    assert (r["action"], r["open_blockers"]) == ("escalate", [43])
+    assert blocked([42], {})["open_blockers"] == [42]
+    # a `blocked` verdict naming NO blocker can never clear — re-dispatching it
+    # would loop forever outside the retry ladder, so it escalates
+    r = blocked([], {})
+    assert (r["outcome"], r["action"], r["open_blockers"]) == ("idle_blocked", "escalate", [])
+    # blocked routes on the DAG even with work on the branch
+    assert blocked([42], {42: "open"}, {**ZERO, "commits_ahead": 4})["action"] == "escalate"
+
+    # open_blockers is reported only for a blocked verdict
+    assert d.classify_no_pr(ZERO, "idle", 600, _verdict("giving-up", [42]), {42: "open"},
+                            NOW, GRACE)["open_blockers"] == []
 
 
 def _takeover_state(now):
@@ -415,6 +476,19 @@ def test_find_orca_worktree():
     assert d.find_orca_worktree([{**rows[1], "linkedIssue": "nine"}], 9, "o/r")["found"] is False
 
 
+def test_furthest_ahead():
+    # several branches can match one issue (an earlier attempt left one behind)
+    assert d.furthest_ahead({"a/issue-9-x": 1, "b/issue-9-y": 3}) == "b/issue-9-y"
+    # ties go to the first by name, whatever order they were measured in
+    assert d.furthest_ahead({"z": 2, "m": 2, "a": 1}) == "m"
+    # an unmeasurable branch (None) never beats a measured one, but is still a
+    # candidate when it is all there is
+    assert d.furthest_ahead({"a": None, "b": 1}) == "b"
+    assert d.furthest_ahead({"b": None, "a": None}) == "a"
+    assert d.furthest_ahead({"only": 0}) == "only"
+    assert d.furthest_ahead({}) is None
+
+
 def test_select_recovery():
     # tier 1 — a worktree is still HERE: reuse it, continue-mode prompt. Never torn down.
     r = d.select_recovery({"present": True, "commits_ahead": 3, "dirty": False},
@@ -489,6 +563,21 @@ def test_render_status_board():
     assert esc.count("- [x]") == 2 and "已升级给人处理" in esc      # 认领 + PR
     assert d.render_status_board({"phase": "escalated"}).count("- [x]") == 1  # no PR → only 认领
 
+    # gate.ci: local — the board names the gate actually being waited on, and a
+    # failed one is not blamed on a CI the fleet never read (ADR-0012)
+    local = d.render_status_board({"phase": "pr_open", "pr": 5, "ci": "local"})
+    assert "- [x] PR 已开 (#5) · 等 本地门" in local and "▸ 当前:等 本地门" in local
+    assert "CI" not in local
+    assert "本地门 失败,修复重试中(1/2)" in d.render_status_board(
+        {"phase": "ci_failed", "pr": 5, "attempt": 1, "ci": "local"})
+    # required is the default, and its wording is unchanged
+    assert d.render_status_board({"phase": "pr_open", "pr": 5, "ci": "required"}) == \
+        d.render_status_board({"phase": "pr_open", "pr": 5})
+    assert "- [x] PR 已开 · 等 CI" in d.render_status_board({"phase": "pr_open"})   # no PR number
+    # retry_max defaults to the config table's `retry`, not a second hardcoded number
+    assert f"(1/{d.CONFIG_DEFAULTS['retry']})" in d.render_status_board(
+        {"phase": "ci_failed", "attempt": 1})
+
     # determinism: identical state → identical body (write-only-on-change relies on it).
     assert d.render_status_board({"phase": "pr_open", "pr": 5}) == \
         d.render_status_board({"phase": "pr_open", "pr": 5})
@@ -499,6 +588,22 @@ def test_render_status_board():
         assert False, "expected ValueError for unknown phase"
     except ValueError:
         pass
+
+
+def test_board_phase():
+    # every status rebuild can emit has a board phase — the tick never translates
+    for status, phase in (("no_pr", "claimed"), ("awaiting_ci", "pr_open"),
+                          ("failure", "ci_failed"), ("awaiting_merge", "awaiting_merge")):
+        assert d.board_phase(status) == phase == d.board_phase(status, "required")
+        assert phase in d.STATUS_PHASES
+    # local mode: an open PR is ready for the merge SEQUENCE, but the gate that
+    # sequence runs has not passed — the board must not show a green gate
+    assert d.board_phase("awaiting_merge", "local") == "pr_open"
+    assert d.board_phase("no_pr", "local") == "claimed"
+    for ci in d.GATE_CI_MODES:                # and it covers subclassify_pr's whole range
+        for pr in ("open", "none"):
+            for checks in ("green", "red", "pending", None):
+                assert d.board_phase(d.subclassify_pr(pr, checks, ci), ci) in d.STATUS_PHASES
 
 
 def test_pace():
@@ -519,7 +624,7 @@ def test_pace():
 
 def test_fingerprint():
     issues = [
-        {"number": 1, "labels": [{"name": "ready-for-agent"}], "updatedAt": "2026-07-01T00:00:00Z"},
+        {"number": 1, "labels": ["ready-for-agent"], "updatedAt": "2026-07-01T00:00:00Z"},
         {"number": 2, "labels": ["epic"], "updatedAt": "2026-07-02T00:00:00Z"},
     ]
     prs = [{"number": 7, "headRefOid": "abc", "updatedAt": "2026-07-03T00:00:00Z",
@@ -527,11 +632,12 @@ def test_fingerprint():
     claims = [{"number": 1, "instance": "me", "sha": "s1"}]
     fp = d.fingerprint(issues, prs, claims)
 
-    # canonical: row order and label representation (gh dicts vs fixture strings) never move it
+    # canonical: row order, label order and fields outside the digest never move it
     assert fp == d.fingerprint(list(reversed(issues)), prs, claims)
-    assert fp == d.fingerprint(
-        [{"number": 1, "labels": ["ready-for-agent"], "updatedAt": "2026-07-01T00:00:00Z"}, issues[1]],
-        prs, claims)
+    assert fp == d.fingerprint([{**issues[0], "title": "retitled"}, issues[1]], prs, claims)
+    two = [{**issues[0], "labels": ["a", "b"]}, issues[1]]
+    assert d.fingerprint(two, prs, claims) == \
+        d.fingerprint([{**issues[0], "labels": ["b", "a"]}, issues[1]], prs, claims)
 
     # every decision-relevant change moves it
     assert fp != d.fingerprint(issues[:1], prs, claims)                       # an issue closed
@@ -596,8 +702,8 @@ def test_assemble_working_set():
         {"number": 6, "instance": "peerB", "sha": "s6"},
     ]
     heartbeats = {"me": now - 10, "peerA": now - 100, "peerB": now - TTL - 999}
-    ws = d.assemble_working_set(issues, prs, claims, heartbeats, {2: 1},
-                                "me", now, TTL, "ready-for-agent", ["epic", "prd"])
+    cfg = d.resolve_config({"epic_labels": ["epic", "prd"], "claim_lease_ttl_seconds": TTL})
+    ws = d.assemble_working_set(issues, prs, claims, heartbeats, {2: 1}, "me", now, cfg)
 
     # frontier: the join (claimed / has_open_pr / blockers) grafted in code, titles ride along
     assert ws["frontier"]["dispatch"] == [{"number": 1, "title": "ready"}]
@@ -610,6 +716,8 @@ def test_assemble_working_set():
     assert mine[3]["status"] == "awaiting_merge" and mine[3]["pr"] == 30 and mine[3]["checks"] == "green"
     assert mine[4]["status"] == "no_pr" and mine[4]["pr"] is None
     assert mine[4]["attempt_labels"] == ["afk-attempt/1"]
+    # each row carries the board phase it renders as — the tick never translates
+    assert mine[3]["board_phase"] == "awaiting_merge" and mine[4]["board_phase"] == "claimed"
 
     # peers: live one identified and left alone; stale one carries the sha reclaim needs
     assert ws["peer_live"] == [{"number": 5, "instance": "peerA"}]
@@ -620,20 +728,32 @@ def test_assemble_working_set():
     assert ws["now"] == now
 
     # missing blocked_by entries default to 0 — safe: only frontier candidates need real counts
-    ws2 = d.assemble_working_set(issues, prs, claims, heartbeats, {},
-                                 "me", now, TTL, "ready-for-agent", ["epic", "prd"])
+    ws2 = d.assemble_working_set(issues, prs, claims, heartbeats, {}, "me", now, cfg)
     assert {e["number"] for e in ws2["frontier"]["dispatch"]} == {1, 2}
 
     # gate.ci: local — a PR whose remote checks are RED is still awaiting_merge,
     # because those checks are not the gate; the tick re-runs the local one at merge
     # time instead (ADR-0012). Everything else about the working set is unchanged.
     red = [{**prs[0], "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "FAILURE"}]}]
-    strict = d.assemble_working_set(issues, red, claims, heartbeats, {2: 1}, "me", now, TTL,
-                                    "ready-for-agent", ["epic", "prd"])
-    local = d.assemble_working_set(issues, red, claims, heartbeats, {2: 1}, "me", now, TTL,
-                                   "ready-for-agent", ["epic", "prd"], "local")
+    local_cfg = {**cfg, "gate": {**cfg["gate"], "ci": "local", "local_command": "make test"}}
+    strict = d.assemble_working_set(issues, red, claims, heartbeats, {2: 1}, "me", now, cfg)
+    local = d.assemble_working_set(issues, red, claims, heartbeats, {2: 1}, "me", now, local_cfg)
     assert {m["number"]: m["status"] for m in strict["mine"]} == {3: "failure", 4: "no_pr"}
     assert {m["number"]: m["status"] for m in local["mine"]} == {3: "awaiting_merge", 4: "no_pr"}
+    assert {m["number"]: m["board_phase"] for m in strict["mine"]} == {3: "ci_failed", 4: "claimed"}
+    assert {m["number"]: m["board_phase"] for m in local["mine"]} == {3: "pr_open", 4: "claimed"}
+
+    # the lease the partition uses is the CONFIG's: shorten it and the live peer goes stale
+    short = d.assemble_working_set(issues, prs, claims, heartbeats, {2: 1}, "me", now,
+                                   {**cfg, "claim_lease_ttl_seconds": 50})
+    assert [s["number"] for s in short["stale"]] == [5, 6] and short["peer_live"] == []
+
+    # several open PRs closing one issue → the highest PR number is the live attempt
+    two_prs = prs + [{"number": 31, "headRefOid": "bbb", "updatedAt": "T8",
+                      "statusCheckRollup": [{"status": "IN_PROGRESS", "conclusion": None}],
+                      "closingIssuesReferences": [{"number": 3}]}]
+    m3 = d.assemble_working_set(issues, two_prs, claims, heartbeats, {}, "me", now, cfg)["mine"][0]
+    assert (m3["pr"], m3["status"]) == (31, "awaiting_ci")
     assert local["frontier"] == strict["frontier"] and local["stale"] == strict["stale"]
 
 
@@ -811,6 +931,22 @@ def test_detect_runtime_from_env():
     assert d.detect_runtime({"QODERCN_CLI": "0"}) == "claude"
     assert d.detect_runtime({"QODERCN_CLI": "false"}) == "claude"
     assert d.detect_runtime({"ANTHROPIC_BASE_URL": "http://x"}) == "claude"
+
+
+def test_qoderclicn_runtime_is_always_stock():
+    alias_type = "ckimi is an alias for (eval x && claude --dangerously-skip-permissions)"
+    # no custom providers exist for qoderclicn, so it is never asked — whatever the
+    # launcher's ANTHROPIC_BASE_URL says, and whatever answer is supplied (ADR-0014)
+    for args in ((None,), (KIMI,), (KIMI, "ckimi", alias_type), (None, "ckim", "")):
+        r = d.resolve_worker_command(*args, runtime="qoderclicn")
+        assert (r["status"], r["command"], r["yolo"]) == \
+            ("stock", d.WORKER_COMMAND_DEFAULT_QODERCN, True), args
+        assert r["runtime"] == "qoderclicn" and r["first_word"] == "qoderclicn"
+        assert r["base_url"] is None
+    # every verdict names the runtime it was settled for; claude is the default
+    assert d.resolve_worker_command(None)["runtime"] == "claude"
+    assert d.resolve_worker_command(KIMI)["runtime"] == "claude"
+    assert d.resolve_worker_command(KIMI, "ckimi", alias_type)["runtime"] == "claude"
 
 
 def test_qoderclicn_stock_default():

@@ -27,7 +27,7 @@ still has — and only a dead claim ever needs asking.
 |---|---|---|---|
 | **1** | `reuse_worktree` | The worktree is still on this machine: **do not `orca worktree rm` it.** Start a new worker *inside it*, on the same branch — `orca terminal create --worktree issue:<n> --command "<worker_command>"`. Lossless: even uncommitted work survives. | continue |
 | **2** | `recreate_at_tip` | No local worktree, but the branch is ahead of base: recreate one at the **branch tip** (`orca worktree create … --base-branch <that branch>`) and continue there. Loss is bounded to "since the last push". | continue |
-| **3** | `dispatch_fresh` | Nothing survived: today's behaviour — tear down any leftover (`orca worktree rm --worktree issue:<n> --force`) and dispatch from base. **The only tier that tears anything down.** | fresh |
+| **3** | `dispatch_fresh` | Nothing survived: tear down any leftover (`orca worktree rm --worktree issue:<n> --force`) and dispatch from base. **The only tier that tears anything down.** | fresh |
 
 `prompt` names the [worker-prompt](worker-prompt.md) variant to deliver: its
 **continue-mode variant** (inspect the existing progress first, treat it as partial work toward the

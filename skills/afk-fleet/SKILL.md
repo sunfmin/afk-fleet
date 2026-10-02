@@ -76,10 +76,14 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
    guessed settings.
 2. **Establish this fleet instance** — mint a short unique **instance id** (this launcher run's
    identity, held only in the launcher and injected into every tick, exactly like the authorization
-   below). Then `afk probe --repo <repo> --config '<config>'`, which answers two compatibility questions:
-   - **Claim namespace** — if it reports `blocked` (an org ruleset forbids `refs/afk/*`), pass its
-     fallback `--ns refs/heads` to every later `afk` call and **warn** that claim refs are then ordinary
-     branches that may trigger `on: push` CI. See [Cooperative multi-fleet](references/cooperative-multi-fleet.md).
+   below). Then `afk probe --repo <repo> --config '<config>'`, which answers two compatibility questions
+   and returns the run's config — **hold its `config` from here on, in place of step 1's**:
+   - **Claim namespace** — the returned `config` carries the `claim_namespace` that actually works, so
+     every later call inherits it through `--config` with nothing extra to pass. If it reports
+     `blocked` (an org ruleset forbids `refs/afk/*`), that namespace is the `refs/heads` fallback:
+     **warn** that claim refs are then ordinary branches that may trigger `on: push` CI. See
+     [Cooperative multi-fleet](references/cooperative-multi-fleet.md). An `{"error": …}` here means the
+     remote could not be pushed to at all (auth, network) — fix that; it is not a namespace question.
    - **Branch protection** (only when `gate.ci: local`) — `protection.verdict == "error"` means
      `merge.target` **requires status checks**, so `gh pr merge` would be rejected however green the
      local gate is: **stop here, with the human present** — drop the required checks on that branch or
@@ -136,19 +140,18 @@ the opening working set differs:
 1. **List what GitHub still remembers.** The dead launcher forgot its own id; the claim markers
    (`instance=<id> host=<host>`) and heartbeat refs did not:
    ```bash
-   python3 <skill>/scripts/afk.py takeover --list --repo <repo> --as <my instance id> --config '<config json>'
+   python3 <skill>/scripts/afk.py takeover --list --repo <repo> --instance <my instance id> --config '<config json>'
    ```
    Show the human each instance's id, host, claim count and heartbeat age, and ask which to take. Rows
    are flagged so the wrong answer is visible: `fresh: true` (looks alive), `claim_count: 0` (drained
    cleanly — nothing to take), `is_me: true` (this run).
 2. **Force-take the selection:**
    ```bash
-   python3 <skill>/scripts/afk.py takeover --instance <dead id> --as <my instance id> --repo <repo> --config '<config json>'
+   python3 <skill>/scripts/afk.py takeover --from <dead id> --instance <my instance id> --repo <repo> --config '<config json>'
    ```
    The *same* atomic `--force-with-lease` push a stale reclaim uses, only skipping the staleness gate —
    so a fleet that is not actually dead still wins the race and the result reports it under `lost`.
-   (Careful: here `--instance` is the instance taken **from**; yours is `--as`.) On
-   `"action": "confirm"` — the target's heartbeat is still fresh — relay the warning **verbatim**, get an
+   On `"action": "confirm"` — the target's heartbeat is still fresh — relay the warning **verbatim**, get an
    explicit yes, then re-run with `--yes`; on `"error"`/`"none"`, show it and continue as an ordinary
    launcher run.
 3. **Then it is an ordinary standing fleet.** Enter the [Loop](#loop) unchanged: the first tick sees the
@@ -209,6 +212,15 @@ its arguments and return shape — is disclosed in
 [references/tools.md](references/tools.md); read it when you need a signature not already shown inline
 at its call site.
 
+**One calling convention.** Every subcommand takes the run's `--config '<config json>'`, and every one
+that touches GitHub takes `--repo <repo>`. **Pass both on every call** — the config is what carries the
+claim namespace, the lease, the labels and the gate mode, so a call without it silently runs on
+defaults. The inline examples below abbreviate them away (`afk release <n>`) only to stay readable.
+
+**Exit 3 is never an outcome.** A subcommand that could not do its job prints `{"error": …}` and exits
+3. That is an operational failure (auth, network, a rejected push, bad input) — stop and report it in
+the tick summary's `note`; do not read it as "nothing to do".
+
 ## A tick (`--tick`) — one reconciliation pass
 
 A tick is stateless: it rebuilds from GitHub, acts, summarizes, and exits. It never waits for the
@@ -222,7 +234,7 @@ spawns).
    ```
    It gathers issues + PRs + claim/heartbeat refs once (the same gatherer the launcher's fingerprint
    gate reads through — the raw 200-issue JSON lives and dies inside the tool) and returns the whole
-   working set: `{frontier: {dispatch, excluded}, mine: [{number, status, pr, checks,
+   working set: `{frontier: {dispatch, excluded}, mine: [{number, status, board_phase, pr, checks,
    attempt_labels}…], peer_live, stale: [{number, sha}…], fingerprint, now}`. Then act on it:
    - **Frontier** — `frontier.dispatch` is the dispatchable set (`open` + `ready_label` + no
      `epic_labels` + **unclaimed** + **no open linked PR** + zero open `blocked_by`) — the published
@@ -230,39 +242,40 @@ spawns).
    - **In-flight** — each of **`mine`** arrives subclassified: *awaiting_merge* → merge;
      *awaiting_ci* → leave; *failure* → failure handling; *no_pr* → see below. (In `gate.ci: local`
      only *awaiting_merge* and *no_pr* occur — no checks are read, and the gate runs inside the merge
-     sequence instead; ADR-0012.) For *no_pr*, **disambiguate finished-from-coding
-     with three signals, never terminal chrome alone.** A worker that ran to completion, concluded there
-     was no PR to open, posted its reason, and went idle looks *identical* to one still coding — both
-     are "a connected terminal with a title" — so a binary liveness probe parks the claim forever.
-     `rebuild` stays git+gh-only and machine-independent (ADR-0008), so the tick gathers these per
-     `no_pr` claim itself (the narrow set only): **(a)** git **progress** — `afk worker-status
-     --worktree <path> --base <base_branch>` (the worktree path is orca's — from `orca worktree list`
-     or the create result); **(b)** the worker's declared reason — `afk verdict --repo <repo> --issue
-     <n>`; **(c)** the orca **liveness** probe (bounded, never a transcript read) for terminal
-     busy / idle / none. Feed all three to `afk classify-no-pr --terminal <busy|idle|none> --idle-seconds
-     <s> --progress <…> --verdict <…> [--blocked-by-open] --config <config>`, which returns one of five
-     `{outcome, action}`:
-       - **coding** (terminal busy, OR activity within `worker_idle_grace_seconds` — `idle_seconds`
-         is the max-recency of `last_commit_ts` / `worktree_mtime_ts` / terminal activity, so recent
-         commits count here) → still implementing, **leave it**. Note what is **not** in this list:
-         `commits_ahead>0`/`dirty`. Those are **standing** facts, not signs of life — they stay true
-         until the branch merges — and including them made every idle+verdict outcome unreachable for
-         any worker that had ever committed, holding its claim forever (ADR-0013);
-       - **idle_done** (idle past grace + verdict `already-satisfied` + **no** changes on the branch)
-         → **verify the empty diff vs base**, then close the issue and `afk release <n>`. Changes on
-         the branch refute an `already-satisfied` claim, so that combination routes to `idle_failed`
-         instead of closing the issue;
-       - **idle_blocked** (verdict `blocked`) → re-check each `blocked_by` issue: all now closed/merged →
-         **re-dispatch** (keep the claim; not a retry); any still open → **escalate the DAG gap** (add
-         `escalate_label`, comment the unmet dependency — pass `--blocked-by-open`);
-       - **idle_failed** (verdict `giving-up`, OR **no verdict at all** after grace) → **failure
-         handling** (`afk next-attempt`: retry → escalate);
-       - **dead** (no live worker/terminal at all) → **orphaned claim**: recover it by
+     sequence instead; ADR-0012.) For *no_pr*, **never decide from terminal chrome alone.** A worker
+     that ran to completion, concluded there was no PR to open, posted its reason, and went idle looks
+     *identical* to one still coding — both are "a connected terminal with a title". Run the orca
+     **liveness** probe (bounded, never a transcript read) for the one thing code cannot see — is the
+     terminal `busy`, `idle`, or is there `none` — then make **one call**:
+     ```bash
+     python3 <skill>/scripts/afk.py no-pr --issue <n> --worktree <path> --terminal <busy|idle|none> \
+          [--terminal-idle-seconds <s>] --repo <repo> --config '<config json>'
+     ```
+     (`<path>` is orca's — from `orca worktree list` or the create result; omit `--worktree` only when
+     no worktree exists. `--terminal-idle-seconds` is how long the terminal has shown no activity, if
+     the probe says.) The tool gathers the rest itself — the worktree's git progress, the worker's
+     `afk:verdict` marker, the state of every issue that marker says it is blocked by — computes how
+     long the worker has been quiet, and returns `{outcome, action, idle_seconds, open_blockers,
+     progress, verdict}`. Act on `action`:
+       - **coding** / `leave` (terminal busy, or a sign of life within `worker_idle_grace_seconds`) →
+         still implementing, **leave it**. Commits ahead or a dirty tree are *standing* facts, never
+         signs of life (ADR-0013) — they do not keep a claim here;
+       - **idle_done** / `close_release` (verdict `already-satisfied`, **no** changes on the branch)
+         → **verify the empty diff vs base**, then close the issue and `afk release <n>`;
+       - **idle_blocked** / `redispatch` (verdict `blocked`, every named blocker now closed) →
+         **re-dispatch** (keep the claim; not a retry);
+       - **idle_blocked** / `escalate` (a blocker in `open_blockers` is still open, or the verdict
+         named none) → **escalate the DAG gap** (add `escalate_label`, comment the unmet dependency);
+       - **idle_failed** / `next_attempt` (verdict `giving-up`, an `already-satisfied` refuted by work
+         on the branch, or **no verdict at all** after grace) → **failure handling**
+         (`afk next-attempt`: retry → escalate);
+       - **dead** / `orphan` (no live worker/terminal at all) → **orphaned claim**: recover it by
          **continuation** — `afk recovery --issue <n>` returns tier 1/2/3 and only tier 3 tears the
          worktree down (see [Recovery by continuation](references/recovery.md)).
          Keep the claim; or `afk release <n>` if the issue should go back to the frontier instead.
-     The liveness probe, the empty-diff verification, and the orphan-vs-alive read stay judgment —
-     deliberately not inside `rebuild`.
+     The liveness probe and the empty-diff verification stay judgment; `no-pr` is a separate call from
+     `rebuild` because it asks *this machine* about a worktree, and `rebuild` stays machine-independent
+     (ADR-0008).
    - **Stale peer claims** — **`stale`** (a peer owns it and its `afk-heartbeat/<id>` is expired past
      `claim_lease_ttl`) is the only foreign claim I may take *unattended*: `afk reclaim <n> --instance
      <id> --expect-sha <the sha rebuild reported>` (atomic — fails if it moved), then treat as my own
@@ -274,7 +287,9 @@ spawns).
    - **Merge** every green in-flight PR (serialized — see below). `afk release <n>` on each merged issue.
    - **Escalate** any retry-exhausted issue (see failure handling).
    - **Dispatch** to fill free slots up to `concurrency`: `afk claim <n> --instance <id>` — if it
-     returns `{"won": false}`, a peer won the race, so skip it. On `{"won": true}`, hand the worktree to
+     returns `{"won": false}`, a peer won the race (the result names the `owner`), so skip it. An
+     `{"error": …}` is **not** a lost race — the push itself failed; stop dispatching and report it. On
+     `{"won": true}`, hand the worktree to
      **orca** — it owns worktree + branch + spawn in one step; the tick never runs raw `git worktree`
      ([ADR-0005](../../docs/adr/0005-orca-owns-the-worktree.md)):
      ```bash
@@ -320,13 +335,14 @@ spawns).
    - **Render progress** (if `progress_comment`) — for each of my claims, upsert the human-facing
      **status board** so a person reading the issue sees how far along it is (esp. the otherwise-invisible
      "claimed, coding, no PR yet" phase — the claim lives in the hidden `refs/afk/*` and the assignee is
-     unused). `afk status <n> --repo <repo> --state <json>` renders a progress checklist and writes the
-     one marker-tagged comment **only when it changed** (idempotent — re-entrant ticks and retries never
-     spam). The `phase` is *derived from state this pass already computed*, never a new fact:
-     `no_pr` + live worker → `claimed`; `awaiting_ci` → `pr_open`; `failure` heading to retry →
-     `ci_failed` (pass `attempt`/`retry_max`); `awaiting_merge` → `awaiting_merge`. The two **terminal**
-     phases are upserted **before the claim is released**: `merged` in the merge sequence, `escalated` in
-     the escalate step. The board is human-read only — no tick ever parses it back (ADR-0006).
+     unused). `afk status <n> --phase <board_phase> --instance <id> [--pr <pr>] [--attempt <k>]
+     --repo <repo>` renders a progress checklist and writes the one marker-tagged comment **only when it
+     changed** (idempotent — re-entrant ticks and retries never spam). The phase is not yours to
+     derive: pass the `board_phase` that `rebuild` put on the claim's `mine` row (for `ci_failed`,
+     add `--attempt` — the number in its `afk-attempt/<k>` label). The two **terminal** phases are
+     upserted **before the claim is released**: `--phase merged` in the merge sequence, `--phase
+     escalated` in the escalate step. The board is human-read only — no tick ever parses it back
+     (ADR-0006).
 3. **Return** the compact summary and **exit**. Freshly-dispatched workers' PRs are picked up by a
    later tick.
 
@@ -392,8 +408,8 @@ corrupt the target branch:
      as a PR comment and route to failure handling as **gate red** — the existing category, not a new one.
 3. `gh pr merge <n> --squash --delete-branch` (per `merge.strategy`). The issue auto-closes via
    `Closes #<n>`.
-   If `progress_comment`, upsert the terminal board now (`afk status <n> --repo <repo> --state
-   '{"phase":"merged",…}'`) — **before** the release below, while the issue is still one of my claims.
+   If `progress_comment`, upsert the terminal board now (`afk status <n> --phase merged --pr <pr>
+   --repo <repo>`) — **before** the release below, while the issue is still one of my claims.
 4. **Delete the claim** — `afk release <n>` (a *different* ref from the work branch that
    `--delete-branch` removed). Then remove the worktree if `worktree_cleanup`
    (`orca worktree rm --worktree issue:<n> --force`, since orca owns it — ADR-0005) and free the slot.
@@ -417,14 +433,14 @@ Per issue, on any of {worker failed, gate red — the PR's CI checks *or* a red 
    checks, the merge-time gate excerpt posted as a PR comment, the verifier's PR review comment, or the
    reproduced sync conflict — never carried in context.
 2. **On `{"action":"escalate"}`:** (if `progress_comment`, upsert the terminal board
-   `--state '{"phase":"escalated",…}'` **before** releasing, while it's still my claim), then `afk
+   `afk status <n> --phase escalated` **before** releasing, while it's still my claim), then `afk
    release <n>` (delete the claim), remove
    `ready_label` and any `afk-attempt/*` label, add `escalate_label` (`ready-for-human`), and (if
    `escalate_comment`) comment the stuck-point with PR + log links — the status board points a reader
    here. Then move on — never silently drop or silently merge bad work.
 
-**`no_pr` idle routing (not all of it is a failure).** Of the five `no_pr` outcomes (defined in the
-tick's In-flight list), only **idle_failed** enters the retry ladder above. **idle_blocked** skips
+**`no_pr` idle routing (not all of it is a failure).** Of the five `afk no-pr` outcomes (defined in
+the tick's In-flight list), only **idle_failed** enters the retry ladder above. **idle_blocked** skips
 retry accounting entirely — re-dispatched when its `blocked_by` issues resolve, escalated as a DAG gap
 when they don't — and **idle_done** closes the issue after an empty-diff check; neither is a failure.
 
@@ -450,9 +466,9 @@ touch shared root config are naturally throttled by the DAG — chain them with 
   "nothing decomposed yet."
 - **Read workers through GitHub, never their transcripts.** A worker's result is its PR (`Closes #n`);
   a not-going-to-PR outcome is its `afk:verdict` marker comment; blockers are issue comments. Liveness
-  is a bounded probe combined, for a `no_pr` claim, with `afk worker-status` git progress and the
-  `afk verdict` marker (see In-flight — the probe alone is never a finished/coding verdict). A full
-  transcript never enters a tick or the launcher.
+  is a bounded probe that `afk no-pr` combines, for a `no_pr` claim, with the worktree's git progress
+  and the worker's verdict marker (see In-flight — the probe alone is never a finished/coding
+  verdict). A full transcript never enters a tick or the launcher.
 - **Claim before work; release on every terminal transition.** Create the `afk-claim/<n>` ref first —
   if the create is rejected, a peer owns it, so stop. Delete the ref on merge, escalate, and
   orphan-release; a leaked ref is a phantom lock. Reconcile only your own claims, and take a peer's
@@ -461,12 +477,12 @@ touch shared root config are naturally throttled by the DAG — chain them with 
 - **Preserve a dead worker's progress.** Recover a dead claim by **continuation** (`afk recovery` →
   tier 1/2), and tear a worktree down only when the tool says tier 3 — an `orca worktree rm` on a
   worktree that still holds work is the one unrecoverable act in the fleet.
-- **Take a live lease only on a human's word.** `afk takeover --instance` runs only on the human's
+- **Take a live lease only on a human's word.** `afk takeover --from` runs only on the human's
   explicit selection from `--list`, with `--yes` only after relaying the fresh-heartbeat warning and
   getting an explicit yes; unattended, the lease is the only path (never `--yes` to ease a tick).
 - **Respect human reservation.** A human reserves an issue by removing `ready_label` (the fleet no
   longer reads the assignee); keep the tracker honest so a peer fleet or a human never double-takes.
 - **Stay off the reserved namespaces.** The fleet manages the `afk-attempt/<n>` labels, the
-  `refs/afk/*` ref namespace (`afk-claim/*`, `afk-heartbeat/*`), the single status-board comment tagged
+  `refs/afk/*` ref namespace (the claim and heartbeat refs), the single status-board comment tagged
   `<!--afk:status-->`, and the worker-authored `<!--afk:verdict …-->` markers (which it parses) — leave
   them to the fleet, and reuse those prefixes / markers for nothing else.

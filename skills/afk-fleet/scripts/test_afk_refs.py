@@ -49,19 +49,32 @@ def git(cwd, *args):
     return p.stdout.strip()
 
 
-def afk(cwd, *args):
-    """One afk subcommand in `cwd` → its parsed JSON object. Exit 0 is required:
-    a lost race is still `{"won": false}` and still exit 0 (only an operational
-    error is exit 3), so a non-zero here is a real defect, not an expected outcome."""
+def run_afk(cwd, *args, env=None):
+    """One afk subcommand in `cwd` → (exit code, its parsed JSON object)."""
     p = subprocess.run([sys.executable, AFK, *args], cwd=cwd,
-                       capture_output=True, text=True, env=ENV)
+                       capture_output=True, text=True, env=env or ENV)
     try:
-        out = json.loads(p.stdout)
+        return p.returncode, json.loads(p.stdout)
     except json.JSONDecodeError:
         raise AssertionError(f"afk {' '.join(args)} printed no JSON "
                              f"(exit {p.returncode}):\n{p.stdout}\n{p.stderr}")
-    assert p.returncode == 0, f"afk {' '.join(args)} exited {p.returncode}: {out}"
+
+
+def afk(cwd, *args, env=None):
+    """One afk subcommand that must SUCCEED → its JSON. A lost race is still
+    `{"won": false}` and still exit 0 (only an operational error is exit 3), so a
+    non-zero here is a real defect, not an expected outcome."""
+    code, out = run_afk(cwd, *args, env=env)
+    assert code == 0, f"afk {' '.join(args)} exited {code}: {out}"
     return out
+
+
+def afk_error(cwd, *args, env=None):
+    """One afk subcommand that must FAIL operationally → its error text. Exit 3 and
+    an `{"error": …}` object are the whole contract a tick can rely on."""
+    code, out = run_afk(cwd, *args, env=env)
+    assert code == 3 and set(out) == {"error"}, f"afk {' '.join(args)}: exit {code}: {out}"
+    return out["error"]
 
 
 class Sandbox:
@@ -94,6 +107,20 @@ class Sandbox:
         """The sha the bare repo has for `ref`, or "" if it has none."""
         out = git(self.root, "ls-remote", self.bare, ref)
         return out.split()[0] if out else ""
+
+    def all_refs(self):
+        """Every ref name the bare repo holds — to assert an op left no litter."""
+        return {ln.split()[1] for ln in git(self.root, "ls-remote", self.bare).splitlines()
+                if ln.split()[1] != "HEAD"}
+
+    def forbid(self, prefix):
+        """Make the bare repo REJECT every push under `prefix` — what a GitHub org
+        ruleset forbidding non-branch refs does (`! [remote rejected]`)."""
+        hook = os.path.join(self.bare, "hooks", "update")
+        with open(hook, "w") as f:
+            f.write(f'#!/bin/sh\ncase "$1" in {prefix}*) echo "ruleset: $1 forbidden" >&2; '
+                    f'exit 1;; esac\nexit 0\n')
+        os.chmod(hook, 0o755)
 
 
 @contextmanager
@@ -242,10 +269,103 @@ def test_release_is_idempotent_and_the_claim_is_really_gone():
 def test_probe_prefers_the_hidden_namespace_and_cleans_up():
     with sandbox() as sb:
         w = sb.clones[0]
-        assert afk(w, "probe", "--now", str(T0)) == {
-            "namespace": "refs/afk", "hidden": True, "ci_on_push": False, "blocked": False}
+        before = sb.all_refs()
+        r = afk(w, "probe", "--now", str(T0))
+        assert (r["namespace"], r["hidden"], r["ci_on_push"], r["blocked"]) == \
+            ("refs/afk", True, False, False), r
+        assert "detail" not in r and "protection" not in r
+        # the config it hands back is canonical, with the namespace that works
+        assert r["config"]["claim_namespace"] == "refs/afk"
+        assert r["config"] == afk(w, "config", "--defaults")
         # it leaves nothing behind: a lingering probe ref would be fleet litter
-        assert sb.remote_ref("refs/afk/probe") == ""
+        assert sb.all_refs() == before
+
+
+def test_probe_falls_back_when_the_server_rejects_the_hidden_namespace():
+    """An org ruleset forbidding non-branch refs: the probe finds the namespace that
+    DOES work and folds it into the config, so every later call inherits it through
+    `--config` — no separate `--ns` for a tick to forget."""
+    with sandbox() as sb:
+        w = sb.clones[0]
+        sb.forbid("refs/afk/")
+        before = sb.all_refs()
+        r = afk(w, "probe", "--now", str(T0))
+        assert (r["namespace"], r["hidden"], r["ci_on_push"], r["blocked"]) == \
+            ("refs/heads", False, True, True), r
+        assert "remote rejected" in r["detail"]
+        assert r["config"]["claim_namespace"] == "refs/heads"
+        assert sb.all_refs() == before
+
+        # carrying ONLY that config, the whole claim lifecycle lands on branches
+        cfg = ("--config", json.dumps(r["config"]))
+        claim = afk(w, "claim", "12", "--instance", "me", "--now", str(T0), *cfg)
+        assert claim["won"] and claim["ref"] == "refs/heads/afk-claim/12"
+        hb = afk(w, "heartbeat", "--instance", "me", "--now", str(T0), *cfg)
+        assert hb["refreshed"] and hb["ref"] == "refs/heads/afk-heartbeat/me"
+        assert afk(w, "classify-claims", "--instance", "me", "--now", str(T0), *cfg)["mine"] == [12]
+        assert afk(w, "release", "12", *cfg)["released"] is True
+        assert sb.remote_ref("refs/heads/afk-claim/12") == ""
+
+        # WITHOUT the config, the blocked namespace is an error — never a quiet
+        # "a peer won the race" that would leave the fleet idling forever
+        err = afk_error(w, "claim", "13", "--instance", "me", "--now", str(T0))
+        assert "not a lost race" in err and "refs/afk/claim/13" in err
+
+
+def test_probe_errors_when_no_namespace_is_usable_or_the_remote_is_unreachable():
+    with sandbox() as sb:
+        w = sb.clones[0]
+        # an unreachable remote says NOTHING about which namespace is allowed, so
+        # it must not be reported as `blocked` and silently switch namespaces
+        err = afk_error(w, "probe", "--remote", "no-such-remote", "--now", str(T0))
+        assert "probe push" in err and "refs/afk/claim/probe" in err
+        # the server rejecting BOTH namespaces is an error with the reason attached
+        sb.forbid("refs/")
+        err = afk_error(w, "probe", "--now", str(T0))
+        assert "both refs/afk and refs/heads" in err and "remote rejected" in err
+
+
+def test_a_failed_push_is_an_error_not_a_lost_race():
+    """`won: false` means exactly one thing — a peer holds the claim. A fleet that
+    cannot push (auth, network, a forbidden namespace) must fail loudly: read as a
+    lost race, it would skip every issue and idle forever with nothing wrong on screen."""
+    with sandbox() as sb:
+        w = sb.clones[0]
+        bad = ("--remote", "no-such-remote")
+        assert "not a lost race" in afk_error(w, "claim", "7", "--instance", "me", *bad)
+        assert sb.remote_ref("refs/afk/claim/7") == ""
+
+        # same for a reclaim: the claim has NOT moved, so a failed push is not a loss
+        claim = afk(w, "claim", "8", "--instance", "dead-peer", "--now", str(T0))
+        sb.forbid("refs/afk/")
+        err = afk_error(w, "reclaim", "8", "--instance", "me", "--expect-sha", claim["sha"])
+        assert "has not moved" in err and "remote rejected" in err
+        assert sb.remote_ref("refs/afk/claim/8") == claim["sha"]      # untouched
+        # …and an unreachable remote cannot even be asked whether it moved
+        afk_error(w, "reclaim", "8", "--instance", "me", "--expect-sha", claim["sha"], *bad)
+        # a heartbeat that cannot be written is an error too (a silent miss lapses the lease)
+        assert "remote rejected" in afk_error(w, "heartbeat", "--instance", "me", "--now", str(T0))
+
+
+def test_malformed_refs_in_the_namespace_are_ignored_not_fatal():
+    """Anything can be pushed under a ref namespace. A claim ref that is not an issue
+    number, or a marker with no fields, must not take the scan (and so every tick) down."""
+    with sandbox() as sb:
+        w = sb.clones[0]
+        afk(w, "claim", "5", "--instance", "me", "--now", str(T0))
+        junk = git(w, "commit-tree", git(w, "hash-object", "-t", "tree", os.devnull),
+                   "-m", "not a marker at all")
+        git(w, "push", "-q", "origin", f"{junk}:refs/afk/claim/not-a-number",
+            f"{junk}:refs/afk/claim/6", f"{junk}:refs/afk/heartbeat/ghost")
+
+        scan = afk(w, "scan")
+        by = {c["number"]: c for c in scan["claims"]}
+        assert set(by) == {5, 6}                       # the non-numeric ref is not a claim
+        assert by[6]["instance"] is None and by[6]["ts"] is None and by[6]["sha"] == junk
+        assert scan["heartbeats"] == {}                # a heartbeat with no ts is no heartbeat
+        # an ownerless claim is nobody's: reclaimable as stale, never "mine"
+        part = afk(w, "classify-claims", "--instance", "me", "--now", str(T0))
+        assert part["mine"] == [5] and part["stale"] == [6] and part["peer_live"] == []
 
 
 def test_every_ref_op_round_trips_under_the_refs_heads_fallback():
@@ -257,9 +377,12 @@ def test_every_ref_op_round_trips_under_the_refs_heads_fallback():
 
         # probed under the fallback, the verdict is honest about what it means:
         # ordinary branches, so `on: push` CI will fire on claim churn
-        assert afk(w, "probe", *NS, "--now", str(T0)) == {
-            "namespace": "refs/heads", "hidden": False, "ci_on_push": True, "blocked": False}
-        assert sb.remote_ref("refs/heads/probe") == ""
+        before = sb.all_refs()
+        r = afk(w, "probe", *NS, "--now", str(T0))
+        assert (r["namespace"], r["hidden"], r["ci_on_push"], r["blocked"]) == \
+            ("refs/heads", False, True, False), r
+        assert r["config"]["claim_namespace"] == "refs/heads"
+        assert sb.all_refs() == before
 
         claim = afk(w, "claim", "12", "--instance", "me", *NS, "--now", str(T0))
         assert claim["won"] and claim["ref"] == "refs/heads/afk-claim/12"
@@ -302,14 +425,14 @@ def test_takeover_lists_and_force_takes_a_dead_fleet():
         afk(w, "heartbeat", "--instance", "live-fleet", "--now", str(T0 - 10), "--ttl", str(TTL))
 
         rows = {r["instance"]: r for r in
-                afk(w, "takeover", "--list", "--as", "new-fleet",
+                afk(w, "takeover", "--list", "--instance", "new-fleet",
                     "--now", str(T0), "--ttl", str(TTL))["instances"]}
         assert rows["dead-fleet"]["claims"] == [21, 22] and rows["dead-fleet"]["fresh"] is False
         assert rows["dead-fleet"]["heartbeat_age"] == TTL + 99
         assert rows["live-fleet"]["fresh"] is True and rows["live-fleet"]["claim_count"] == 1
 
         # a live-looking fleet: warned about, and NOTHING is taken
-        held = afk(w, "takeover", "--instance", "live-fleet", "--as", "new-fleet",
+        held = afk(w, "takeover", "--from", "live-fleet", "--instance", "new-fleet",
                    "--now", str(T0), "--ttl", str(TTL))
         assert held["action"] == "confirm" and held["taken"] == []
         assert sb.remote_ref("refs/afk/claim/23")
@@ -317,23 +440,33 @@ def test_takeover_lists_and_force_takes_a_dead_fleet():
                    "--now", str(T0), "--ttl", str(TTL))["mine"] == []
 
         # the dead one transfers wholesale, re-stamped with my instance id
-        took = afk(w, "takeover", "--instance", "dead-fleet", "--as", "new-fleet",
+        took = afk(w, "takeover", "--from", "dead-fleet", "--instance", "new-fleet",
                    "--now", str(T0), "--ttl", str(TTL))
         assert took["action"] == "taken" and took["taken"] == [21, 22] and took["lost"] == []
+        assert took["as"] == "new-fleet" and took["instance"] == "dead-fleet"
         part = afk(w, "classify-claims", "--instance", "new-fleet",
                    "--now", str(T0), "--ttl", str(TTL))
         assert part["mine"] == [21, 22] and part["peer_live"] == [23]
 
         # --yes is the informed human override of the fresh-heartbeat hold
-        forced = afk(w, "takeover", "--instance", "live-fleet", "--as", "new-fleet", "--yes",
+        forced = afk(w, "takeover", "--from", "live-fleet", "--instance", "new-fleet", "--yes",
                      "--now", str(T0), "--ttl", str(TTL))
         assert forced["action"] == "taken" and forced["taken"] == [23]
         assert afk(w, "classify-claims", "--instance", "new-fleet",
                    "--now", str(T0), "--ttl", str(TTL))["mine"] == [21, 22, 23]
 
         # and taking from myself is refused, not silently re-stamped
-        assert afk(w, "takeover", "--instance", "new-fleet", "--as", "new-fleet",
+        assert afk(w, "takeover", "--from", "new-fleet", "--instance", "new-fleet",
                    "--now", str(T0))["action"] == "error"
+        # `--instance` is MY id on every subcommand, takeover included; without a
+        # `--from` there is nothing to take, and that is said rather than guessed
+        assert "--from" in afk_error(w, "takeover", "--instance", "new-fleet")
+        # the lease the freshness check uses comes from --config when no flag is given
+        short = json.dumps({"claim_lease_ttl_seconds": 5})
+        rows = {r["instance"]: r for r in
+                afk(w, "takeover", "--list", "--instance", "x", "--now", str(T0),
+                    "--config", short)["instances"]}
+        assert rows["live-fleet"]["fresh"] is False
 
 
 def test_recovery_reads_pushed_progress_from_the_remote_alone():
@@ -371,6 +504,25 @@ def test_recovery_reads_pushed_progress_from_the_remote_alone():
         r = afk(w, "recovery", "--issue", "31", "--worktree", w, "--config", cfg)
         assert (r["tier"], r["action"], r["prompt"]) == (1, "reuse_worktree", "continue"), r
         assert r["worktree"]["present"] is True and r["worktree"]["commits_ahead"] == 2
+
+        # an earlier attempt left a second, shorter branch behind: the one FURTHEST
+        # ahead is the progress worth continuing, whatever its name sorts as
+        git(w, "checkout", "-q", "-b", "aaa/issue-31-first-try", sb.base)
+        with open(os.path.join(w, "old.txt"), "w") as f:
+            f.write("old\n")
+        git(w, "add", "-A")
+        git(w, "commit", "-qm", "old attempt")
+        git(w, "push", "-q", "origin", "HEAD")
+        r = afk(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg)
+        assert r["branch"]["candidates"] == ["aaa/issue-31-first-try",
+                                             "sunfmin/issue-31-continuation"]
+        assert r["branch"]["name"] == "sunfmin/issue-31-continuation"
+        assert r["branch"]["commits_ahead"] == 2 and r["tier"] == 2
+        # a branch named outright is measured as given, with no discovery
+        r = afk(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg,
+                "--branch", "aaa/issue-31-first-try")
+        assert (r["branch"]["name"], r["branch"]["commits_ahead"]) == ("aaa/issue-31-first-try", 1)
+        assert r["branch"]["candidates"] == []
 
 
 def run():

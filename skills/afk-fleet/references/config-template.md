@@ -22,6 +22,10 @@ ready_label: ready-for-agent          # a child issue is dispatchable when it ca
 epic_labels: [epic, prd, wayfinder:map]   # never dispatched (a PRD is not a worker task)
 claim: ref                            # atomic lock ref refs/afk/claim/<n> marks an issue as taken —
                                       #   replaces assignee; required for cooperating multi-fleet (ADR-0003)
+claim_namespace: refs/afk             # where claim + heartbeat refs live. Leave it: bootstrap's `afk probe`
+                                      #   switches the run to refs/heads (ordinary afk-claim/* branches, so
+                                      #   `on: push` CI fires) when an org ruleset forbids non-branch refs.
+                                      #   Set refs/heads here only to skip that probe-and-warn every run.
 dependencies: native                   # GitHub native blocked_by (open blockers gate dispatch)
 
 # --- workers ---
@@ -132,5 +136,5 @@ force_tick_after_skips: 6              # safety net: a full tick at least every 
   overwritten by that marker each tick). This is what keeps ticks stateless and lets fleets cooperate
   (see the skill's "Why it runs forever" and ADR-0003). Don't hand-edit them or reuse the
   `afk-attempt/*` / `refs/afk/*` prefixes or the `<!--afk:status-->` marker. If an org ruleset forbids
-  non-branch refs, the fleet falls back to `refs/heads/afk-claim/*` at bootstrap and warns that `on:
-  push` CI will then fire.
+  non-branch refs, bootstrap's `afk probe` falls back to `refs/heads/afk-claim/*` for the run (it returns
+  the config with `claim_namespace` switched) and warns that `on: push` CI will then fire.
