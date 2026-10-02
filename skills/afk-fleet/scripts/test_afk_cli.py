@@ -763,9 +763,12 @@ def test_the_docs_name_only_subcommands_and_flags_that_exist():
     subcommand or flag in prose is a call that fails at 3am. Every `afk …` written as
     code must parse, and tools.md must list every subcommand."""
     subs = afk.build_parser().subcommands
-    docs = [os.path.join(SKILL, "SKILL.md"), os.path.join(SKILL, "..", "..", "CONTEXT.md")]
     refs = os.path.join(SKILL, "references")
+    docs = [os.path.join(SKILL, "SKILL.md")]
     docs += [os.path.join(refs, f) for f in sorted(os.listdir(refs)) if f.endswith(".md")]
+    # the glossary lives in the source repo only — an installed skill ships without it
+    context = os.path.join(SKILL, "..", "..", "CONTEXT.md")
+    docs += [context] if os.path.exists(context) else []
 
     checked = 0
     for path in docs:
