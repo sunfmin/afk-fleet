@@ -15,10 +15,13 @@ each one runs is shown so the mechanism is legible, but the tick calls the tool.
 
 - **Instance id** — minted once per launcher run at bootstrap, injected into every tick. It stamps
   every claim this fleet makes (`--instance <id>`) and names this fleet's heartbeat.
-- **Claim → `afk claim <n> --instance <id>`.** Internally it creates `afk-claim/<n>` pointing at a
+- **Claim → the first step of `afk dispatch`** (`afk claim <n> --instance <id>` is the same step on
+  its own). Internally it creates `afk-claim/<n>` pointing at a
   marker commit carrying `instance=<id> host=<host>`; the ref name is the issue number *only*. Creating
   a ref that already exists is **rejected by the server** — that rejection *is* the compare-and-swap.
-  `{"won": true}` → proceed; `{"won": false}` (with the current `owner`) → a peer has it, skip. A
+  Won → the dispatch goes on to start the worker; lost (the result names the current `owner`) → a peer
+  has it, and nothing is started. A claim that is already **mine** (reclaimed, taken over, orphaned)
+  is `held`, and the dispatch continues it. A
   push that failed with **no** claim on the remote is not a lost race: the tool exits 3 with
   `{"error": …}` instead, so an auth or network failure can never pass for bad luck. The claim ref is
   immutable after creation.
@@ -29,7 +32,8 @@ each one runs is shown so the mechanism is legible, but the tick calls the tool.
 - **Owner check → rides in `afk rebuild`.** The ref scan reads every `afk-claim/*` marker, and the
   working set arrives already partitioned into `mine` / `peer_live` / `stale` (in-flight = `mine`).
   (`afk scan` / `afk classify-claims` remain as standalone debug surfaces over the same core.)
-- **Heartbeat (the lease) → `afk heartbeat --instance <id>`.** One ref `afk-heartbeat/<id>`
+- **Heartbeat (the lease) → `afk heartbeat --instance <id>`** in a tick, and inside `afk cycle` on a
+  cycle that spawns none. One ref `afk-heartbeat/<id>`
   carries a timestamp; the tool refreshes it **only if due** (`now - ts > ttl/3`) by force-pushing a
   new marker (it reads the old ts itself, so this stays stateless). **Per instance, not per claim**
   (claim refs never churn); a fleet holding no claims never beats.
@@ -41,8 +45,11 @@ each one runs is shown so the mechanism is legible, but the tick calls the tool.
   A peer with a *fresh* heartbeat is left strictly alone — it reconciles its own dead workers locally.
   A reclaimed claim is then recovered by **continuation**, not restarted (ADR-0011). The
   lease-skipping, human-authorized sibling is [`--takeover`](../SKILL.md#takeover-mode---takeover).
-- **Release / cleanup → `afk release <n>`** (idempotent: a claim already gone counts as released) on
-  **merge**, **escalate**, and **orphan-release**. A delete that fails with the claim still on the
+- **Release / cleanup** — the last step of every transition that ends a claim: `afk merge` (after the
+  PR landed), `afk escalate` (after the relabel — released first, a PR-less issue still carrying
+  `ready_label` would be back on the frontier for a peer to dispatch), `afk close`. `afk release <n>`
+  (idempotent: a claim already gone counts as released) is the same step on its own, for an
+  **orphan-release**, a `closed` row, and the drain. A delete that fails with the claim still on the
   remote exits 3 — `released` is never reported for a claim that is still there. On **graceful stop**, the drain tick releases claims with **no PR yet** and
   **retains** those with an open PR (a peer inherits it once the lease expires — merging it if it is
   finished, **continuing** it if it is not).

@@ -6,6 +6,9 @@ Run: python3 test_afk_decide.py   (plain asserts, no test-framework dependency)
 These cover the correctness-critical verdicts (esp. classify_claims: the
 mine/peer_live/stale partition whose wrong answer silently corrupts state).
 """
+import os
+import re
+
 import afk_decide as d
 
 TTL = 4500  # ~75 min, the default lease
@@ -115,6 +118,13 @@ def test_subclassify_pr():
             for checks in ("green", "red", "pending", None):
                 assert d.subclassify_pr(has_pr, checks, ci)[1] in d.STATUS_PHASES
 
+    # the issue is CLOSED but the claim is still mine — a merge or `afk close` that
+    # crashed before releasing. Nothing else about it matters, and there is no board
+    # to write: the only thing left to do is release.
+    for ci in d.GATE_CI_MODES:
+        for has_pr in (True, False):
+            assert d.subclassify_pr(has_pr, "red", ci, closed=True) == ("closed", None)
+
 
 def test_validate_config():
     ok = d.resolve_config({})
@@ -154,6 +164,18 @@ def test_validate_config():
         assert False, "expected ValueError for an unknown gate.ci"
     except ValueError as e:
         assert "gate.ci" in str(e) and "required" in str(e)
+
+    # merge.strategy is a `gh pr merge --<strategy>` flag: a closed set, checked
+    # here rather than discovered at the first merge
+    for strategy in d.MERGE_STRATEGIES:
+        d.validate_config(d.resolve_config({"merge": {"strategy": strategy}}))
+    assert d.CONFIG_DEFAULTS["merge"]["strategy"] in d.MERGE_STRATEGIES
+    for bad in ("fast-forward", "", "Squash", None):
+        try:
+            d.validate_config(d.resolve_config({"merge": {"strategy": bad}}))
+            assert False, f"expected ValueError for merge.strategy {bad!r}"
+        except ValueError as e:
+            assert "merge.strategy" in str(e)
 
 
 def test_gate_verdict():
@@ -276,13 +298,14 @@ def test_classify_no_pr_coding_needs_a_live_signal():
     assert _no_pr({**ZERO, "commits_ahead": 2}, "idle", 120) == ("coding", "leave")
     # the boundary: exactly `grace` seconds idle is no longer within grace
     assert _no_pr(ZERO, "idle", GRACE - 1) == ("coding", "leave")
-    assert _no_pr(ZERO, "idle", GRACE) == ("idle_failed", "next_attempt")
+    assert _no_pr(ZERO, "idle", GRACE) == ("idle_stalled", "nudge")
 
     # ADR-0013: commits ahead / a dirty tree are STANDING facts, not signs of life.
     # A worker that committed 4×, went idle 33 min ago, and left no PR and no verdict
-    # must reach failure handling — not be re-read as `coding` on every tick forever.
-    assert _no_pr({**ZERO, "commits_ahead": 4}, "idle", 1992) == ("idle_failed", "next_attempt")
-    assert _no_pr({**ZERO, "dirty": True}, "idle", 9999) == ("idle_failed", "next_attempt")
+    # must leave `coding` (a nudge first, then failure handling — see the stalled
+    # test) — not be re-read as `coding` on every tick forever.
+    assert _no_pr({**ZERO, "commits_ahead": 4}, "idle", 1992) == ("idle_stalled", "nudge")
+    assert _no_pr({**ZERO, "dirty": True}, "idle", 9999) == ("idle_stalled", "nudge")
     # …while a busy terminal still wins regardless of what is on the branch
     assert _no_pr({**ZERO, "commits_ahead": 4}, "busy", 9999) == ("coding", "leave")
 
@@ -300,13 +323,13 @@ def test_classify_no_pr_idle_seconds_is_the_most_recent_sign_of_life():
     assert r["idle_seconds"] == 10 and r["outcome"] == "coding"       # terminal activity
     # all three stale → idle past grace
     r = idle({**ZERO, "last_commit_ts": NOW - 5000, "worktree_mtime_ts": NOW - 4000}, 3000)
-    assert r["idle_seconds"] == 3000 and r["outcome"] == "idle_failed"
+    assert r["idle_seconds"] == 3000 and r["outcome"] == "idle_stalled"
 
     # nothing known at all is NOT "within grace": unknown never keeps a claim parked
     r = idle(ZERO, None)
-    assert r["idle_seconds"] is None and r["outcome"] == "idle_failed"
+    assert r["idle_seconds"] is None and r["outcome"] == "idle_stalled"
     r = idle(None, None)                                              # unreadable worktree
-    assert r["idle_seconds"] is None and r["outcome"] == "idle_failed"
+    assert r["idle_seconds"] is None and r["outcome"] == "idle_stalled"
     # a clock skewed into the future reads as "just now", never a negative age
     assert idle({**ZERO, "worktree_mtime_ts": NOW + 30}, None)["idle_seconds"] == 0
 
@@ -320,15 +343,58 @@ def test_classify_no_pr_routes_idle_workers_on_their_verdict():
     assert _no_pr({**ZERO, "dirty": True}, "idle", 9999, _verdict("already-satisfied")) == \
         ("idle_failed", "next_attempt")
 
-    # giving-up, no verdict at all, a not-found verdict, a garbage phase → failed
+    # giving-up, a garbage phase → failed: the worker DECLARED something
     assert _no_pr(ZERO, "idle", 600, _verdict("giving-up")) == ("idle_failed", "next_attempt")
-    assert _no_pr(ZERO, "idle", 600, None) == ("idle_failed", "next_attempt")
-    assert _no_pr(ZERO, "idle", 600, {"found": False}) == ("idle_failed", "next_attempt")
     assert _no_pr(ZERO, "idle", 600, _verdict("weird-phase")) == ("idle_failed", "next_attempt")
+    # no verdict at all, a not-found verdict → it declared nothing: stalled, not failed
+    assert _no_pr(ZERO, "idle", 600, None) == ("idle_stalled", "nudge")
+    assert _no_pr(ZERO, "idle", 600, {"found": False}) == ("idle_stalled", "nudge")
 
     # dead: no live worker/terminal at all → orphan path, whatever it left behind
     assert _no_pr({**ZERO, "commits_ahead": 3}, "none", 5, _verdict("blocked", [1])) == \
         ("dead", "orphan")
+
+
+def test_classify_no_pr_nudges_a_silent_worker_once_before_failing_it():
+    """A worker idle past grace with NO verdict stopped without an outcome — most
+    often it is waiting on a question nobody will answer. Failing it discards its
+    work and sends a fresh worker into the same wall, so it is nudged first; a
+    nudge is spent once (ADR-0018)."""
+    def silent(idle, **nudge):
+        r = d.classify_no_pr(ZERO, "idle", idle, None, {}, NOW, GRACE, **nudge)
+        return r["outcome"], r["action"], r["idle_seconds"]
+
+    assert silent(600) == ("idle_stalled", "nudge", 600)
+    # the nudge is a sign of life: the worker gets a whole grace period to answer it
+    assert silent(600, nudged_at=NOW - 10) == ("coding", "leave", 10)
+    assert silent(600, nudged_at=NOW - GRACE + 1)[:2] == ("coding", "leave")
+    # …and silence after that is a failure, never a second nudge
+    assert silent(9000, nudged_at=NOW - GRACE) == ("idle_failed", "next_attempt", GRACE)
+    # nowhere to record a nudge (no worktree on this machine) → it fails at once
+    assert silent(600, can_nudge=False)[:2] == ("idle_failed", "next_attempt")
+
+    # a nudge never overrides what the worker DECLARED, nor a terminal that is gone
+    def routed(verdict, terminal="idle", **nudge):
+        r = d.classify_no_pr(ZERO, terminal, 600, verdict, {}, NOW, GRACE, **nudge)
+        return r["outcome"], r["action"]
+    assert routed(_verdict("giving-up")) == ("idle_failed", "next_attempt")
+    assert routed(_verdict("already-satisfied"), nudged_at=NOW - 9000) == ("idle_done", "close_release")
+    assert routed(None, terminal="none") == ("dead", "orphan")
+
+
+def test_stall_reason_carries_where_the_worker_stopped():
+    screen = ["", "● 要我按这段说明把 #41 从头做到开 PR 吗？", "   ", "x" * 500, "❯ "]
+    assert d.stall_tail(screen) == ["● 要我按这段说明把 #41 从头做到开 PR 吗？", "x" * 200, "❯"]
+    assert d.stall_tail([str(i) for i in range(100)], limit=3) == ["97", "98", "99"]
+    assert d.stall_tail(None) == []
+    reason = d.stall_reason("idle with no outcome\n", screen)
+    assert reason.startswith("idle with no outcome\n\nThe previous worker stopped")
+    assert "```\n● 要我按这段说明把 #41 从头做到开 PR 吗？\n" in reason and reason.endswith("❯\n```")
+    assert d.stall_reason("idle with no outcome", []) == "idle with no outcome"   # nothing to add
+    # the nudge is one short line — a long one is the very paste it is sent to break
+    for text in (d.nudge_text(), d.nudge_text("/w/.git/afk-worker-prompt.md")):
+        assert "\n" not in text and len(text) < 400 and "afk:verdict" in text
+    assert "/w/.git/afk-worker-prompt.md" in d.nudge_text("/w/.git/afk-worker-prompt.md")
 
 
 def test_classify_no_pr_blocked_routes_on_the_blockers_real_state():
@@ -551,19 +617,42 @@ def test_current_attempt_is_the_one_reader_of_the_label():
 
 
 def test_next_attempt():
-    assert d.next_attempt(0, 2) == {"action": "retry", "from_label": None, "to_label": "afk-attempt/1"}
-    assert d.next_attempt(1, 2) == \
-        {"action": "retry", "from_label": "afk-attempt/1", "to_label": "afk-attempt/2"}
-    assert d.next_attempt(2, 2) == {"action": "escalate", "from_label": "afk-attempt/2"}
-    assert d.next_attempt(3, 2) == {"action": "escalate", "from_label": "afk-attempt/3"}
-    # retry: 0 escalates the first failure, with no label to remove
-    assert d.next_attempt(0, 0) == {"action": "escalate", "from_label": None}
+    assert d.next_attempt(0, 2) == {"action": "retry", "attempt": 1, "to_label": "afk-attempt/1"}
+    assert d.next_attempt(1, 2) == {"action": "retry", "attempt": 2, "to_label": "afk-attempt/2"}
+    assert d.next_attempt(2, 2) == {"action": "escalate", "attempt": 2}
+    assert d.next_attempt(3, 2) == {"action": "escalate", "attempt": 3}
+    # retry: 0 escalates the first failure
+    assert d.next_attempt(0, 0) == {"action": "escalate", "attempt": 0}
     # the label it hands back is one current_attempt reads as the next number —
     # the two are a round trip, so the ladder cannot stall on its own output
     n = 0
     for _ in range(3):
-        n = d.current_attempt([d.next_attempt(n, 9)["to_label"]])
+        step = d.next_attempt(n, 9)
+        n = d.current_attempt([step["to_label"]])
+        assert n == step["attempt"]
     assert n == 3
+
+
+def test_attempt_and_escalation_labels():
+    labels = ["ready-for-agent", "afk-attempt/2", "bug", "afk-attempt/1", "xafk-attempt/9", 7]
+    # every attempt label the issue carries — a hand-edit can leave more than one
+    assert d.attempt_labels(labels) == ["afk-attempt/1", "afk-attempt/2"]
+    assert d.attempt_labels(None) == []
+
+    cfg = d.resolve_config({})
+    add, remove = d.escalation_labels(labels, cfg)
+    assert add == ["ready-for-human"]
+    assert remove == ["afk-attempt/1", "afk-attempt/2", "ready-for-agent"]   # never "bug"
+    # only what the issue actually carries is removed: gh refuses an absent label
+    assert d.escalation_labels(["bug"], cfg) == (["ready-for-human"], [])
+    add, remove = d.escalation_labels(["go"], {**cfg, "ready_label": "go", "escalate_label": "human"})
+    assert (add, remove) == (["human"], ["go"])
+
+    body = d.escalation_comment("  the gate needs a secret CI has and I do not  ", 2, pr=31)
+    assert "escalated to a human" in body and "after 2 retries" in body and "#31" in body
+    assert body.endswith("the gate needs a secret CI has and I do not")
+    assert "after 1 retry)" in d.escalation_comment("x", 1)
+    assert "without a retry" in d.escalation_comment("x", 0) and "PR" not in d.escalation_comment("x", 0)
 
 
 def test_render_status_board():
@@ -595,6 +684,11 @@ def test_render_status_board():
     assert esc.count("- [x]") == 2 and "已升级给人处理" in esc      # 认领 + PR
     assert d.render_status_board("escalated", "required", 2).count("- [x]") == 1  # no PR → only 认领
 
+    # closed: the worker found the base already satisfies the issue — no PR ever
+    # existed, so nothing past 认领 is ticked and the line says why it is closed
+    closed = d.render_status_board("closed", "required", 2, instance="x")
+    assert closed.count("- [x]") == 1 and "无需改动" in closed and "已关闭" in closed
+
     # gate.ci: local — the board names the gate actually being waited on, and a
     # failed one is not blamed on a CI the fleet never read (ADR-0012)
     local = d.render_status_board("pr_open", "local", 2, pr=5)
@@ -620,20 +714,263 @@ def test_render_status_board():
             pass
 
 
+PACE_CFG = {"busy_interval_seconds": 90, "idle_interval_seconds": 1500,
+            "idle_ticks_before_sleep": 3, "claim_lease_ttl_seconds": TTL,
+            "fingerprint_gate": True, "force_tick_after_skips": 6}
+
+
 def test_pace():
-    cfg = {"busy_interval_seconds": 90, "idle_interval_seconds": 1500,
-           "idle_ticks_before_sleep": 3, "claim_lease_ttl_seconds": TTL}
+    cfg = PACE_CFG
     # did work → busy
-    assert d.pace({"merged": [1], "in_flight": 0, "empty_streak": 0}, cfg) == 90
-    # in-flight → busy, and under the ttl/2 cap
-    assert d.pace({"in_flight": 2, "empty_streak": 9}, cfg) == 90
+    assert d.pace(True, 0, 0, cfg) == 90
+    # in-flight → busy, and under the ttl/2 cap, however long the streak
+    assert d.pace(False, 2, 9, cfg) == 90
     # idle but recently active (streak < threshold) → stay busy for stragglers
-    assert d.pace({"in_flight": 0, "empty_streak": 2}, cfg) == 90
+    assert d.pace(False, 0, 2, cfg) == 90
     # idle past threshold → idle interval
-    assert d.pace({"in_flight": 0, "empty_streak": 3}, cfg) == 1500
-    # ttl/2 cap actually bites when the idle interval would exceed it while holding a claim
-    cap_cfg = {**cfg, "idle_interval_seconds": 999999}
-    assert d.pace({"in_flight": 1, "empty_streak": 0}, {**cap_cfg, "busy_interval_seconds": 999999}) == TTL // 2
+    assert d.pace(False, 0, 3, cfg) == 1500
+    # ttl/2 cap actually bites when the interval would exceed it while holding a claim
+    assert d.pace(False, 1, 0, {**cfg, "busy_interval_seconds": 999999}) == TTL // 2
+    # pace re-applies no default: a config arriving here is canonical
+    try:
+        d.pace(False, 0, 9, {})
+        assert False, "expected a KeyError: pace must not re-apply defaults"
+    except KeyError:
+        pass
+
+
+def test_cycle_state_is_validated_not_guessed():
+    assert d.cycle_state(None) == d.CYCLE_START and d.cycle_state("") == d.CYCLE_START
+    assert d.cycle_state(None) is not d.CYCLE_START           # a copy: the constant is not shared
+    st = {"fingerprint": "abc", "skips": 2, "empty_streak": 1, "in_flight": 0,
+          "frontier_remaining": 4}
+    assert d.cycle_state(st) == st
+    # a launcher that mangled the state must hear so — run on zeros, a fleet
+    # holding claims would be paced as if it held none
+    for bad in ({"fingerprint": "abc"}, {**st, "extra": 1}, [], "abc", {**st, "skips": "x"}):
+        try:
+            d.cycle_state(bad)
+            assert False, f"expected ValueError for {bad!r}"
+        except ValueError:
+            pass
+
+
+def test_cycle_ticked_folds_the_summary_and_counts_empty_ticks():
+    cfg, st = PACE_CFG, d.cycle_state(None)
+
+    def ticked(state, **summary):
+        return d.cycle_ticked(state, {"in_flight": 0, "frontier_remaining": 0, **summary}, cfg)
+
+    # an EMPTY tick: nothing done, nothing in flight, nothing left to dispatch
+    r = ticked(st)
+    assert r["state"]["empty_streak"] == 1 and r["sleep_seconds"] == 90
+    r = ticked(r["state"])
+    r = ticked(r["state"])
+    assert r["state"]["empty_streak"] == 3 and r["sleep_seconds"] == 1500     # idle at last
+    # anything that is not empty resets the streak — work done, a claim held, or
+    # frontier the tick could not take (e.g. no free slot)
+    for summary in ({"merged": [3]}, {"escalated": [4]}, {"dispatched": [1]}, {"reclaimed": [6]},
+                    {"in_flight": 2}, {"frontier_remaining": 5}):
+        back = ticked(r["state"], **summary)
+        assert back["state"]["empty_streak"] == 0 and back["sleep_seconds"] == 90, summary
+    # what the next skipped cycle paces and beats on is carried in the state
+    held = ticked(st, in_flight=2, frontier_remaining=7)["state"]
+    assert (held["in_flight"], held["frontier_remaining"]) == (2, 7)
+    assert ticked({**st, "fingerprint": "abc", "skips": 4})["state"]["fingerprint"] == "abc"
+
+    # in_flight / frontier_remaining are REQUIRED: defaulted to 0, a fleet holding
+    # claims would pace to idle and let its own lease lapse
+    for bad in ({}, {"in_flight": 1}, {"frontier_remaining": 0}, {"in_flight": "2",
+                "frontier_remaining": 0}, {"in_flight": True, "frontier_remaining": 0}, [], None):
+        try:
+            d.cycle_ticked(st, bad, cfg)
+            assert False, f"expected ValueError for {bad!r}"
+        except ValueError:
+            pass
+
+
+def test_cycle_wake_gates_beats_and_paces_a_skipped_cycle():
+    cfg, st = PACE_CFG, d.cycle_state(None)
+    first = d.cycle_wake(st, "aaa", cfg)
+    assert (first["action"], first["reason"]) == ("tick", "first")
+    assert first["state"]["fingerprint"] == "aaa"
+    # a tick owes its sleep to cycle_ticked, not to the gate
+    assert "sleep_seconds" not in first and "heartbeat" not in first
+
+    # unchanged + idle fleet → skip; each such skip is itself an empty cycle
+    idle = d.cycle_ticked(first["state"], {"in_flight": 0, "frontier_remaining": 0}, cfg)["state"]
+    s1 = d.cycle_wake(idle, "aaa", cfg)
+    assert (s1["action"], s1["reason"], s1["heartbeat"]) == ("skip", "unchanged", False)
+    assert (s1["state"]["skips"], s1["state"]["empty_streak"], s1["sleep_seconds"]) == (1, 2, 90)
+    s2 = d.cycle_wake(s1["state"], "aaa", cfg)
+    assert (s2["state"]["empty_streak"], s2["sleep_seconds"]) == (3, 1500)
+
+    # unchanged while HOLDING claims → skip, but beat, stay busy, and never count as empty
+    held = d.cycle_ticked(first["state"], {"in_flight": 2, "frontier_remaining": 0}, cfg)["state"]
+    h = d.cycle_wake(held, "aaa", cfg)
+    assert (h["action"], h["heartbeat"], h["sleep_seconds"]) == ("skip", True, 90)
+    assert h["state"]["empty_streak"] == 0
+    long_busy = {**cfg, "busy_interval_seconds": 999999}
+    assert d.cycle_wake(held, "aaa", long_busy)["sleep_seconds"] == TTL // 2     # the lease cap
+    # frontier left over (the tick had no free slot) is not empty either
+    waiting = d.cycle_ticked(first["state"], {"in_flight": 0, "frontier_remaining": 3}, cfg)["state"]
+    assert d.cycle_wake(waiting, "aaa", cfg)["state"]["empty_streak"] == 0
+
+    # changed → tick; the Nth consecutive skip → a forced tick
+    moved = d.cycle_wake(s2["state"], "bbb", cfg)
+    assert (moved["action"], moved["reason"], moved["state"]["skips"]) == ("tick", "changed", 0)
+    forced = d.cycle_wake({**idle, "skips": 5}, "aaa", cfg)
+    assert (forced["action"], forced["reason"], forced["state"]["skips"]) == ("tick", "forced", 0)
+    # the streak survives a tick decision: only cycle_ticked resets it
+    assert moved["state"]["empty_streak"] == 3
+
+    # fingerprint_gate off → always a tick, and nothing was gathered to digest
+    off = d.cycle_wake({**idle, "skips": 3}, None, {**cfg, "fingerprint_gate": False})
+    assert (off["action"], off["reason"]) == ("tick", "gate_off")
+    assert off["state"]["fingerprint"] == "aaa" and off["state"]["skips"] == 0
+
+
+def test_checks_gate_and_gate_comment():
+    # required mode: only green on the head that lands merges
+    assert d.checks_gate("green", pushed=False) == "green"
+    assert d.checks_gate("red", pushed=False) == "gate_red"
+    assert d.checks_gate("pending", pushed=False) == "awaiting_ci"
+    # the sync moved the head: those checks describe a tree that will not land
+    for state in ("green", "red", "pending"):
+        assert d.checks_gate(state, pushed=True) == "awaiting_ci"
+    # no checks at all is the tick's judgment, never a default
+    assert d.checks_gate(None, pushed=False) == "no_checks"
+    assert d.checks_gate(None, pushed=True) == "no_checks"
+    assert d.checks_gate(None, pushed=True, allow_no_checks=True) == "green"
+    assert d.checks_gate("red", pushed=False, allow_no_checks=True) == "gate_red"   # not a bypass
+
+    red = d.gate_verdict(7, "\n".join(f"line {i}" for i in range(50)), max_lines=3)
+    body = d.gate_comment(red, "make test")
+    assert "`make test`" in body and "exit 7" in body and "line 49" in body
+    assert "47 earlier line(s) omitted" in body and "line 1\n" not in body
+    hung = d.gate_comment(d.gate_verdict(124, "x", timed_out=True), "make test")
+    assert "timed out" in hung and "omitted" not in hung
+
+
+def test_find_orca_repo_and_worktree_name():
+    ident = lambda key: {"gitRemoteIdentity": {"canonicalKey": key}}
+    repos = [{"id": "r-other", "path": "/o", **ident("github.com/acme/other")},
+             {"id": "r-folder", "path": "/f", "kind": "folder"},         # no git identity at all
+             {"id": "", "path": "/x", **ident("github.com/acme/widgets")},
+             {"id": "r-1", "path": "/src/widgets", "displayName": "w", **ident("github.com/Acme/Widgets")}]
+    # case-insensitive, as GitHub is; only the two fields a caller needs
+    assert d.find_orca_repo(repos, "acme/widgets") == {"id": "r-1", "path": "/src/widgets"}
+    assert d.find_orca_repo(repos, "acme/widget") is None             # never a prefix match
+    assert d.find_orca_repo(None, "acme/widgets") is None
+
+    name = d.worktree_name("issue-{number}-{slug}", 31, "Fix the  Names inspector: tab (v2)!")
+    assert name == "issue-31-fix-the-names-inspector-tab-v2"
+    # the name it produces is one recovery recognises as this issue's branch
+    assert d.branch_candidates([f"sunfmin/{name}", f"sunfmin/{name}-2", "sunfmin/issue-3-x"],
+                               "issue-{number}-{slug}", 31) == [f"sunfmin/{name}", f"sunfmin/{name}-2"]
+    assert d.worktree_name("issue-{number}-{slug}", 4, "中文标题") == "issue-4-work"
+    assert d.worktree_name("issue-{number}-{slug}", 4, None) == "issue-4-work"
+    long = d.worktree_name("issue-{number}-{slug}", 4, "word " * 40)
+    assert len(long) <= len("issue-4-") + 40 and not long.endswith("-")
+    assert d.worktree_name("afk/{number}", 9, "anything") == "afk/9"
+
+
+def test_closing_pr_and_superseded_prs():
+    prs = [{"number": 30, "headRefName": "sunfmin/issue-3-x",
+            "closingIssuesReferences": [{"number": 3}]},
+           {"number": 31, "headRefName": "sunfmin/issue-3-x-2",
+            "closingIssuesReferences": [{"number": 3}]},
+           {"number": 32, "headRefName": "alice/hotfix",                 # a human's PR
+            "closingIssuesReferences": [{"number": 3}, {"number": 4}]},
+           {"number": 33, "headRefName": "sunfmin/issue-3-y", "closingIssuesReferences": []},
+           {"number": 34, "headRefName": "sunfmin/issue-30-x",
+            "closingIssuesReferences": [{"number": 30}]}]
+    assert d.closing_pr(prs, 3)["number"] == 32                          # the latest closes it
+    assert d.closing_pr(prs, 4)["number"] == 32 and d.closing_pr(prs, 99) is None
+    # a fresh start closes only what the FLEET opened for THIS issue: fleet-shaped
+    # branch AND closes the issue — never a human's PR, never issue 30's
+    assert [p["number"] for p in d.superseded_prs(prs, 3, "issue-{number}-{slug}")] == [30, 31]
+    assert d.superseded_prs(prs, 4, "issue-{number}-{slug}") == []
+    assert d.superseded_prs(None, 3, "issue-{number}-{slug}") == []
+
+
+def _prompt_template():
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "..", "references", "worker-prompt.md")) as f:
+        return f.read()
+
+
+PROMPT_FIELDS = {"n": 31, "title": "Names inspector tab", "repo": "acme/widgets",
+                 "base_branch": "main", "local_command": "make test",
+                 "branch": "sunfmin/issue-31-names", "worktree_path": "/wt/issue-31"}
+
+
+def test_render_worker_prompt_fills_the_shipped_template():
+    t = _prompt_template()
+    fresh = d.render_worker_prompt(t, "fresh", PROMPT_FIELDS)
+    cont = d.render_worker_prompt(t, "continue", PROMPT_FIELDS)
+
+    for body in (fresh, cont):
+        # every field landed, and nothing template-ish is left for a worker to read
+        assert "`acme/widgets#31` — Names inspector tab" in body
+        assert "`sunfmin/issue-31-names`" in body and "`/wt/issue-31`" in body
+        assert "Closes #31" in body and "gh issue view 31 --repo acme/widgets" in body
+        assert "make test" in body and "git merge origin/main" in body
+        assert not re.search(r"\{[a-z_0-9.]+\}", body), re.findall(r"\{[a-z_0-9.]+\}", body)
+        assert "afk:block" not in body and "Worker prompt template" not in body
+        # the single-outcome rule and the checkpoint rule are in both variants
+        assert "<!--afk:verdict n=31 phase=" in body and "Publish progress as you go" in body
+        assert "Why the previous attempt failed" not in body          # not a retry
+
+    # the variants differ ONLY in the opening and in step 1
+    assert fresh.startswith("You are an afk-fleet worker. You own")
+    assert cont.startswith("You are an afk-fleet worker **continuing**")
+    assert "1. **Read the ground truth first.**" in fresh and "Inspect the existing" not in fresh
+    assert "1. **Inspect the existing progress first.**" in cont
+    assert "git log origin/main..HEAD" in cont
+    strip = lambda b: b[b.index("**Your issue:**"):b.index("## Steps")] + b[b.index("\n2. **Implement**"):]
+    assert strip(fresh) == strip(cont)
+
+    # a retry carries the reason the previous attempt failed, last
+    retry = d.render_worker_prompt(t, "fresh", PROMPT_FIELDS, reason="  gate red: 2 tests fail in x_test.go  ")
+    assert retry.startswith(fresh.rstrip("\n")) and retry.rstrip().endswith("gate red: 2 tests fail in x_test.go")
+    assert "## Why the previous attempt failed" in retry
+
+    # no local gate configured: a no-op with a note, never an empty command line
+    none = d.render_worker_prompt(t, "fresh", {**PROMPT_FIELDS, "local_command": "  "})
+    assert "no gate.local_command configured" in none
+
+
+def test_render_worker_prompt_never_ships_a_placeholder():
+    t = _prompt_template()
+    # free text is substituted LAST, so a title or reason that looks like a
+    # placeholder is delivered verbatim rather than filled in
+    odd = d.render_worker_prompt(t, "fresh", {**PROMPT_FIELDS, "title": "Support {branch} and {n}"},
+                                 reason="it printed {worktree_path}")
+    assert "— Support {branch} and {n}\n" in odd and "it printed {worktree_path}" in odd
+
+    def refuses(*args, why):
+        try:
+            d.render_worker_prompt(*args)
+            assert False, f"expected ValueError ({why})"
+        except ValueError as e:
+            assert why in str(e), e
+
+    refuses(t, "resume", PROMPT_FIELDS, why="variant")
+    refuses(t, "fresh", {k: v for k, v in PROMPT_FIELDS.items() if k != "branch"}, why="branch")
+    refuses("no blocks here", "fresh", PROMPT_FIELDS, why="'prompt' block")
+    block = lambda name, body: f"<!--afk:block {name}-->\n{body}\n<!--/afk:block-->\n"
+    partial = block("prompt", "{opening} {step1} {retry_reason}") + block("opening.fresh", "hi")
+    refuses(partial, "fresh", PROMPT_FIELDS, why="step1.fresh")
+    # a template naming a slot it never fills is caught, not sent
+    looping = (block("prompt", "{opening} {step1}") + block("opening.fresh", "O")
+               + block("step1.fresh", "see {opening}"))
+    refuses(looping, "fresh", PROMPT_FIELDS, why="unfilled")
+    # the minimal well-formed template renders
+    ok = (block("prompt", "{opening}|{step1}|{n}{retry_reason}") + block("opening.fresh", "O")
+          + block("step1.fresh", "S") + block("retry_reason", " because {reason}"))
+    assert d.render_worker_prompt(ok, "fresh", PROMPT_FIELDS) == "O|S|31\n"
+    assert d.render_worker_prompt(ok, "fresh", PROMPT_FIELDS, reason="R") == "O|S|31 because R\n"
 
 
 def test_fingerprint():
@@ -758,6 +1095,23 @@ def test_assemble_working_set():
     assert {m["number"]: m["board_phase"] for m in strict["mine"]} == {3: "ci_failed", 4: "claimed"}
     assert {m["number"]: m["board_phase"] for m in local["mine"]} == {3: "pr_open", 4: "claimed"}
 
+    # free_slots: how many more workers this tick may dispatch — the config's
+    # concurrency less what I already hold, never negative
+    assert ws["free_slots"] == cfg["concurrency"] - 2 == 1
+    assert d.assemble_working_set(issues, prs, claims, heartbeats, {}, "me", now,
+                                  {**cfg, "concurrency": 1})["free_slots"] == 0
+    assert d.assemble_working_set(issues, prs, [], heartbeats, {}, "me", now, cfg)["free_slots"] == 3
+
+    # a claim of mine whose issue is CLOSED (so it is absent from `issues`): status
+    # `closed`, no board phase — instead of a title-less `no_pr` a tick would wait
+    # on, or re-dispatch a worker for, forever
+    gone = claims + [{"number": 9, "instance": "me", "sha": "s9"}]
+    ws3 = d.assemble_working_set(issues, prs, gone, heartbeats, {}, "me", now, cfg, closed=[9])
+    row = {m["number"]: m for m in ws3["mine"]}[9]
+    assert (row["status"], row["board_phase"], row["title"]) == ("closed", None, None)
+    assert {m["number"]: m["status"] for m in ws3["mine"]} == {3: "awaiting_merge", 4: "no_pr", 9: "closed"}
+    assert ws3["free_slots"] == 0                       # it still holds a slot until released
+
     # the lease the partition uses is the CONFIG's: shorten it and the live peer goes stale
     short = d.assemble_working_set(issues, prs, claims, heartbeats, {2: 1}, "me", now,
                                    {**cfg, "claim_lease_ttl_seconds": 50})
@@ -834,20 +1188,6 @@ def test_resolve_config():
     assert r["merge"]["strategy"] == "squash"
     # idempotent: resolving canonical config is a no-op
     assert d.resolve_config(r) == r
-
-
-def test_pace_reads_the_config_it_is_given():
-    # pace resolves nothing itself: `_cfg` is the one resolution point, so a config
-    # arriving here is canonical and a missing key is a bug upstream, not a default
-    full = d.resolve_config({})
-    assert d.pace({"in_flight": 0, "empty_streak": 9}, full) == full["idle_interval_seconds"]
-    assert d.pace({"in_flight": 1, "empty_streak": 0},
-                  {**full, "busy_interval_seconds": 999999}) == TTL // 2
-    try:
-        d.pace({"in_flight": 0, "empty_streak": 9}, {})
-        assert False, "expected a KeyError: pace must not re-apply defaults"
-    except KeyError:
-        pass
 
 
 def _leaves(table, prefix=""):

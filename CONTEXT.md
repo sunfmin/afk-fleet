@@ -31,7 +31,8 @@ _Avoid_: node, worker (that is the per-issue coding agent), coordinator
 
 **Tick**:
 One fresh-context, disposable reconciliation pass, run as an Agent subagent. It rebuilds the working
-set from fleet state, acts once (merge green PRs, escalate exhausted, dispatch to free slots), returns
+set from fleet state, acts once (merge green PRs, escalate exhausted, dispatch to free slots — each a
+single **transition**), returns
 a compact summary, and dies — without waiting for the workers it dispatched. Runtime is bounded
 because ticks are disposable, not because one session stays disciplined.
 _Avoid_: batch (implies draining a whole wave), poll (a tick acts, not just observes), coordinator
@@ -49,7 +50,7 @@ _Avoid_: dry run (that is its mode, not its name), preview pass
 A fire-and-forget, ephemeral coding-agent session (Claude Code or qoderclicn — the run's **runtime**),
 isolated in one git worktree, that owns exactly one
 issue, opens a PR, and reports done via GitHub. It never merges, and its terminal is never read for
-its result. Its worktree is created and later torn down by the **worker backend** — orca (`orca
+its result (only, once it has gone silent with no outcome, for *where it stopped* — see **Nudge**). Its worktree is created and later torn down by the **worker backend** — orca (`orca
 worktree create` / `orca worktree rm`), the only supported backend — never by the tick with raw `git
 worktree`; orca also names the branch (a `<user>/…` prefix), and the tick **reads that back** rather
 than dictating it (ADR-0005). It is started by running the **worker launch command** in the
@@ -122,6 +123,26 @@ authorization. It stays with the **tick** (an LLM). "Extract mechanics to code, 
 LLM" is the fleet's core build rule.
 _Avoid_: automation vs decision, deterministic vs heuristic (near, but this is specifically the
 code/LLM ownership split), script vs agent (the tick is not a script)
+
+**Transition**:
+One change of a **claim**'s state, performed as a single `afk` call that runs its whole ordered
+sequence in code: **dispatch** (claim → worktree at the right commit → worker started → prompt
+delivered → status board), **merge** (sync → gate → merge pinned to the gated head → status board →
+release → cleanup), **fail** (count the attempt, then a fresh retry or an escalation), **escalate**
+(status board → relabel → comment → release, the release last), **close** (status board → close →
+release → cleanup). A transition stops with an **outcome** exactly where the next move is judgment —
+a sync conflict, a PR with no checks, a verification still owed — and takes the tick's judgment as an
+argument (a reason, a verified head, "start fresh"). The tick therefore types no raw `git`, `gh` or
+`orca` to act; orderings such as "relabel before release" are code under test, not prose (ADR-0017).
+_Avoid_: recipe, procedure, step list (those were the prose a tick used to re-derive), action
+(`action` is a field of an outcome)
+
+**Cycle state**:
+The one value the **launcher** carries between cycles: an opaque object `afk cycle` returns and takes
+back verbatim, holding the last fingerprint, the skip streak, the empty streak and what the last
+**tick** left in flight. The launcher never reads into it or does arithmetic on it; pacing, the
+skipped cycle's heartbeat and the forced tick are all decided from it in code (ADR-0017).
+_Avoid_: launcher memory, last summary (the summary is folded in and discarded)
 
 **Fleet state**:
 The authoritative record of the fleet's progress — what is claimed, in-flight, gated, merged,
@@ -206,6 +227,16 @@ the dead peer's claims plus the **frontier**. Claims taken are recovered by **co
 takeover never counts as a **retry** (ADR-0011).
 _Avoid_: failover (implies automatic), rescue (it seeds a standing fleet, not a bounded mission),
 stale reclaim (that is the unattended, lease-gated path)
+
+**Nudge**:
+The one line the fleet types at a live **worker** that went idle past the grace period with no PR and
+no verdict — the `idle_stalled` **outcome** of `afk no-pr`. Such a worker has not failed; it stopped
+without an outcome, usually to ask a question nobody will answer. A nudge tells it to carry on, is
+sent **once per worker** (recorded in the worktree's git dir), spends no **retry** and discards
+nothing; a worker still silent a grace period later is a failure, and the last screen of its terminal
+travels in the failure reason. That screen is the only thing the fleet ever reads from a worker's
+terminal, and it is read for *where the worker stopped*, never for its result (ADR-0018).
+_Avoid_: ping, poke, retry (a retry discards the attempt; a nudge keeps it), reminder
 
 **Continuation**:
 The fleet's default way of recovering a claim whose **worker** died mid-flight — recovering it *from

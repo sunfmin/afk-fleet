@@ -94,6 +94,9 @@ BRANCH_NAMESPACE = "refs/heads"
 # at merge time against the exact tree that lands.
 GATE_CI_MODES = ("required", "local")
 
+# How `afk merge` lands a PR — each is a `gh pr merge` flag of the same name.
+MERGE_STRATEGIES = ("squash", "merge", "rebase")
+
 # Keys that were renamed, and why. A file still carrying the old name must fail
 # LOUDLY with the migration note rather than be silently defaulted — a config that
 # lies to its author is the failure mode ADR-0009 exists to prevent.
@@ -136,6 +139,10 @@ def validate_config(cfg):
         raise ValueError("config gate.ci: 'local' requires a non-empty gate.local_command — in "
                          "local mode that command IS the completion gate (ADR-0012), so an empty "
                          "one would merge every PR unverified")
+    strategy = (cfg.get("merge") or {}).get("strategy")
+    if strategy not in MERGE_STRATEGIES:
+        raise ValueError(f"config merge.strategy: expected one of "
+                         f"{' | '.join(MERGE_STRATEGIES)}, got {strategy!r}")
     return cfg
 
 
@@ -386,7 +393,7 @@ def classify_claims(claims, heartbeats, me, now, ttl):
     return {"mine": sorted(mine), "peer_live": sorted(peer_live), "stale": sorted(stale)}
 
 
-def subclassify_pr(has_pr, checks_state, ci_mode):
+def subclassify_pr(has_pr, checks_state, ci_mode, closed=False):
     """
     Classify one of MY in-flight claims from its PR + checks → `(status,
     board_phase)`: what the tick does next, and what the status board shows a human
@@ -395,12 +402,15 @@ def subclassify_pr(has_pr, checks_state, ci_mode):
       has_pr:       an open PR closes the issue
       checks_state: "green" | "red" | "pending" | None  (`pr_checks_state`)
       ci_mode:      gate.ci — "required" reads the checks; "local" never does
+      closed:       the claimed issue is itself CLOSED — a merge whose tick died
+                    before releasing, or a human finishing it by hand
 
       status           the tick…                                board_phase
+      closed           releases the leftover claim               None (not re-rendered)
       no_pr            asks `afk no-pr` why                      claimed
       awaiting_ci      leaves it                                 pr_open
-      failure          runs failure handling                     ci_failed
-      awaiting_merge   runs the merge sequence                   awaiting_merge
+      failure          runs `afk fail`                           ci_failed
+      awaiting_merge   runs `afk merge`                          awaiting_merge
                        (`local`: an open PR, whatever its        (`local`: pr_open)
                        remote checks say)
 
@@ -413,6 +423,8 @@ def subclassify_pr(has_pr, checks_state, ci_mode):
     green gate nobody has run. (`merged` / `escalated`, the two terminal board
     phases, are set by the merge and escalate steps themselves.)
     """
+    if closed:
+        return "closed", None
     if not has_pr:
         return "no_pr", "claimed"
     if ci_mode == "local":
@@ -501,6 +513,39 @@ def protection_verdict(ci_mode, protection, unavailable=None):
             "detail": "target branch requires no status checks — a local gate can merge"}
 
 
+def checks_gate(checks_state, pushed, allow_no_checks=False):
+    """
+    The `gate.ci: required` half of `afk merge`'s gate: may this PR merge on what
+    its GitHub checks say, right now?
+
+      checks_state:    `pr_checks_state` of the PR as read BEFORE the merge-time sync
+      pushed:          the sync just pushed new commits to the PR — those checks
+                       describe a tree that is no longer the one that would land
+      allow_no_checks: the tick's judgment that a repo with no CI at all may merge
+                       on its acceptance criteria (the progressive gate)
+
+    Returns "green" | "awaiting_ci" | "gate_red" | "no_checks". A sync that moved
+    the head always waits: CI must run on the tree that lands, and a later tick's
+    merge finds the sync a no-op and reads the fresh verdict.
+    """
+    if checks_state is None:
+        return "green" if allow_no_checks else "no_checks"
+    if pushed:
+        return "awaiting_ci"
+    return {"green": "green", "red": "gate_red"}.get(checks_state, "awaiting_ci")
+
+
+def gate_comment(verdict, command):
+    """The PR comment a red merge-time local gate leaves behind, so the retry's
+    worker re-reads the failure from where it lives (ADR-0012)."""
+    how = (f"timed out (exit {verdict['exit_code']})" if verdict["timed_out"]
+           else f"exit {verdict['exit_code']}")
+    omitted = (f"\n\n_({verdict['omitted_lines']} earlier line(s) omitted)_"
+               if verdict["omitted_lines"] else "")
+    return (f"**afk-fleet merge-time gate: red** — `{command}` → {how}, run after syncing "
+            f"with the merge target.\n\n```\n{verdict['excerpt']}\n```{omitted}")
+
+
 # --------------------------------------------------------------------------- #
 # no_pr reconciliation — disambiguating a FINISHED worker from a CODING one    #
 # --------------------------------------------------------------------------- #
@@ -580,7 +625,7 @@ def latest_verdict(comments):
 
 
 def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, blocker_states,
-                   now, grace_seconds):
+                   now, grace_seconds, nudged_at=None, can_nudge=True):
     """
     The outcome for one of MY `no_pr` claims, from the raw signals.
 
@@ -594,6 +639,10 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
       blocker_states:  {issue number: "open"|"closed"} for the verdict's blocked_by.
                        Anything not provably "closed" counts as still open.
       now, grace_seconds: epoch seconds / `worker_idle_grace_seconds`.
+      nudged_at:       epoch seconds this worker was nudged (`afk nudge`), None if
+                       it never was. A nudge is spent once: the second silence fails.
+      can_nudge:       False when there is nowhere to record a nudge (no worktree
+                       on this machine) — the silence then fails at once.
 
     Returns {"outcome", "action", "idle_seconds", "open_blockers"} — `action` is
     what the tick does, `outcome` the reason it is grouped under:
@@ -604,12 +653,19 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
       idle_blocked redispatch    — …+ `blocked`, and every blocked_by is now closed.
       idle_blocked escalate      — …+ `blocked`, and a blocked_by is still open (or
                                    the verdict names none, so nothing can ever clear).
-      idle_failed  next_attempt  — …+ `giving-up`, an unknown phase, or NO verdict at
-                                   all → failure handling (`afk next-attempt`).
+      idle_stalled nudge         — …+ NO verdict at all, never nudged: the worker
+                                   stopped without an outcome — typically waiting on
+                                   a question nobody will answer. `afk nudge` tells
+                                   it to carry on; no attempt is spent (ADR-0018).
+      idle_failed  next_attempt  — …+ `giving-up`, an unknown phase, an
+                                   `already-satisfied` refuted by work on the branch,
+                                   or no verdict even after a nudge → failure
+                                   handling (`afk fail`).
       dead         orphan        — no live worker/terminal → recovery by continuation.
 
     `idle_seconds` is the time since the MOST RECENT sign of life (last commit,
-    newest file mtime, terminal activity); None when none is known, which is never
+    newest file mtime, terminal activity, the nudge — a nudged worker gets a whole
+    grace period to answer it); None when none is known, which is never
     "within grace". `open_blockers` is the still-open subset of blocked_by.
     """
     progress = progress or {}
@@ -617,6 +673,8 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
             if t is not None]
     if terminal_idle_seconds is not None:
         seen.append(int(now) - int(terminal_idle_seconds))
+    if nudged_at is not None:
+        seen.append(int(nudged_at))
     idle_seconds = max(0, int(now) - int(max(seen))) if seen else None
 
     def out(outcome, action, open_blockers=()):
@@ -647,7 +705,41 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
         if still_open or not named:
             return out("idle_blocked", "escalate", still_open)
         return out("idle_blocked", "redispatch")
+    if not verdict.get("found") and nudged_at is None and can_nudge:
+        return out("idle_stalled", "nudge")
     return out("idle_failed", "next_attempt")
+
+
+# How much of a stalled worker's screen is carried into a failure reason.
+STALL_TAIL_LINES = 30
+_STALL_LINE_CHARS = 200
+
+
+def nudge_text(brief=None):
+    """The one line `afk nudge` types at a worker that stopped without an outcome.
+    Short on purpose: a long text arrives as a paste the worker asks to have
+    confirmed, which is the stall this is sent to break."""
+    task = f"your task brief ({brief})" if brief else "your task"
+    return (f"You stopped without an outcome. Nobody is watching this terminal, so do not wait "
+            f"for a confirmation or an answer: continue {task} to the end, and finish with a PR "
+            f"or an afk:verdict marker comment.")
+
+
+def stall_tail(lines, limit=STALL_TAIL_LINES):
+    """The last `limit` non-blank lines of a terminal screen, each cut to a
+    bounded width — what a stalled worker was last saying, small enough to carry."""
+    kept = [ln.rstrip()[:_STALL_LINE_CHARS] for ln in (lines or []) if str(ln).strip()]
+    return kept[-limit:]
+
+
+def stall_reason(reason, tail):
+    """A failure reason with the stalled worker's last screen appended, so the retry
+    (or the human it escalates to) reads WHERE it stopped, not just that it did."""
+    tail = stall_tail(tail)
+    if not tail:
+        return reason
+    return (f"{reason.rstrip()}\n\nThe previous worker stopped without an outcome and stayed "
+            f"silent after one nudge. Its terminal ended with:\n\n```\n" + "\n".join(tail) + "\n```")
 
 
 # --------------------------------------------------------------------------- #
@@ -820,6 +912,33 @@ def find_orca_worktree(worktrees, number, repo=None):
     return {"found": True, "path": best.get("path") or None, "branch": branch}
 
 
+def find_orca_repo(repos, repo):
+    """
+    The repo orca knows the target by, from `orca repo list --json`'s
+    `result.repos` rows → {"id", "path"}: the id `orca worktree create --repo
+    id:<id>` needs, and the checkout whose object store a new worktree is cut from.
+    A row matches when its `gitRemoteIdentity.canonicalKey` is
+    `github.com/<owner>/<name>` (compared case-insensitively, as GitHub does). None
+    when orca has no such repo.
+    """
+    want = f"github.com/{repo}".lower()
+    for r in repos or []:
+        key = ((r.get("gitRemoteIdentity") or {}).get("canonicalKey") or "").lower()
+        if key == want and r.get("id") and r.get("path"):
+            return {"id": r["id"], "path": r["path"]}
+    return None
+
+
+def worktree_name(branch_pattern, number, title):
+    """`branch_pattern` filled for one issue — the NAME hint handed to `orca
+    worktree create --name` (orca derives the real branch from it, ADR-0005). The
+    slug is the title lowercased to `[a-z0-9-]`, at most 40 characters; a title
+    with nothing usable (all CJK, say) slugs to `work`."""
+    slug = re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")[:40].rstrip("-")
+    return (branch_pattern.replace("{number}", str(number))
+            .replace("{slug}", slug or "work"))
+
+
 def furthest_ahead(ahead_by_branch):
     """Of several remote branches matching one issue (an earlier attempt left one
     behind), the one furthest ahead of base — ties, and unmeasurable counts
@@ -887,6 +1006,71 @@ def select_recovery(worktree, branch):
 
 
 # --------------------------------------------------------------------------- #
+# The worker prompt — one template, filled by code (`afk dispatch`)            #
+# --------------------------------------------------------------------------- #
+#
+# references/worker-prompt.md is the template: named blocks between
+# `<!--afk:block NAME-->` and `<!--/afk:block-->`. The `prompt` block is the body;
+# it names three slots — {opening} and {step1}, each filled from the block of
+# that name for the chosen variant (`opening.fresh`, `step1.continue`, …), and
+# {retry_reason}, filled from the `retry_reason` block only when a failure reason
+# is handed over. Everything else in braces is a field.
+
+_BLOCK_RE = re.compile(r"<!--afk:block ([a-z0-9_.]+)-->\n(.*?)\n?<!--/afk:block-->", re.DOTALL)
+PROMPT_VARIANTS = ("fresh", "continue")
+PROMPT_FIELDS = ("n", "title", "repo", "base_branch", "local_command", "branch", "worktree_path")
+_NO_LOCAL_COMMAND = "true   # (no gate.local_command configured: run the repo's own build/test, if any)"
+
+
+def render_worker_prompt(template, variant, fields, reason=None):
+    """
+    The prompt one worker is started with, from the template file's text.
+
+      template: the text of references/worker-prompt.md
+      variant:  "fresh" (a clean checkout of the base) or "continue" (the worktree
+                or branch already carries a dead worker's progress — ADR-0011)
+      fields:   {name: value} for every one of PROMPT_FIELDS. An empty
+                `local_command` renders as a no-op with a note.
+      reason:   why the previous attempt failed, when this is a retry; None otherwise
+
+    Raises ValueError on a template missing a block, a missing field, or a
+    placeholder left unfilled — a worker must never be started on a prompt with a
+    literal `{branch}` in it.
+    """
+    if variant not in PROMPT_VARIANTS:
+        raise ValueError(f"unknown worker prompt variant: {variant!r}")
+    blocks = dict(_BLOCK_RE.findall(template or ""))
+
+    def block(name):
+        if name not in blocks:
+            raise ValueError(f"worker prompt template has no {name!r} block")
+        return blocks[name]
+
+    missing = [k for k in PROMPT_FIELDS if k not in fields]
+    if missing:
+        raise ValueError(f"worker prompt: missing field(s) {', '.join(missing)}")
+    values = {k: str(fields[k]) for k in PROMPT_FIELDS}
+    values["local_command"] = values["local_command"].strip() or _NO_LOCAL_COMMAND
+
+    text = block("prompt")
+    slots = {"opening": block(f"opening.{variant}"), "step1": block(f"step1.{variant}"),
+             "retry_reason": block("retry_reason") if reason else ""}
+    for name, body in slots.items():
+        text = text.replace("{" + name + "}", body)
+    free_text = {"title": values.pop("title"), "reason": (reason or "").strip()}
+    for name, value in values.items():
+        text = text.replace("{" + name + "}", value)
+    left = sorted(set(re.findall(r"\{(?:%s)\}" % "|".join((*values, *slots)), text)))
+    if left:
+        raise ValueError(f"worker prompt: unfilled placeholder(s) {', '.join(left)}")
+    # the free-text values go in last, so a title that happens to contain
+    # "{branch}" is never itself substituted into
+    for name, value in free_text.items():
+        text = text.replace("{" + name + "}", value)
+    return text.strip() + "\n"
+
+
+# --------------------------------------------------------------------------- #
 # Human-facing progress status board — render only (ADR-0006)                  #
 # --------------------------------------------------------------------------- #
 #
@@ -905,9 +1089,11 @@ def select_recovery(worktree, branch):
 
 STATUS_MARKER = "<!--afk:status-->"
 
-# The closed set of lifecycle phases the board renders. Happy path plus two
-# off-ramps (ci_failed, escalated) that reuse the same checkboxes + an annotation.
-STATUS_PHASES = ("claimed", "pr_open", "ci_failed", "awaiting_merge", "merged", "escalated")
+# The closed set of lifecycle phases the board renders. Happy path plus three
+# off-ramps that reuse the same checkboxes + an annotation: ci_failed, escalated,
+# and closed (the worker found the issue already satisfied — `afk close`).
+STATUS_PHASES = ("claimed", "pr_open", "ci_failed", "awaiting_merge", "merged", "escalated",
+                 "closed")
 
 # Happy-path milestones, in order — these are the task-list checkboxes.
 _STATUS_STEPS = (
@@ -924,7 +1110,7 @@ _GATE_NAME = {"required": "CI", "local": "本地门"}
 # step). escalated is a terminal give-up handled specially in `render_status_board`.
 _PHASE_REACHED = {
     "claimed": 0, "pr_open": 1, "ci_failed": 1, "awaiting_merge": 2, "merged": 3,
-    "escalated": 1,
+    "escalated": 1, "closed": 0,
 }
 
 
@@ -940,6 +1126,8 @@ def _status_current_line(phase, gate, attempt, retry_max):
         return "▸ 当前:门已绿,待合并"
     if phase == "merged":
         return "✅ 已合并,完成"
+    if phase == "closed":
+        return "✅ 主干已满足此需求,无需改动 —— 已关闭"
     return "⚠️ 已升级给人处理 —— 见下方评论"   # escalated
 
 
@@ -1002,56 +1190,164 @@ def current_attempt(labels):
     return max(attempts)
 
 
+def attempt_labels(labels):
+    """Every `afk-attempt/*` label among an issue's label names — what a retry
+    swaps out and an escalation strips, however many a hand-edit left behind."""
+    return sorted(lb for lb in labels or []
+                  if isinstance(lb, str) and lb.startswith(_ATTEMPT_PREFIX))
+
+
 def next_attempt(attempt, retry_max):
     """
     Retry-or-escalate for a failed issue on attempt `attempt` (`current_attempt`).
 
-      {"action":"retry","from_label":<cur|None>,"to_label":"afk-attempt/<n+1>"}
-      {"action":"escalate","from_label":<cur|None>}   when n >= retry_max
+      {"action":"retry","attempt":<n+1>,"to_label":"afk-attempt/<n+1>"}
+      {"action":"escalate","attempt":<n>}                when n >= retry_max
 
-    `from_label` is the label the issue carries now (None on attempt 0, which has
-    no label) — the one to swap for `to_label`, or to remove on escalate.
+    `afk fail` is the one caller, and the one writer of the label: it applies
+    `to_label` and removes every `attempt_labels` the issue carried.
     """
-    cur = f"{_ATTEMPT_PREFIX}{attempt}" if attempt > 0 else None
     if attempt >= retry_max:
-        return {"action": "escalate", "from_label": cur}
-    return {"action": "retry", "from_label": cur, "to_label": f"{_ATTEMPT_PREFIX}{attempt + 1}"}
+        return {"action": "escalate", "attempt": attempt}
+    return {"action": "retry", "attempt": attempt + 1,
+            "to_label": f"{_ATTEMPT_PREFIX}{attempt + 1}"}
 
 
-def pace(summary, config):
+def escalation_comment(reason, attempt, pr=None):
+    """The durable hand-off comment an escalation appends to the issue (ADR-0006
+    keeps it apart from the status board, which only points here). The stuck-point
+    wording is the tick's; this frames it."""
+    tried = f"after {attempt} retr{'y' if attempt == 1 else 'ies'}" if attempt else "without a retry"
+    link = f" Last PR: #{pr}." if pr else ""
+    return (f"**afk-fleet: escalated to a human** ({tried}).{link}\n\n"
+            f"{(reason or '').strip()}")
+
+
+def escalation_labels(labels, config):
+    """The label edit that hands an issue to a human: `(add, remove)`. Removes
+    `ready_label` and every attempt label the issue actually carries (never one it
+    does not — gh refuses to remove an absent label), adds `escalate_label`."""
+    present = set(labels or [])
+    remove = sorted(present & {config["ready_label"], *attempt_labels(labels)})
+    return [config["escalate_label"]], remove
+
+
+def pace(did_work, in_flight, empty_streak, config):
     """
-    Next launcher sleep in seconds, from the last tick's summary + config.
+    The launcher's next sleep, in seconds.
 
-      summary: {"merged":[],"dispatched":[],"reclaimed":[],"in_flight":int,
-                "empty_streak":int}   (empty_streak: consecutive empty ticks so far)
-      config:  the canonical config — read for busy_interval_seconds,
-               idle_interval_seconds, idle_ticks_before_sleep and
-               claim_lease_ttl_seconds
+      did_work:     the tick that just ran merged / dispatched / reclaimed / escalated
+      in_flight:    claims this fleet holds
+      empty_streak: consecutive empty cycles so far (`cycle_ticked` / `cycle_wake`)
+      config:       read for busy_interval_seconds, idle_interval_seconds,
+                    idle_ticks_before_sleep and claim_lease_ttl_seconds
 
-    - did work (merged/dispatched/reclaimed) or in_flight>0 → busy interval;
-    - else stay busy until `idle_ticks_before_sleep` empty ticks, then idle interval;
-    - HARD CAP: while holding any claim (in_flight>0), never exceed ttl/2, so the
-      per-instance heartbeat cannot lapse and get a live claim reclaimed (ADR-0003).
+    - did work, or holding claims → busy interval;
+    - else stay busy until `idle_ticks_before_sleep` empty cycles, then idle interval;
+    - HARD CAP: while holding any claim, never exceed ttl/2, so the per-instance
+      heartbeat cannot lapse and get a live claim reclaimed (ADR-0003).
     """
     busy = int(config["busy_interval_seconds"])
-    idle = int(config["idle_interval_seconds"])
-    threshold = int(config["idle_ticks_before_sleep"])
-    ttl = int(config["claim_lease_ttl_seconds"])
-
-    did_work = bool(summary.get("merged") or summary.get("dispatched") or summary.get("reclaimed"))
-    in_flight = int(summary.get("in_flight", 0))
-    empty_streak = int(summary.get("empty_streak", 0))
-
-    if did_work or in_flight > 0:
-        interval = busy
-    elif empty_streak >= threshold:
-        interval = idle
+    if did_work or in_flight > 0 or empty_streak < int(config["idle_ticks_before_sleep"]):
+        interval = busy       # working, or recently active — stay responsive
     else:
-        interval = busy  # recently active — stay responsive for stragglers
-
+        interval = int(config["idle_interval_seconds"])
     if in_flight > 0:
-        interval = min(interval, ttl // 2)
+        interval = min(interval, int(config["claim_lease_ttl_seconds"]) // 2)
     return int(interval)
+
+
+# --------------------------------------------------------------------------- #
+# The launcher's cycle — gate, heartbeat, streaks and sleep as one state machine#
+# --------------------------------------------------------------------------- #
+#
+# Everything the launcher carries between cycles is ONE opaque value, the cycle
+# state, which `afk cycle` hands back and takes again:
+#
+#   fingerprint         the digest the last gate computed (ADR-0007)
+#   skips               consecutive skipped cycles
+#   empty_streak        consecutive EMPTY cycles — a tick that did nothing with
+#                       nothing in flight and nothing on the frontier, or a skip
+#                       while that was still so
+#   in_flight           claims held, per the last tick's summary
+#   frontier_remaining  dispatchable issues the last tick left undispatched
+#
+# The launcher never reads or edits a field; it is state for this code alone.
+
+CYCLE_START = {"fingerprint": "", "skips": 0, "empty_streak": 0,
+               "in_flight": 0, "frontier_remaining": 0}
+
+_SUMMARY_WORK = ("merged", "dispatched", "reclaimed", "escalated")
+
+
+def cycle_state(raw):
+    """The cycle state from what the launcher handed back (None / "" on the first
+    cycle → CYCLE_START). Raises ValueError on anything that is not a state this
+    code produced — a launcher that mangled it must hear so, not run on zeros."""
+    if raw is None or raw == "":
+        return dict(CYCLE_START)
+    if not isinstance(raw, dict) or set(raw) != set(CYCLE_START):
+        raise ValueError(f"--state is not a cycle state (pass back the `state` the previous "
+                         f"`afk cycle` returned, verbatim): {raw!r}")
+    return {"fingerprint": str(raw["fingerprint"]),
+            **{k: int(raw[k]) for k in CYCLE_START if k != "fingerprint"}}
+
+
+def cycle_wake(state, current_fp, config):
+    """
+    The top of one launcher cycle: tick, or skip?
+
+      state:      the cycle state (`cycle_state`)
+      current_fp: `fingerprint` of what a rebuild would observe now; None when
+                  `fingerprint_gate` is off (nothing was gathered)
+
+    Returns {"action": "tick"|"skip", "reason", "state"} and, on a skip, the two
+    things a skipped cycle still owes: `sleep_seconds`, and `heartbeat` — True when
+    the fleet holds claims, so the effect layer refreshes the lease no tick will.
+    On a tick the launcher spawns one and reports back through `cycle_ticked`,
+    which is what returns that cycle's sleep.
+
+    A skipped cycle extends the empty streak only while nothing is in flight and
+    nothing is left on the frontier: unchanged state then proves the cycle empty.
+    """
+    if not config["fingerprint_gate"]:
+        return {"action": "tick", "reason": "gate_off", "state": {**state, "skips": 0}}
+    gate = fingerprint_gate(state["fingerprint"], current_fp, state["skips"],
+                            config["force_tick_after_skips"])
+    new = {**state, "fingerprint": current_fp, "skips": gate["skips"]}
+    if gate["action"] == "tick":
+        return {"action": "tick", "reason": gate["reason"], "state": new}
+    if new["in_flight"] == 0 and new["frontier_remaining"] == 0:
+        new["empty_streak"] += 1
+    return {"action": "skip", "reason": gate["reason"], "state": new,
+            "heartbeat": new["in_flight"] > 0,
+            "sleep_seconds": pace(False, new["in_flight"], new["empty_streak"], config)}
+
+
+def cycle_ticked(state, summary, config):
+    """
+    The bottom of a cycle that ran a tick: fold the tick's summary into the cycle
+    state and say how long to sleep.
+
+      summary: the tick's return — {"merged":[], "escalated":[], "dispatched":[],
+               "reclaimed":[], "in_flight": int, "frontier_remaining": int, ...}
+
+    `in_flight` and `frontier_remaining` are REQUIRED: a summary missing either
+    would read as an idle fleet holding nothing, and pace it past its own lease.
+    Returns {"state", "sleep_seconds"}.
+    """
+    if not isinstance(summary, dict):
+        raise ValueError(f"--summary must be the tick's summary object, got {summary!r}")
+    for key in ("in_flight", "frontier_remaining"):
+        if not isinstance(summary.get(key), int) or isinstance(summary.get(key), bool):
+            raise ValueError(f"--summary needs an integer {key!r} (the tick's return schema)")
+    did_work = any(summary.get(k) for k in _SUMMARY_WORK)
+    in_flight, remaining = summary["in_flight"], summary["frontier_remaining"]
+    empty = not did_work and in_flight == 0 and remaining == 0
+    new = {**state, "in_flight": in_flight, "frontier_remaining": remaining,
+           "empty_streak": state["empty_streak"] + 1 if empty else 0}
+    return {"state": new,
+            "sleep_seconds": pace(did_work, in_flight, new["empty_streak"], config)}
 
 
 # --------------------------------------------------------------------------- #
@@ -1248,8 +1544,8 @@ def fingerprint_gate(last, current, skips, force_after):
                    skipping entirely)
 
     Returns {"action": "tick"|"skip", "reason": "first"|"changed"|"forced"|
-    "unchanged", "skips": <new streak>} — the launcher carries `skips` (and the
-    digest) forward, exactly like the last tick summary.
+    "unchanged", "skips": <new streak>} — `cycle_wake` folds both into the cycle
+    state the launcher carries.
     """
     if not last:
         return {"action": "tick", "reason": "first", "skips": 0}
@@ -1306,7 +1602,24 @@ def _closing_pr_map(prs):
     return m
 
 
-def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, config):
+def closing_pr(prs, number):
+    """The open PR that closes issue <number> (the latest, when several do), or None."""
+    return _closing_pr_map(prs).get(number)
+
+
+def superseded_prs(prs, number, branch_pattern):
+    """The open PRs a FRESH start of issue <number> supersedes: the ones that
+    close it from a branch shaped like the fleet's own (`branch_regex`). A PR a
+    human opened from some other branch is never one of them — the fleet closes
+    only what the fleet opened."""
+    rx = branch_regex(branch_pattern, number)
+    return [p for p in prs or []
+            if any(ref.get("number") == number for ref in p.get("closingIssuesReferences") or [])
+            and rx.match(p.get("headRefName") or "")]
+
+
+def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, config,
+                         closed=()):
     """
     The tick's whole working set from the raw observables. Pure — afk.py's
     `rebuild` gathers, this assembles, and a fixture pins the join.
@@ -1321,7 +1634,10 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
                    already fails a cheaper eligibility check first.
       me, now:     my instance id / epoch seconds
       config:      the canonical config — read for ready_label, epic_labels,
-                   claim_lease_ttl_seconds and gate.ci
+                   claim_lease_ttl_seconds, gate.ci and concurrency
+      closed:      the numbers of MY claims whose issue is closed (`issues` holds
+                   only open ones, so `afk rebuild` asks about each of mine that is
+                   missing from it)
 
     Returns:
       {"frontier": {"dispatch": [{"number","title"}...], "excluded": [...]},
@@ -1329,11 +1645,12 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
                  "attempt"}...],
        "peer_live": [{"number","instance"}...],
        "stale": [{"number","instance","sha"}...],   # sha feeds reclaim --expect-sha
+       "free_slots": <how many workers may be dispatched: concurrency - len(mine)>,
        "fingerprint": <digest of the same observables the gate hashes>,
        "now": now}
 
     `status` and `board_phase` are `subclassify_pr`'s pair; `attempt` is
-    `current_attempt` — the number `afk next-attempt` and `afk status` take.
+    `current_attempt` — the number `afk status` takes.
     """
     ttl, ci_mode = config["claim_lease_ttl_seconds"], config["gate"]["ci"]
     by_num = {i.get("number"): i for i in issues}
@@ -1352,7 +1669,8 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
         pr = pr_for.get(n)
         checks = pr_checks_state(pr.get("statusCheckRollup")) if pr else None
         issue = by_num.get(n, {})
-        status, board_phase = subclassify_pr(pr is not None, checks, ci_mode)
+        status, board_phase = subclassify_pr(pr is not None, checks, ci_mode,
+                                             closed=n in set(closed))
         mine.append({"number": n, "title": issue.get("title"),
                      "status": status, "board_phase": board_phase,
                      "pr": pr.get("number") if pr else None, "checks": checks,
@@ -1365,5 +1683,6 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
             "stale": [{"number": n, "instance": by_claim.get(n, {}).get("instance"),
                        "sha": by_claim.get(n, {}).get("sha")}
                       for n in part["stale"]],
+            "free_slots": max(0, int(config["concurrency"]) - len(mine)),
             "fingerprint": fingerprint(issues, prs, claims),
             "now": now}
