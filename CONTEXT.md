@@ -49,7 +49,7 @@ _Avoid_: dry run (that is its mode, not its name), preview pass
 **Worker**:
 A fire-and-forget, ephemeral coding-agent session (Claude Code or qoderclicn — the run's **runtime**),
 isolated in one git worktree, that owns exactly one
-issue, opens a PR, and reports done via GitHub. It never merges, and its terminal is never read for
+issue, opens a PR, reports done via GitHub, and then **wakes** the launcher. It never merges, and its terminal is never read for
 its result (only, once it has gone silent with no outcome, for *where it stopped* — see **Nudge**). Its worktree is created and later torn down by the **worker backend** — orca (`orca
 worktree create` / `orca worktree rm`), the only supported backend — never by the tick with raw `git
 worktree`; orca also names the branch (a `<user>/…` prefix), and the tick **reads that back** rather
@@ -238,6 +238,17 @@ nothing; a worker still silent a grace period later is a failure, and the last s
 travels in the failure reason. That screen is the only thing the fleet ever reads from a worker's
 terminal, and it is read for *where the worker stopped*, never for its result (ADR-0018).
 _Avoid_: ping, poke, retry (a retry discards the attempt; a nudge keeps it), reminder
+
+**Wake**:
+The one line a **worker** types into the **launcher**'s terminal once its outcome is on GitHub — a PR,
+a verdict marker, a **hand-back**'s resolution pushed: `afk-wake #<n>`. It ends the launcher's sleep
+so the next cycle opens now rather than a busy interval later, and it carries nothing: the cycle it
+triggers reads GitHub like any other, and the launcher never acts on the line itself. A lost wake
+costs only the wait it would have saved — polling is unchanged underneath. The worker is handed the
+line ready-made in its prompt; the launcher's terminal handle is read from the environment by the
+**transition** that fills the prompt, never configured (ADR-0020).
+_Avoid_: notification (nothing is conveyed, and no human is told), callback, done signal (the outcome
+is the PR or the verdict, not this), **nudge** (that is fleet → worker; a wake is worker → launcher)
 
 **Hand-back**:
 Returning a **sync** conflict to the **worker** that wrote the branch, instead of failing the claim.

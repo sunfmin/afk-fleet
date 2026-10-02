@@ -1109,14 +1109,45 @@ def select_recovery(worktree, branch):
 # is handed over, and {handback}, filled from the `handback` block only when the
 # worker is started on a sync conflict that was handed back (ADR-0019). That
 # block is also a brief of its own — `render_handback` — for a worker that is
-# still there to be told. Everything else in braces is a field.
+# still there to be told. Everything else in braces is a field — one of them
+# derived: {wake_command}, the line a worker runs to wake the launcher once its
+# outcome is on GitHub, built from the `launcher_terminal` field (ADR-0020).
 
 _BLOCK_RE = re.compile(r"<!--afk:block ([a-z0-9_.]+)-->\n(.*?)\n?<!--/afk:block-->", re.DOTALL)
 PROMPT_VARIANTS = ("fresh", "continue")
-PROMPT_FIELDS = ("n", "title", "repo", "base_branch", "local_command", "branch", "worktree_path")
+PROMPT_FIELDS = ("n", "title", "repo", "base_branch", "local_command", "branch", "worktree_path",
+                 "launcher_terminal")
 HANDBACK_FIELDS = ("pr", "pr_branch", "target", "target_tip", "files")
 _PROMPT_SLOTS = ("opening", "step1", "retry_reason", "handback")
 _NO_LOCAL_COMMAND = "true   # (no gate.local_command configured: run the repo's own build/test, if any)"
+_NO_WAKE = "true   # (no coordinator terminal to wake: it finds your outcome at its next poll)"
+_TERMINAL_HANDLE_RE = re.compile(r"[A-Za-z0-9_.:-]+")
+
+
+def wake_line(number):
+    """The one line a wake types at the launcher's terminal. It names the issue for
+    the human scrolling back, and nothing the launcher may act on (ADR-0020)."""
+    return f"afk-wake #{number}"
+
+
+def wake_command(launcher_terminal, number):
+    """
+    The command a worker runs once its outcome is on GitHub — a PR, a verdict
+    marker, a hand-back's resolution pushed — to wake the launcher out of its sleep
+    (ADR-0020), so the next cycle opens now instead of a busy interval later.
+
+      launcher_terminal: the orca handle of the terminal the launcher runs in; ""
+                         or None when it runs in none (a headless tick)
+
+    The wake is a hint and carries no state: the cycle it triggers reads GitHub
+    like any other, and a wake that is lost costs only the wait it would have
+    saved. With no handle — or one that is not a bare handle, since this string is
+    run in the worker's shell — the command is a no-op with a note.
+    """
+    handle = (launcher_terminal or "").strip()
+    if not _TERMINAL_HANDLE_RE.fullmatch(handle):
+        return _NO_WAKE
+    return f'orca terminal send --terminal {handle} --text "{wake_line(number)}" --enter'
 
 
 def _prompt_blocks(template):
@@ -1140,6 +1171,7 @@ def _fill_prompt(text, fields, handback, reason=None):
         raise ValueError(f"worker prompt: missing field(s) {', '.join(missing)}")
     values = {k: str(fields[k]) for k in PROMPT_FIELDS}
     values["local_command"] = values["local_command"].strip() or _NO_LOCAL_COMMAND
+    values["wake_command"] = wake_command(values.pop("launcher_terminal"), fields["n"])
     free_text = {"title": values.pop("title"), "reason": (reason or "").strip()}
     if handback is not None:
         values.update({k: str(handback[k]) for k in HANDBACK_FIELDS if k != "files"})
@@ -1147,7 +1179,7 @@ def _fill_prompt(text, fields, handback, reason=None):
                               or "- (the sync reported none — the merge itself will list them)")
     for name, value in values.items():
         text = text.replace("{" + name + "}", value)
-    known = (*PROMPT_FIELDS, *HANDBACK_FIELDS, *_PROMPT_SLOTS)
+    known = (*PROMPT_FIELDS, *HANDBACK_FIELDS, *_PROMPT_SLOTS, "wake_command")
     left = sorted(set(re.findall(r"\{(?:%s)\}" % "|".join(known), text))
                   - {"{%s}" % k for k in free_text})
     if left:
@@ -1165,7 +1197,8 @@ def render_worker_prompt(template, variant, fields, reason=None, handback=None):
       variant:  "fresh" (a clean checkout of the base) or "continue" (the worktree
                 or branch already carries a dead worker's progress — ADR-0011)
       fields:   {name: value} for every one of PROMPT_FIELDS. An empty
-                `local_command` renders as a no-op with a note.
+                `local_command` renders as a no-op with a note, and so does the
+                wake when `launcher_terminal` is empty (`wake_command`).
       reason:   why the previous attempt failed, when this is a retry; None otherwise
       handback: {name: value} for every one of HANDBACK_FIELDS when the worker is
                 started on a sync conflict handed back to it (`files` a list of

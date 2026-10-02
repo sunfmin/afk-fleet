@@ -957,7 +957,8 @@ def _prompt_template():
 
 PROMPT_FIELDS = {"n": 31, "title": "Names inspector tab", "repo": "acme/widgets",
                  "base_branch": "main", "local_command": "make test",
-                 "branch": "sunfmin/issue-31-names", "worktree_path": "/wt/issue-31"}
+                 "branch": "sunfmin/issue-31-names", "worktree_path": "/wt/issue-31",
+                 "launcher_terminal": "term_launcher-1"}
 
 
 def test_render_worker_prompt_fills_the_shipped_template():
@@ -994,6 +995,28 @@ def test_render_worker_prompt_fills_the_shipped_template():
     # no local gate configured: a no-op with a note, never an empty command line
     none = d.render_worker_prompt(t, "fresh", {**PROMPT_FIELDS, "local_command": "  "})
     assert "no gate.local_command configured" in none
+
+
+def test_a_worker_is_told_how_to_wake_the_launcher_and_nothing_else():
+    t = _prompt_template()
+    wake = 'orca terminal send --terminal term_launcher-1 --text "afk-wake #31" --enter'
+    assert d.wake_command("term_launcher-1", 31) == wake and d.wake_line(31) == "afk-wake #31"
+
+    # every way a worker is instructed carries the same one line: a fresh start, a
+    # continuation, and a hand-back delivered alone to a worker that is still there
+    for body in (d.render_worker_prompt(t, "fresh", PROMPT_FIELDS),
+                 d.render_worker_prompt(t, "continue", PROMPT_FIELDS),
+                 d.render_handback(t, PROMPT_FIELDS, HANDBACK)):
+        assert wake in body and "launcher_terminal" not in body and "{wake_command}" not in body
+
+    # no launcher terminal (a headless tick): a no-op with a note, never a broken
+    # command — and the same for anything that is not a bare handle, because the
+    # worker runs this string in its shell
+    for handle in ("", None, "  ", "term_1; rm -rf ~", "$(whoami)", "a b"):
+        cmd = d.wake_command(handle, 31)
+        assert cmd.startswith("true ") and "orca" not in cmd, (handle, cmd)
+    headless = d.render_worker_prompt(t, "fresh", {**PROMPT_FIELDS, "launcher_terminal": ""})
+    assert "orca terminal send" not in headless and "no coordinator terminal to wake" in headless
 
 
 HANDBACK = {"pr": 77, "pr_branch": "sunfmin/issue-31-names", "target": "main",

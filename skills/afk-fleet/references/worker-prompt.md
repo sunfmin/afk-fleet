@@ -24,8 +24,10 @@ and never needs to read this file. It is a template of named blocks:
   `{target_tip}` and `{files}`.
 
 The fields are `{n}`, `{title}`, `{repo}`, `{base_branch}`, `{local_command}` (from the issue and the
-config) and `{branch}`, `{worktree_path}` (the **actual** values orca returned — orca names the branch
-`<user>/…`, never assumed from `branch_pattern`). A field or slot the code cannot fill is an error: no
+config), `{branch}`, `{worktree_path}` (the **actual** values orca returned — orca names the branch
+`<user>/…`, never assumed from `branch_pattern`) and `{wake_command}` — the line that **wakes** the
+launcher, built from the handle of the terminal the launcher runs in, or a no-op when it runs in
+none (ADR-0020). A field or slot the code cannot fill is an error: no
 worker is ever started on a prompt with a literal placeholder in it. A test renders both variants.
 
 <!--afk:block prompt-->
@@ -58,6 +60,15 @@ leaving exactly one of these two durable, machine-readable facts:
 
 **Do not just stop.** No PR and no verdict marker is the one failure the fleet cannot see — it parks
 your claim forever. Emit a PR or a verdict, every time.
+
+**Then wake the coordinator.** The moment your one outcome is on GitHub — the PR is open, or the
+verdict marker is posted — run this, exactly as written, once:
+```bash
+{wake_command}
+```
+It carries nothing: the coordinator still reads your outcome from GitHub, and this line only ends its
+sleep so it acts now instead of at its next poll. If the command fails, ignore it and stop as usual —
+the coordinator polls anyway. Never send anything else to that terminal.
 
 ## Publish progress as you go (every worker)
 
@@ -113,8 +124,8 @@ anyway (ADR-0011).
    leave it genuinely green, not green-if-you-squint.
 5. **Open the PR:** `gh pr create --base {base_branch} --head {branch} --title "..." --body "Closes #{n}
    ..."`. Body: what you changed, how you verified, any follow-ups.
-6. **Report done:** your PR is the result. Emit the PR URL and "done", then stop — do not merge, do
-   not touch other issues. (The coordinator detects completion from the PR on GitHub, not from your
+6. **Report done:** your PR is the result. Wake the coordinator (the one line under "outcome"
+   above), emit the PR URL and "done", then stop — do not merge, do not touch other issues. (The coordinator detects completion from the PR on GitHub, not from your
    terminal, so the PR — its `Closes #{n}` body — and this line are what matter.)
    **Your PR may come back to you.** If `{base_branch}` moves before the coordinator merges and your
    branch then conflicts with it, the conflict is handed back to you in this same session: one line
@@ -206,8 +217,12 @@ any step above that says to implement the issue or to open a PR.** Do exactly th
    ```bash
    git push origin HEAD:{pr_branch}
    ```
-5. **Stop.** That push is your outcome: the coordinator merges PR #{pr} once its head contains the
-   `{target}` tip above. Do not open another PR, do not close this one, do not merge. If `{target}`
+5. **Wake the coordinator, then stop.** That push is your outcome: run this once, exactly as
+   written (if it fails, ignore it — the coordinator polls anyway):
+   ```bash
+   {wake_command}
+   ```
+   The coordinator merges PR #{pr} once its head contains the `{target}` tip above. Do not open another PR, do not close this one, do not merge. If `{target}`
    moves again before the merge, this comes back to you once more — each round merges a newer tip.
 
 If you genuinely cannot resolve it, say so instead of going quiet: post a **`phase=giving-up`**

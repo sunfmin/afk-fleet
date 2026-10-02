@@ -978,10 +978,14 @@ def _handback_fields(pr, handback):
 
 
 def _prompt_fields(a, cfg, issue, path, branch):
-    """The PROMPT_FIELDS of a worker prompt for one issue in one worktree."""
+    """The PROMPT_FIELDS of a worker prompt for one issue in one worktree. The
+    launcher's terminal is read off the environment, never passed in: a tick is a
+    subagent of the launcher, so the handle orca gave that terminal is the one
+    this process inherited (ADR-0020)."""
     return {"n": issue["number"], "title": issue["title"], "repo": a.repo,
             "base_branch": cfg["base_branch"], "local_command": cfg["gate"]["local_command"],
-            "branch": branch, "worktree_path": path}
+            "branch": branch, "worktree_path": path,
+            "launcher_terminal": os.environ.get("ORCA_TERMINAL_HANDLE", "")}
 
 
 def _start_worker(a, cfg, rem, issue, start, reason=None):

@@ -44,8 +44,9 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 8. The worker **syncs** (merges the base into its branch, never rebases), pushes, and runs the
    **local gate** until it is green on the combined tree.
    `skills/afk-fleet/references/worker-prompt.md:local_command`
-9. The worker opens a PR whose body says `Closes #n`, and stops; it never merges.
-   `skills/afk-fleet/references/worker-prompt.md:Closes`
+9. The worker opens a PR whose body says `Closes #n`, **wakes** the launcher with one line that
+   carries nothing, and stops; it never merges.
+   `skills/afk-fleet/scripts/afk_decide.py:wake_command`
 10. A later tick's rebuild matches that PR to the claim and classifies it: awaiting merge once its
     checks are green (or, with `gate.ci: local`, as soon as the PR is open).
     `skills/afk-fleet/scripts/afk_decide.py:subclassify_pr`
@@ -119,6 +120,8 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 - The digest is unchanged: no tick is spawned, the same call refreshes the heartbeat if the fleet
   holds claims and returns the sleep, and a full tick is forced every `force_tick_after_skips`
   cycles: `skills/afk-fleet/scripts/afk_decide.py:cycle_wake`, ADR-0007.
+- A worker's **wake** arrives during the sleep of step 9: the launcher goes to step 6 at once, and
+  acts on nothing the line says, `skills/afk-fleet/SKILL.md:wake`, ADR-0020.
 - The org forbids `refs/afk/*`, so claims fall back to ordinary branches:
   `skills/afk-fleet/scripts/afk.py:_usable_namespace`.
 - A local gate meets a target branch that requires checks, and bootstrap stops:
@@ -229,6 +232,9 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   enters the retry ladder. (ADR-0019;
   `test_hand_back_returns_a_sync_conflict_to_the_worker_that_wrote_the_branch`,
   `test_an_unanswered_hand_back_falls_through_to_the_nudge_and_then_the_retry_ladder`)
+- A wake carries no state and nothing waits on one: the cycle it opens reads GitHub like any other,
+  and a worker with no launcher terminal to wake is given a no-op. (ADR-0020;
+  `test_a_worker_is_told_how_to_wake_the_launcher_and_nothing_else`)
 - An unreadable remote is an error, never an empty fleet, and no subcommand runs without the run's
   config. (ADR-0015, ADR-0016; `test_an_unreadable_remote_is_an_error_not_an_empty_fleet`,
   `test_config_is_required_and_resolves_one_way_on_every_subcommand`)
