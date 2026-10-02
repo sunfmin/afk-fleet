@@ -169,7 +169,8 @@ an error, never a lost race — ADR-0015). Where the refs live is the config key
 one of exactly two layouts: `refs/afk` (`refs/afk/claim/<n>`), or `refs/heads` (ordinary
 `afk-claim/<n>` branches), which bootstrap's probe switches to when an org ruleset forbids non-branch
 refs. Every later call inherits it through the config, which every call must carry (ADR-0016). Its marker commit names the owning instance.
-It is the single source of truth for "taken" — replacing the assignee, which under a shared account
+Each ownership generation has a unique marker SHA; release compares that observed SHA so a stale
+owner cannot delete a successor. It is the single source of truth for "taken" — replacing the assignee, which under a shared account
 cannot say *who* owns an issue. Deleted at every terminal transition; a leaked claim is a phantom lock
 that silently starves an issue.
 _Avoid_: assignee (dropped as a claim signal), assignment, lock (too generic)
@@ -178,7 +179,9 @@ _Avoid_: assignee (dropped as a claim signal), assignment, lock (too generic)
 The liveness signal a **fleet instance** publishes for itself — one ref `afk-heartbeat/<id>` carrying
 a timestamp, refreshed while it holds any claim (per instance, not per claim; roughly once per
 `claim_lease_ttl`/3, not once per tick). A claim is leased-live while its owner's heartbeat is within
-`claim_lease_ttl`; its freshness is the only thing that lets a peer tell a live owner from a dead one.
+`claim_lease_ttl`; a newly created or transferred claim also grants one bounded TTL from its own
+timestamp before the first heartbeat. Reclaim rechecks those timestamps before its claim-SHA CAS;
+that liveness read and the CAS are separate transactions, not an atomic distributed lease.
 _Avoid_: ping, keepalive, liveness probe (that name is the local orca-cli worker check — a different
 thing, at a different granularity)
 
@@ -204,8 +207,8 @@ Contrast **Stale claim**, which is a peer's.
 _Avoid_: stuck issue, dead worker, zombie
 
 **Stale claim**:
-A **peer's** claim whose owner's **heartbeat** has expired past `claim_lease_ttl` — evidence the owning
-instance died mid-flight. It is the only claim a fleet may take from another *unattended*: reclaimed
+A **peer's** claim whose owner's **heartbeat** and initial claim-timestamp grace have both expired
+past `claim_lease_ttl` — evidence the owning instance may have died mid-flight. It is the only claim a fleet may take from another *unattended*: reclaimed
 by an atomic `git push --force-with-lease` takeover of the ref, and only then, then recovered by
 **continuation**. A live peer's claim is never touched — that is what keeps cooperating fleets from
 cannibalising each other's in-flight work. The lease-bypassing, human-authorized sibling of this
