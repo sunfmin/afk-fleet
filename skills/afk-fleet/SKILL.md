@@ -210,8 +210,9 @@ streak, what is in flight — lives in there, maintained by code.
    gate and the tick read GitHub as always, and a cycle it opens may well `skip`. A wake that arrives
    while a tick is running needs nothing until that cycle closes; then open the next one at once
    instead of sleeping.
-5. **Stop** on the user's word: run one final **drain** tick that `afk release <n>`s claims with no PR
-   yet and retains those with an open PR (see [Cooperative multi-fleet](references/cooperative-multi-fleet.md)), then
+5. **Stop** on the user's word: run one final **drain** tick that releases claims with no PR using
+   `afk release <n> --expect-sha <sha>` from each observed `mine` row,
+   and retains those with an open PR (see [Cooperative multi-fleet](references/cooperative-multi-fleet.md)), then
    spawn no more ticks. In-flight workers finish on their own; their PRs are inherited and merged by a
    peer (or a later run) once the lease expires; escalated issues stay labelled for the human.
 
@@ -239,7 +240,9 @@ the two bootstrap ones that run before a config exists — `afk config`, `afk wo
 one that touches GitHub takes `--repo <repo>`. **Pass both on every call** — the config is what carries
 the claim namespace, the lease, the labels and the gate mode. A call without `--config` is refused
 (exit 3); it never runs on defaults. The inline examples below abbreviate both away
-(`afk release <n>`) only to stay readable.
+(`afk release <n> --expect-sha <sha>`) only to stay readable. Standalone release always uses the
+`sha` of the observed `mine` row from `rebuild`; `released: false` means ownership changed, so leave
+the successor and its worktree alone and rebuild. Never retry with the successor's SHA.
 
 **The tool is one executable word.** `<skill>/scripts/afk.py` is executable — call it by its path, with
 no interpreter in front. If you shorten it, hold only the **path** in a variable or define a shell
@@ -267,7 +270,7 @@ spawns).
    It gathers issues + PRs + claim/heartbeat refs once (the same gatherer the launcher's cycle
    gate reads through — the raw 200-issue JSON lives and dies inside the tool) and returns the whole
    working set: `{frontier: {dispatch, excluded}, mine: [{number, status, board_phase, pr, checks,
-   attempt}…], peer_live, stale: [{number, sha}…], free_slots, fingerprint, now}`. Then act on it:
+   attempt, sha}…], peer_live, stale: [{number, sha}…], free_slots, fingerprint, now}`. Then act on it:
    - **Frontier** — `frontier.dispatch` is the dispatchable set (`open` + `ready_label` + no
      `epic_labels` + **unclaimed** + **no open linked PR** + zero open `blocked_by`) — the published
      contract; `--plan` and live agree because both are this one code path. `free_slots` is how many
@@ -276,7 +279,7 @@ spawns).
      next: *awaiting_merge* → `afk merge` (see [Merge](#merge-serialized)); *awaiting_ci* → leave;
      *failure* → `afk fail` (see [Failure handling](#failure-handling--bounded-retry--escalate-never-silently-drop));
      *closed* → the issue is already closed but its claim outlived it (a merge or close that died
-     before releasing): `afk release <n>`, nothing else; *handed_back* → a sync conflict on its PR is
+     before releasing): `afk release <n> --expect-sha <sha>`, nothing else; *handed_back* → a sync conflict on its PR is
      with its worker and the PR head does not contain the target tip yet: **never `afk merge` it** —
      probe the worker and ask `afk no-pr`, exactly as for *no_pr* (see [Hand-back](#hand-back--a-sync-conflict-goes-back-to-its-worker));
      *no_pr* → see below. (In `gate.ci: local` only *awaiting_merge*, *handed_back*, *closed* and
@@ -320,15 +323,16 @@ spawns).
        - **dead** / `orphan` (no live worker/terminal at all) → **orphaned claim**: `afk dispatch
          --issue <n>` recovers it by **continuation** — it resumes from the worktree still here, else
          from the pushed branch, and starts from base only when nothing survived (see
-         [Recovery by continuation](references/recovery.md)). Or `afk release <n>` if the issue should
+         [Recovery by continuation](references/recovery.md)). Or `afk release <n> --expect-sha <sha>` if the issue should
          go back to the frontier instead.
      The liveness probe and the empty-diff verification stay judgment; `no-pr` is a separate call from
      `rebuild` because it asks *this machine* about a worktree, and `rebuild` stays machine-independent
      (ADR-0008).
-   - **Stale peer claims** — **`stale`** (a peer owns it and its `afk-heartbeat/<id>` is expired past
-     `claim_lease_ttl`) is the only foreign claim I may take *unattended*: `afk reclaim <n> --instance
-     <id> --expect-sha <the sha rebuild reported>` (atomic — fails if it moved), then `afk dispatch
-     --issue <n>` — a reclaimed claim's worker is dead by definition, so it is recovered by
+   - **Stale peer claims** — **`stale`** (both the initial claim grace and its owner's heartbeat
+     are missing/expired past `claim_lease_ttl_seconds`) is the only foreign claim I may take
+     *unattended*: `afk reclaim <n> --instance <id> --expect-sha <the sha rebuild reported>`.
+     The command rechecks liveness and compares the generation. Only if `won: true`, run
+     `afk dispatch --issue <n>` — the old owner is presumed dead, so its work is recovered by
      **continuation** like any dead claim of mine (the worktree is reused when the dead peer ran on
      *this* box). **`peer_live`** is left strictly alone. The human-gated, lease-skipping sibling of
      this reclaim is [`--takeover`](#takeover-mode---takeover).
@@ -436,6 +440,7 @@ from another machine). It stops, with an `outcome`, wherever the next move is yo
 | `outcome` | What happened | What you do |
 |---|---|---|
 | `merged` | Landed; board upserted, claim released, worktree removed. | Count it in `merged`; the slot is free. |
+| `claim_lost` | The ownership generation changed; `merged` reports whether the remote merge request already succeeded, and cleanup is withheld. | Leave the successor alone and rebuild. Do not run `fail`, release its claim, or remove its worktree. |
 | `conflict` | The sync conflicted. The merge is **left in progress** in `worktree`, `files` unmerged; nothing was pushed. | **Hand it back to its worker**: `afk hand-back --issue <n>` (see [Hand-back](#hand-back--a-sync-conflict-goes-back-to-its-worker)). Not `afk fail` — the work is not failing. |
 | `handed_back` | An earlier conflict on this PR is still with its worker. Nothing was touched. | Leave it — a *handed_back* row is never merged. |
 | `gate_red` | `local`: the merge-time gate was red, and its `gate.excerpt` is now a PR comment. `required`: the PR's checks are red. | `afk fail --issue <n> --reason "<the failure>"`. |
@@ -443,9 +448,12 @@ from another machine). It stops, with an `outcome`, wherever the next move is yo
 | `no_checks` | `required`, and the PR has no checks at all — the progressive gate. | If you judge the issue's acceptance criteria met, re-run with `--allow-no-checks`; else `afk fail`. |
 | `needs_verify` | `gate.adversarial_verify` is on, the machine gate is green, and `--verified` does not name `head`. | Run the [adversarial verify](references/completion-gate.md) against `head`. Passed → re-run with `--verified <head>`; refuted → `afk fail`. |
 
-The invariant every path keeps: **what lands on the target was gated in the form it lands.** A sync
-that moved the head invalidates checks and verifications of the old one, and gh refuses the merge if
-the branch moved after the gate. An `{"error": …}` settles nothing — the claim is still yours.
+The gate is bound to the **observed committed head**. A sync that moved that head invalidates
+checks and verifications of the old one, and gh refuses the merge if the branch moved after the gate.
+The local clean-worktree guard is not hermetic isolation, and head pinning does not pin a concurrently
+advancing target; see the [completion-gate requirements](references/completion-gate.md#local-worktree-and-environment-requirements). An `{"error": …}` confirms no settlement; rebuild ownership before
+retrying. Claim fences and compare-and-delete protect against stale owners, with the cross-service
+race limits described in [Cooperative multi-fleet](references/cooperative-multi-fleet.md#ownership-fences-and-limits).
 
 The fleet's mandate **ends at a green merge to `merge.target`.** Deploying is a separate,
 human-gated step — never done here.
@@ -565,8 +573,9 @@ touch shared root config are naturally throttled by the DAG — chain them with 
 - **Claim before work; release on every terminal transition.** `afk dispatch` creates the
   `afk-claim/<n>` ref first — if the create is rejected, a peer owns it and nothing is started.
   `afk merge`, `afk escalate` and `afk close` each delete it as their last step; an orphan-release and a
-  *closed* row are yours to `afk release`. A leaked ref is a phantom lock. Reconcile only your own claims, and take a peer's
-  only when its heartbeat is expired (a **stale claim**) — the single exception is an explicit human
+  *closed* row are yours to `afk release <n> --expect-sha <sha>`. A leaked ref is a phantom lock.
+  Reconcile only your own claims, and take a peer's only when both its initial claim grace and
+  heartbeat have expired (a **stale claim**) — the single exception is an explicit human
   [`--takeover`](#takeover-mode---takeover).
 - **Preserve a dead worker's progress.** Recover a dead claim by **continuation** (a plain
   `afk dispatch`), and discard an attempt only where discarding is the point — `afk fail`'s retry, or
