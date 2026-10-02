@@ -80,8 +80,9 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
    and returns the run's config — **hold its `config` from here on, in place of step 1's**:
    - **Claim namespace** — the returned `config` carries the `claim_namespace` that actually works, so
      every later call inherits it through `--config` with nothing extra to pass. If it reports
-     `blocked` (an org ruleset forbids `refs/afk/*`), that namespace is the `refs/heads` fallback:
-     **warn** that claim refs are then ordinary branches that may trigger `on: push` CI. See
+     `"blocked": true` (an org ruleset forbids `refs/afk/*`; `detail` is the server's rejection), that
+     namespace is the `refs/heads` fallback: **warn** that claim refs are then ordinary branches that
+     may trigger `on: push` CI. See
      [Cooperative multi-fleet](references/cooperative-multi-fleet.md). An `{"error": …}` here means the
      remote could not be pushed to at all (auth, network) — fix that; it is not a namespace question.
    - **Branch protection** (only when `gate.ci: local`) — `protection.verdict == "error"` means
@@ -212,14 +213,18 @@ its arguments and return shape — is disclosed in
 [references/tools.md](references/tools.md); read it when you need a signature not already shown inline
 at its call site.
 
-**One calling convention.** Every subcommand takes the run's `--config '<config json>'`, and every one
-that touches GitHub takes `--repo <repo>`. **Pass both on every call** — the config is what carries the
-claim namespace, the lease, the labels and the gate mode, so a call without it silently runs on
-defaults. The inline examples below abbreviate them away (`afk release <n>`) only to stay readable.
+**One calling convention.** Every subcommand **requires** the run's `--config '<config json>'` (all but
+the two bootstrap ones that run before a config exists — `afk config`, `afk worker-command`), and every
+one that touches GitHub takes `--repo <repo>`. **Pass both on every call** — the config is what carries
+the claim namespace, the lease, the labels and the gate mode. A call without `--config` is refused
+(exit 3); it never runs on defaults. The inline examples below abbreviate both away
+(`afk release <n>`) only to stay readable.
 
 **Exit 3 is never an outcome.** A subcommand that could not do its job prints `{"error": …}` and exits
-3. That is an operational failure (auth, network, a rejected push, bad input) — stop and report it in
-the tick summary's `note`; do not read it as "nothing to do".
+3. That is an operational failure (auth, network, a rejected push, an unreadable remote, a claim that
+could not be deleted, a bad command line) — stop and report it in the tick summary's `note`; do not
+read it as "nothing to do". The converse holds too: an exit-0 result is always a real answer — an
+empty `mine` means you hold nothing, `"released": true` means the claim is gone.
 
 ## A tick (`--tick`) — one reconciliation pass
 
@@ -235,14 +240,15 @@ spawns).
    It gathers issues + PRs + claim/heartbeat refs once (the same gatherer the launcher's fingerprint
    gate reads through — the raw 200-issue JSON lives and dies inside the tool) and returns the whole
    working set: `{frontier: {dispatch, excluded}, mine: [{number, status, board_phase, pr, checks,
-   attempt_labels}…], peer_live, stale: [{number, sha}…], fingerprint, now}`. Then act on it:
+   attempt}…], peer_live, stale: [{number, sha}…], fingerprint, now}`. Then act on it:
    - **Frontier** — `frontier.dispatch` is the dispatchable set (`open` + `ready_label` + no
      `epic_labels` + **unclaimed** + **no open linked PR** + zero open `blocked_by`) — the published
      contract; `--plan` and live agree because both are this one code path.
-   - **In-flight** — each of **`mine`** arrives subclassified: *awaiting_merge* → merge;
-     *awaiting_ci* → leave; *failure* → failure handling; *no_pr* → see below. (In `gate.ci: local`
-     only *awaiting_merge* and *no_pr* occur — no checks are read, and the gate runs inside the merge
-     sequence instead; ADR-0012.) For *no_pr*, **never decide from terminal chrome alone.** A worker
+   - **In-flight** — each of **`mine`** arrives subclassified, and its `status` names what you do
+     next: *awaiting_merge* → run the [merge sequence](#merge-serialized); *awaiting_ci* → leave;
+     *failure* → failure handling; *no_pr* → see below. (In `gate.ci: local` only *awaiting_merge* and
+     *no_pr* occur — no checks are read, and the gate runs inside the merge sequence instead;
+     ADR-0012.) For *no_pr*, **never decide from terminal chrome alone.** A worker
      that ran to completion, concluded there was no PR to open, posted its reason, and went idle looks
      *identical* to one still coding — both are "a connected terminal with a title". Run the orca
      **liveness** probe (bounded, never a transcript read) for the one thing code cannot see — is the
@@ -256,7 +262,8 @@ spawns).
      the probe says.) The tool gathers the rest itself — the worktree's git progress, the worker's
      `afk:verdict` marker, the state of every issue that marker says it is blocked by — computes how
      long the worker has been quiet, and returns `{outcome, action, idle_seconds, open_blockers,
-     progress, verdict}`. Act on `action`:
+     progress, worker_verdict}`. `outcome` / `action` are the tool's conclusion; `worker_verdict` is
+     only what the worker *declared* in its marker (one of the inputs). Act on `action`:
        - **coding** / `leave` (terminal busy, or a sign of life within `worker_idle_grace_seconds`) →
          still implementing, **leave it**. Commits ahead or a dirty tree are *standing* facts, never
          signs of life (ADR-0013) — they do not keep a claim here;
@@ -337,9 +344,9 @@ spawns).
      "claimed, coding, no PR yet" phase — the claim lives in the hidden `refs/afk/*` and the assignee is
      unused). `afk status <n> --phase <board_phase> --instance <id> [--pr <pr>] [--attempt <k>]
      --repo <repo>` renders a progress checklist and writes the one marker-tagged comment **only when it
-     changed** (idempotent — re-entrant ticks and retries never spam). The phase is not yours to
-     derive: pass the `board_phase` that `rebuild` put on the claim's `mine` row (for `ci_failed`,
-     add `--attempt` — the number in its `afk-attempt/<k>` label). The two **terminal** phases are
+     changed** (idempotent — re-entrant ticks and retries never spam). Neither value is yours to
+     derive: pass the `board_phase` and the `attempt` that `rebuild` put on the claim's `mine` row.
+     The two **terminal** phases are
      upserted **before the claim is released**: `--phase merged` in the merge sequence, `--phase
      escalated` in the escalate step. The board is human-read only — no tick ever parses it back
      (ADR-0006).
@@ -425,9 +432,10 @@ Per issue, on any of {worker failed, gate red — the PR's CI checks *or* a red 
 **idle_failed** — a `giving-up` verdict, or a worker gone idle with **no verdict at all** after grace}:
 
 1. **Retry up to `retry` times** (default 2). The attempt count lives as an **`afk-attempt/<n>`
-   label** on the issue (not in tick memory). `afk next-attempt --labels <the issue's labels>
-   --config <config>` reads it and returns the verdict: on `{"action":"retry", "to_label":…}`, swap the label,
-   tear down the worktree (`orca worktree rm --worktree issue:<n> --force`), and re-dispatch —
+   label** on the issue (not in tick memory); `rebuild` reads it onto the claim's `mine` row as
+   `attempt`. `afk next-attempt --attempt <that attempt> --config <config>` returns the decision: on
+   `{"action":"retry", "from_label":…, "to_label":…}`, swap the label (`from_label` is null on the
+   first retry — there is nothing to remove), tear down the worktree (`orca worktree rm --worktree issue:<n> --force`), and re-dispatch —
    **keeping the claim ref** (you still own the issue). The
    failure reason handed to the new worker is **re-read from where it already lives** — the PR's CI
    checks, the merge-time gate excerpt posted as a PR comment, the verifier's PR review comment, or the
