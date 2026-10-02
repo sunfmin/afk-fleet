@@ -175,7 +175,7 @@ streak, what is in flight — lives in there, maintained by code.
 
 1. **Open the cycle:**
    ```bash
-   python3 <skill>/scripts/afk.py cycle --repo <repo> --instance <id> --config '<config json>' [--state '<state json>']
+   <skill>/scripts/afk.py cycle --repo <repo> --instance <id> --config '<config json>' [--state '<state json>']
    ```
    (No `--state` on the very first cycle.) It gathers what a tick's Rebuild would observe
    (issues+labels, PRs+checks, claim refs) **inside the tool** — the raw JSON never enters the
@@ -193,7 +193,7 @@ streak, what is in flight — lives in there, maintained by code.
    pace a fleet holding claims as if it held none.
 3. **Close the cycle** — hand the summary back, untouched:
    ```bash
-   python3 <skill>/scripts/afk.py cycle --repo <repo> --instance <id> --config '<config json>' \
+   <skill>/scripts/afk.py cycle --repo <repo> --instance <id> --config '<config json>' \
         --state '<state json>' --summary '<the tick's summary json>'
    ```
    → `{state, sleep_seconds}`. Keep `state`; surface a short progress line to the user from the summary,
@@ -277,7 +277,7 @@ spawns).
      **liveness** probe (bounded, never a transcript read) for the one thing code cannot see — is the
      terminal `busy`, `idle`, or is there `none` — then make **one call**:
      ```bash
-     python3 <skill>/scripts/afk.py no-pr --issue <n> --terminal <busy|idle|none> \
+     <skill>/scripts/afk.py no-pr --issue <n> --terminal <busy|idle|none> \
           [--terminal-idle-seconds <s>] --repo <repo> --config '<config json>'
      ```
      (`--terminal-idle-seconds` is how long the terminal has shown no activity, if the probe says.)
@@ -330,7 +330,7 @@ spawns).
    - **Dispatch** to fill the free slots (`free_slots`, plus one for every claim this tick settled),
      taking `frontier.dispatch` in order:
      ```bash
-     python3 <skill>/scripts/afk.py dispatch --issue <n> --instance <id> --worker-command '<worker_command>' \
+     <skill>/scripts/afk.py dispatch --issue <n> --instance <id> --worker-command '<worker_command>' \
           --repo <repo> --config '<config json>'
      ```
      One call claims the issue, has **orca** create the worktree + branch at the remote's current base
@@ -412,7 +412,7 @@ Within a tick, merges are **strictly serialized** — one `afk merge` at a time 
 never corrupt the target branch:
 
 ```bash
-python3 <skill>/scripts/afk.py merge --issue <n> --instance <id> --repo <repo> --config '<config json>'
+<skill>/scripts/afk.py merge --issue <n> --instance <id> --repo <repo> --config '<config json>'
 ```
 
 One call runs the whole sequence: **sync** the branch up to the latest `merge.target` (by **merging,
@@ -446,7 +446,7 @@ adversarial refute, a **sync** conflict you could not resolve, a `no_pr` claim c
 period after its one nudge}:
 
 ```bash
-python3 <skill>/scripts/afk.py fail --issue <n> --instance <id> --worker-command '<worker_command>' \
+<skill>/scripts/afk.py fail --issue <n> --instance <id> --worker-command '<worker_command>' \
      --reason "<why it failed>" --repo <repo> --config '<config json>'
 ```
 
