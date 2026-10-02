@@ -6,8 +6,9 @@ that file to the worker's terminal (the prompt itself, sent as text, lands as a 
 to have confirmed instead of acting on) — **a tick never fills or sends it by hand**,
 and never needs to read this file. It is a template of named blocks:
 
-- `prompt` — the body. It names three **slots**: `{opening}` and `{step1}`, each filled from the block
-  of that name for the chosen variant, and `{retry_reason}`, filled only for a retry.
+- `prompt` — the body. It names four **slots**: `{opening}` and `{step1}`, each filled from the block
+  of that name for the chosen variant, `{retry_reason}`, filled only for a retry, and `{handback}`,
+  filled only for a worker started on a hand-back.
 - `opening.fresh` / `step1.fresh` — a worker starting from a clean checkout of the latest base.
 - `opening.continue` / `step1.continue` — a worker **continuing** an issue whose previous worker died:
   its worktree or branch already carries that progress, so inspection comes first (ADR-0011). Every
@@ -15,6 +16,12 @@ and never needs to read this file. It is a template of named blocks:
   is the same for both.
 - `retry_reason` — appended when the retry ladder starts a fresh attempt, carrying the failure reason
   the tick re-read from where it lives (`{reason}`).
+- `handback` — the instruction for a **sync conflict handed back** to the worker that wrote the
+  branch (ADR-0019). It is used two ways: `afk hand-back` writes it **alone** as the brief of a worker
+  whose terminal is still there (it already has the rest), and it is appended to the continue-mode
+  prompt when that worker is gone and a new one is started in its worktree. Its own fields are
+  `{pr}`, `{pr_branch}` (the PR's head branch — where the resolution is pushed), `{target}`,
+  `{target_tip}` and `{files}`.
 
 The fields are `{n}`, `{title}`, `{repo}`, `{base_branch}`, `{local_command}` (from the issue and the
 config) and `{branch}`, `{worktree_path}` (the **actual** values orca returned — orca names the branch
@@ -99,9 +106,9 @@ anyway (ADR-0011).
    **Merge, never rebase:** a rebase replays your commits and drops the merge commits, re-igniting
    conflicts whose resolutions lived only inside them; and because the coordinator squash-merges, the
    target branch's history is identical either way (ADR-0012). **Resolve integration conflicts here**
-   — you are the author, your context is loaded, and the fix is cheap. The only other venue is the
-   coordinator's serialized merge point, where you are gone, the queue is blocked, and it costs a
-   retry. Note the coordinator re-runs this same `{local_command}` at merge time against the tree that
+   — you are the author, your context is loaded, and the fix is cheap. A conflict that only shows up
+   later, at the coordinator's serialized merge point, comes back to you anyway (see step 6) — after
+   a round trip that blocks the queue. Note the coordinator re-runs this same `{local_command}` at merge time against the tree that
    actually lands, and in `gate.ci: local` repos that run is the *only* machine gate there is — so
    leave it genuinely green, not green-if-you-squint.
 5. **Open the PR:** `gh pr create --base {base_branch} --head {branch} --title "..." --body "Closes #{n}
@@ -109,6 +116,10 @@ anyway (ADR-0011).
 6. **Report done:** your PR is the result. Emit the PR URL and "done", then stop — do not merge, do
    not touch other issues. (The coordinator detects completion from the PR on GitHub, not from your
    terminal, so the PR — its `Closes #{n}` body — and this line are what matter.)
+   **Your PR may come back to you.** If `{base_branch}` moves before the coordinator merges and your
+   branch then conflicts with it, the conflict is handed back to you in this same session: one line
+   pointing at this brief file, rewritten with what to do — merge the target in, resolve, re-run the
+   gate, push to the **same** PR. Carry it out exactly like a first instruction.
 
 ## Hard rules
 - One issue, one worktree. Never edit files outside your worktree.
@@ -121,6 +132,8 @@ anyway (ADR-0011).
   comment and will retry or escalate.
 
 {retry_reason}
+
+{handback}
 <!--/afk:block-->
 
 <!--afk:block opening.fresh-->
@@ -159,4 +172,45 @@ This issue is being **retried**: an earlier attempt was discarded and you are st
 `{base_branch}`. Address this directly — it is the reason that attempt did not land:
 
 {reason}
+<!--/afk:block-->
+
+<!--afk:block handback-->
+## A sync conflict on your PR was handed back to you
+
+The work on `{repo}#{n}` is finished and PR #{pr} is open — the coordinator was about to merge it.
+But `{target}` moved first: merging its tip (`{target_tip}`) into the PR's branch `{pr_branch}`
+conflicts in:
+
+{files}
+
+Nothing is wrong with the work and nothing was discarded: the PR, the branch and this worktree
+(`{worktree_path}`) are as they were, with no merge in progress. The branch is yours, so the
+resolution is yours — the coordinator has none of the context it takes. **This instruction replaces
+any step above that says to implement the issue or to open a PR.** Do exactly this:
+
+1. **Fetch and merge the target — never rebase** (a rebase drops the merge commits and re-ignites
+   the conflicts resolved inside them; ADR-0012):
+   ```bash
+   git fetch origin {target}
+   git merge origin/{target}
+   ```
+2. **Resolve every conflict so both sides' intent survives.** Read what landed first — `git log
+   HEAD..origin/{target}` and the diffs of the conflicting commits — then fix each file, `git add`
+   it, and **commit the merge**. Do not drop the other change to make yours fit, and do not
+   re-implement the issue.
+3. **Run the gate until it is green**, committing each fix:
+   ```bash
+   {local_command}
+   ```
+4. **Push to the existing PR's branch** — the same PR, never a new one:
+   ```bash
+   git push origin HEAD:{pr_branch}
+   ```
+5. **Stop.** That push is your outcome: the coordinator merges PR #{pr} once its head contains the
+   `{target}` tip above. Do not open another PR, do not close this one, do not merge. If `{target}`
+   moves again before the merge, this comes back to you once more — each round merges a newer tip.
+
+If you genuinely cannot resolve it, say so instead of going quiet: post a **`phase=giving-up`**
+`afk:verdict` marker comment on issue #{n} naming the stuck point. Silence here is failed like any
+other silence — and failing discards this branch.
 <!--/afk:block-->

@@ -18,7 +18,8 @@ injected, fixture-tested). This file only gathers their inputs — git refs, a
 worktree's git, gh, orca, the login shell — and applies their effects.
 
 The tick's Act half is transitions, not recipes (ADR-0017): `dispatch` starts a
-worker, `merge` lands a PR, `fail` / `escalate` / `close` settle a claim. Each
+worker, `merge` lands a PR, `hand-back` returns a sync conflict to its worker,
+`fail` / `escalate` / `close` settle a claim. Each
 performs its whole ordered sequence in one process, so an invariant like "relabel
 before release" or "start from the fetched base tip" is code, not a paragraph.
 
@@ -201,6 +202,26 @@ def _issue_state(repo, number):
     """"open" | "closed", or None if the issue could not be read."""
     p = _gh(["api", f"repos/{repo}/issues/{number}", "--jq", ".state"], check=False)
     return p.stdout.strip() or None if p.returncode == 0 else None
+
+
+def _contains(repo, sha, head):
+    """Does `head` contain commit `sha`? Asked of GitHub (one compare, no objects
+    fetched), so it reads the same from any machine. Raises when it cannot be
+    read: "could not look" is never "the worker has not answered"."""
+    behind = _gh(["api", f"repos/{repo}/compare/{sha}...{head}", "--jq", ".behind_by"]).stdout
+    return int(behind.strip()) == 0
+
+
+def _open_handback(repo, pr):
+    """The hand-back still open on a PR (`afk_decide.handback_open`) → its record,
+    or None when the PR was never handed back or its head already contains the
+    target tip the hand-back named."""
+    handback = afk_decide.latest_handback(_issue_comments(repo, pr["number"]))
+    if handback is None:
+        return None
+    head = pr["headRefOid"]
+    contains = head != handback["head"] and _contains(repo, handback["tip"], head)
+    return handback if afk_decide.handback_open(handback, head, contains) else None
 
 
 def _orca_worktree_rows():
@@ -635,9 +656,10 @@ def cmd_cycle(a):
 def cmd_rebuild(a):
     """One read-only call → the tick's whole working set (ADR-0008). The
     per-issue blocked_by read is paid only by issues that pass every cheaper
-    eligibility check, and the per-issue state read only by a claim of mine whose
-    issue is missing from the open list. Strictly observation: nothing here
-    writes a ref, a comment, or a PR."""
+    eligibility check, the per-issue state read only by a claim of mine whose
+    issue is missing from the open list, and the hand-back read only by a claim of
+    mine that has a PR. Strictly observation: nothing here writes a ref, a
+    comment, or a PR."""
     cfg = _cfg(a)
     issues, prs, claims, heartbeats = _gather(a, cfg)
     blocked = {}
@@ -650,8 +672,12 @@ def cmd_rebuild(a):
     closed = [c["number"] for c in claims
               if c["instance"] == a.instance and c["number"] not in listed
               and _issue_state(a.repo, c["number"]) == "closed"]
+    my_prs = {c["number"]: afk_decide.closing_pr(prs, c["number"])
+              for c in claims if c["instance"] == a.instance}
+    handed_back = [n for n, pr in my_prs.items() if pr and _open_handback(a.repo, pr)]
     return afk_decide.assemble_working_set(issues, prs, claims, heartbeats, blocked,
-                                           a.instance, _now(a), cfg, closed=closed)
+                                           a.instance, _now(a), cfg, closed=closed,
+                                           handed_back=handed_back)
 
 
 def _issue_worktree(repo, number):
@@ -665,13 +691,16 @@ def _issue_worktree(repo, number):
 
 def cmd_no_pr(a):
     """Why does one of my claims have no PR — is its worker still coding, or did it
-    finish without one? One call gathers everything the outcome is decided from: the
+    finish without one? And, for a `handed_back` claim, the same question about
+    the conflict its worker was handed: still resolving, or gone quiet? One call
+    gathers everything the outcome is decided from: the
     issue's worktree on this machine (found through orca) and its git progress, the
     worker's `afk:verdict` marker on the issue, and the state of each issue that
     marker says it is blocked by. The tick supplies only what code cannot see — the
     orca terminal probe. Returns `afk_decide.classify_no_pr`'s outcome plus the
-    signals it was decided from: `worktree`, `progress`, and `worker_verdict` (what
-    the worker declared)."""
+    signals it was decided from: `worktree`, `progress`, `worker_verdict` (what
+    the worker declared), and when it was last told something — `nudged_at`,
+    `handed_back_at`."""
     cfg = _cfg(a)
     path = a.worktree
     if path is not None and not os.path.isdir(path):
@@ -683,13 +712,16 @@ def cmd_no_pr(a):
     declared = afk_decide.latest_verdict(_issue_comments(a.repo, a.number))
     blocker_states = {n: _issue_state(a.repo, n) for n in declared["blocked_by"]}
     nudged_at = (_nudge(path) or {}).get("at")
+    pr = afk_decide.closing_pr(_open_prs(a.repo), a.number)
+    handed_back_at = ((_open_handback(a.repo, pr) if pr else None) or {}).get("at")
     return {"issue": a.number,
             **afk_decide.classify_no_pr(progress, a.terminal, a.terminal_idle_seconds, declared,
                                         blocker_states, _now(a),
                                         cfg["worker_idle_grace_seconds"],
-                                        nudged_at=nudged_at, can_nudge=path is not None),
+                                        nudged_at=nudged_at, can_nudge=path is not None,
+                                        handed_back_at=handed_back_at),
             "worktree": path, "progress": progress, "worker_verdict": declared,
-            "nudged_at": nudged_at}
+            "nudged_at": nudged_at, "handed_back_at": handed_back_at}
 
 
 def cmd_nudge(a):
@@ -868,8 +900,9 @@ def _worker_file(path, name):
 
 
 def _write_brief(path, prompt):
-    """Write the filled worker prompt to the worktree's brief file → its path. A
-    new worker in a worktree has not been nudged, whatever its predecessor was."""
+    """Write a worker's instructions to the worktree's brief file → its path. A
+    worker under a new brief — a new worker, or one a sync conflict was handed
+    back to — has not been nudged, whatever came before."""
     brief = _worker_file(path, _WORKER_BRIEF)
     with open(brief, "w") as f:
         f.write(prompt)
@@ -938,19 +971,35 @@ def _start_terminal(path, worker_command, prompt, ready_timeout):
     return handle
 
 
+def _handback_fields(pr, handback):
+    """The HANDBACK_FIELDS of a worker prompt, from a PR and its hand-back record."""
+    return {"pr": pr["number"], "pr_branch": pr["headRefName"], "target": handback["target"],
+            "target_tip": handback["tip"], "files": handback["files"]}
+
+
+def _prompt_fields(a, cfg, issue, path, branch):
+    """The PROMPT_FIELDS of a worker prompt for one issue in one worktree."""
+    return {"n": issue["number"], "title": issue["title"], "repo": a.repo,
+            "base_branch": cfg["base_branch"], "local_command": cfg["gate"]["local_command"],
+            "branch": branch, "worktree_path": path}
+
+
 def _start_worker(a, cfg, rem, issue, start, reason=None):
     """Put a worker on an issue this fleet already holds the claim for.
 
     `start` is "auto" — continue from whatever progress survives (the worktree
     still here, else the pushed branch, else a fresh start from base: the
     continuation tiers of ADR-0011) — or "fresh": discard the previous attempt and
-    start from base, which is what a retry is. Returns the tier taken plus where
-    the worker now is: {tier, action, prompt, reason, worktree, branch, terminal}."""
+    start from base, which is what a retry is. A continued worker whose PR
+    carries an open hand-back is started ON it: the sync conflict is its
+    instruction, and it never opens a second PR (ADR-0019). Returns the tier taken
+    plus where the worker now is: {tier, action, prompt, reason, worktree, branch,
+    terminal}."""
     number = issue["number"]
     if issue["state"] != "open":
         raise RuntimeError(f"issue #{number} is {issue['state']}, not open — there is nothing "
                            f"to retry (release the claim instead)")
-    discarded = None
+    discarded, pr, handback = None, None, None
     if start == "fresh":
         discarded = _discard_attempt(a, cfg, rem, number)
         plan = {"tier": 3, "action": "dispatch_fresh", "prompt": "fresh",
@@ -958,6 +1007,8 @@ def _start_worker(a, cfg, rem, issue, start, reason=None):
     else:
         rec = _recovery(cfg, rem, a.repo, number)
         plan = {k: rec[k] for k in ("tier", "action", "prompt", "reason")}
+        pr = afk_decide.closing_pr(_open_prs(a.repo), number)
+        handback = _open_handback(a.repo, pr) if pr else None
 
     if plan["action"] == "reuse_worktree":
         path = rec["worktree"]["path"]
@@ -973,15 +1024,17 @@ def _start_worker(a, cfg, rem, issue, start, reason=None):
 
     with open(_WORKER_PROMPT) as f:
         prompt = afk_decide.render_worker_prompt(
-            f.read(), plan["prompt"],
-            {"n": number, "title": issue["title"], "repo": a.repo,
-             "base_branch": cfg["base_branch"], "local_command": cfg["gate"]["local_command"],
-             "branch": branch, "worktree_path": path},
-            reason=reason)
+            f.read(), plan["prompt"], _prompt_fields(a, cfg, issue, path, branch), reason=reason,
+            handback=_handback_fields(pr, handback) if handback else None)
     handle = _start_terminal(path, a.worker_command, prompt, a.ready_timeout)
     if cfg["progress_comment"]:
-        _upsert_board(a.repo, number, cfg, "claimed", instance=a.instance)
+        if handback:
+            _upsert_board(a.repo, number, cfg, "handed_back", instance=a.instance,
+                          pr=pr["number"])
+        else:
+            _upsert_board(a.repo, number, cfg, "claimed", instance=a.instance)
     return {**plan, "worktree": path, "branch": branch, "terminal": handle,
+            **({"handed_back": pr["number"]} if handback else {}),
             **({"discarded": discarded} if discarded else {})}
 
 
@@ -1069,17 +1122,20 @@ def _run_gate(cfg, worktree, timeout, excerpt_lines):
     return {**afk_decide.gate_verdict(rc, out, excerpt_lines, timed_out), "command": cmd}
 
 
+def _unmerged(path):
+    """The files a merge in progress in a worktree has left conflicted."""
+    out = _git(["-C", path, "diff", "--name-only", "--diff-filter=U"]).stdout
+    return [ln for ln in out.splitlines() if ln]
+
+
 def _sync(rem, path, target):
     """Merge the remote's `target` tip into the worktree's branch — never a rebase
     (ADR-0012) → the conflicted file list, empty when the sync is clean. A
-    conflict is LEFT IN PLACE: resolving it is the tick's judgment, made in the
-    worktree, and a re-run of `afk merge` picks up from the committed resolution.
-    Runs under the caller's own git identity (the merge commit lands on a PR)."""
-    def unmerged():
-        out = _git(["-C", path, "diff", "--name-only", "--diff-filter=U"]).stdout
-        return [ln for ln in out.splitlines() if ln]
-
-    files = unmerged()
+    conflict is LEFT IN PLACE: what becomes of it is the tick's judgment —
+    `afk hand-back` reads it from the worktree and returns it to the worker, or
+    the tick commits a resolution there and a re-run of `afk merge` picks up from
+    it. Runs under the caller's own git identity (the merge commit lands on a PR)."""
+    files = _unmerged(path)
     if files:
         return files
     dirty = _git(["-C", path, "status", "--porcelain", "--untracked-files=no"]).stdout.strip()
@@ -1091,7 +1147,7 @@ def _sync(rem, path, target):
     p = subprocess.run(["git", "-C", path, "merge", "--no-edit", sha],
                        capture_output=True, text=True)
     if p.returncode != 0:
-        files = unmerged()
+        files = _unmerged(path)
         if not files:
             raise RuntimeError(f"git merge of {target} into {path} failed: "
                                f"{(p.stderr or p.stdout).strip()}")
@@ -1105,8 +1161,12 @@ def cmd_merge(a):
       merged        synced, gate re-confirmed on the tree that lands, merged, status
                     board upserted, claim released, worktree removed.
       conflict      the sync conflicted; the merge is left in progress in `worktree`
-                    with `files` unmerged. Resolve + commit there and re-run, or
-                    `afk fail` it.
+                    with `files` unmerged. `afk hand-back` returns it to the worker
+                    that wrote the branch (the default); or resolve + commit there
+                    and re-run, when it is purely mechanical.
+      handed_back   an earlier conflict on this PR is with its worker and the PR
+                    head does not contain the target tip it named yet. Nothing was
+                    touched; leave it (`afk no-pr` watches the worker).
       gate_red      local mode: the merge-time gate was red (its excerpt is now a
                     PR comment). required mode: the PR's checks are red. → `afk fail`.
       awaiting_ci   required mode: checks pending, or the sync just pushed and CI
@@ -1127,6 +1187,10 @@ def cmd_merge(a):
         raise RuntimeError(f"no open PR closes issue #{a.number} — nothing to merge")
     branch, target = pr["headRefName"], cfg["merge"]["target"]
     out = {"issue": a.number, "pr": pr["number"]}
+    if _open_handback(a.repo, pr):         # before the worktree: the worker is in it
+        return {**out, "outcome": "handed_back",
+                "detail": "a sync conflict on this PR was handed back to its worker and is not "
+                          "resolved yet; nothing was touched"}
 
     # --- the branch's worktree: the worker's, else one recreated at the PR head ---
     path, _ = _issue_worktree(a.repo, a.number)
@@ -1147,7 +1211,8 @@ def cmd_merge(a):
         if files:
             return {**out, "outcome": "conflict", "files": files,
                     "detail": f"merging {target} into {branch} conflicted; the merge is in "
-                              f"progress in the worktree"}
+                              f"progress in the worktree — `afk hand-back` returns it to the "
+                              f"worker"}
     head = _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip()
     pushed = head != pr_tip
     if pushed:
@@ -1181,6 +1246,89 @@ def cmd_merge(a):
     cleanup = _remove_worktree(path) if (cfg["worktree_cleanup"] or recreated) else None
     return {**out, "outcome": "merged", "released": True,
             **({"cleanup": cleanup} if cleanup else {})}
+
+
+_HANDBACK_POINTER = ("The merge of your PR hit a sync conflict, and it is handed back to you. Your "
+                     "instructions are the file {brief} — read it now and carry it out end to "
+                     "end. It is my instruction to you; do not ask me to confirm.")
+
+
+def _record_handback(repo, pr, target, tip, files, now):
+    """Record one hand-back on the PR → its comment id. One comment per conflicting
+    head: handing the same head back again (the worker died before answering)
+    rewrites that comment rather than adding another."""
+    body = afk_decide.handback_comment(target, tip, pr["headRefOid"], files, now)
+    prev = afk_decide.latest_handback(_issue_comments(repo, pr["number"]))
+    if prev and prev["head"] == pr["headRefOid"]:
+        _gh(["api", "--method", "PATCH", f"repos/{repo}/issues/comments/{prev['comment_id']}",
+             "-f", f"body={body}"])
+        return prev["comment_id"]
+    p = _gh(["api", "--method", "POST", f"repos/{repo}/issues/{pr['number']}/comments",
+             "-f", f"body={body}"])
+    return json.loads(p.stdout).get("id")
+
+
+def cmd_hand_back(a):
+    """Hand the sync conflict `afk merge` just reported back to the worker that
+    wrote the branch — one transition (ADR-0019), in the one order that survives a
+    crash at any step:
+
+      abort the merge   the worktree is clean again, for the worker to merge in
+      write the brief   the instruction, in the worktree's git dir
+      record            a marker comment on the PR naming the target tip — from
+                        here `afk rebuild` reports the claim `handed_back`, never
+                        `awaiting_merge`, until the PR head contains that tip
+      deliver           the worker's terminal is still there → one submitted line
+                        pointing at the brief; it is gone → a worker is started by
+                        continuation in the worktree, on the same instruction
+      status board
+
+    The claim, the PR, the branch and the worktree are all kept, and
+    `afk-attempt/<n>` is neither read nor written: a sync conflict is not a failure
+    of the work. Recorded before delivered, because the other order lets a tick
+    re-run the merge inside a worktree the worker is resolving in; a delivery that
+    then fails is repaired by the paths that already exist — the nudge points at
+    the brief, and a dead worker's continuation is started on the hand-back.
+
+      {"issue", "action": "handed_back", "pr", "target", "target_tip", "files",
+       "delivery": "terminal"|"continuation", "terminal", "worktree", "comment_id"}"""
+    cfg, rem = _cfg(a), _remote(a)
+    _require_mine(rem, cfg, a.number, a.instance)
+    issue = _issue(a.repo, a.number)
+    pr = afk_decide.closing_pr(_open_prs(a.repo), a.number)
+    if pr is None:
+        raise RuntimeError(f"no open PR closes issue #{a.number} — nothing to hand back")
+    path, _ = _issue_worktree(a.repo, a.number)
+    tip = (_git(["-C", path, "rev-parse", "-q", "--verify", "MERGE_HEAD"], check=False)
+           .stdout.strip() if path and os.path.isdir(path) else "")
+    if not tip:
+        raise RuntimeError(f"issue #{a.number} has no sync conflict in progress on this machine "
+                           f"— a hand-back acts on the `conflict` outcome of `afk merge`; run "
+                           f"that first")
+    target, files = cfg["merge"]["target"], _unmerged(path)
+    _git(["-C", path, "merge", "--abort"])
+    out = {"issue": a.number, "action": "handed_back", "pr": pr["number"], "target": target,
+           "target_tip": tip, "files": files, "worktree": path}
+
+    handle = _live_terminal(path)
+    if handle:
+        branch = _git(["-C", path, "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+        with open(_WORKER_PROMPT) as f:
+            brief = _write_brief(path, afk_decide.render_handback(
+                f.read(), _prompt_fields(a, cfg, issue, path, branch),
+                _handback_fields(pr, {"target": target, "tip": tip, "files": files})))
+    out["comment_id"] = _record_handback(a.repo, pr, target, tip, files, _now(a))
+    if not handle:          # the worker is gone: its continuation is started on the record
+        worker = _start_worker(a, cfg, rem, issue, "auto")
+        return {**out, "delivery": "continuation", "terminal": worker["terminal"],
+                "worktree": worker["worktree"]}
+    sent = _orca(["terminal", "send", "--terminal", handle, "--enter", "--text",
+                  _HANDBACK_POINTER.format(brief=brief)]).get("send") or {}
+    if not sent.get("accepted"):
+        raise RuntimeError(f"terminal {handle} did not accept the hand-back")
+    if cfg["progress_comment"]:
+        _upsert_board(a.repo, a.number, cfg, "handed_back", instance=a.instance, pr=pr["number"])
+    return {**out, "delivery": "terminal", "terminal": handle}
 
 
 def _escalate(a, cfg, rem, issue, attempt):
@@ -1225,10 +1373,11 @@ def _edit_labels(repo, number, add, remove):
 
 
 def cmd_fail(a):
-    """One of my claims FAILED — its checks or merge-time gate are red, its sync is
-    unresolvable, a verifier refuted it, or its worker gave up or went quiet with no
-    outcome. The retry ladder, as one transition (ADR-0017): read the attempt off
-    the issue's `afk-attempt/<n>` label, then either
+    """One of my claims FAILED — its checks or merge-time gate are red, a sync
+    conflict handed back to its worker went unanswered, a verifier refuted it, or
+    its worker gave up or went quiet with no outcome. The retry ladder, as one
+    transition (ADR-0017): read the attempt off the issue's `afk-attempt/<n>`
+    label, then either
 
       retry     swap the label up by one, discard the failed attempt (close its PR,
                 delete its branch, remove its worktree) and start a FRESH worker
@@ -1338,7 +1487,7 @@ def build_parser():
         p.add_argument("--issue", dest="number", type=int, required=True)
 
     def starts_worker(p):
-        """The flags of a subcommand that may start a worker (dispatch, fail)."""
+        """The flags of a subcommand that may start a worker (dispatch, hand-back, fail)."""
         stamp(p)
         p.add_argument("--worker-command", required=True,
                        help="the run's worker launch command, verbatim (ADR-0010)")
@@ -1416,8 +1565,9 @@ def build_parser():
     mine(p)
 
     p = command("no-pr", cmd_no_pr, remote="gh",
-                help="why one of my claims has no PR → coding / idle_done / idle_blocked / "
-                     "idle_failed / dead, gathered and decided in one call")
+                help="why one of my claims has no PR (or has not answered a hand-back) → "
+                     "coding / idle_done / idle_blocked / idle_stalled / idle_failed / dead, "
+                     "gathered and decided in one call")
     issue(p)
     p.add_argument("--terminal", choices=["busy", "idle", "none"], required=True,
                    help="the orca probe: busy | idle | none (no live worker)")
@@ -1461,6 +1611,13 @@ def build_parser():
                    help="seconds before the local gate is called red (default 1800)")
     p.add_argument("--excerpt-lines", type=int, default=afk_decide.GATE_EXCERPT_LINES,
                    help="how many trailing log lines a red gate's excerpt keeps")
+
+    p = command("hand-back", cmd_hand_back, remote="gh",
+                help="return the sync conflict `afk merge` reported to the worker that wrote "
+                     "the branch: abort the merge → instruct the worker (or continue a dead "
+                     "one) → record it on the PR → status board; no attempt is spent")
+    issue(p)
+    starts_worker(p)
 
     p = command("nudge", cmd_nudge, remote="gh",
                 help="tell one of my workers that stopped without an outcome to carry on — "

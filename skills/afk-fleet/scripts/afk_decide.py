@@ -393,7 +393,7 @@ def classify_claims(claims, heartbeats, me, now, ttl):
     return {"mine": sorted(mine), "peer_live": sorted(peer_live), "stale": sorted(stale)}
 
 
-def subclassify_pr(has_pr, checks_state, ci_mode, closed=False):
+def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=False):
     """
     Classify one of MY in-flight claims from its PR + checks → `(status,
     board_phase)`: what the tick does next, and what the status board shows a human
@@ -404,10 +404,15 @@ def subclassify_pr(has_pr, checks_state, ci_mode, closed=False):
       ci_mode:      gate.ci — "required" reads the checks; "local" never does
       closed:       the claimed issue is itself CLOSED — a merge whose tick died
                     before releasing, or a human finishing it by hand
+      handed_back:  a sync conflict on the PR was handed back to its worker and the
+                    PR head does not yet contain the target tip it named
+                    (`handback_open`)
 
       status           the tick…                                board_phase
       closed           releases the leftover claim               None (not re-rendered)
       no_pr            asks `afk no-pr` why                      claimed
+      handed_back      asks `afk no-pr` whether its worker is    handed_back
+                       still resolving — never `afk merge`
       awaiting_ci      leaves it                                 pr_open
       failure          runs `afk fail`                           ci_failed
       awaiting_merge   runs `afk merge`                          awaiting_merge
@@ -427,6 +432,10 @@ def subclassify_pr(has_pr, checks_state, ci_mode, closed=False):
         return "closed", None
     if not has_pr:
         return "no_pr", "claimed"
+    if handed_back:
+        # whatever the checks say: re-running the merge against the same head would
+        # hit the same conflict and hand it back again, every cycle
+        return "handed_back", "handed_back"
     if ci_mode == "local":
         return "awaiting_merge", "pr_open"
     if checks_state == "green":
@@ -550,9 +559,10 @@ def gate_comment(verdict, command):
 # no_pr reconciliation — disambiguating a FINISHED worker from a CODING one    #
 # --------------------------------------------------------------------------- #
 #
-# `subclassify_pr` only says a claim has no PR yet. A worker that finished
-# without one and went idle looks identical, to a terminal probe, to one still
-# coding, so three signals disambiguate (all gathered by `afk no-pr`):
+# `subclassify_pr` only says a claim has no PR yet — or that its PR's sync
+# conflict was handed back and the worker has not answered. Either way a worker
+# that finished and went idle looks identical, to a terminal probe, to one still
+# working, so three signals disambiguate (all gathered by `afk no-pr`):
 #   1. git PROGRESS in the worktree (commits ahead / dirty tree / last activity);
 #   2. the worker's VERDICT marker on the issue — its declared reason for opening
 #      no PR: `already-satisfied` (done in base, empty diff), `blocked` (a
@@ -625,9 +635,10 @@ def latest_verdict(comments):
 
 
 def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, blocker_states,
-                   now, grace_seconds, nudged_at=None, can_nudge=True):
+                   now, grace_seconds, nudged_at=None, can_nudge=True, handed_back_at=None):
     """
-    The outcome for one of MY `no_pr` claims, from the raw signals.
+    The outcome for one of MY claims that is waiting on its WORKER — a `no_pr`
+    claim, or a `handed_back` one — from the raw signals.
 
       progress:        the worktree's git progress {"commits_ahead", "dirty",
                        "last_commit_ts", "worktree_mtime_ts"}; {} / None if unreadable.
@@ -643,6 +654,11 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
                        it never was. A nudge is spent once: the second silence fails.
       can_nudge:       False when there is nowhere to record a nudge (no worktree
                        on this machine) — the silence then fails at once.
+      handed_back_at:  epoch seconds a sync conflict was handed back to this worker
+                       (`afk hand-back`) and is still unanswered; None otherwise. A
+                       sign of life like the nudge: the worker gets a whole grace
+                       period to start on it, and after that its silence takes the
+                       same nudge → failure path as any other.
 
     Returns {"outcome", "action", "idle_seconds", "open_blockers"} — `action` is
     what the tick does, `outcome` the reason it is grouped under:
@@ -664,8 +680,9 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
       dead         orphan        — no live worker/terminal → recovery by continuation.
 
     `idle_seconds` is the time since the MOST RECENT sign of life (last commit,
-    newest file mtime, terminal activity, the nudge — a nudged worker gets a whole
-    grace period to answer it); None when none is known, which is never
+    newest file mtime, terminal activity, the nudge, the hand-back — a nudged or
+    handed-back worker gets a whole grace period to answer); None when none is
+    known, which is never
     "within grace". `open_blockers` is the still-open subset of blocked_by.
     """
     progress = progress or {}
@@ -673,8 +690,9 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
             if t is not None]
     if terminal_idle_seconds is not None:
         seen.append(int(now) - int(terminal_idle_seconds))
-    if nudged_at is not None:
-        seen.append(int(nudged_at))
+    for told_at in (nudged_at, handed_back_at):
+        if told_at is not None:
+            seen.append(int(told_at))
     idle_seconds = max(0, int(now) - int(max(seen))) if seen else None
 
     def out(outcome, action, open_blockers=()):
@@ -740,6 +758,80 @@ def stall_reason(reason, tail):
         return reason
     return (f"{reason.rstrip()}\n\nThe previous worker stopped without an outcome and stayed "
             f"silent after one nudge. Its terminal ended with:\n\n```\n" + "\n".join(tail) + "\n```")
+
+
+# --------------------------------------------------------------------------- #
+# Hand-back — a sync conflict returned to the worker that wrote the branch     #
+# --------------------------------------------------------------------------- #
+#
+# When `afk merge`'s sync conflicts, the work is finished and gate-green; only
+# the target moved. The conflict goes back to the worker (ADR-0019), and the
+# hand-back is recorded where it concerns — a marker comment on the PR:
+#
+#   <!--afk:handback target=<branch> tip=<sha> head=<sha> at=<epoch>-->
+#
+# `tip` is the target tip the worker was told to merge in, `head` the PR head
+# that conflicted with it. The record is OPEN until the PR head contains `tip`;
+# while it is open the claim is `handed_back`, never `awaiting_merge`. It lives
+# and dies with the PR: a retry closes the PR, and its fresh attempt starts with
+# no hand-back.
+
+_HANDBACK_MARKER_RE = re.compile(r"<!--\s*afk:handback\b(.*?)-->", re.DOTALL)
+_HANDBACK_FILE_RE = re.compile(r"^- `(.+)`$", re.MULTILINE)
+
+
+def handback_comment(target, tip, head, files, at):
+    """The PR comment that records one hand-back: the marker `latest_handback`
+    reads back, then the same facts worded for a human reading the PR."""
+    listed = "\n".join(f"- `{f}`" for f in files) or "_(the sync reported no file)_"
+    return (f"<!--afk:handback target={target} tip={tip} head={head} at={int(at)}-->\n"
+            f"**afk-fleet: sync conflict handed back to the worker.** Merging `{target}` "
+            f"(`{tip[:12]}`) into this branch conflicts in:\n\n{listed}\n\n"
+            f"The worker that wrote this branch was told to merge `{target}` in, resolve the "
+            f"conflicts, re-run the gate and push here. Nothing was discarded and no retry was "
+            f"spent; this PR merges once its head contains that `{target}` tip.")
+
+
+def latest_handback(comments):
+    """
+    The LATEST hand-back recorded on a PR, from its comments ([{"id", "body"}...],
+    oldest first) → {"target", "tip", "head", "at", "files", "comment_id"}, or None
+    when the PR was never handed back. A marker missing `tip` or `head` is not a
+    record: nothing could ever be compared against it.
+    """
+    found = None
+    for c in comments or []:
+        body = c.get("body") or ""
+        m = _HANDBACK_MARKER_RE.search(body)
+        if not m:
+            continue
+        attrs = dict(tok.split("=", 1) for tok in m.group(1).split() if "=" in tok)
+        if not attrs.get("tip") or not attrs.get("head"):
+            continue
+        at = attrs.get("at", "")
+        found = {"target": attrs.get("target"), "tip": attrs["tip"], "head": attrs["head"],
+                 "at": int(at) if at.isdigit() else None,
+                 "files": _HANDBACK_FILE_RE.findall(body[m.end():]),
+                 "comment_id": c.get("id")}
+    return found
+
+
+def handback_open(handback, pr_head, contains_tip):
+    """
+    Is a PR's hand-back still unanswered?
+
+      handback:     `latest_handback` of the PR's comments, or None
+      pr_head:      the PR's head sha now
+      contains_tip: whether `pr_head` contains the target tip the hand-back named
+                    (asked of GitHub; not consulted while the head has not moved)
+
+    Open while the head is the one that conflicted, and still open after a push
+    that did not bring the named tip in (a checkpoint commit, a half-done merge).
+    Closed — the claim is `awaiting_merge` again — only once the head contains it.
+    """
+    if not handback:
+        return False
+    return pr_head == handback["head"] or not contains_tip
 
 
 # --------------------------------------------------------------------------- #
@@ -1011,18 +1103,61 @@ def select_recovery(worktree, branch):
 #
 # references/worker-prompt.md is the template: named blocks between
 # `<!--afk:block NAME-->` and `<!--/afk:block-->`. The `prompt` block is the body;
-# it names three slots — {opening} and {step1}, each filled from the block of
-# that name for the chosen variant (`opening.fresh`, `step1.continue`, …), and
+# it names four slots — {opening} and {step1}, each filled from the block of
+# that name for the chosen variant (`opening.fresh`, `step1.continue`, …),
 # {retry_reason}, filled from the `retry_reason` block only when a failure reason
-# is handed over. Everything else in braces is a field.
+# is handed over, and {handback}, filled from the `handback` block only when the
+# worker is started on a sync conflict that was handed back (ADR-0019). That
+# block is also a brief of its own — `render_handback` — for a worker that is
+# still there to be told. Everything else in braces is a field.
 
 _BLOCK_RE = re.compile(r"<!--afk:block ([a-z0-9_.]+)-->\n(.*?)\n?<!--/afk:block-->", re.DOTALL)
 PROMPT_VARIANTS = ("fresh", "continue")
 PROMPT_FIELDS = ("n", "title", "repo", "base_branch", "local_command", "branch", "worktree_path")
+HANDBACK_FIELDS = ("pr", "pr_branch", "target", "target_tip", "files")
+_PROMPT_SLOTS = ("opening", "step1", "retry_reason", "handback")
 _NO_LOCAL_COMMAND = "true   # (no gate.local_command configured: run the repo's own build/test, if any)"
 
 
-def render_worker_prompt(template, variant, fields, reason=None):
+def _prompt_blocks(template):
+    blocks = dict(_BLOCK_RE.findall(template or ""))
+
+    def block(name):
+        if name not in blocks:
+            raise ValueError(f"worker prompt template has no {name!r} block")
+        return blocks[name]
+    return block
+
+
+def _fill_prompt(text, fields, handback, reason=None):
+    """Fill every field of an assembled prompt text. Raises ValueError on a missing
+    field or a placeholder left unfilled; the free-text values (title, reason, the
+    conflicted file names) go in last, so one that happens to contain "{branch}"
+    is never itself substituted into."""
+    missing = [k for k in PROMPT_FIELDS if k not in fields]
+    missing += [k for k in HANDBACK_FIELDS if handback is not None and k not in handback]
+    if missing:
+        raise ValueError(f"worker prompt: missing field(s) {', '.join(missing)}")
+    values = {k: str(fields[k]) for k in PROMPT_FIELDS}
+    values["local_command"] = values["local_command"].strip() or _NO_LOCAL_COMMAND
+    free_text = {"title": values.pop("title"), "reason": (reason or "").strip()}
+    if handback is not None:
+        values.update({k: str(handback[k]) for k in HANDBACK_FIELDS if k != "files"})
+        free_text["files"] = ("\n".join(f"- `{f}`" for f in handback["files"])
+                              or "- (the sync reported none — the merge itself will list them)")
+    for name, value in values.items():
+        text = text.replace("{" + name + "}", value)
+    known = (*PROMPT_FIELDS, *HANDBACK_FIELDS, *_PROMPT_SLOTS)
+    left = sorted(set(re.findall(r"\{(?:%s)\}" % "|".join(known), text))
+                  - {"{%s}" % k for k in free_text})
+    if left:
+        raise ValueError(f"worker prompt: unfilled placeholder(s) {', '.join(left)}")
+    for name, value in free_text.items():
+        text = text.replace("{" + name + "}", value)
+    return text.strip() + "\n"
+
+
+def render_worker_prompt(template, variant, fields, reason=None, handback=None):
     """
     The prompt one worker is started with, from the template file's text.
 
@@ -1032,6 +1167,9 @@ def render_worker_prompt(template, variant, fields, reason=None):
       fields:   {name: value} for every one of PROMPT_FIELDS. An empty
                 `local_command` renders as a no-op with a note.
       reason:   why the previous attempt failed, when this is a retry; None otherwise
+      handback: {name: value} for every one of HANDBACK_FIELDS when the worker is
+                started on a sync conflict handed back to it (`files` a list of
+                names); None otherwise
 
     Raises ValueError on a template missing a block, a missing field, or a
     placeholder left unfilled — a worker must never be started on a prompt with a
@@ -1039,35 +1177,25 @@ def render_worker_prompt(template, variant, fields, reason=None):
     """
     if variant not in PROMPT_VARIANTS:
         raise ValueError(f"unknown worker prompt variant: {variant!r}")
-    blocks = dict(_BLOCK_RE.findall(template or ""))
-
-    def block(name):
-        if name not in blocks:
-            raise ValueError(f"worker prompt template has no {name!r} block")
-        return blocks[name]
-
-    missing = [k for k in PROMPT_FIELDS if k not in fields]
-    if missing:
-        raise ValueError(f"worker prompt: missing field(s) {', '.join(missing)}")
-    values = {k: str(fields[k]) for k in PROMPT_FIELDS}
-    values["local_command"] = values["local_command"].strip() or _NO_LOCAL_COMMAND
-
+    block = _prompt_blocks(template)
     text = block("prompt")
     slots = {"opening": block(f"opening.{variant}"), "step1": block(f"step1.{variant}"),
-             "retry_reason": block("retry_reason") if reason else ""}
+             "retry_reason": block("retry_reason") if reason else "",
+             "handback": block("handback") if handback is not None else ""}
     for name, body in slots.items():
         text = text.replace("{" + name + "}", body)
-    free_text = {"title": values.pop("title"), "reason": (reason or "").strip()}
-    for name, value in values.items():
-        text = text.replace("{" + name + "}", value)
-    left = sorted(set(re.findall(r"\{(?:%s)\}" % "|".join((*values, *slots)), text)))
-    if left:
-        raise ValueError(f"worker prompt: unfilled placeholder(s) {', '.join(left)}")
-    # the free-text values go in last, so a title that happens to contain
-    # "{branch}" is never itself substituted into
-    for name, value in free_text.items():
-        text = text.replace("{" + name + "}", value)
-    return text.strip() + "\n"
+    text = re.sub(r"\n{3,}", "\n\n", text)      # an unfilled slot leaves no gap behind
+    return _fill_prompt(text, fields, handback, reason)
+
+
+def render_handback(template, fields, handback):
+    """
+    The brief a worker that is STILL THERE is pointed at when a sync conflict on
+    its PR is handed back: the template's `handback` block alone, filled from the
+    same `fields` and `handback` as `render_worker_prompt`. The worker already has
+    the rest of its prompt; this is the one new instruction.
+    """
+    return _fill_prompt(_prompt_blocks(template)("handback"), fields, handback)
 
 
 # --------------------------------------------------------------------------- #
@@ -1089,11 +1217,12 @@ def render_worker_prompt(template, variant, fields, reason=None):
 
 STATUS_MARKER = "<!--afk:status-->"
 
-# The closed set of lifecycle phases the board renders. Happy path plus three
-# off-ramps that reuse the same checkboxes + an annotation: ci_failed, escalated,
-# and closed (the worker found the issue already satisfied — `afk close`).
-STATUS_PHASES = ("claimed", "pr_open", "ci_failed", "awaiting_merge", "merged", "escalated",
-                 "closed")
+# The closed set of lifecycle phases the board renders. Happy path plus four
+# off-ramps that reuse the same checkboxes + an annotation: ci_failed, handed_back
+# (a sync conflict returned to the worker — `afk hand-back`), escalated, and
+# closed (the worker found the issue already satisfied — `afk close`).
+STATUS_PHASES = ("claimed", "pr_open", "ci_failed", "handed_back", "awaiting_merge", "merged",
+                 "escalated", "closed")
 
 # Happy-path milestones, in order — these are the task-list checkboxes.
 _STATUS_STEPS = (
@@ -1109,8 +1238,8 @@ _GATE_NAME = {"required": "CI", "local": "本地门"}
 # How far along the happy path each phase has reached (index of the last DONE
 # step). escalated is a terminal give-up handled specially in `render_status_board`.
 _PHASE_REACHED = {
-    "claimed": 0, "pr_open": 1, "ci_failed": 1, "awaiting_merge": 2, "merged": 3,
-    "escalated": 1, "closed": 0,
+    "claimed": 0, "pr_open": 1, "ci_failed": 1, "handed_back": 1, "awaiting_merge": 2,
+    "merged": 3, "escalated": 1, "closed": 0,
 }
 
 
@@ -1122,6 +1251,8 @@ def _status_current_line(phase, gate, attempt, retry_max):
         return f"▸ 当前:等 {gate}"
     if phase == "ci_failed":
         return f"▸ 当前:{gate} 失败,修复重试中({attempt}/{retry_max}) —— 见下方 {gate} 与评论"
+    if phase == "handed_back":
+        return "▸ 当前:与目标分支同步冲突,已交还 worker 解决 —— 见 PR 评论"
     if phase == "awaiting_merge":
         return "▸ 当前:门已绿,待合并"
     if phase == "merged":
@@ -1619,7 +1750,7 @@ def superseded_prs(prs, number, branch_pattern):
 
 
 def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, config,
-                         closed=()):
+                         closed=(), handed_back=()):
     """
     The tick's whole working set from the raw observables. Pure — afk.py's
     `rebuild` gathers, this assembles, and a fixture pins the join.
@@ -1638,6 +1769,9 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
       closed:      the numbers of MY claims whose issue is closed (`issues` holds
                    only open ones, so `afk rebuild` asks about each of mine that is
                    missing from it)
+      handed_back: the numbers of MY claims whose PR carries an open hand-back
+                   (`handback_open` — `afk rebuild` asks about each of mine that
+                   has a PR)
 
     Returns:
       {"frontier": {"dispatch": [{"number","title"}...], "excluded": [...]},
@@ -1670,7 +1804,8 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
         checks = pr_checks_state(pr.get("statusCheckRollup")) if pr else None
         issue = by_num.get(n, {})
         status, board_phase = subclassify_pr(pr is not None, checks, ci_mode,
-                                             closed=n in set(closed))
+                                             closed=n in set(closed),
+                                             handed_back=n in set(handed_back))
         mine.append({"number": n, "title": issue.get("title"),
                      "status": status, "board_phase": board_phase,
                      "pr": pr.get("number") if pr else None, "checks": checks,

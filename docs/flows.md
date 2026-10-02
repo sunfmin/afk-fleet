@@ -67,8 +67,12 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   (ADR-0018).
 - The worker declared the issue already satisfied and its branch is empty: the tick verifies the
   empty diff and closes it, `skills/afk-fleet/scripts/afk.py:cmd_close`.
-- The checks or the merge-time gate are red: the retry mainline below. The sync conflicts: the
-  merge stops with the conflict left in the worktree for the tick to resolve or fail.
+- The checks or the merge-time gate are red: the retry mainline below.
+- The sync conflicts: the merge stops, and the tick **hands the conflict back** to the worker that
+  wrote the branch — claim, PR, branch and worktree kept, no attempt spent,
+  `skills/afk-fleet/scripts/afk.py:cmd_hand_back` (ADR-0019). The claim is then `handed_back`, not
+  awaiting merge, until the PR head contains the target tip it named
+  (`skills/afk-fleet/scripts/afk_decide.py:handback_open`), and rejoins this mainline at step 10.
 - The PR has no checks at all, or an adversarial verify is required: the merge stops and the tick
   decides (`--allow-no-checks`, `--verified`), `skills/afk-fleet/SKILL.md:needs_verify`.
 - A peer wins the claim race, or the claim push fails outright (an error, never a lost race):
@@ -181,7 +185,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 
 **Where it forks.**
 - Other ways into step 1: a red merge-time gate (`skills/afk-fleet/scripts/afk_decide.py:gate_verdict`),
-  an unresolvable sync conflict, an adversarial refute (`skills/afk-fleet/references/completion-gate.md:adversarial_verify`),
+  a sync conflict handed back to its worker and never answered, an adversarial refute (`skills/afk-fleet/references/completion-gate.md:adversarial_verify`),
   or a worker idle past grace with a `giving-up` verdict or none at all
   (`skills/afk-fleet/scripts/afk_decide.py:classify_no_pr`).
 - A worker that declares itself blocked is not a failure: re-dispatched when its blockers close,
@@ -219,6 +223,12 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   nothing down — only a retry or an explicit fresh start discards an attempt — and neither
   continuation nor takeover reads or increments the attempt count.
   (ADR-0011; `test_select_recovery`, `test_dispatch_continues_from_whatever_progress_survived`)
+- A sync conflict is not a failure of the work: it is handed back to the worker that wrote the
+  branch, spends no attempt and discards nothing, and the claim is not awaiting merge again until
+  the PR head contains the target tip the hand-back named; only a hand-back the worker never answers
+  enters the retry ladder. (ADR-0019;
+  `test_hand_back_returns_a_sync_conflict_to_the_worker_that_wrote_the_branch`,
+  `test_an_unanswered_hand_back_falls_through_to_the_nudge_and_then_the_retry_ladder`)
 - An unreadable remote is an error, never an empty fleet, and no subcommand runs without the run's
   config. (ADR-0015, ADR-0016; `test_an_unreadable_remote_is_an_error_not_an_empty_fleet`,
   `test_config_is_required_and_resolves_one_way_on_every_subcommand`)
@@ -239,7 +249,12 @@ stateDiagram-v2
   pr_open --> merged: local gate mode, gated at merge time instead
   pr_open --> ci_failed: checks red
   awaiting_merge --> merged: synced, gate re-confirmed, squash-merged
-  awaiting_merge --> ci_failed: merge-time gate red, or sync conflict
+  awaiting_merge --> ci_failed: merge-time gate red
+  awaiting_merge --> handed_back: sync conflict, returned to its worker
+  pr_open --> handed_back: local gate mode, sync conflict at merge time
+  handed_back --> awaiting_merge: worker merged the target in and pushed
+  handed_back --> handed_back: worker died, continued on the hand-back
+  handed_back --> ci_failed: never answered, after one nudge
   ci_failed --> claimed: attempts left, fresh worker under the same claim
   ci_failed --> escalated: attempts exhausted
   claimed --> escalated: no outcome after grace and attempts exhausted, or blocker still open
