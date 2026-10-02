@@ -10,8 +10,10 @@ verbs: what happens, in what order, and what it leaves behind.
 **tick** are LLM sessions executing the prose of `skills/afk-fleet/SKILL.md`, the **worker** executes
 `skills/afk-fleet/references/worker-prompt.md`, and every deterministic step is a subcommand of
 `skills/afk-fleet/scripts/afk.py` deciding through a pure function in
-`skills/afk-fleet/scripts/afk_decide.py`. So an anchor into a `.py` file names a function, and an
-anchor into a `.md` file names a word in the passage that step is executed from. Check them all with
+`skills/afk-fleet/scripts/afk_decide.py`. Each thing a tick *does* to a claim — start a worker, land
+a PR, fail, escalate, close — is one such subcommand performing its whole ordered sequence
+(ADR-0017), so most steps below anchor into code. An anchor into a `.py` file names a function, and
+an anchor into a `.md` file names a word in the passage that step is executed from. Check them all with
 the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 
 ## How does a ready issue become a merged PR?
@@ -22,43 +24,57 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 2. The **frontier** is selected: an issue is dispatchable only if it is open, carries the ready
    label, is not an epic, is unclaimed, has no open linked PR and has zero open blockers.
    `skills/afk-fleet/scripts/afk_decide.py:select_frontier`
-3. For each free slot under `concurrency`, the tick **claims** the issue by creating its claim ref;
-   the server accepts that creation for exactly one **fleet instance**, and a loser skips the issue.
-   `skills/afk-fleet/scripts/afk.py:cmd_claim`
-4. The tick has orca create the worktree and branch from the latest base, starts a **worker** in it
-   with the run's **worker launch command**, and submits the filled worker prompt.
-   `skills/afk-fleet/SKILL.md:worker_command`
-5. The tick refreshes its **heartbeat**, upserts the issue's **status board** to "claimed", returns
-   its summary and dies, without waiting for the worker.
-   `skills/afk-fleet/scripts/afk.py:cmd_status`
-6. The worker implements the issue's acceptance criteria, committing and pushing its own branch
+3. For each free slot under `concurrency`, the tick **dispatches** an issue, and the dispatch begins
+   by **claiming** it: creating its claim ref, which the server accepts for exactly one **fleet
+   instance**; a loser starts nothing.
+   `skills/afk-fleet/scripts/afk.py:cmd_dispatch`
+4. The dispatch fetches the base's tip from the remote and has orca create the worktree and branch
+   at that sha, then asserts the worktree contains it.
+   `skills/afk-fleet/scripts/afk.py:_create_worktree`
+5. It starts a **worker** there with the run's **worker launch command**, waits until the agent is
+   ready, and delivers the worker prompt, filled with the branch and path orca returned, as a brief
+   file plus one submitted line pointing at it.
+   `skills/afk-fleet/scripts/afk.py:_start_terminal`
+6. It upserts the issue's **status board** to "claimed"; the tick refreshes its **heartbeat**,
+   returns its summary and dies, without waiting for the worker.
+   `skills/afk-fleet/scripts/afk.py:_upsert_board`
+7. The worker implements the issue's acceptance criteria, committing and pushing its own branch
    after every completed step so a hard stop loses at most the step in flight.
    `skills/afk-fleet/references/worker-prompt.md:Publish`
-7. The worker **syncs** (merges the base into its branch, never rebases), pushes, and runs the
+8. The worker **syncs** (merges the base into its branch, never rebases), pushes, and runs the
    **local gate** until it is green on the combined tree.
    `skills/afk-fleet/references/worker-prompt.md:local_command`
-8. The worker opens a PR whose body says `Closes #n`, and stops; it never merges.
+9. The worker opens a PR whose body says `Closes #n`, and stops; it never merges.
    `skills/afk-fleet/references/worker-prompt.md:Closes`
-9. A later tick's rebuild matches that PR to the claim and classifies it: awaiting merge once its
-   checks are green (or, with `gate.ci: local`, as soon as the PR is open).
-   `skills/afk-fleet/scripts/afk_decide.py:subclassify_pr`
-10. One PR at a time, the tick syncs the branch with the merge target again and re-confirms the gate
-    against the exact tree that will land.
-    `skills/afk-fleet/scripts/afk.py:cmd_gate_run`
-11. The tick squash-merges the PR, which closes the issue, and upserts the status board to "merged"
-    while the issue is still its claim.
-    `skills/afk-fleet/scripts/afk_decide.py:render_status_board`
-12. The tick releases the claim and has orca remove the worktree, freeing the slot.
-    `skills/afk-fleet/scripts/afk.py:cmd_release`
+10. A later tick's rebuild matches that PR to the claim and classifies it: awaiting merge once its
+    checks are green (or, with `gate.ci: local`, as soon as the PR is open).
+    `skills/afk-fleet/scripts/afk_decide.py:subclassify_pr`
+11. One PR at a time, the tick **merges**: the merge syncs the branch with the merge target again,
+    in the issue's worktree, and pushes what that produced.
+    `skills/afk-fleet/scripts/afk.py:_sync`
+12. It re-confirms the gate against the exact head that will land: the local gate run there, or the
+    PR's checks, which count only if the sync did not move the head.
+    `skills/afk-fleet/scripts/afk_decide.py:checks_gate`
+13. It merges the PR, pinned to the gated head, which closes the issue; upserts the status board to
+    "merged"; releases the claim; and has orca remove the worktree, freeing the slot.
+    `skills/afk-fleet/scripts/afk.py:cmd_merge`
 
 **Where it forks.**
 - The worker opens no PR and leaves an `afk:verdict` marker instead (already-satisfied, blocked,
   giving-up), or goes quiet: `skills/afk-fleet/scripts/afk_decide.py:classify_no_pr`.
-- The checks or the merge-time gate are red, or the sync conflicts: the retry mainline below.
+- The worker went idle past grace with no PR and no verdict at all: it is nudged once, in its own
+  terminal, before that silence counts as a failure, `skills/afk-fleet/scripts/afk.py:cmd_nudge`
+  (ADR-0018).
+- The worker declared the issue already satisfied and its branch is empty: the tick verifies the
+  empty diff and closes it, `skills/afk-fleet/scripts/afk.py:cmd_close`.
+- The checks or the merge-time gate are red: the retry mainline below. The sync conflicts: the
+  merge stops with the conflict left in the worktree for the tick to resolve or fail.
+- The PR has no checks at all, or an adversarial verify is required: the merge stops and the tick
+  decides (`--allow-no-checks`, `--verified`), `skills/afk-fleet/SKILL.md:needs_verify`.
 - A peer wins the claim race, or the claim push fails outright (an error, never a lost race):
   ADR-0015.
 - `--plan` stops after step 2 and returns the dispatch plan: ADR-0002.
-- A cold `--tick` with no injected authorization does steps 1–10 and holds the merge: SKILL.md
+- A cold `--tick` with no injected authorization does steps 1–10 and calls no merge: SKILL.md
   Guardrails.
 
 ## How does a fleet get permission once and then run for days?
@@ -77,26 +93,28 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 5. The human authorizes, once and for the whole run, pushing worker branches and auto-merging green
    PRs to the target.
    `skills/afk-fleet/SKILL.md:Authorize`
-6. Each cycle, the launcher digests what a rebuild would observe and gets back skip or tick; the raw
-   state never enters its context.
-   `skills/afk-fleet/scripts/afk.py:cmd_fingerprint`
+6. Each cycle, the launcher opens with one call that digests what a rebuild would observe and gets
+   back skip or tick, plus an opaque cycle state to hand back; the raw state never enters its context.
+   `skills/afk-fleet/scripts/afk.py:cmd_cycle`
 7. When the digest moved, the launcher spawns a fresh tick, handing it only the repo, the config and
    the three launcher-held facts (authorization, instance id, worker launch command).
    `skills/afk-fleet/SKILL.md:instance_id`
-8. The tick does one reconciliation pass (the mainline above) and returns one compact summary; the
-   launcher keeps that line, the digest and the skip streak, and nothing else.
-   `skills/afk-fleet/SKILL.md:frontier_remaining`
-9. The launcher sleeps a busy or an idle interval, never longer than half the lease while the fleet
-   holds a claim, then repeats from step 6.
+8. The tick does one reconciliation pass (the mainline above) and returns one compact summary, which
+   the launcher hands back to the same call; it folds the summary into the cycle state and counts
+   whether the cycle was empty.
+   `skills/afk-fleet/scripts/afk_decide.py:cycle_ticked`
+9. The launcher sleeps the interval that call returned — busy, or idle after enough consecutive
+   empty cycles, never longer than half the lease while the fleet holds a claim — then repeats from
+   step 6, keeping nothing but the cycle state.
    `skills/afk-fleet/scripts/afk_decide.py:pace`
 10. On the human's word, one final drain tick releases the claims that have no PR, keeps the ones
     that do, and the launcher spawns no more ticks.
     `skills/afk-fleet/scripts/afk.py:cmd_release`
 
 **Where it forks.**
-- The digest is unchanged: no tick is spawned, the launcher refreshes the heartbeat itself, and a
-  full tick is forced every `force_tick_after_skips` cycles:
-  `skills/afk-fleet/scripts/afk_decide.py:fingerprint_gate`, ADR-0007.
+- The digest is unchanged: no tick is spawned, the same call refreshes the heartbeat if the fleet
+  holds claims and returns the sleep, and a full tick is forced every `force_tick_after_skips`
+  cycles: `skills/afk-fleet/scripts/afk_decide.py:cycle_wake`, ADR-0007.
 - The org forbids `refs/afk/*`, so claims fall back to ordinary branches:
   `skills/afk-fleet/scripts/afk.py:_usable_namespace`.
 - A local gate meets a target branch that requires checks, and bootstrap stops:
@@ -115,16 +133,16 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 3. The peer takes the claim by re-stamping the ref with its own instance, a push the server rejects
    unless the ref still points at the sha the peer read.
    `skills/afk-fleet/scripts/afk.py:cmd_reclaim`
-4. The peer asks what survived the death: a worktree for the issue still on this machine, and the
-   issue's branch on the remote ahead of base.
-   `skills/afk-fleet/scripts/afk.py:cmd_recovery`
+4. The peer **dispatches** the issue it now holds; the dispatch asks what survived the death: a
+   worktree for the issue still on this machine, and the issue's branch on the remote ahead of base.
+   `skills/afk-fleet/scripts/afk.py:_recovery`
 5. **Continuation** picks the tier: reuse the worktree, else recreate one at the pushed branch tip,
-   else dispatch fresh from base.
+   else start fresh from base.
    `skills/afk-fleet/scripts/afk_decide.py:select_recovery`
-6. The tick starts a new worker there with the continue-mode prompt, which has it inspect the
+6. The dispatch starts a new worker there with the continue-mode prompt, which has it inspect the
    existing progress before anything else and treat it as partial work toward the same criteria.
-   `skills/afk-fleet/references/worker-prompt.md:Continue`
-7. The issue rejoins the first mainline at its step 6, its claim kept and its retry count untouched.
+   `skills/afk-fleet/scripts/afk_decide.py:render_worker_prompt`
+7. The issue rejoins the first mainline at its step 7, its claim kept and its retry count untouched.
    `skills/afk-fleet/references/recovery.md:converges`
 
 **Where it forks.**
@@ -132,6 +150,8 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   `skills/afk-fleet/scripts/afk_decide.py:plan_takeover`, ADR-0011.
 - The dead worker is one of this fleet's own (an **orphaned claim**): no reclaim, straight to step 4,
   reached from `skills/afk-fleet/scripts/afk_decide.py:classify_no_pr`.
+- The tick judges the surviving state not worth continuing: a fresh start discards it instead,
+  `skills/afk-fleet/scripts/afk.py:_discard_attempt`.
 - The peer's heartbeat is fresh: the claim is left strictly alone, ADR-0003.
 - Two peers reclaim at once: one push wins, the other reports a lost race,
   `skills/afk-fleet/scripts/afk.py:_force_take`.
@@ -143,19 +163,21 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 2. The rebuild reads the issue's attempt number off its `afk-attempt/<n>` label, the only place the
    count lives.
    `skills/afk-fleet/scripts/afk_decide.py:current_attempt`
-3. The tick asks whether to retry or escalate: retry while the attempt is below `retry`.
+3. The tick **fails** the claim, giving the reason re-read from where it lives; the retry ladder
+   decides: retry while the attempt is below `retry`.
    `skills/afk-fleet/scripts/afk_decide.py:next_attempt`
-4. On retry, the tick swaps the attempt label up by one, tears the worktree down, and dispatches a
-   fresh worker under the same claim, handing it the failure reason re-read from where it lives.
-   `skills/afk-fleet/SKILL.md:from_label`
-5. When the attempts are exhausted, the tick upserts the status board to "escalated" while the issue
-   is still its claim.
-   `skills/afk-fleet/scripts/afk.py:cmd_status`
-6. The tick releases the claim.
-   `skills/afk-fleet/scripts/afk.py:cmd_release`
-7. The tick removes the ready label and the attempt label, adds the escalate label, and comments the
-   stuck point with PR and log links; the issue is now a human's.
-   `skills/afk-fleet/SKILL.md:escalate_label`
+4. On retry, the label is swapped up by one and the failed attempt is discarded: its PR closed, its
+   branch deleted, its worktree removed.
+   `skills/afk-fleet/scripts/afk.py:_discard_attempt`
+5. A fresh worker is started from the base under the same claim, its prompt ending with the failure
+   reason.
+   `skills/afk-fleet/scripts/afk.py:cmd_fail`
+6. When the attempts are exhausted, the status board is upserted to "escalated" and the issue is
+   relabelled: the escalate label on, the ready label and the attempt label off.
+   `skills/afk-fleet/scripts/afk_decide.py:escalation_labels`
+7. The stuck point is commented with the PR, and only then is the claim released; the issue is now
+   a human's, with its PR and worktree left as evidence.
+   `skills/afk-fleet/scripts/afk.py:_escalate`
 
 **Where it forks.**
 - Other ways into step 1: a red merge-time gate (`skills/afk-fleet/scripts/afk_decide.py:gate_verdict`),
@@ -163,9 +185,9 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   or a worker idle past grace with a `giving-up` verdict or none at all
   (`skills/afk-fleet/scripts/afk_decide.py:classify_no_pr`).
 - A worker that declares itself blocked is not a failure: re-dispatched when its blockers close,
-  escalated as a DAG gap when they do not, never counted as an attempt (same function).
+  escalated as a DAG gap when they do not (`skills/afk-fleet/scripts/afk.py:cmd_escalate`), never counted as an attempt.
 - A worker that declares the issue already satisfied, with nothing on its branch: the issue is
-  closed and the claim released (same function).
+  closed and the claim released (the first mainline's fork).
 
 ## Invariants
 
@@ -178,18 +200,25 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 - A fleet never takes a peer's claim unattended while that peer's heartbeat is within the lease, and
   its own claims stay its own even when its heartbeat has expired. (ADR-0003;
   `test_classify_claims`, `test_classify_claims_my_own_expired_stays_mine`)
-- A claim is deleted at every terminal transition (merge, escalate, release), and a release that
-  left the ref on the remote is an error, never "released". (ADR-0016;
-  `test_a_release_that_did_not_delete_the_claim_is_an_error`)
+- A claim is deleted at every terminal transition (merge, escalate, close, release) and as its last
+  step — after the PR landed, after the relabel — and a release that left the ref on the remote is
+  an error, never "released". (ADR-0016, ADR-0017;
+  `test_a_release_that_did_not_delete_the_claim_is_an_error`,
+  `test_escalate_relabels_before_it_releases`)
 - A branch catches up with its base by merging, never rebasing, and what lands on the target was
-  gated in the form it lands; only exit 0 is green, and a timeout is red. (ADR-0012;
-  `test_gate_run_is_green_only_on_exit_zero`)
+  gated in the form it lands; only exit 0 is green, and a timeout is red. (ADR-0012, ADR-0017;
+  `test_merge_gates_the_tree_that_lands_then_settles_the_claim`,
+  `test_merge_in_required_mode_trusts_checks_only_on_the_head_that_lands`)
+- A worker starts from the commit the remote has, never a stale local branch, and is told the branch
+  orca actually created. (ADR-0017;
+  `test_dispatch_starts_a_worker_on_the_remote_base_tip_and_submits_its_prompt`)
 - Commits ahead and a dirty tree are standing facts, never signs of life: only a busy terminal or
   activity within the grace period keeps a PR-less claim "coding". (ADR-0013;
   `test_classify_no_pr_coding_needs_a_live_signal`)
-- A dead worker's progress is continued, never restarted while any survives; only tier 3 tears a
-  worktree down, and neither continuation nor takeover reads or increments the attempt count.
-  (ADR-0011; `test_select_recovery`)
+- A dead worker's progress is continued, never restarted while any survives; continuation tears
+  nothing down — only a retry or an explicit fresh start discards an attempt — and neither
+  continuation nor takeover reads or increments the attempt count.
+  (ADR-0011; `test_select_recovery`, `test_dispatch_continues_from_whatever_progress_survived`)
 - An unreadable remote is an error, never an empty fleet, and no subcommand runs without the run's
   config. (ADR-0015, ADR-0016; `test_an_unreadable_remote_is_an_error_not_an_empty_fleet`,
   `test_config_is_required_and_resolves_one_way_on_every_subcommand`)
@@ -214,6 +243,8 @@ stateDiagram-v2
   ci_failed --> claimed: attempts left, fresh worker under the same claim
   ci_failed --> escalated: attempts exhausted
   claimed --> escalated: no outcome after grace and attempts exhausted, or blocker still open
+  claimed --> closed: already satisfied, empty diff verified
+  closed --> [*]: claim released, worktree removed
   merged --> [*]: claim released, worktree removed
   escalated --> [*]: claim released, handed to a human
 ```
@@ -236,14 +267,16 @@ four claim refs.
 
 What the tick then does, each row a different mainline:
 
-- **#3** is the first mainline from step 10: sync, re-confirm the gate, squash-merge PR #30, board
-  to "merged", release the claim.
-- **#1** is the first mainline from step 3: claim it, hand it to orca, send the worker its prompt.
+- **#3** is the first mainline from step 11: `afk merge` syncs, re-confirms the gate, squash-merges
+  PR #30, sets the board to "merged" and releases the claim.
+- **#1** is the first mainline from step 3: `afk dispatch` claims it, has orca create the worktree,
+  and delivers the worker its prompt. The row also says `free_slots: 1` — one slot is all
+  `concurrency: 3` leaves beside the two claims held.
 - **#6** is the dead-fleet mainline from step 3: `peerB` last beat 5499 s ago, past the 4500 s
-  lease, so reclaim with `--expect-sha s6`, then recover by continuation.
+  lease, so reclaim with `--expect-sha s6`, then `afk dispatch` recovers it by continuation.
 - **#4** has no PR, so the tick probes its terminal and asks `afk no-pr` why; it is already on
-  attempt 1, so if the answer is a failure, one more retry is left before it escalates (`retry`
-  defaults to 2).
+  attempt 1, so if the answer is a failure, `afk fail` has one more retry left before it escalates
+  (`retry` defaults to 2).
 - **#5** is left strictly alone: `peerA` beat 100 s ago.
 - **#2** waits: it rejoins the frontier when its blocker closes.
 

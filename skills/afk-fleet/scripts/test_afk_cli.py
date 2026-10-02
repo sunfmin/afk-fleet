@@ -7,9 +7,10 @@ Run: python3 test_afk_cli.py   (or under pytest, beside the other two suites)
 
 `test_afk_decide.py` pins the pure verdicts and `test_afk_refs.py` the ref races;
 what neither reaches is the seam between them: that `afk rebuild` asks gh for the
-fields its verdicts read, that `afk no-pr` derives its inputs from a real worktree
-and real comments, that `--set` beats `--config` beats the defaults table — and that
-a call with no `--config` is refused — on every subcommand, and that the docs name
+fields its verdicts read, that `afk dispatch` puts a worker on the commit the
+REMOTE has and submits its prompt, that `afk merge` gates the tree that lands and
+releases only after it landed, that `afk escalate` relabels before it releases,
+that `--set` beats `--config` beats the defaults table — and that the docs name
 subcommands and flags that exist.
 
 Nothing is injected into afk.py to make that possible. The outside world is faked
@@ -18,9 +19,15 @@ where it actually lives — executables on PATH:
   gh    a stand-in backed by one JSON state file. It projects exactly the fields
         asked for (asking for one GitHub does not have is a KeyError), applies only
         the `--jq` filters it knows (a changed filter fails loudly rather than
-        silently diverging), and logs every call so a test can assert what was —
-        and was NOT — asked.
-  orca  prints a canned `worktree list --json` document.
+        silently diverging), refuses what GitHub refuses (an unknown label, a merge
+        pinned to a head the branch has left), and logs every call so a test can
+        assert what was — and was NOT — asked. A merge moves the real target
+        branch in the bare repo.
+  orca  a stand-in backed by one JSON document, in orca's own response shapes
+        (pinned against orca 1.4). `worktree create` makes a REAL git worktree on a
+        `tester/<name>` branch; terminals record the command they were started
+        with and every prompt sent to them, so a test reads what a worker was
+        actually told.
   $SHELL  a stand-in login shell that knows a fixed set of aliases.
 
 git is real, against the same bare-repo sandbox as `test_afk_refs.py`; `--repo
@@ -29,6 +36,7 @@ owner/name` reaches it through a `url.<bare>.insteadOf` rewrite in the clone.
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from contextlib import contextmanager
@@ -42,7 +50,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SKILL = os.path.dirname(HERE)
 
 FAKE_GH = r'''#!%(python)s
-import json, os, sys
+import json, os, subprocess, sys
 
 path = os.environ["AFK_FAKE_GH"]
 with open(path) as f:
@@ -64,14 +72,97 @@ def opt(name, default=None):
     return argv[argv.index(name) + 1] if name in argv else default
 
 
+def opts(name):
+    return [argv[i + 1] for i, x in enumerate(argv) if x == name]
+
+
+def bare(*args):
+    """git against the bare repo standing in for GitHub's copy of the code."""
+    return subprocess.run(["git", "--git-dir", st["bare"], *args],
+                          capture_output=True, text=True).stdout.strip()
+
+
+def head_of(pr):
+    """A PR's head is wherever its branch points NOW — as on GitHub."""
+    return bare("rev-parse", "-q", "--verify", "refs/heads/" + pr["headRefName"]) or pr["headRefOid"]
+
+
+def known_labels():
+    return set(st.get("labels", [])) | {lb["name"] for i in st["issues"] for lb in i["labels"]}
+
+
+if " ".join(argv[:2]) in st.get("fail", []):
+    finish(code=1, err="fake gh: injected failure\n")
+
+if argv[0] in ("issue", "pr", "label") and opt("--repo") != st["repo"]:
+    finish(code=1, err="fake gh: unknown repo %%s\n" %% opt("--repo"))
+
 if argv[:2] in (["issue", "list"], ["pr", "list"]):
-    if opt("--repo") != st["repo"]:
-        finish(code=1, err="fake gh: unknown repo %%s\n" %% opt("--repo"))
     assert opt("--state") == "open", argv
     rows = [r for r in st["issues" if argv[0] == "issue" else "prs"]
             if r.get("state", "open") == "open"]
+    if argv[0] == "pr":
+        rows = [{**r, "headRefOid": head_of(r)} for r in rows]
     fields = opt("--json").split(",")
     finish(json.dumps([{k: r[k] for k in fields} for r in rows]))
+
+if argv[:2] == ["label", "create"]:
+    if argv[2] in known_labels():
+        finish(code=1, err="label with name %%r already exists\n" %% argv[2])
+    st.setdefault("labels", []).append(argv[2])
+    finish()
+
+if argv[0] == "issue" and argv[1] in ("edit", "close"):
+    row = next((r for r in st["issues"] if str(r["number"]) == argv[2]), None)
+    if row is None or row.get("state", "open") != "open":
+        finish(code=1, err="fake gh: no open issue %%s\n" %% argv[2])
+    if argv[1] == "close":
+        assert opt("--reason") == "completed", argv
+        row["state"] = "closed"
+        finish()
+    have = [lb["name"] for lb in row["labels"]]
+    for name in opts("--add-label"):
+        if name not in known_labels():
+            finish(code=1, err="'%%s' not found\n" %% name)
+    for name in opts("--remove-label"):                  # stricter than GitHub, on purpose
+        if name not in have:
+            finish(code=1, err="fake gh: issue does not carry %%r\n" %% name)
+    have = [n for n in have if n not in opts("--remove-label")]
+    have += [n for n in opts("--add-label") if n not in have]
+    row["labels"] = [{"name": n, "color": "ededed"} for n in have]
+    finish()
+
+if argv[0] == "pr" and argv[1] in ("merge", "close", "comment"):
+    row = next((r for r in st["prs"] if str(r["number"]) == argv[2]), None)
+    if row is None or row.get("state", "open") != "open":
+        finish(code=1, err="fake gh: no open pull request %%s\n" %% argv[2])
+    notes = st.setdefault("pr_comments", {}).setdefault(argv[2], [])
+    ref = "refs/heads/" + row["headRefName"]
+    if argv[1] == "comment":
+        notes.append(opt("--body"))
+        finish()
+    if argv[1] == "close":
+        notes.append(opt("--comment"))
+        row["state"] = "closed"
+        if "--delete-branch" in argv:
+            bare("update-ref", "-d", ref)
+        finish()
+    strategy = [x[2:] for x in argv if x in ("--squash", "--merge", "--rebase")]
+    assert len(strategy) == 1, argv
+    if opt("--match-head-commit") != head_of(row):
+        finish(code=1, err="GraphQL: Head branch was modified. Review and try the merge again.\n")
+    # the head already contains the target (the sync merged it in), so landing it
+    # is a fast-forward of the target — the same tree a real squash would produce
+    bare("update-ref", "refs/heads/" + st["base"], head_of(row))
+    row.update(state="merged", merged={"strategy": strategy[0], "head": head_of(row),
+                                       "delete_branch": "--delete-branch" in argv})
+    if "--delete-branch" in argv:
+        bare("update-ref", "-d", ref)
+    for ref_issue in row["closingIssuesReferences"]:
+        for i in st["issues"]:
+            if i["number"] == ref_issue["number"]:
+                i["state"] = "closed"
+    finish()
 
 assert argv[0] == "api", argv
 endpoint = next(x for x in argv[1:] if x.startswith("repos/"))
@@ -109,6 +200,9 @@ if parts[0] == "issues" and len(parts) == 2:
         finish(code=1, err="gh: Not Found (HTTP 404)\n")
     if jq == ".state":
         finish(row.get("state", "open"))
+    if jq == "{title, state, labels: [.labels[].name]}":
+        finish(json.dumps({"title": row["title"], "state": row.get("state", "open"),
+                           "labels": [lb["name"] for lb in row["labels"]]}))
     assert jq == ".issue_dependencies_summary.blocked_by", "fake gh: unsupported jq %%r" %% jq
     finish(json.dumps(row.get("blocked_by")))
 
@@ -124,11 +218,133 @@ finish(code=1, err="fake gh: unsupported call %%r\n" %% argv)
 '''
 
 FAKE_ORCA = r'''#!%(python)s
-import os, sys
-assert sys.argv[1:] == ["worktree", "list", "--json"], sys.argv
-with open(os.environ["AFK_FAKE_ORCA"]) as f:
-    sys.stdout.write(f.read())
-sys.exit(int(os.environ.get("AFK_FAKE_ORCA_EXIT", "0")))
+import json, os, subprocess, sys
+
+path = os.environ["AFK_FAKE_ORCA"]
+argv = sys.argv[1:]
+with open(path) as f:
+    raw = f.read()
+if argv == ["worktree", "list", "--json"]:       # verbatim, so a test can make it garbage
+    sys.stdout.write(raw)
+    sys.exit(int(os.environ.get("AFK_FAKE_ORCA_EXIT", "0")))
+
+assert argv[-1] == "--json", argv
+doc = json.loads(raw)
+fake, rows = doc["fake"], doc["result"]["worktrees"]
+fake["calls"].append(argv[:-1])
+
+
+def finish(result=None, error=None):
+    with open(path, "w") as f:
+        json.dump(doc, f)
+    print(json.dumps({"id": "x", "ok": error is None, "result": result,
+                      **({"error": {"code": error, "message": error}} if error else {})}))
+    sys.exit(1 if error else 0)
+
+
+def opt(name):
+    return argv[argv.index(name) + 1]
+
+
+def git(cwd, *args):
+    p = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True)
+    assert p.returncode == 0, (args, p.stderr)
+    return p.stdout.strip()
+
+
+def worktree():
+    sel = opt("--worktree")
+    assert sel.startswith("path:"), argv
+    return next((r for r in rows if r["path"] == sel[len("path:"):]), None)
+
+
+def terminal():
+    return next((t for t in fake["terminals"] if t["handle"] == opt("--terminal") and t["open"]), None)
+
+
+cmd = argv[:2]
+if cmd == ["repo", "list"]:
+    finish({"repos": fake["repos"]})
+
+if cmd == ["worktree", "create"]:
+    repo = next((r for r in fake["repos"] if "id:" + r["id"] == opt("--repo")), None)
+    if repo is None:
+        finish(error="selector_not_found")
+    assert "--no-parent" in argv, argv
+    taken = git(repo["path"], "for-each-ref", "--format=%%(refname:short)", "refs/heads").splitlines()
+    name, n = opt("--name"), 1
+    while "tester/" + name + ("" if n == 1 else "-%%d" %% n) in taken:     # orca never reuses a branch
+        n += 1
+    name += "" if n == 1 else "-%%d" %% n
+    wt = os.path.join(fake["root"], name.replace("/", "-"))
+    git(repo["path"], "worktree", "add", "-q", "-b", "tester/" + name, wt,
+        fake.get("stale_base") or opt("--base-branch"))
+    rows.append({"linkedIssue": int(opt("--issue")), "path": wt, "branch": "refs/heads/tester/" + name,
+                 "projectId": fake["project"], "isMainWorktree": False, "isArchived": False,
+                 "lastActivityAt": len(fake["calls"])})
+    finish({"worktree": {"path": wt, "branch": "refs/heads/tester/" + name,
+                         "head": git(wt, "rev-parse", "HEAD"), "baseRef": opt("--base-branch")}})
+
+if cmd == ["worktree", "rm"]:
+    row = worktree()
+    if row is None:
+        finish(error="selector_not_found")
+    if fake.get("rm_fails"):
+        finish(error="worktree_busy")
+    assert "--force" in argv, argv
+    if os.path.isdir(row["path"]):
+        git(fake["repos"][0]["path"], "worktree", "remove", "--force", row["path"])
+    rows.remove(row)
+    for t in fake["terminals"]:
+        t["open"] = t["open"] and t["worktreePath"] != row["path"]
+    finish({"removed": True})
+
+if cmd == ["terminal", "create"]:
+    row = worktree()
+    if row is None:
+        finish(error="selector_not_found")
+    handle = "term-%%d" %% (len(fake["terminals"]) + 1)
+    fake["terminals"].append({"handle": handle, "worktreePath": row["path"],
+                              "command": opt("--command"), "sent": [], "open": True})
+    finish({"terminal": {"handle": handle, "worktreePath": row["path"]}})
+
+if cmd == ["terminal", "wait"]:
+    assert opt("--for") == "tui-idle" and int(opt("--timeout-ms")) > 0, argv
+    if terminal() is None:
+        finish(error="terminal_handle_stale")
+    ready = not fake.get("never_ready")
+    finish({"wait": {"satisfied": ready, "status": "idle" if ready else "timeout"}})
+
+if cmd == ["terminal", "send"]:
+    term = terminal()
+    if term is None:
+        finish(error="terminal_handle_stale")
+    term["sent"].append({"text": opt("--text"), "enter": "--enter" in argv})
+    finish({"send": {"accepted": True}})
+
+if cmd == ["terminal", "list"]:
+    row = worktree()
+    finish({"terminals": [{"handle": t["handle"], "worktreePath": t["worktreePath"],
+                           "connected": True, "writable": True, "lastOutputAt": i}
+                          for i, t in enumerate(fake["terminals"])
+                          if t["open"] and row and t["worktreePath"] == row["path"]]})
+
+if cmd == ["terminal", "read"]:
+    term = terminal()
+    if term is None:
+        finish(error="terminal_handle_stale")
+    assert "--screen" in argv and int(opt("--limit")) > 0, argv
+    finish({"terminal": {"handle": term["handle"], "tail": term.get("screen", []),
+                         "source": "screen"}})
+
+if cmd == ["terminal", "close"]:
+    row = worktree()
+    assert "--all" in argv, argv
+    for t in fake["terminals"]:
+        t["open"] = t["open"] and not (row and t["worktreePath"] == row["path"])
+    finish({"closed": True})
+
+finish(error="fake orca: unsupported call %%r" %% (argv,))
 '''
 
 # A login shell that knows two aliases. Like zsh, an unresolvable `type` prints
@@ -158,8 +374,13 @@ def issue(n, *labels, **extra):
 
 
 def pr(n, closes, conclusion="SUCCESS", **extra):
-    return {"number": n, "headRefOid": f"sha{n}", "updatedAt": f"P{n}",
-            "statusCheckRollup": [{"name": "ci", "status": "COMPLETED", "conclusion": conclusion}],
+    """One open PR. `conclusion=None` is a PR with no checks at all. Its head is
+    wherever `headRefName` points in the bare repo, `headRefOid` when it is not there."""
+    checks = [{"name": "ci", "status": "COMPLETED", "conclusion": conclusion}] if conclusion else []
+    if conclusion == "PENDING":
+        checks = [{"name": "ci", "status": "IN_PROGRESS", "conclusion": None}]
+    return {"number": n, "headRefName": f"tester/issue-{closes}-x", "headRefOid": f"sha{n}",
+            "updatedAt": f"P{n}", "statusCheckRollup": checks,
             "closingIssuesReferences": [{"number": closes, "url": "u"}], **extra}
 
 
@@ -183,9 +404,15 @@ class World:
                     "SHELL": os.path.join(bindir, "fakeshell")}
         for leak in ("QODERCN_CLI", "ANTHROPIC_BASE_URL"):
             self.env.pop(leak, None)
-        self.set(**{"repo": REPO, "issues": [], "prs": [], "comments": {}, **state})
+        self.set(**{"repo": REPO, "bare": sb.bare, "base": sb.base, "issues": [], "prs": [],
+                    "comments": {}, "labels": ["ready-for-agent"], **state})
+        self._fake = {"repos": [{"id": "repo-1", "path": self.cwd, "displayName": "widgets",
+                                 "gitRemoteIdentity": {"canonicalKey": f"github.com/{REPO}"}}],
+                      "project": f"github:{REPO}", "root": os.path.join(sb.root, "wt"),
+                      "terminals": [], "calls": []}
         self.orca([])
 
+    # --- GitHub -----------------------------------------------------------
     def set(self, **state):
         cur = self.state() if os.path.exists(self.gh_file) else {}
         with open(self.gh_file, "w") as f:
@@ -202,17 +429,74 @@ class World:
             self.set(calls=[])
         return calls
 
-    def orca(self, worktrees):
-        with open(self.orca_file, "w") as f:
-            json.dump({"id": "x", "ok": True, "result": {"worktrees": worktrees, "totalCount":
-                                                         len(worktrees)}}, f)
+    def issue(self, n):
+        row = next(i for i in self.state()["issues"] if i["number"] == n)
+        return {"state": row.get("state", "open"), "labels": [lb["name"] for lb in row["labels"]]}
 
+    def pr(self, n):
+        return next(p for p in self.state()["prs"] if p["number"] == n)
+
+    def comments(self, n):
+        return [c["body"] for c in self.state()["comments"].get(str(n), [])]
+
+    def board(self, n):
+        """The issue's ONE status board comment body ("" when it has none)."""
+        rows = [b for b in self.comments(n) if afk_decide.STATUS_MARKER in b]
+        assert len(rows) <= 1, rows
+        return rows[0] if rows else ""
+
+    def open_pr(self, number, closes, branch, conclusion="SUCCESS"):
+        self.set(prs=self.state()["prs"] + [pr(number, closes, conclusion, headRefName=branch)])
+
+    def claimed_by(self, n):
+        """The instance holding issue n's claim on the remote, None when unclaimed."""
+        if not self.sb.remote_ref(f"refs/afk/claim/{n}"):
+            return None
+        return next(c["instance"] for c in self.afk("scan", *R)["claims"] if c["number"] == n)
+
+    # --- orca -------------------------------------------------------------
+    def orca(self, worktrees=None, **knobs):
+        """Set orca's worktree rows and/or the fake's knobs (`never_ready`,
+        `stale_base`, `rm_fails`, `repos`), keeping everything else it remembers."""
+        if os.path.exists(self.orca_file):
+            try:
+                with open(self.orca_file) as f:
+                    doc = json.load(f)
+                self._fake = doc["fake"]
+                worktrees = doc["result"]["worktrees"] if worktrees is None else worktrees
+            except (ValueError, KeyError, TypeError):
+                pass                                  # a test wrote garbage there: start over
+        self._fake.update(knobs)
+        rows = worktrees or []
+        with open(self.orca_file, "w") as f:
+            json.dump({"id": "x", "ok": True, "fake": self._fake,
+                       "result": {"worktrees": rows, "totalCount": len(rows)}}, f)
+
+    def orca_doc(self):
+        with open(self.orca_file) as f:
+            return json.load(f)
+
+    def worktrees(self):
+        return self.orca_doc()["result"]["worktrees"]
+
+    def terminals(self):
+        return self.orca_doc()["fake"]["terminals"]
+
+    def orca_calls(self, reset=True):
+        """Every stateful orca invocation since the last look, as `"<noun> <verb>"`."""
+        calls = [" ".join(c[:2]) for c in self.orca_doc()["fake"]["calls"]]
+        if reset:
+            self.orca(calls=[])
+        return calls
+
+    # --- the CLI ----------------------------------------------------------
     def afk(self, *args, env=None):
         return run(self.cwd, *args, env={**self.env, **(env or {})})
 
     def error(self, *args, env=None, bare=False):
         return afk_error(self.cwd, *args, env={**self.env, **(env or {})}, bare=bare)
 
+    # --- the code ---------------------------------------------------------
     def commit(self, name, branch=None):
         if branch:
             git(self.cwd, "checkout", "-q", "-b", branch)
@@ -220,6 +504,34 @@ class World:
             f.write(name + "\n")
         git(self.cwd, "add", "-A")
         git(self.cwd, "commit", "-qm", name)
+
+    def work(self, path, name, text=None, push=True):
+        """What a worker does in its worktree: commit a file, push its branch → sha."""
+        with open(os.path.join(path, name), "w") as f:
+            f.write((text or name) + "\n")
+        git(path, "add", "-A")
+        git(path, "commit", "-qm", f"work: {name}")
+        if push:
+            git(path, "push", "-q", "origin", "HEAD")
+        return git(path, "rev-parse", "HEAD")
+
+    def advance_base(self, name, text=None):
+        """Someone else lands a commit on the base branch — on the REMOTE only: no
+        clone here has fetched it → its sha."""
+        seed = os.path.join(self.sb.root, "seed")
+        git(seed, "pull", "-q", "origin", self.sb.base)
+        with open(os.path.join(seed, name), "w") as f:
+            f.write((text or name) + "\n")
+        git(seed, "add", "-A")
+        git(seed, "commit", "-qm", f"base: {name}")
+        git(seed, "push", "-q", "origin", f"HEAD:refs/heads/{self.sb.base}")
+        return git(seed, "rev-parse", "HEAD")
+
+    def remote_files(self, ref):
+        """The file names in the tree the remote has at `ref`."""
+        p = subprocess.run(["git", "--git-dir", self.sb.bare, "ls-tree", "--name-only", ref],
+                           capture_output=True, text=True, env=ENV)
+        return set(p.stdout.split())
 
 
 @contextmanager
@@ -230,10 +542,34 @@ def world(**state):
 
 
 R = ("--repo", REPO)
+ME = ("--instance", "me")
+NOW = ("--now", str(T0))
+WORKER = "ckimi --dangerously-skip-permissions"     # the run's worker launch command: opaque
+
+
+def dispatch(n, *extra, instance="me"):
+    """The argv of one `afk dispatch`. A claim marker is a commit of (instance, host,
+    ts), so a re-dispatch at the very same `--now` pushes the identical sha and reads
+    as `won` again; a test asserting `held` passes a later one, as a later tick would."""
+    return ("dispatch", "--issue", str(n), "--instance", instance, "--worker-command", WORKER,
+            *R, *NOW, *extra)
+
+
+def local_gate(command):
+    return ("--set", "gate.ci=local", "--set", f"gate.local_command={command}")
+
+
+def with_pr(w, n, pr_number, conclusion="SUCCESS", **work):
+    """Issue n as a tick finds it at merge time: dispatched, its worker committed and
+    pushed, and a PR closing it is open → (the dispatch result, the PR head sha)."""
+    d = w.afk(*dispatch(n))
+    head = w.work(d["worktree"], work.pop("name", f"feature{n}.txt"), **work)
+    w.open_pr(pr_number, closes=n, branch=d["branch"], conclusion=conclusion)
+    return d, head
 
 
 # --------------------------------------------------------------------------- #
-# rebuild / fingerprint                                                        #
+# rebuild / cycle                                                              #
 # --------------------------------------------------------------------------- #
 
 def test_rebuild_assembles_the_working_set_from_gh_and_refs():
@@ -312,56 +648,153 @@ def test_rebuild_reads_the_dispatch_contract_from_config_and_set():
         assert "unknown repo" in w.error("rebuild", "--instance", "me", "--repo", "acme/other")
 
 
-def test_rebuild_and_fingerprint_fail_when_the_claim_refs_cannot_be_read():
+def test_rebuild_reports_free_slots_and_a_claim_whose_issue_is_closed():
+    """A merge (or `afk close`) that died between landing and releasing leaves a
+    claim on a CLOSED issue. gh's open list no longer has the issue, so the row used
+    to read as a title-less `no_pr` — a worker to wait on, or re-dispatch, forever."""
+    issues = [issue(1, "ready-for-agent"), issue(2, "ready-for-agent", state="closed"),
+              issue(3, "ready-for-agent")]
+    with world(issues=issues) as w:
+        assert w.afk("rebuild", *ME, *R, *NOW)["free_slots"] == 3
+        for n in (2, 3):
+            w.afk("claim", str(n), *ME, *NOW, *R)
+        w.calls()
+        ws = w.afk("rebuild", *ME, *R, *NOW)
+        rows = {m["number"]: (m["status"], m["board_phase"], m["title"]) for m in ws["mine"]}
+        assert rows == {2: ("closed", None, None), 3: ("no_pr", "claimed", "issue 3")}
+        assert ws["free_slots"] == 1 and ws["frontier"]["dispatch"] == [{"number": 1, "title": "issue 1"}]
+        # the state read is paid only by a claim of mine missing from the open list
+        assert [c[1] for c in w.calls() if ".state" in c] == [f"repos/{REPO}/issues/2"]
+        assert w.afk("rebuild", *ME, *R, *NOW, "--set", "concurrency=1")["free_slots"] == 0
+
+        # the one thing left to do for it
+        w.afk("release", "2", *R)
+        ws = w.afk("rebuild", *ME, *R, *NOW)
+        assert [m["number"] for m in ws["mine"]] == [3] and ws["free_slots"] == 2
+
+
+def test_rebuild_and_cycle_fail_when_the_claim_refs_cannot_be_read():
     """gh answering while git cannot fetch (an expired git credential beside a live
     gh token) used to assemble a working set with NO claims in it: nothing of mine
     in flight, every claimed issue back on the frontier, and a fingerprint that
     never moves. It is an error, on both commands that share the gatherer."""
     with world(issues=[issue(1, "ready-for-agent")]) as w:
-        w.afk("claim", "1", "--instance", "me", "--now", str(T0), *R)
-        assert [m["number"] for m in w.afk("rebuild", "--instance", "me", *R)["mine"]] == [1]
+        w.afk("claim", "1", *ME, *NOW, *R)
+        assert [m["number"] for m in w.afk("rebuild", *ME, *R)["mine"]] == [1]
 
         git(w.cwd, "config", "--unset", f"url.{w.sb.bare}.insteadOf")   # git loses the remote
-        assert "fetch" in w.error("rebuild", "--instance", "me", *R)
-        assert "fetch" in w.error("fingerprint", *R)
+        assert "fetch" in w.error("rebuild", *ME, *R)
+        assert "fetch" in w.error("cycle", *ME, *R)
 
 
-def test_fingerprint_gate_skips_until_observable_state_moves():
+def test_cycle_gates_paces_and_beats_through_a_whole_run():
+    """The launcher's loop as it actually runs: one `afk cycle` at the top of every
+    cycle, one more after each tick, and an opaque `state` threaded between them.
+    The launcher holds no counter and does no arithmetic — in particular none for the
+    empty streak, which nothing used to produce at all: the idle interval was
+    unreachable."""
     with world(issues=[issue(1, "ready-for-agent")], prs=[pr(30, closes=2)]) as w:
-        first = w.afk("fingerprint", *R)
-        assert (first["action"], first["reason"], first["skips"]) == ("tick", "first", 0)
-        fp = first["fingerprint"]
+        hb = "refs/afk/heartbeat/me"
+
+        def top(state, *extra, now=T0):
+            return w.afk("cycle", *ME, *R, "--now", str(now), "--state", json.dumps(state), *extra)
+
+        def ticked(state, *extra, **summary):
+            body = {"merged": [], "dispatched": [], "in_flight": 0, "frontier_remaining": 0, **summary}
+            return w.afk("cycle", *ME, *R, *NOW, "--state", json.dumps(state),
+                         "--summary", json.dumps(body), *extra)
+
+        # cycle 1: no state at all → the first tick
+        first = w.afk("cycle", *ME, *R, *NOW)
+        assert (first["action"], first["reason"]) == ("tick", "first")
+        assert set(first) == {"action", "reason", "state"}            # a tick owes no sleep yet
+        st = first["state"]
         # the digest is the SAME one rebuild reports: one gatherer, one function
-        assert w.afk("rebuild", "--instance", "me", *R)["fingerprint"] == fp
+        assert st["fingerprint"] == w.afk("rebuild", *ME, *R)["fingerprint"]
 
-        skip = w.afk("fingerprint", *R, "--last", fp, "--skips", "0")
-        assert (skip["action"], skip["reason"], skip["skips"], skip["fingerprint"]) == \
-            ("skip", "unchanged", 1, fp)
-        # the forced full tick: default every 6, from --config, or --set — --set wins
-        assert w.afk("fingerprint", *R, "--last", fp, "--skips", "5")["reason"] == "forced"
-        short = json.dumps({"force_tick_after_skips": 2})
-        assert w.afk("fingerprint", *R, "--last", fp, "--skips", "1", "--config", short)["reason"] == "forced"
-        assert w.afk("fingerprint", *R, "--last", fp, "--skips", "1", "--config", short,
-                     "--set", "force_tick_after_skips=9")["action"] == "skip"
+        # …the tick dispatched #1 and now holds it
+        w.afk("claim", "1", *ME, *NOW, *R)
+        after = ticked(st, dispatched=[1], in_flight=1)
+        assert after["sleep_seconds"] == 90 and set(after) == {"state", "sleep_seconds"}
 
-        # each kind of movement a tick would act on moves the digest
-        w.afk("claim", "1", "--instance", "peer", "--now", str(T0), *R)
-        claimed = w.afk("fingerprint", *R, "--last", fp)
-        assert (claimed["action"], claimed["reason"]) == ("tick", "changed")
+        # cycle 2: the claim moved the digest → tick
+        woke = top(after["state"])
+        assert (woke["action"], woke["reason"]) == ("tick", "changed")
+        held = ticked(woke["state"], in_flight=1)["state"]
+
+        # cycle 3: nothing moved, but the fleet HOLDS a claim → skip, and the lease
+        # no tick will refresh is refreshed here, in the same call
+        assert not w.sb.remote_ref(hb)
+        w.calls()
+        skip = top(held)
+        assert (skip["action"], skip["reason"], skip["sleep_seconds"]) == ("skip", "unchanged", 90)
+        assert skip["heartbeat"]["refreshed"] is True and w.sb.remote_ref(hb)
+        assert skip["state"]["empty_streak"] == 0                     # holding a claim is not empty
+        # a skipped cycle is cheap by construction: the two lists, no per-issue read
+        assert [c[:2] for c in w.calls()] == [["issue", "list"], ["pr", "list"]]
+        # the beat is stateless and self-limiting…
+        again = top(skip["state"])
+        assert (again["action"], again["heartbeat"]["refreshed"]) == ("skip", False)
+        late = top(again["state"], now=T0 + TTL // 2)
+        assert late["heartbeat"]["refreshed"] is True
+        # …and does not itself move the digest it is gated on
+        assert top(late["state"])["action"] == "skip"
+        # the sleep under a held claim is capped at half the lease, whatever the config
+        assert top(held, "--set", "busy_interval_seconds=99999")["sleep_seconds"] == TTL // 2
+
+        # each kind of movement a tick would act on wakes it
         w.set(prs=[pr(30, closes=2, conclusion="FAILURE")])
-        red = w.afk("fingerprint", *R, "--last", claimed["fingerprint"])
-        assert red["reason"] == "changed"
-        w.set(issues=[issue(1)])                                   # ready label pulled
-        assert w.afk("fingerprint", *R, "--last", red["fingerprint"])["reason"] == "changed"
-        # …and a heartbeat does not: the launcher's own skip-cycle refresh must not defeat the gate
-        now_fp = w.afk("fingerprint", *R)["fingerprint"]
-        w.afk("heartbeat", "--instance", "peer", "--now", str(T0), *R)
-        assert w.afk("fingerprint", *R, "--last", now_fp)["action"] == "skip"
+        red = top(late["state"])
+        assert (red["action"], red["reason"], red["state"]["skips"]) == ("tick", "changed", 0)
+        w.set(issues=[issue(1)])                                      # ready label pulled
+        assert top(red["state"])["reason"] == "changed"
+
+        # the fleet goes quiet: #1 merged and released, nothing left on the frontier
+        w.afk("release", "1", *R)
+        st = top(red["state"])["state"]
+        idle = ticked(st, merged=[1])                                 # work was done: not empty
+        assert (idle["state"]["empty_streak"], idle["sleep_seconds"]) == (0, 90)
+        s1 = top(idle["state"])
+        assert (s1["action"], s1["state"]["empty_streak"], s1["sleep_seconds"]) == ("skip", 1, 90)
+        assert "heartbeat" not in s1                                  # holding nothing: no beat
+        s2 = top(s1["state"])
+        s3 = top(s2["state"])
+        assert (s3["state"]["empty_streak"], s3["sleep_seconds"]) == (3, 1500)   # idle, at last
+        assert top(s2["state"], "--set", "idle_ticks_before_sleep=9")["sleep_seconds"] == 90
+        # an empty TICK counts exactly like an empty skip
+        assert ticked(s2["state"])["sleep_seconds"] == 1500
+        # …and anything it did, holds, or could not take resets the streak
+        assert ticked(s3["state"], frontier_remaining=2)["sleep_seconds"] == 90
+
+        # the forced full tick: default every 6 skips, from --config, or --set — --set wins
+        assert top({**s3["state"], "skips": 5})["reason"] == "forced"
+        short = ("--config", json.dumps({"force_tick_after_skips": 4}))
+        assert top(s3["state"], *short)["reason"] == "forced"
+        assert top(s3["state"], *short, "--set", "force_tick_after_skips=9")["action"] == "skip"
+
+        # the gate switched off: always a tick — and nothing was gathered to decide it
+        w.calls()
+        off = top(s3["state"], "--set", "fingerprint_gate=false")
+        assert (off["action"], off["reason"], off["state"]["skips"]) == ("tick", "gate_off", 0)
+        assert w.calls() == []
+
+        # a state or summary the launcher mangled is an error, never a fleet paced on zeros
+        assert "--state" in w.error("cycle", *ME, *R, "--state", json.dumps({"fingerprint": "x"}))
+        w.error("cycle", *ME, *R, "--state", "{not json")
+        for bad in ({}, {"in_flight": 1}, {"in_flight": "1", "frontier_remaining": 0}):
+            assert "--summary" in w.error("cycle", *ME, *R, "--summary", json.dumps(bad)), bad
+        assert "gh issue list failed" in w.error("cycle", *ME, "--repo", "acme/other")
 
 
 # --------------------------------------------------------------------------- #
 # no-pr                                                                        #
 # --------------------------------------------------------------------------- #
+
+def _orca_row(issue_no, path, **extra):
+    return {"linkedIssue": issue_no, "path": path, "branch": "refs/heads/sunfmin/issue-31-x",
+            "projectId": f"github:{REPO}", "isMainWorktree": False, "isArchived": False,
+            "lastActivityAt": 100, **extra}
+
 
 def _marker(phase, extra=""):
     return f"<!--afk:verdict n=4 phase={phase}{extra}-->\nexplanation"
@@ -386,14 +819,15 @@ def test_no_pr_gathers_every_signal_and_decides_in_one_call():
         # the tool's conclusion is `outcome`/`action`; what the WORKER declared is
         # `worker_verdict` — never one bare "verdict" that could be read as either
         assert set(r) == {"issue", "outcome", "action", "idle_seconds", "open_blockers",
-                          "progress", "worker_verdict"}
-        assert r["issue"] == 4 and r["open_blockers"] == []
+                          "worktree", "progress", "worker_verdict", "nudged_at"}
+        assert r["issue"] == 4 and r["open_blockers"] == [] and r["worktree"] == w.cwd
 
         # idle_seconds is derived HERE, from the freshest of commit / file / terminal
         # clocks: the tick supplies a terminal reading, never arithmetic
         r = w.afk(*base, "--terminal", "idle", "--now", later)
         assert 4900 < r["idle_seconds"] < 5100                    # the worktree's own clocks
-        assert (r["outcome"], r["action"]) == ("idle_failed", "next_attempt")
+        # silent with no verdict: stalled, to be nudged — not yet a failure
+        assert (r["outcome"], r["action"], r["nudged_at"]) == ("idle_stalled", "nudge", None)
         r = w.afk(*base, "--terminal", "idle", "--now", later, "--terminal-idle-seconds", "12")
         assert r["idle_seconds"] == 12 and r["outcome"] == "coding"   # the terminal is fresher
         # busy and none are the terminal's alone to say
@@ -443,9 +877,102 @@ def test_no_pr_gathers_every_signal_and_decides_in_one_call():
         r = w.afk(*base, "--terminal", "idle", "--now", later)
         assert r["progress"]["commits_ahead"] == 2 - 1 and r["progress"]["dirty"] is False
         assert (r["outcome"], r["action"]) == ("idle_failed", "next_attempt")
-        # the base it counts against is the config's
-        r = w.afk(*base, "--terminal", "idle", "--now", later, "--set", "base_branch=HEAD")
+        # the base it counts against is the config's — and it is the REMOTE's tip of
+        # that branch, not the local one: a checkout that has not pulled must not make
+        # a worktree cut from the fresh tip look like it carries work
+        git(w.cwd, "push", "-q", "origin", "HEAD:refs/heads/release")
+        r = w.afk(*base, "--terminal", "idle", "--now", later, "--set", "base_branch=release")
         assert r["progress"]["commits_ahead"] == 0 and r["outcome"] == "idle_done"
+        git(w.cwd, "branch", "-q", "-f", "release", "HEAD~1")        # a stale LOCAL release
+        r = w.afk(*base, "--terminal", "idle", "--now", later, "--set", "base_branch=release")
+        assert r["progress"]["commits_ahead"] == 0
+        assert "no branch 'gone'" in w.error(*base, "--terminal", "idle", "--set", "base_branch=gone")
+
+
+def test_a_silent_worker_is_nudged_once_and_its_screen_explains_the_failure():
+    """A worker that stops to ask a question nobody will answer is idle with no
+    verdict. Failing it straight away discards its work and sends a fresh worker
+    into the same wall; so it is told to carry on first — once, spending no attempt
+    — and if it stays silent, what its screen said goes into the failure reason."""
+    asking = ["● 这些都是对外可见的操作，我需要你确认一下。", "", "  要我从头做到开 PR 吗？", "❯ "]
+    with world(issues=[issue(7, "ready-for-agent")]) as w:
+        d = w.afk(*dispatch(7))
+        wt, real_now = d["worktree"], int(time.time())
+        cfg = ("--config", json.dumps({"base_branch": w.sb.base, "worker_idle_grace_seconds": 300}))
+        nudge = ("nudge", "--issue", "7", *ME, *R, *cfg)
+
+        def no_pr(at, terminal="idle"):
+            r = w.afk("no-pr", "--issue", "7", "--terminal", terminal, *R, *cfg, "--now", str(at))
+            return r["outcome"], r["action"]
+
+        def screen(lines):
+            terms = w.terminals()
+            terms[-1]["screen"] = lines
+            w.orca(terminals=terms)
+
+        t1 = real_now + 5000
+        assert no_pr(t1) == ("idle_stalled", "nudge")
+        screen(asking)
+        w.orca_calls()
+        r = w.afk(*nudge, "--now", str(t1))
+        assert r == {"issue": 7, "action": "nudged", "terminal": d["terminal"],
+                     "terminal_tail": [asking[0], asking[2], "❯"]}
+        assert w.orca_calls() == ["terminal list", "terminal read", "terminal send"]
+        brief, said = w.terminals()[-1]["sent"]
+        assert said["enter"] is True and "\n" not in said["text"]
+        assert "do not wait for a confirmation" in said["text"] and "afk:verdict" in said["text"]
+        assert brief["text"].split(" — ")[0].split(" ")[-1] in said["text"]   # names the same brief
+        # nothing was spent or discarded, and the worktree stays clean of fleet files
+        assert w.issue(7)["labels"] == ["ready-for-agent"] and w.claimed_by(7) == "me"
+        assert git(wt, "status", "--porcelain") == ""
+
+        # the nudge buys one grace period…
+        r = w.afk("no-pr", "--issue", "7", "--terminal", "idle", *R, *cfg, "--now", str(t1 + 60))
+        assert (r["outcome"], r["idle_seconds"], r["nudged_at"]) == ("coding", 60, t1)
+        # …and it is spent once: the second silence is a failure, by outcome and by rule
+        assert no_pr(t1 + 300) == ("idle_failed", "next_attempt")
+        assert "already nudged" in w.error(*nudge)
+        # a worker that answered the nudge is simply coding, or done
+        assert no_pr(t1 + 9000, "busy") == ("coding", "leave")
+
+        # the failure reason carries where it stopped — its screen as it is NOW
+        screen(["● 我还是需要你确认。"])
+        r = w.afk(*_fail(7, "idle past grace with no PR and no verdict"))
+        assert r["action"] == "retry"
+        told = _told(w.terminals()[-1])
+        assert "idle past grace with no PR and no verdict" in told
+        assert "stayed silent after one nudge" in told and "● 我还是需要你确认。" in told
+        # the retry's worker is a new worker: it has not been nudged
+        assert no_pr(t1 + 9000) == ("idle_stalled", "nudge")
+
+    with world(issues=[issue(8, "ready-for-agent")]) as w:
+        d = w.afk(*dispatch(8))
+        cfg = ("--config", json.dumps({"base_branch": w.sb.base}))
+        nudge = ("nudge", "--issue", "8", *R, *cfg)
+        # only my own claim, only a worker that is still there
+        assert "not this fleet's claim" in w.error(*nudge, "--instance", "peer")
+        terms = w.terminals()
+        terms[-1].update(screen=["● 确认一下？"], open=False)
+        w.orca(terminals=terms)
+        assert "no live terminal" in w.error(*nudge, *ME)
+        # a worker restarted in the SAME worktree starts un-nudged, and when the
+        # terminal is gone by failure time the screen saved at the nudge still speaks
+        terms[-1]["open"] = True
+        w.orca(terminals=terms)
+        w.afk(*nudge, *ME)
+        terms = w.terminals()
+        terms[-1]["open"] = False
+        w.orca(terminals=terms)
+        r = w.afk(*_fail(8, "went quiet", "--set", "retry=0"))
+        assert r["action"] == "escalate" and "● 确认一下？" in w.comments(8)[-1]
+        w.afk("claim", "8", *ME, "--now", str(T0 + 1), *R)
+        w.set(issues=[issue(8, "ready-for-agent")])
+        r = w.afk(*dispatch(8)[:-2], "--now", str(T0 + 2))
+        assert r["action"] == "reuse_worktree"
+        assert w.afk("no-pr", "--issue", "8", "--terminal", "idle", *R, *cfg,
+                     "--now", str(int(time.time()) + 5000))["action"] == "nudge"
+        assert "no worktree on this machine" in w.error(
+            "nudge", "--issue", "8", *ME, *R, *cfg, "--worktree", "/no/such/dir")
 
 
 def test_no_pr_without_a_worktree_and_with_bad_input():
@@ -453,12 +980,21 @@ def test_no_pr_without_a_worktree_and_with_bad_input():
         # no worktree at all (it lives on another machine): progress is unknown, the
         # terminal reading is the only clock, and the verdict still routes
         r = w.afk("no-pr", "--issue", "4", "--terminal", "idle", "--terminal-idle-seconds", "900", *R)
-        assert r["progress"] == {} and r["idle_seconds"] == 900
+        assert r["progress"] == {} and r["idle_seconds"] == 900 and r["worktree"] is None
         assert (r["outcome"], r["action"]) == ("idle_failed", "next_attempt")
         r = w.afk("no-pr", "--issue", "4", "--terminal", "idle", *R)
         assert r["idle_seconds"] is None and r["outcome"] == "idle_failed"
 
-        # a worktree path that does not exist is a mistake, never "no progress":
+        # the worktree is found through orca — the tick passes no path
+        w.orca([_orca_row(4, w.cwd), _orca_row(4, w.cwd + "-other", projectId="github:acme/other")])
+        r = w.afk("no-pr", "--issue", "4", "--terminal", "idle", *R)
+        assert r["worktree"] == w.cwd and r["progress"]["commits_ahead"] == 0
+        # one orca remembers but the disk no longer has is no worktree
+        w.orca([_orca_row(4, os.path.join(w.sb.root, "gone"))])
+        r = w.afk("no-pr", "--issue", "4", "--terminal", "idle", *R)
+        assert r["worktree"] is None and r["progress"] == {}
+
+        # a worktree path GIVEN that does not exist is a mistake, never "no progress":
         # read as empty it could close an issue whose branch holds real work
         err = w.error("no-pr", "--issue", "4", "--terminal", "idle", "--worktree", "/no/such/dir", *R)
         assert "worktree not found" in err
@@ -609,7 +1145,9 @@ def test_config_file_loads_validates_and_round_trips():
         assert cfg["retry"] == 4 and cfg["claim_namespace"] == "refs/heads"
         assert cfg["gate"] == {**defaults["gate"], "ci": "local", "local_command": "make test"}
         # canonical JSON fed back as --config is a fixed point for every consumer
-        assert w.afk("next-attempt", "--attempt", "3", "--config", json.dumps(cfg))["action"] == "retry"
+        quiet = json.dumps({"in_flight": 0, "frontier_remaining": 3})
+        assert w.afk("cycle", *ME, *R, "--summary", quiet, "--config", json.dumps(cfg)) == \
+            w.afk("cycle", *ME, *R, "--summary", quiet, "--config", "{}")
         assert w.afk("probe", "--config", json.dumps(cfg), "--now", str(T0))["config"] == cfg
 
         for bad, why in (("retyr: 4", "unknown key"),
@@ -623,14 +1161,8 @@ def test_config_file_loads_validates_and_round_trips():
 
 
 # --------------------------------------------------------------------------- #
-# recovery via orca / gate-run                                                 #
+# recovery via orca                                                            #
 # --------------------------------------------------------------------------- #
-
-def _orca_row(issue_no, path, **extra):
-    return {"linkedIssue": issue_no, "path": path, "branch": "refs/heads/sunfmin/issue-31-x",
-            "projectId": f"github:{REPO}", "isMainWorktree": False, "isArchived": False,
-            "lastActivityAt": 100, **extra}
-
 
 def test_recovery_finds_this_machines_worktree_through_orca():
     with world() as w:
@@ -671,66 +1203,541 @@ def test_recovery_finds_this_machines_worktree_through_orca():
         assert (r["tier"], r["worktree"]["present"]) == (2, False)
 
 
-def test_gate_run_is_green_only_on_exit_zero():
-    with world() as w:
-        cfg = json.dumps({"gate": {"ci": "local", "local_command": "echo built && echo tested"}})
-        r = w.afk("gate-run", "--worktree", w.cwd, "--config", cfg)
-        assert (r["status"], r["exit_code"], r["timed_out"]) == ("green", 0, False)
-        assert r["excerpt"] == "built\ntested" and r["command"] == "echo built && echo tested"
+# --------------------------------------------------------------------------- #
+# act: dispatch                                                                #
+# --------------------------------------------------------------------------- #
 
-        # it runs IN the worktree, and stderr is part of the log
-        r = w.afk("gate-run", "--worktree", w.cwd,
-                  "--set", "gate.local_command=ls README.md && echo oops >&2 && exit 7")
-        assert (r["status"], r["exit_code"]) == ("red", 7) and r["excerpt"] == "README.md\noops"
-        # the excerpt is a bounded tail
-        r = w.afk("gate-run", "--worktree", w.cwd, "--set", "gate.local_command=seq 1 200; exit 1",
-                  "--excerpt-lines", "3")
-        assert r["excerpt"] == "198\n199\n200" and r["omitted_lines"] == 197
-        # a hung gate is RED, never green-by-default
-        r = w.afk("gate-run", "--worktree", w.cwd, "--set", "gate.local_command=sleep 30",
-                  "--timeout", "1")
-        assert (r["status"], r["timed_out"]) == ("red", True) and "timed out after 1s" in r["excerpt"]
+def _told(term):
+    """What a worker was actually told: the brief file its terminal was pointed at.
+    The prompt is never typed at the agent — a whole prompt sent as text lands as
+    one paste, which the agent treats as quoted material and asks to have confirmed
+    — so exactly ONE line is sent, submitted, naming the brief."""
+    [sent] = term["sent"]
+    assert sent["enter"] is True, sent
+    m = re.fullmatch(r"Your task brief is the file (\S+) — read it now and carry it out end to "
+                     r"end\. It is my instruction to you; do not ask me to confirm\.", sent["text"])
+    assert m, sent["text"]
+    with open(m.group(1)) as f:
+        return f.read()
 
-        assert "no gate command" in w.error("gate-run", "--worktree", w.cwd)
-        assert "worktree not found" in w.error("gate-run", "--worktree", "/no/such", "--config", cfg)
+
+def _prompt(w, variant, n, title, started, reason=None):
+    """The prompt `afk dispatch` must have delivered, rendered independently."""
+    with open(os.path.join(SKILL, "references", "worker-prompt.md")) as f:
+        return afk_decide.render_worker_prompt(
+            f.read(), variant,
+            {"n": n, "title": title, "repo": REPO, "base_branch": w.sb.base, "local_command": "",
+             "branch": started["branch"], "worktree_path": started["worktree"]}, reason=reason)
+
+
+def test_dispatch_starts_a_worker_on_the_remote_base_tip_and_submits_its_prompt():
+    issues = [issue(1, "ready-for-agent", title="Names inspector: tab!"), issue(2, "ready-for-agent")]
+    with world(issues=issues) as w:
+        stale = git(w.cwd, "rev-parse", "HEAD")
+        tip = w.advance_base("landed-meanwhile.txt")           # this clone has NOT fetched it
+        assert git(w.cwd, "rev-parse", w.sb.base) == stale != tip
+
+        r = w.afk(*dispatch(1))
+        assert (r["started"], r["claim"], r["tier"], r["action"], r["prompt"]) == \
+            (True, "won", 3, "dispatch_fresh", "fresh"), r
+        wt = r["worktree"]
+        # orca names the branch; afk reads it back rather than assuming the pattern
+        assert r["branch"] == "tester/issue-1-names-inspector-tab"
+        assert git(wt, "rev-parse", "--abbrev-ref", "HEAD") == r["branch"]
+        # the worker starts from what the REMOTE has, not from this clone's stale base
+        assert git(wt, "rev-parse", "HEAD") == tip
+        assert w.orca_calls() == ["repo list", "worktree create", "terminal create",
+                                  "terminal wait", "terminal send"]
+        assert [(t["linkedIssue"], t["path"]) for t in w.worktrees()] == [(1, wt)]
+
+        # the agent was started with the run's worker launch command, verbatim —
+        # and the prompt was SUBMITTED, not just typed
+        [term] = w.terminals()
+        assert (term["handle"], term["command"], term["worktreePath"]) == (r["terminal"], WORKER, wt)
+        told = _told(term)
+        assert told == _prompt(w, "fresh", 1, "Names inspector: tab!", r)
+        assert f"`{r['branch']}`" in told and f"`{wt}`" in told
+        assert "Closes #1" in told and "{" + "branch" + "}" not in told
+        # the brief lives in the worktree's git dir: a worker's `git add -A` never stages it
+        assert git(wt, "status", "--porcelain") == ""
+
+        # the claim is mine, and the invisible phase is on the issue for a human
+        assert w.claimed_by(1) == "me"
+        assert "认领方 `me`" in w.board(1) and "尚无 PR" in w.board(1)
+        ws = w.afk("rebuild", *ME, *R, *NOW)
+        assert [(m["number"], m["status"]) for m in ws["mine"]] == [(1, "no_pr")]
+        assert ws["free_slots"] == 2 and [f["number"] for f in ws["frontier"]["dispatch"]] == [2]
+        # a worktree cut from the fresh tip is pristine, whatever the stale local base says
+        r_np = w.afk("no-pr", "--issue", "1", "--terminal", "busy", *R)
+        assert (r_np["worktree"], r_np["progress"]["commits_ahead"]) == (wt, 0)
+
+        # however orca resolved the base it was handed, the worktree ends up containing
+        # the fetched tip — asserted by code, not hoped for
+        w.orca(stale_base=stale)
+        r2 = w.afk(*dispatch(2, "--set", "progress_comment=false"))
+        assert git(r2["worktree"], "rev-parse", "HEAD") == tip and w.board(2) == ""
+
+
+def test_dispatch_claims_first_and_never_starts_a_worker_it_cannot_own():
+    issues = [issue(n, "ready-for-agent") for n in (1, 3, 4)] + [issue(2, "ready-for-agent", state="closed")]
+    with world(issues=issues) as w:
+        # a peer holds it → an OUTCOME (exit 0), and nothing at all was started
+        w.afk("claim", "1", "--instance", "peer", *NOW, *R)
+        r = w.afk(*dispatch(1))
+        assert (r["started"], r["claim"], r["owner"]["instance"]) == (False, "lost", "peer")
+        assert set(r) == {"issue", "started", "claim", "owner"}
+        assert w.orca_calls() == [] and w.worktrees() == [] and w.board(1) == ""
+
+        # a closed or unknown issue is refused BEFORE the claim: never a lock on nothing
+        assert "closed" in w.error(*dispatch(2))
+        assert "gh api" in w.error(*dispatch(99))
+        assert w.claimed_by(2) is None and w.claimed_by(99) is None
+
+        # orca cannot serve this repo → an error — with the claim held, so the next
+        # tick sees a claim of mine with no worker and simply dispatches it again
+        w.orca(repos=[])
+        assert "orca knows no repo" in w.error(*dispatch(3))
+        assert w.claimed_by(3) == "me" and w.worktrees() == []
+        w.orca(repos=[{"id": "repo-1", "path": w.cwd,
+                       "gitRemoteIdentity": {"canonicalKey": f"github.com/{REPO}"}}])
+        r = w.afk(*dispatch(3, "--now", str(T0 + 90)))          # the next tick
+        assert (r["started"], r["claim"], r["tier"]) == (True, "held", 3)
+
+        # the agent never became ready → an error naming it; the worktree it made is
+        # reused, not duplicated, by the retry
+        w.orca(never_ready=True)
+        assert "not ready" in w.error(*dispatch(4, "--ready-timeout", "1"))
+        assert w.claimed_by(4) == "me" and len(w.worktrees()) == 2
+        assert w.terminals()[-1]["sent"] == []                   # nothing was typed at it
+        w.orca(never_ready=False)
+        r = w.afk(*dispatch(4, "--now", str(T0 + 90)))
+        # a pristine worktree gets the FRESH prompt: there is nothing to continue
+        assert (r["claim"], r["tier"], r["action"], r["prompt"]) == ("held", 1, "reuse_worktree", "fresh")
+        assert len(w.worktrees()) == 2
+        assert [t["open"] for t in w.terminals() if t["worktreePath"] == r["worktree"]] == [False, True]
+
+
+def test_dispatch_continues_from_whatever_progress_survived():
+    """ADR-0011's tiers, acted on rather than described: the same `afk dispatch`
+    that starts a frontier issue resumes a claim whose worker died."""
+    with world(issues=[issue(7, "ready-for-agent")]) as w:
+        first = w.afk(*dispatch(7))
+        pushed = w.work(first["worktree"], "step1.txt")
+        local = w.work(first["worktree"], "step2.txt", push=False)   # committed, never pushed
+        wip = os.path.join(first["worktree"], "wip.txt")
+        with open(wip, "w") as f:
+            f.write("uncommitted\n")
+        w.orca_calls()
+
+        # tier 1: the worktree is still here → reuse it, lossless, on its own branch
+        r = w.afk(*dispatch(7, "--now", str(T0 + 90)))
+        assert (r["claim"], r["tier"], r["action"], r["prompt"]) == ("held", 1, "reuse_worktree", "continue")
+        assert (r["worktree"], r["branch"]) == (first["worktree"], first["branch"])
+        assert git(r["worktree"], "rev-parse", "HEAD") == local and os.path.exists(wip)
+        # the dead worker's terminal is closed before a second agent enters the worktree
+        assert w.orca_calls() == ["terminal close", "terminal create", "terminal wait", "terminal send"]
+        old, new = w.terminals()
+        assert (old["open"], new["open"], new["handle"]) == (False, True, r["terminal"])
+        assert _told(new) == _prompt(w, "continue", 7, "issue 7", r)
+        assert _told(new).startswith("You are an afk-fleet worker **continuing**")
+        assert git(r["worktree"], "status", "--porcelain") == "?? wip.txt"   # the brief is not in it
+
+        # tier 2: the worktree is gone (the worker ran on another machine) → recreate
+        # at the PUSHED tip; orca gives it a new branch name, and the prompt carries it
+        git(w.cwd, "worktree", "remove", "--force", first["worktree"])
+        w.orca([])
+        r2 = w.afk(*dispatch(7, "--now", str(T0 + 180)))
+        assert (r2["tier"], r2["action"], r2["prompt"]) == (2, "recreate_at_tip", "continue")
+        assert git(r2["worktree"], "rev-parse", "HEAD") == pushed
+        assert r2["branch"] == first["branch"] + "-2"
+        assert f"`{r2['branch']}`" in _told(w.terminals()[-1])
+        w.work(r2["worktree"], "step3.txt")
+
+        # --start fresh: the tick judged the recovered state unsafe to build on → the
+        # previous attempt is discarded (its PR, its branches, its worktree), base again
+        w.open_pr(70, closes=7, branch=first["branch"])
+        w.set(prs=w.state()["prs"] + [pr(71, closes=7, headRefName="alice/hotfix")])   # a human's
+        r3 = w.afk(*dispatch(7, "--start", "fresh", "--now", str(T0 + 270)))
+        assert (r3["claim"], r3["tier"], r3["action"], r3["prompt"]) == ("held", 3, "dispatch_fresh", "fresh")
+        assert r3["discarded"] == {"closed_prs": [70], "deleted_branches": [r2["branch"]],
+                                   "removed_worktree": r2["worktree"]}
+        assert w.pr(70)["state"] == "closed" and w.pr(71).get("state", "open") == "open"
+        assert not [ref for ref in w.sb.all_refs() if "issue-7" in ref]
+        assert not os.path.isdir(r2["worktree"]) and [t["path"] for t in w.worktrees()] == [r3["worktree"]]
+        assert git(r3["worktree"], "rev-parse", "HEAD") == w.sb.remote_ref(f"refs/heads/{w.sb.base}")
+        # a worktree that cannot be removed stops the fresh start: two attempts must
+        # never share an issue
+        w.orca(rm_fails=True)
+        assert "could not remove" in w.error(*dispatch(7, "--start", "fresh"))
+
+
+# --------------------------------------------------------------------------- #
+# act: merge                                                                   #
+# --------------------------------------------------------------------------- #
+
+def _merge(n, *extra, instance="me"):
+    return ("merge", "--issue", str(n), "--instance", instance, *R, *NOW, *extra)
+
+
+def test_merge_gates_the_tree_that_lands_then_settles_the_claim():
+    """gate.ci: local, the whole sequence: sync → push → gate → merge → status
+    board → release → cleanup. What merges is the SYNCED tree, and it is that tree
+    the gate ran on."""
+    with world(issues=[issue(3, "ready-for-agent")]) as w:
+        d, pr_head = with_pr(w, 3, 30, conclusion="FAILURE")   # remote CI is not the gate here
+        base_tip = w.advance_base("landed-meanwhile.txt")
+        # green ONLY on the combined tree: the worker's file and what landed meanwhile
+        gate = local_gate("test -f feature3.txt && test -f landed-meanwhile.txt")
+
+        # only the claim's owner may land it — and a refusal changes nothing
+        assert "not this fleet's claim" in w.error(*_merge(3, *gate, instance="peer"))
+        assert w.sb.remote_ref(f"refs/heads/{d['branch']}") == pr_head
+
+        # gh refusing the merge is an error, and NOTHING is settled on it: released
+        # before it landed, the issue would be re-dispatched under an open green PR
+        w.set(fail=["pr merge"])
+        assert "pr merge" in w.error(*_merge(3, *gate))
+        assert w.claimed_by(3) == "me" and os.path.isdir(d["worktree"])
+        assert w.pr(30).get("state", "open") == "open" and "已合并,完成" not in w.board(3)
+        synced = w.sb.remote_ref(f"refs/heads/{d['branch']}")
+        assert synced != pr_head                               # …though the sync was pushed
+
+        w.set(fail=[])
+        w.orca_calls()
+        r = w.afk(*_merge(3, *gate))
+        assert (r["outcome"], r["pr"], r["released"], r["synced"]) == ("merged", 30, True, False), r
+        assert r["head"] == synced and r["worktree"] == d["worktree"]
+        # gh was pinned to the gated head, with the configured strategy
+        assert w.pr(30)["merged"] == {"strategy": "squash", "head": synced, "delete_branch": True}
+        # what landed contains both sides, by MERGE (the base tip is an ancestor)
+        assert w.sb.remote_ref(f"refs/heads/{w.sb.base}") == synced
+        assert {"feature3.txt", "landed-meanwhile.txt"} <= w.remote_files(w.sb.base)
+        git(w.cwd, "fetch", "-q", "origin", w.sb.base)
+        assert git(w.cwd, "merge-base", base_tip, synced) == base_tip
+        # settled: board, claim, branch, worktree
+        assert "已合并,完成" in w.board(3) and "#30" in w.board(3)
+        assert w.claimed_by(3) is None and w.issue(3)["state"] == "closed"
+        assert not w.sb.remote_ref(f"refs/heads/{d['branch']}")
+        assert r["cleanup"] == {"removed": True, "path": d["worktree"]}
+        assert w.worktrees() == [] and not os.path.isdir(d["worktree"])
+        assert w.orca_calls() == ["worktree rm"]
+        assert w.afk("rebuild", *ME, *R, *NOW)["mine"] == []
+
+
+def test_merge_red_local_gate_is_published_on_the_pr_and_lands_nothing():
+    with world(issues=[issue(4, "ready-for-agent")]) as w:
+        d, pr_head = with_pr(w, 4, 40)
+        base_tip = w.advance_base("landed-meanwhile.txt")
+
+        # it runs IN the worktree, on the synced tree; stderr is part of the log
+        r = w.afk(*_merge(4, *local_gate(
+            "test -f feature4.txt && test -f landed-meanwhile.txt && echo 'FAIL TestNames' >&2 && exit 7")))
+        assert (r["outcome"], r["synced"], r["pr"]) == ("gate_red", True, 40), r
+        assert (r["gate"]["status"], r["gate"]["exit_code"], r["gate"]["excerpt"]) == \
+            ("red", 7, "FAIL TestNames")
+        # the sync was pushed (the PR shows what was gated); the target was not touched
+        assert r["head"] == w.sb.remote_ref(f"refs/heads/{d['branch']}") != pr_head
+        assert w.sb.remote_ref(f"refs/heads/{w.sb.base}") == base_tip
+        # the failure is durable where a later tick — and a human — can re-read it
+        [note] = w.state()["pr_comments"]["40"]
+        assert "FAIL TestNames" in note and "exit 7" in note
+        assert w.pr(40).get("state", "open") == "open" and w.claimed_by(4) == "me"
+        assert os.path.isdir(d["worktree"])
+
+        # a hung gate is RED, never green-by-default; the excerpt is a bounded tail
+        r = w.afk(*_merge(4, *local_gate("sleep 30"), "--gate-timeout", "1"))
+        assert (r["outcome"], r["gate"]["timed_out"], r["synced"]) == ("gate_red", True, False)
+        assert "timed out after 1s" in r["gate"]["excerpt"]
+        r = w.afk(*_merge(4, *local_gate("seq 1 200; exit 1"), "--excerpt-lines", "3"))
+        assert (r["gate"]["excerpt"], r["gate"]["omitted_lines"]) == ("198\n199\n200", 197)
+        assert len(w.state()["pr_comments"]["40"]) == 3
+
+        # adversarial verify sits AFTER a green machine gate, and is pinned to the head
+        green = (*local_gate("true"), "--set", "gate.adversarial_verify=true")
+        r = w.afk(*_merge(4, *green))
+        assert r["outcome"] == "needs_verify" and len(r["head"]) == 40
+        assert w.afk(*_merge(4, *green, "--verified", pr_head))["outcome"] == "needs_verify"
+        assert w.pr(40).get("state", "open") == "open"
+        r = w.afk(*_merge(4, *green, "--verified", r["head"], "--set", "merge.strategy=rebase",
+                          "--set", "merge.delete_branch=false", "--set", "worktree_cleanup=false"))
+        assert r["outcome"] == "merged" and "cleanup" not in r
+        assert w.pr(40)["merged"]["strategy"] == "rebase"
+        # config decides what is left behind
+        assert w.sb.remote_ref(f"refs/heads/{d['branch']}") == r["head"]
+        assert os.path.isdir(d["worktree"]) and w.claimed_by(4) is None
+
+
+def test_merge_conflict_is_left_in_the_worktree_for_the_ticks_judgment():
+    with world(issues=[issue(2, "ready-for-agent")]) as w:
+        d, pr_head = with_pr(w, 2, 20, name="shared.txt", text="from the worker")
+        base_tip = w.advance_base("shared.txt", text="from someone else")
+        gate = local_gate("true")
+        wt = d["worktree"]
+
+        r = w.afk(*_merge(2, *gate))
+        assert (r["outcome"], r["files"], r["worktree"]) == ("conflict", ["shared.txt"], wt), r
+        assert "head" not in r and "gate" not in r               # nothing was gated or pushed
+        assert w.sb.remote_ref(f"refs/heads/{d['branch']}") == pr_head
+        assert w.sb.remote_ref(f"refs/heads/{w.sb.base}") == base_tip
+        assert os.path.exists(os.path.join(wt, ".git")) and git(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD")
+        # re-entrant: a re-run reports the same conflict rather than piling on a merge
+        assert w.afk(*_merge(2, *gate))["files"] == ["shared.txt"]
+
+        # resolved but not committed: what would be gated is not what would land
+        with open(os.path.join(wt, "shared.txt"), "w") as f:
+            f.write("resolved: both\n")
+        git(wt, "add", "shared.txt")
+        assert "uncommitted" in w.error(*_merge(2, *gate))
+        git(wt, "commit", "-qm", "merge main: keep both")
+
+        r = w.afk(*_merge(2, *gate))
+        assert (r["outcome"], r["synced"]) == ("merged", True)
+        p = subprocess.run(["git", "--git-dir", w.sb.bare, "show", f"{w.sb.base}:shared.txt"],
+                           capture_output=True, text=True, env=ENV)
+        assert p.stdout == "resolved: both\n"
+
+        # a claim with no PR has nothing to merge
+        w.set(issues=w.state()["issues"] + [issue(8, "ready-for-agent")])
+        w.afk("claim", "8", *ME, *NOW, *R)
+        assert "nothing to merge" in w.error(*_merge(8, *gate))
+
+
+def test_merge_in_required_mode_trusts_checks_only_on_the_head_that_lands():
+    with world(issues=[issue(n, "ready-for-agent") for n in range(1, 7)]) as w:
+        heads = {}
+        for n, conclusion in ((1, "SUCCESS"), (2, "FAILURE"), (3, "PENDING"), (4, None), (5, "SUCCESS")):
+            _, heads[n] = with_pr(w, n, n * 10, conclusion=conclusion)
+        base0 = w.sb.remote_ref(f"refs/heads/{w.sb.base}")
+
+        def branch_tip(n):
+            return w.sb.remote_ref("refs/heads/" + w.pr(n * 10)["headRefName"])
+
+        # the base has not moved, so the sync is a no-op and the checks describe the
+        # head that would land: red → fail it, pending → leave it, none → the tick's call
+        for n, outcome, checks in ((2, "gate_red", "red"), (3, "awaiting_ci", "pending"),
+                                   (4, "no_checks", None)):
+            r = w.afk(*_merge(n))
+            assert (r["outcome"], r["checks"], r["synced"], r["head"]) == \
+                (outcome, checks, False, heads[n]), (n, r)
+            assert w.claimed_by(n) == "me" and w.pr(n * 10).get("state", "open") == "open"
+        assert w.sb.remote_ref(f"refs/heads/{w.sb.base}") == base0
+        assert "pr_comments" not in w.state()                    # required mode publishes nothing
+
+        # no checks at all: merged only on the tick's explicit judgment
+        r = w.afk(*_merge(4, "--allow-no-checks"))
+        assert (r["outcome"], r["head"], r["synced"]) == ("merged", heads[4], False)
+        assert w.pr(40)["merged"]["head"] == heads[4]
+
+        # the base moved (PR 40 landed): PR 10's green checks ran on a tree that will
+        # NOT land. The sync is pushed and CI must speak about the new head first.
+        r = w.afk(*_merge(1))
+        assert (r["outcome"], r["checks"], r["synced"]) == ("awaiting_ci", "green", True), r
+        assert r["head"] == branch_tip(1) != heads[1]
+        assert w.claimed_by(1) == "me" and w.pr(10).get("state", "open") == "open"
+        # …even a RED run is stale once the head moved: it is not this head's verdict
+        assert w.afk(*_merge(2))["outcome"] == "awaiting_ci"
+        # --allow-no-checks waives ABSENT checks only, never present ones
+        assert w.afk(*_merge(2, "--allow-no-checks"))["outcome"] == "gate_red"
+
+        # CI is green on the synced head (the fake's rollup still says SUCCESS) → lands
+        r = w.afk(*_merge(1))
+        assert (r["outcome"], r["synced"], r["head"]) == ("merged", False, branch_tip(1) or r["head"])
+        assert {"feature1.txt", "feature4.txt"} <= w.remote_files(w.sb.base)
+
+        # sync_before_merge: false → the PR head lands as it is, on its own checks
+        r = w.afk(*_merge(5, "--set", "merge.sync_before_merge=false"))
+        assert (r["outcome"], r["synced"], r["head"]) == ("merged", False, heads[5])
+
+
+def test_merge_recreates_a_worktree_when_the_worker_ran_elsewhere():
+    with world(issues=[issue(9, "ready-for-agent")]) as w:
+        d, pr_head = with_pr(w, 9, 90)
+        w.advance_base("landed-meanwhile.txt")
+        git(w.cwd, "worktree", "remove", "--force", d["worktree"])
+        w.orca([])                                               # this machine has no worktree
+
+        r = w.afk(*_merge(9, *local_gate("test -f feature9.txt && test -f landed-meanwhile.txt"),
+                          "--set", "worktree_cleanup=false", "--set", "merge.delete_branch=false"))
+        assert (r["outcome"], r["synced"]) == ("merged", True), r
+        assert r["worktree"] != d["worktree"]
+        # the sync went to the PR's branch, whatever orca named the scratch one
+        assert w.sb.remote_ref(f"refs/heads/{d['branch']}") == r["head"] != pr_head
+        # its own scratch worktree is removed even when the config keeps workers' ones
+        assert r["cleanup"]["removed"] is True and w.worktrees() == []
+
+
+# --------------------------------------------------------------------------- #
+# act: fail / escalate / close                                                 #
+# --------------------------------------------------------------------------- #
+
+def _fail(n, reason, *extra):
+    return ("fail", "--issue", str(n), *ME, "--worker-command", WORKER, *R, *NOW,
+            "--reason", reason, *extra)
+
+
+def test_fail_retries_from_a_clean_base_then_escalates_when_exhausted():
+    """The retry ladder as one transition. `afk fail` is the ONE writer of the
+    attempt label — it used to exist only as a sentence — and a retry discards the
+    failed attempt, so the claim does not loop on the same red PR."""
+    with world(issues=[issue(5, "ready-for-agent", "bug")]) as w:
+        first, _ = with_pr(w, 5, 50, conclusion="FAILURE")
+        row = w.afk("rebuild", *ME, *R, *NOW)["mine"][0]
+        assert (row["status"], row["attempt"], row["pr"]) == ("failure", 0, 50)
+        assert "afk-attempt/1" not in w.state()["labels"]         # the label does not exist yet
+
+        r = w.afk(*_fail(5, "CI red: TestNames fails in names_test.go"))
+        assert (r["action"], r["attempt"], r["retry_max"]) == ("retry", 1, 2), r
+        r = r["worker"]                                          # where the new worker is
+        assert (r["tier"], r["action"], r["prompt"]) == (3, "dispatch_fresh", "fresh")
+        # the attempt is counted on the issue, where every fleet and human can read it
+        assert w.issue(5)["labels"] == ["ready-for-agent", "bug", "afk-attempt/1"]
+        # the failed attempt is gone: PR closed, branch deleted, worktree removed
+        assert w.pr(50)["state"] == "closed" and "superseded" in w.state()["pr_comments"]["50"][0]
+        assert not w.sb.remote_ref(f"refs/heads/{first['branch']}")
+        assert not os.path.isdir(first["worktree"])
+        assert r["discarded"]["closed_prs"] == [50]
+        # a new worker, from the base tip, under the SAME claim, told why it is here
+        assert git(r["worktree"], "rev-parse", "HEAD") == w.sb.remote_ref(f"refs/heads/{w.sb.base}")
+        assert w.claimed_by(5) == "me"
+        told = _told(w.terminals()[-1])
+        assert told == _prompt(w, "fresh", 5, "issue 5", r,
+                               reason="CI red: TestNames fails in names_test.go")
+        assert "## Why the previous attempt failed" in told
+        # …and the next rebuild sees a worker coding, not the same failure again
+        row = w.afk("rebuild", *ME, *R, *NOW)["mine"][0]
+        assert (row["status"], row["attempt"], row["pr"]) == ("no_pr", 1, None)
+
+        # second failure: the label is SWAPPED, never stacked
+        w.work(r["worktree"], "attempt1.txt")
+        w.open_pr(51, closes=5, branch=r["branch"], conclusion="FAILURE")
+        r2 = w.afk(*_fail(5, "still red"))
+        assert (r2["action"], r2["attempt"]) == ("retry", 2)
+        r2 = r2["worker"]
+        assert w.issue(5)["labels"] == ["ready-for-agent", "bug", "afk-attempt/2"]
+
+        # third: exhausted → escalated, with no worker started and the evidence kept
+        w.work(r2["worktree"], "attempt2.txt")
+        w.open_pr(52, closes=5, branch=r2["branch"], conclusion="FAILURE")
+        w.orca_calls()
+        r3 = w.afk(*_fail(5, "third time red: needs a human"))
+        assert {k: r3[k] for k in ("action", "attempt", "pr", "labels", "released")} == \
+            {"action": "escalate", "attempt": 2, "pr": 52, "released": True,
+             "labels": {"added": ["ready-for-human"], "removed": ["afk-attempt/2", "ready-for-agent"]}}
+        assert w.issue(5)["labels"] == ["bug", "ready-for-human"]
+        assert w.claimed_by(5) is None and w.orca_calls() == []
+        assert w.pr(52).get("state", "open") == "open" and os.path.isdir(r2["worktree"])
+        assert "已升级给人处理" in w.board(5)
+        note = w.comments(5)[-1]
+        assert "third time red: needs a human" in note and "#52" in note and "after 2 retries" in note
+        ws = w.afk("rebuild", *ME, *R, *NOW)
+        assert ws["mine"] == [] and ws["frontier"]["dispatch"] == []
+
+    # retry: 0 → the first failure escalates; and a failure is only mine to declare
+    with world(issues=[issue(6, "ready-for-agent")]) as w:
+        w.afk("claim", "6", "--instance", "peer", *NOW, *R)
+        assert "not this fleet's claim" in w.error(*_fail(6, "x"))
+        w.afk("release", "6", *R)
+        w.afk("claim", "6", *ME, *NOW, *R)
+        r = w.afk(*_fail(6, "gave up", "--set", "retry=0"))
+        assert (r["action"], r["attempt"], r["pr"]) == ("escalate", 0, None)
+        assert w.orca_calls() == []
+
+
+def test_escalate_relabels_before_it_releases():
+    """Released first, a PR-less issue still carrying the ready label is back on
+    the frontier — a peer dispatches the issue a human was just handed."""
+    issues = [issue(8, "ready-for-agent", "afk-attempt/1"), issue(9, "ready-for-agent"), issue(10)]
+    with world(issues=issues) as w:
+        for n in (8, 9):
+            w.afk("claim", str(n), *ME, *NOW, *R)
+
+        def escalate(n, *extra, instance="me"):
+            return ("escalate", "--issue", str(n), "--instance", instance, *R, *NOW,
+                    "--reason", "blocked by #41, which is still open", *extra)
+
+        assert "held by 'me'" in w.error(*escalate(8, instance="peer"))
+        assert "not claimed at all" in w.error(*escalate(10))
+
+        # the relabel FAILS → the claim must still be held: nothing got back on the frontier
+        w.set(fail=["issue edit"])
+        assert "issue edit" in w.error(*escalate(8))
+        assert w.claimed_by(8) == "me" and "ready-for-agent" in w.issue(8)["labels"]
+        assert w.afk("rebuild", "--instance", "peer", *R, *NOW)["frontier"]["dispatch"] == []
+
+        w.set(fail=[])
+        w.calls()
+        r = w.afk(*escalate(8))
+        assert (r["action"], r["attempt"], r["pr"], r["released"]) == ("escalate", 1, None, True)
+        assert w.issue(8)["labels"] == ["ready-for-human"] and w.claimed_by(8) is None
+        # one order: status board → labels → comment (the release is the last thing)
+        writes = [" ".join(c[:2]) if c[0] != "api" else "comment " + c[c.index("--method") + 1]
+                  for c in w.calls() if c[0] != "api" or "--method" in c]
+        assert writes == ["pr list", "label create", "issue edit", "comment POST"], writes
+        assert "已升级给人处理" in w.board(8)                       # written by the failed run
+        assert w.comments(8)[-1].endswith("blocked by #41, which is still open")
+        assert "after 1 retry)" in w.comments(8)[-1]
+        # a peer's next rebuild does not see it as dispatchable
+        assert w.afk("rebuild", "--instance", "peer", *R, *NOW)["frontier"]["dispatch"] == \
+            [{"number": 9, "title": "issue 9"}][:0]
+
+        # both human-facing writes are config
+        r = w.afk(*escalate(9, "--set", "escalate_comment=false", "--set", "progress_comment=false",
+                            "--set", "escalate_label=needs-human"))
+        assert r["comment_id"] is None and w.comments(9) == []
+        assert w.issue(9)["labels"] == ["needs-human"] and "needs-human" in w.state()["labels"]
+
+
+def test_close_settles_an_issue_that_needed_no_change():
+    with world(issues=[issue(6, "ready-for-agent"), issue(7, "ready-for-agent")]) as w:
+        d6, d7 = w.afk(*dispatch(6)), w.afk(*dispatch(7))
+        close = lambda n, *extra: ("close", "--issue", str(n), *ME, *R, *NOW, *extra)
+
+        assert "not this fleet's claim" in w.error("close", "--issue", "6", "--instance", "peer", *R)
+        # the close fails → still claimed: an open issue is never left unowned AND ready
+        w.set(fail=["issue close"])
+        assert "issue close" in w.error(*close(6))
+        assert w.claimed_by(6) == "me" and w.issue(6)["state"] == "open"
+
+        w.set(fail=[])
+        r = w.afk(*close(6))
+        assert r == {"issue": 6, "action": "closed", "released": True,
+                     "cleanup": {"removed": True, "path": d6["worktree"]}}
+        assert w.issue(6)["state"] == "closed" and w.claimed_by(6) is None
+        assert "无需改动" in w.board(6) and not os.path.isdir(d6["worktree"])
+
+        r = w.afk(*close(7, "--set", "worktree_cleanup=false"))
+        assert r == {"issue": 7, "action": "closed", "released": True}
+        assert os.path.isdir(d7["worktree"]) and w.afk("rebuild", *ME, *R, *NOW)["mine"] == []
 
 
 # --------------------------------------------------------------------------- #
 # the CLI's own contracts                                                      #
 # --------------------------------------------------------------------------- #
 
-def test_pure_subcommands_and_the_json_error_contract():
+def test_every_failure_is_one_json_error():
     with world() as w:
-        assert w.afk("next-attempt", "--attempt", "1") == \
-            {"action": "retry", "from_label": "afk-attempt/1", "to_label": "afk-attempt/2"}
-        assert w.afk("next-attempt", "--attempt", "2")["action"] == "escalate"
-        assert w.afk("next-attempt", "--attempt", "0")["to_label"] == "afk-attempt/1"
-        assert w.afk("next-attempt", "--attempt", "2", "--set", "retry=3")["action"] == "retry"
-
-        busy = json.dumps({"merged": [3], "in_flight": 1, "empty_streak": 0})
-        idle = json.dumps({"in_flight": 0, "empty_streak": 9})
-        assert w.afk("pace", "--summary", busy) == {"seconds": 90}
-        assert w.afk("pace", "--summary", idle) == {"seconds": 1500}
-        cfg = json.dumps({"idle_interval_seconds": 60})
-        assert w.afk("pace", "--summary", idle, "--config", cfg) == {"seconds": 60}
-
         # every operational failure is exit 3 with one {"error": …} object — bad JSON
         # in, a missing file, a failing gh — so a tick never has to parse a traceback
-        w.error("pace", "--summary", "{not json")
-        w.error("pace", "--summary", busy, "--config", "{not json")
-        assert "gh issue list failed" in w.error("fingerprint", "--repo", "acme/other")
+        w.error("cycle", *ME, *R, "--summary", "{not json")
+        w.error("rebuild", *ME, *R, "--config", "{not json")
+        assert "gh issue list failed" in w.error("rebuild", *ME, "--repo", "acme/other")
         # …and so is a bad command line: argparse's usage error is the same one shape
-        assert "--attempt" in w.error("next-attempt")
+        assert "--instance" in w.error("rebuild", *R)
+        assert "--reason" in w.error("escalate", "--issue", "4", *ME, *R)
+        assert "--worker-command" in w.error("dispatch", "--issue", "4", *ME, *R)
         assert "invalid choice" in w.error("status", "4", "--phase", "bogus", *R)
         assert "invalid choice" in w.error("no-such-subcommand", bare=True)
+        # the recipes that became transitions are gone, not aliased
+        for gone in ("fingerprint", "pace", "next-attempt", "gate-run"):
+            assert "invalid choice" in w.error(gone, bare=True), gone
 
 
 def _minimal_argv(name, sub):
     """The shortest valid command line for one subcommand, minus `--config`."""
     positional = {"claim": ["1"], "reclaim": ["1"], "release": ["1"], "status": ["1"]}
     required = {"--instance": "me", "--repo": REPO, "--issue": "1", "--terminal": "idle",
-                "--worktree": ".", "--attempt": "0", "--summary": "{}", "--expect-sha": "s",
-                "--phase": "claimed"}
+                "--expect-sha": "s", "--phase": "claimed", "--worker-command": WORKER,
+                "--reason": "why"}
     argv = [name, *positional.get(name, [])]
     for act in sub._actions:
         if act.required and act.option_strings and act.option_strings[0] != "--config":
@@ -777,16 +1784,19 @@ def test_config_is_required_and_resolves_one_way_on_every_subcommand():
 
         # what `_cfg` hands a subcommand is always a config `afk config` would accept:
         # --config and --set are validated like the file is
+        quiet = json.dumps({"in_flight": 0, "frontier_remaining": 1})
         for bad, why in ((("--config", json.dumps({"gate": {"ci": "local"}})), "local_command"),
                          (("--config", json.dumps({"claim_namespace": "refs/x"})), "claim_namespace"),
                          (("--config", "{}", "--set", "gate.ci=optional"), "gate.ci"),
+                         (("--config", "{}", "--set", "merge.strategy=octopus"), "merge.strategy"),
                          (("--config", "{}", "--set", "retyr=3"), "--set"),
                          (("--config", "{}", "--set", "retry=soon"), "retry"),
                          (("--config", "{not json"), "")):
-            assert why in w.error("pace", "--summary", "{}", *bad), bad
+            assert why in w.error("cycle", *ME, *R, "--summary", quiet, *bad), bad
         # …while a valid combination split across the two is accepted as a whole
-        assert w.afk("pace", "--summary", "{}", "--config", json.dumps({"gate": {"ci": "local"}}),
-                     "--set", "gate.local_command=make test") == {"seconds": 90}
+        assert w.afk("cycle", *ME, *R, "--summary", quiet,
+                     "--config", json.dumps({"gate": {"ci": "local"}}),
+                     "--set", "gate.local_command=make test")["sleep_seconds"] == 90
 
     # only ref ops have a second way to name the remote; gh ops need --repo, full stop
     for name, sub in parser.subcommands.items():

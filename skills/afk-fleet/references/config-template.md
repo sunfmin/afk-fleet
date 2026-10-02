@@ -37,7 +37,8 @@ worker: orca                           # the only supported backend: orca create
                                       #   (ADR-0005), then the fleet starts a real Claude Code in it with
                                       #   the run's worker launch command — NOT a key here (ADR-0010)
 concurrency: 3                         # max workers running at once
-worktree_cleanup: true                 # after merge/escalate, remove via `orca worktree rm issue:<n>`
+worktree_cleanup: true                 # after a merge or a close, remove the worker's worktree (via orca).
+                                      #   An escalated issue's worktree is always left for the human.
 worker_idle_grace_seconds: 300         # a no-PR worker that went idle is judged "finished" only after
                                       #   this much quiet (no commits, clean tree, no recent file activity);
                                       #   inside the window it's assumed still working between steps, so a
@@ -83,11 +84,12 @@ progress_comment: true                 # upsert ONE "status board" comment per i
 # --- loop (launcher pacing) ---
 busy_interval_seconds: 90              # re-tick soon (~1.5 min) when the last tick had work / in-flight PRs
 idle_interval_seconds: 1500            # slow re-tick (~25 min) when idle
-idle_ticks_before_sleep: 3             # this many empty ticks (frontier empty + no in-flight) → idle cadence
+idle_ticks_before_sleep: 3             # this many consecutive empty cycles (nothing done, nothing in
+                                      #   flight, frontier empty — a tick or a skipped cycle) → idle cadence
 claim_lease_ttl_seconds: 4500          # a claim is live while its owner's heartbeat is this fresh (~75 min,
                                       #   3× idle). A peer may reclaim only a staler claim; while holding a
                                       #   claim the launcher never sleeps past ttl/2 so the lease can't lapse.
-fingerprint_gate: true                 # each wake-up the launcher runs `afk fingerprint` (code, zero LLM
+fingerprint_gate: true                 # each wake-up the launcher runs `afk cycle` (code, zero LLM
                                       #   tokens) and spawns a tick only when the digest of observable
                                       #   state (issues+labels, PRs+checks, claim refs) moved (ADR-0007)
 force_tick_after_skips: 6              # safety net: a full tick at least every N skipped cycles — time-
