@@ -20,6 +20,8 @@ function in `afk_decide.py` (fixture-tested); `afk.py` only gathers their inputs
 - `--set <key>=<value>` (repeatable) overrides one config key for one call, by the config file's own
   key name — `--set claim_lease_ttl_seconds=60`, `--set gate.ci=local`. It is for tests and
   hand-debugging; a tick passes the run's `--config` and nothing else.
+- `afk …` in this table is shorthand for the executable `<skill>/scripts/afk.py …` — one word, no
+  interpreter in front, so it survives being held in a shell variable under zsh.
 - `afk <subcommand> --help` is the authoritative flag list; a test fails if this table or any
   `afk …` example in the skill names a subcommand or flag that does not exist.
 

@@ -26,7 +26,7 @@ Every subcommand that reads config REQUIRES the same `--config` (the canonical
 JSON from `afk config`, then `afk probe`) and resolves it one way, in `_cfg`:
 `--set key=value` → `--config` → CONFIG_DEFAULTS for the keys it omits (ADR-0009).
 
-Invoked as:  python3 <skill>/scripts/afk.py <subcommand> [flags]
+Invoked as:  <skill>/scripts/afk.py <subcommand> [flags]
 """
 import argparse
 import json

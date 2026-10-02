@@ -1844,10 +1844,18 @@ def test_the_docs_name_only_subcommands_and_flags_that_exist():
             checked += 1
     assert checked > 30, checked          # the scan really found the invocations
 
+    # the tool is ONE word: executable, and never documented behind an interpreter — a
+    # tick that copies `python3 …/afk.py` into a variable gets exit 127 under zsh
+    assert os.access(os.path.join(SKILL, "scripts", "afk.py"), os.X_OK)
+    for path in docs:
+        with open(path) as f:
+            behind = re.findall(r"(?:python3?|uv run|bash|sh) +<skill>/scripts/afk\.py", f.read())
+        assert not behind, f"{os.path.basename(path)}: {behind}"
+
     # the scanner itself: both spellings, fenced and inline, and nothing that merely
     # contains "afk" (the skill's name, a ref, a marker, a path)
     sample = ("Run `afk claim <n> --instance <id>`, not `/afk-fleet --tick` or `afk-claim/<n>`.\n"
-              "```bash\npython3 <skill>/scripts/afk.py no-pr --issue <n> \\\n     --terminal idle\n```\n"
+              "```bash\n<skill>/scripts/afk.py no-pr --issue <n> \\\n     --terminal idle\n```\n"
               "See `docs/agents/afk-fleet.md` and `<!--afk:verdict …-->`; `afk` alone is not a call.")
     assert list(_documented_invocations(sample)) == \
         [("no-pr", ["--issue", "--terminal"]), ("claim", ["--instance"])]

@@ -37,7 +37,7 @@ looping.
 to build on is your read, exactly like orphan-vs-alive. To look before acting, ask without acting:
 
 ```bash
-python3 <skill>/scripts/afk.py recovery --issue <n> --repo <repo> --config '<config json>'
+<skill>/scripts/afk.py recovery --issue <n> --repo <repo> --config '<config json>'
 ```
 
 It returns the same `{tier, action, prompt, worktree, branch, reason}` the dispatch would act on —
