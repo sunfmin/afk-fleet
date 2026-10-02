@@ -219,8 +219,8 @@ tick; even the bootstrap preview is a plan-tick subagent. This keeps the launche
 Every **deterministic** step the skill runs is a subcommand of `afk.py`, each printing one JSON object:
 the tick orchestrates and judges, but calls the tool for the fixed mechanics rather than re-deriving
 git/gh/orca incantations from prose each pass (ADR-0004). That holds for the **Act half** too: starting
-a worker, landing a PR, failing, escalating and closing a claim are each **one call that performs the
-whole ordered sequence** and returns an `outcome` wherever your judgment is needed (ADR-0017). A tick
+a worker, landing a PR, handing a sync conflict back, failing, escalating and closing a claim are each
+**one call that performs the whole ordered sequence** and returns an `outcome` wherever your judgment is needed (ADR-0017). A tick
 therefore runs **no raw `git`, `gh pr merge`, `gh issue edit` or `orca worktree`/`terminal create`** of
 its own — the only orca command it types is the liveness probe. The full interface table — every
 subcommand with its arguments and return shape — is disclosed in
@@ -269,9 +269,12 @@ spawns).
      next: *awaiting_merge* → `afk merge` (see [Merge](#merge-serialized)); *awaiting_ci* → leave;
      *failure* → `afk fail` (see [Failure handling](#failure-handling--bounded-retry--escalate-never-silently-drop));
      *closed* → the issue is already closed but its claim outlived it (a merge or close that died
-     before releasing): `afk release <n>`, nothing else; *no_pr* → see below. (In `gate.ci: local` only
-     *awaiting_merge*, *closed* and *no_pr* occur — no checks are read, and the gate runs inside
-     `afk merge` instead; ADR-0012.) For *no_pr*, **never decide from terminal chrome alone.** A worker
+     before releasing): `afk release <n>`, nothing else; *handed_back* → a sync conflict on its PR is
+     with its worker and the PR head does not contain the target tip yet: **never `afk merge` it** —
+     probe the worker and ask `afk no-pr`, exactly as for *no_pr* (see [Hand-back](#hand-back--a-sync-conflict-goes-back-to-its-worker));
+     *no_pr* → see below. (In `gate.ci: local` only *awaiting_merge*, *handed_back*, *closed* and
+     *no_pr* occur — no checks are read, and the gate runs inside `afk merge` instead; ADR-0012.) For
+     *no_pr*, **never decide from terminal chrome alone.** A worker
      that ran to completion, concluded there was no PR to open, posted its reason, and went idle looks
      *identical* to one still coding — both are "a connected terminal with a title". Run the orca
      **liveness** probe (bounded, never a transcript read) for the one thing code cannot see — is the
@@ -284,7 +287,8 @@ spawns).
      The tool gathers the rest itself — the issue's worktree on this machine (asked of orca) and its
      git progress, the worker's `afk:verdict` marker, the state of every issue that marker says it is
      blocked by — computes how long the worker has been quiet, and returns `{outcome, action,
-     idle_seconds, open_blockers, worktree, progress, worker_verdict, nudged_at}`. `outcome` / `action` are the
+     idle_seconds, open_blockers, worktree, progress, worker_verdict, nudged_at, handed_back_at}`.
+     `outcome` / `action` are the
      tool's conclusion; `worker_verdict` is only what the worker *declared* in its marker (one of the
      inputs). Act on `action` — each is one call:
        - **coding** / `leave` (terminal busy, or a sign of life within `worker_idle_grace_seconds`) →
@@ -425,7 +429,8 @@ from another machine). It stops, with an `outcome`, wherever the next move is yo
 | `outcome` | What happened | What you do |
 |---|---|---|
 | `merged` | Landed; board upserted, claim released, worktree removed. | Count it in `merged`; the slot is free. |
-| `conflict` | The sync conflicted. The merge is **left in progress** in `worktree`, `files` unmerged; nothing was pushed. | Your judgment: resolve in that worktree, **commit**, and re-run `afk merge` — or, if it is not yours to resolve, `afk fail --issue <n> --reason "<the conflict>"`. |
+| `conflict` | The sync conflicted. The merge is **left in progress** in `worktree`, `files` unmerged; nothing was pushed. | **Hand it back to its worker**: `afk hand-back --issue <n>` (see [Hand-back](#hand-back--a-sync-conflict-goes-back-to-its-worker)). Not `afk fail` — the work is not failing. |
+| `handed_back` | An earlier conflict on this PR is still with its worker. Nothing was touched. | Leave it — a *handed_back* row is never merged. |
 | `gate_red` | `local`: the merge-time gate was red, and its `gate.excerpt` is now a PR comment. `required`: the PR's checks are red. | `afk fail --issue <n> --reason "<the failure>"`. |
 | `awaiting_ci` | `required`: checks are pending — or the sync just pushed a new head, so CI must speak about *that* head first. | Leave it; a later tick merges. |
 | `no_checks` | `required`, and the PR has no checks at all — the progressive gate. | If you judge the issue's acceptance criteria met, re-run with `--allow-no-checks`; else `afk fail`. |
@@ -438,12 +443,59 @@ the branch moved after the gate. An `{"error": …}` settles nothing — the cla
 The fleet's mandate **ends at a green merge to `merge.target`.** Deploying is a separate,
 human-gated step — never done here.
 
+## Hand-back — a sync conflict goes back to its worker
+
+A `conflict` means a finished, gate-green PR met a target that moved first. The work is not failing,
+so this is **not** a failure: the conflict goes back to the worker that wrote the branch
+([ADR-0019](../../docs/adr/0019-a-sync-conflict-is-handed-back-to-its-worker.md)). You have none of
+the context it takes to resolve it, and `afk fail` would throw the whole attempt away.
+
+```bash
+<skill>/scripts/afk.py hand-back --issue <n> --instance <id> --worker-command '<worker_command>' \
+     --repo <repo> --config '<config json>'
+```
+
+One call, right after the `conflict`. It aborts the merge (the worktree is clean again), tells the
+worker — the target and its tip, the conflicted files, *fetch → **merge**, never rebase → resolve →
+`gate.local_command` until green → push to the same PR* — records the hand-back as a marker comment on
+the PR, and upserts the status board. **The claim, the PR, the branch and the worktree are kept, and
+`afk-attempt/<n>` is neither read nor written.** `delivery` says how the worker was reached:
+
+- `"terminal"` — its terminal is still there: one submitted line pointing at the brief.
+- `"continuation"` — its terminal is gone (it finished and closed, the machine restarted, the claim
+  came from another machine): a new terminal is opened **in the same worktree, on the same branch**,
+  a new worker is started there with the worker launch command, and it is given that instruction —
+  by [continuation](references/recovery.md), never from base.
+
+From then on `afk rebuild` reports the claim as **`handed_back`**, not `awaiting_merge`, until the PR
+head contains the target tip the hand-back named — so no tick re-runs the merge into a worktree the
+worker is resolving in. Treat a *handed_back* row as you treat a *no_pr* one: the liveness probe, then
+`afk no-pr --issue <n> --terminal <…>`, and act on its `action`:
+
+- `leave` — the worker is on it (busy, or within grace of the hand-back).
+- `nudge` → `afk nudge`; still silent a grace period later it is `next_attempt` → `afk fail --reason
+  "sync conflict handed back and never answered: <files>"`. **Only an unanswered hand-back enters the
+  retry ladder** — that is what keeps a hand-back from parking a claim forever.
+- `orphan` (no terminal) → `afk dispatch --issue <n>`: it continues in the worktree and starts the
+  new worker **on the hand-back** (the result carries `handed_back: <pr>`).
+
+Once the worker pushes a head that contains the tip, the row is *awaiting_merge* again and `afk merge`
+proceeds as usual. If the target moved again meanwhile, that merge conflicts again and you hand it
+back again: each round merges a newer tip, so it converges.
+
+**The one conflict you may still resolve yourself** is a purely mechanical one: both sides added
+independent adjacent lines (two imports, two list entries, two changelog lines) and the resolution is
+*keep both*, with nothing to understand about what the code is for. Resolve it in `worktree`,
+**commit**, and re-run `afk merge`. Anything else — the same lines rewritten, a file moved or deleted
+under an edit, more than a handful of hunks — is the worker's: hand it back.
+
 ## Failure handling — bounded retry → escalate, never silently drop
 
 Per issue, on any of {gate red — a *failure* row's CI checks *or* a red merge-time gate —
-adversarial refute, a **sync** conflict you could not resolve, a `no_pr` claim classified
-**idle_failed** — a `giving-up` verdict, or a worker still idle with **no verdict at all** a grace
-period after its one nudge}:
+adversarial refute, a `no_pr` or `handed_back` claim classified **idle_failed** — a `giving-up`
+verdict, or a worker still idle with **no verdict at all** a grace period after its one nudge (for a
+*handed_back* claim: a hand-back it never answered)}. A **sync conflict is not on this list** — it is
+[handed back](#hand-back--a-sync-conflict-goes-back-to-its-worker), and costs an attempt only if the worker never answers:
 
 ```bash
 <skill>/scripts/afk.py fail --issue <n> --instance <id> --worker-command '<worker_command>' \
@@ -451,8 +503,8 @@ period after its one nudge}:
 ```
 
 `--reason` is your one contribution: the failure, **re-read from where it already lives** — the PR's
-CI checks, the merge-time gate excerpt on the PR, the verifier's review comment, the conflicted files —
-never carried in context. The call does the rest and reports which way it went:
+CI checks, the merge-time gate excerpt on the PR, the verifier's review comment, the hand-back comment
+on the PR — never carried in context. The call does the rest and reports which way it went:
 
 - `"action": "retry"` — under `retry` attempts (default 2). The attempt count lives as an
   **`afk-attempt/<n>` label** on the issue (not in tick memory) and `afk fail` is its one writer: it
@@ -477,7 +529,7 @@ when they don't — and **idle_done** closes the issue after an empty-diff check
 
 `concurrency` (default 3) bounds parallel workers. Semantic ordering is the backlog's dependency DAG
 (your responsibility when decomposing); textual conflicts between parallel PRs are caught by the
-serialized sync-before-merge and routed through failure handling. Early machinery issues that all
+serialized sync-before-merge and handed back to the worker that wrote the branch. Early machinery issues that all
 touch shared root config are naturally throttled by the DAG — chain them with `blocked_by`.
 
 ## Guardrails
@@ -508,7 +560,8 @@ touch shared root config are naturally throttled by the DAG — chain them with 
   [`--takeover`](#takeover-mode---takeover).
 - **Preserve a dead worker's progress.** Recover a dead claim by **continuation** (a plain
   `afk dispatch`), and discard an attempt only where discarding is the point — `afk fail`'s retry, or
-  an explicit `--start fresh`. Never run `orca worktree rm` yourself: on a worktree that still holds
+  an explicit `--start fresh`. A finished PR that merely conflicts with a moved target is **handed
+  back** (`afk hand-back`), never failed. Never run `orca worktree rm` yourself: on a worktree that still holds
   work it is the one unrecoverable act in the fleet.
 - **Take a live lease only on a human's word.** `afk takeover --from` runs only on the human's
   explicit selection from `--list`, with `--yes` only after relaying the fresh-heartbeat warning and
@@ -517,5 +570,5 @@ touch shared root config are naturally throttled by the DAG — chain them with 
   longer reads the assignee); keep the tracker honest so a peer fleet or a human never double-takes.
 - **Stay off the reserved namespaces.** The fleet manages the `afk-attempt/<n>` labels, the
   `refs/afk/*` ref namespace (the claim and heartbeat refs), the single status-board comment tagged
-  `<!--afk:status-->`, and the worker-authored `<!--afk:verdict …-->` markers (which it parses) — leave
-  them to the fleet, and reuse those prefixes / markers for nothing else.
+  `<!--afk:status-->`, the `<!--afk:handback …-->` marker comment on a PR (which it parses), and the
+  worker-authored `<!--afk:verdict …-->` markers (which it parses) — leave them to the fleet, and reuse those prefixes / markers for nothing else.

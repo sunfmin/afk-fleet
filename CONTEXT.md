@@ -128,7 +128,8 @@ code/LLM ownership split), script vs agent (the tick is not a script)
 One change of a **claim**'s state, performed as a single `afk` call that runs its whole ordered
 sequence in code: **dispatch** (claim → worktree at the right commit → worker started → prompt
 delivered → status board), **merge** (sync → gate → merge pinned to the gated head → status board →
-release → cleanup), **fail** (count the attempt, then a fresh retry or an escalation), **escalate**
+release → cleanup), **hand-back** (abort the conflicted sync → instruct the worker → record on the PR
+→ status board), **fail** (count the attempt, then a fresh retry or an escalation), **escalate**
 (status board → relabel → comment → release, the release last), **close** (status board → close →
 release → cleanup). A transition stops with an **outcome** exactly where the next move is judgment —
 a sync conflict, a PR with no checks, a verification still owed — and takes the tick's judgment as an
@@ -238,6 +239,19 @@ travels in the failure reason. That screen is the only thing the fleet ever read
 terminal, and it is read for *where the worker stopped*, never for its result (ADR-0018).
 _Avoid_: ping, poke, retry (a retry discards the attempt; a nudge keeps it), reminder
 
+**Hand-back**:
+Returning a **sync** conflict to the **worker** that wrote the branch, instead of failing the claim.
+When the merge-time sync conflicts, the work is finished and gate-green — only the target moved — so
+the **tick** hands the conflict back in one **transition** (`afk hand-back`): the worker is told to
+merge the target in (never rebase), resolve, re-run the **local gate** and push to the same PR. The
+claim, the PR, the branch and the worktree are kept and no **retry** is spent. It is recorded as a
+marker comment on the PR naming the target tip; while the PR head does not contain that tip the claim
+is `handed_back` — never `awaiting_merge` — and its worker is watched like a PR-less one, so an
+unanswered hand-back is **nudged** and then failed. A worker whose terminal is gone is replaced by
+**continuation** in the same worktree, started on the hand-back (ADR-0019).
+_Avoid_: retry (nothing is discarded), bounce, re-dispatch (the worker and its worktree are kept),
+conflict resolution (that is what the worker then does)
+
 **Continuation**:
 The fleet's default way of recovering a claim whose **worker** died mid-flight — recovering it *from
 its durable progress* rather than re-dispatching fresh. It is tiered by what survived the death:
@@ -256,7 +270,7 @@ progress)
 **Status board** (a.k.a. progress comment):
 The human-facing projection of an issue's lifecycle onto the issue surface: a **single** comment the
 owning **fleet instance**'s **tick** upserts each **rebuild**, rendering a milestone checklist (claimed
-→ PR open → gate green → merged, with the *ci-failed* and *escalated* off-ramps) **derived** from
+→ PR open → gate green → merged, with the *ci-failed*, *handed-back* and *escalated* off-ramps) **derived** from
 **fleet state**. It exists because the **claim** lives in a hidden ref namespace and the assignee is
 unused, so the "claimed but no PR yet" phase is otherwise invisible to a reader. It is a *rendering* of
 existing state, **never a source of truth** and **never read back by a tick**; it is edited in place

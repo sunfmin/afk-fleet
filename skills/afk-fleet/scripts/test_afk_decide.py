@@ -125,6 +125,43 @@ def test_subclassify_pr():
         for has_pr in (True, False):
             assert d.subclassify_pr(has_pr, "red", ci, closed=True) == ("closed", None)
 
+    # a sync conflict handed back to the worker and not yet answered: whatever the
+    # checks say, in either mode, the claim is NOT awaiting_merge — the merge would
+    # hit the same conflict and hand it back again every cycle (ADR-0019)
+    for ci in d.GATE_CI_MODES:
+        for checks in ("green", "red", "pending", None):
+            assert d.subclassify_pr(True, checks, ci, handed_back=True) == \
+                ("handed_back", "handed_back"), (ci, checks)
+        assert d.subclassify_pr(True, "green", ci, closed=True, handed_back=True)[0] == "closed"
+    assert "handed_back" in d.STATUS_PHASES
+
+
+def test_handback_record_round_trips_and_stays_open_until_the_head_contains_the_tip():
+    body = d.handback_comment("main", "t" * 40, "h" * 40, ["a/b.go", "c d.md"], 1234)
+    # the marker leads, the same facts follow for a human, and no retry is implied
+    assert body.startswith(f"<!--afk:handback target=main tip={'t' * 40} head={'h' * 40} at=1234-->\n")
+    assert "- `a/b.go`" in body and "no retry was spent" in body
+    rec = d.latest_handback([{"id": 7, "body": "a human note"}, {"id": 8, "body": body}])
+    assert rec == {"target": "main", "tip": "t" * 40, "head": "h" * 40, "at": 1234,
+                   "files": ["a/b.go", "c d.md"], "comment_id": 8}
+    assert d.latest_handback([]) is None and d.latest_handback([{"id": 1, "body": "x"}]) is None
+    assert d.latest_handback([{"id": 1, "body": None}]) is None
+    # the latest round wins; a marker that names no tip or head is not a record
+    later = d.handback_comment("main", "u" * 40, "i" * 40, [], 2000)
+    assert "reported no file" in later
+    rec2 = d.latest_handback([{"id": 8, "body": body}, {"id": 9, "body": later},
+                              {"id": 10, "body": "<!--afk:handback target=main at=3-->"}])
+    assert (rec2["tip"], rec2["files"], rec2["comment_id"]) == ("u" * 40, [], 9)
+
+    # open while the head is the one that conflicted — GitHub is not even asked…
+    assert d.handback_open(rec, "h" * 40, False) is True
+    assert d.handback_open(rec, "h" * 40, True) is True
+    # …still open after a push that did not bring the named tip in…
+    assert d.handback_open(rec, "n" * 40, False) is True
+    # …and answered only once the head contains it
+    assert d.handback_open(rec, "n" * 40, True) is False
+    assert d.handback_open(None, "n" * 40, False) is False
+
 
 def test_validate_config():
     ok = d.resolve_config({})
@@ -380,6 +417,19 @@ def test_classify_no_pr_nudges_a_silent_worker_once_before_failing_it():
     assert routed(_verdict("giving-up")) == ("idle_failed", "next_attempt")
     assert routed(_verdict("already-satisfied"), nudged_at=NOW - 9000) == ("idle_done", "close_release")
     assert routed(None, terminal="none") == ("dead", "orphan")
+
+    # a hand-back is the same kind of sign of life (ADR-0019): one grace period to
+    # start on it, then the same nudge → failure path — never a parked claim
+    def handed(idle, at, **nudge):
+        r = d.classify_no_pr({**ZERO, "commits_ahead": 3}, "idle", idle, None, {}, NOW, GRACE,
+                             handed_back_at=at, **nudge)
+        return r["outcome"], r["action"], r["idle_seconds"]
+    assert handed(9000, NOW - 10) == ("coding", "leave", 10)
+    assert handed(9000, NOW - GRACE) == ("idle_stalled", "nudge", GRACE)
+    assert handed(9000, NOW - 2 * GRACE, nudged_at=NOW - GRACE) == \
+        ("idle_failed", "next_attempt", GRACE)
+    r = d.classify_no_pr(ZERO, "none", None, None, {}, NOW, GRACE, handed_back_at=NOW - 10)
+    assert (r["outcome"], r["action"]) == ("dead", "orphan")      # a gone terminal is still dead
 
 
 def test_stall_reason_carries_where_the_worker_stopped():
@@ -689,6 +739,11 @@ def test_render_status_board():
     closed = d.render_status_board("closed", "required", 2, instance="x")
     assert closed.count("- [x]") == 1 and "无需改动" in closed and "已关闭" in closed
 
+    # handed_back: the PR is open and stays ticked; the line says where the work is
+    handed = d.render_status_board("handed_back", "required", 2, instance="x", pr=9)
+    assert handed.count("- [x]") == 2 and "- [x] PR 已开 (#9)" in handed
+    assert "已交还 worker 解决" in handed and "失败" not in handed
+
     # gate.ci: local — the board names the gate actually being waited on, and a
     # failed one is not blamed on a CI the fleet never read (ADR-0012)
     local = d.render_status_board("pr_open", "local", 2, pr=5)
@@ -941,6 +996,48 @@ def test_render_worker_prompt_fills_the_shipped_template():
     assert "no gate.local_command configured" in none
 
 
+HANDBACK = {"pr": 77, "pr_branch": "sunfmin/issue-31-names", "target": "main",
+            "target_tip": "abc123def456", "files": ["a/names.go", "b/{branch}.md"]}
+
+
+def test_render_handback_is_one_block_alone_or_appended_to_a_continuation():
+    t = _prompt_template()
+    alone = d.render_handback(t, PROMPT_FIELDS, HANDBACK)
+    # the whole instruction: target + tip, the files, merge-not-rebase, gate, same PR
+    assert alone.startswith("## A sync conflict on your PR was handed back to you")
+    for needle in ("PR #77", "`main` moved first", "(`abc123def456`)", "- `a/names.go`",
+                   "git fetch origin main", "git merge origin/main", "never rebase", "make test",
+                   "git push origin HEAD:sunfmin/issue-31-names", "Do not open another PR",
+                   "phase=giving-up"):
+        assert needle in alone, needle
+    # a file name that looks like a placeholder is delivered verbatim (free text, last)
+    assert "- `b/{branch}.md`" in alone
+    assert not re.search(r"\{(?!branch\})[a-z_0-9.]+\}", alone) and "afk:block" not in alone
+    assert "the merge itself will list them" in d.render_handback(
+        t, PROMPT_FIELDS, {**HANDBACK, "files": []})
+
+    # a worker STARTED on a hand-back (its predecessor is gone) gets the continue
+    # prompt with that same block last; every other worker's prompt has no such block
+    cont = d.render_worker_prompt(t, "continue", PROMPT_FIELDS)
+    started = d.render_worker_prompt(t, "continue", PROMPT_FIELDS, handback=HANDBACK)
+    assert started == cont.rstrip("\n") + "\n\n" + alone
+    assert "was handed back to you" not in cont
+    # …though every worker is told its PR may come back, so the message is no surprise
+    assert "Your PR may come back to you" in cont
+
+    for bad in ({k: v for k, v in HANDBACK.items() if k != "target_tip"},):
+        try:
+            d.render_handback(t, PROMPT_FIELDS, bad)
+            assert False, "expected ValueError"
+        except ValueError as e:
+            assert "target_tip" in str(e)
+    try:
+        d.render_handback("no blocks here", PROMPT_FIELDS, HANDBACK)
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "'handback' block" in str(e)
+
+
 def test_render_worker_prompt_never_ships_a_placeholder():
     t = _prompt_template()
     # free text is substituted LAST, so a title or reason that looks like a
@@ -1111,6 +1208,14 @@ def test_assemble_working_set():
     assert (row["status"], row["board_phase"], row["title"]) == ("closed", None, None)
     assert {m["number"]: m["status"] for m in ws3["mine"]} == {3: "awaiting_merge", 4: "no_pr", 9: "closed"}
     assert ws3["free_slots"] == 0                       # it still holds a slot until released
+
+    # a claim of mine whose PR carries an open hand-back: the worker is resolving a
+    # sync conflict, so the row is `handed_back` — not the awaiting_merge its green
+    # checks would otherwise make it
+    hb = d.assemble_working_set(issues, prs, claims, heartbeats, {}, "me", now, cfg,
+                                handed_back=[3])
+    row = {m["number"]: m for m in hb["mine"]}[3]
+    assert (row["status"], row["board_phase"], row["pr"]) == ("handed_back", "handed_back", 30)
 
     # the lease the partition uses is the CONFIG's: shorten it and the live peer goes stale
     short = d.assemble_working_set(issues, prs, claims, heartbeats, {2: 1}, "me", now,

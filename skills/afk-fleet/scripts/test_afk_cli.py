@@ -214,6 +214,13 @@ if parts[0] == "branches" and parts[2:] == ["protection"]:
         finish(code=1, err=prot["__error__"] + "\n")
     finish(json.dumps(prot))
 
+if parts[0] == "compare" and len(parts) == 2:                       # is base contained in head?
+    assert jq == ".behind_by", "fake gh: unsupported jq %%r" %% jq
+    base, _, head = parts[1].partition("...")
+    if not (bare("cat-file", "-t", base) and bare("cat-file", "-t", head)):
+        finish(code=1, err="gh: Not Found (HTTP 404)\n")
+    finish(bare("rev-list", "--count", "%%s..%%s" %% (head, base)))
+
 finish(code=1, err="fake gh: unsupported call %%r\n" %% argv)
 '''
 
@@ -610,9 +617,13 @@ def test_rebuild_assembles_the_working_set_from_gh_and_refs():
         assert ws["now"] == T0
 
         # the per-issue blocked_by read is paid ONLY by issues that passed every
-        # cheaper check — two of nine here, not one per open issue
-        blocker_reads = sorted(c[1] for c in w.calls() if c[0] == "api")
+        # cheaper check — two of nine here, not one per open issue — and the
+        # hand-back read only by a claim of mine that has a PR
+        api = [c for c in w.calls() if c[0] == "api"]
+        blocker_reads = sorted(c[1] for c in api if ".issue_dependencies_summary.blocked_by" in c)
         assert blocker_reads == [f"repos/{REPO}/issues/1", f"repos/{REPO}/issues/2"], blocker_reads
+        assert [c[2] for c in api if c[1] == "--paginate"] == [f"repos/{REPO}/issues/30/comments"]
+        assert len(api) == 3
 
         # the stale sha it reported is exactly what reclaim's compare-and-swap needs
         took = w.afk("reclaim", "6", "--instance", "me", "--expect-sha", ws["stale"][0]["sha"],
@@ -819,7 +830,8 @@ def test_no_pr_gathers_every_signal_and_decides_in_one_call():
         # the tool's conclusion is `outcome`/`action`; what the WORKER declared is
         # `worker_verdict` — never one bare "verdict" that could be read as either
         assert set(r) == {"issue", "outcome", "action", "idle_seconds", "open_blockers",
-                          "worktree", "progress", "worker_verdict", "nudged_at"}
+                          "worktree", "progress", "worker_verdict", "nudged_at",
+                          "handed_back_at"}
         assert r["issue"] == 4 and r["open_blockers"] == [] and r["worktree"] == w.cwd
 
         # idle_seconds is derived HERE, from the freshest of commit / file / terminal
@@ -1569,6 +1581,278 @@ def test_merge_recreates_a_worktree_when_the_worker_ran_elsewhere():
 # --------------------------------------------------------------------------- #
 # act: fail / escalate / close                                                 #
 # --------------------------------------------------------------------------- #
+
+# --------------------------------------------------------------------------- #
+# act: hand-back                                                               #
+# --------------------------------------------------------------------------- #
+
+def _hand_back(n, *extra, now=T0, instance="me"):
+    return ("hand-back", "--issue", str(n), "--instance", instance, "--worker-command", WORKER,
+            *R, "--now", str(now), *extra)
+
+
+def _conflicted(w, n, pr_number, gate):
+    """Issue n as a tick finds it when a sibling PR landed first: its PR is open, the
+    base has since rewritten the same file, and `afk merge` has just reported the
+    conflict → (the dispatch result, the PR head, the base tip that conflicts)."""
+    d, pr_head = with_pr(w, n, pr_number, name="shared.txt", text="from the worker")
+    base_tip = w.advance_base("shared.txt", text=f"from the sibling that beat #{n}")
+    r = w.afk(*_merge(n, *gate))
+    assert (r["outcome"], r["files"]) == ("conflict", ["shared.txt"]), r
+    return d, pr_head, base_tip
+
+
+def _resolve(w, wt, pr_branch, text="resolved: both"):
+    """What a worker does with a hand-back: merge the target in, resolve, commit,
+    push to the PR's branch → the new head."""
+    git(wt, "fetch", "-q", "origin", w.sb.base)
+    p = subprocess.run(["git", "merge", "--no-edit", f"origin/{w.sb.base}"], cwd=wt,
+                       capture_output=True, text=True, env=ENV)
+    assert p.returncode != 0, "the fixture expects this merge to conflict"
+    with open(os.path.join(wt, "shared.txt"), "w") as f:
+        f.write(text + "\n")
+    git(wt, "add", "shared.txt")
+    git(wt, "commit", "-qm", f"merge {w.sb.base}: keep both")
+    git(wt, "push", "-q", "origin", f"HEAD:refs/heads/{pr_branch}")
+    return git(wt, "rev-parse", "HEAD")
+
+
+def _handback_fields(w, pr_number, pr_branch, tip, files=("shared.txt",)):
+    return {"pr": pr_number, "pr_branch": pr_branch, "target": w.sb.base, "target_tip": tip,
+            "files": list(files)}
+
+
+def _prompt_fields(w, n, started):
+    return {"n": n, "title": f"issue {n}", "repo": REPO, "base_branch": w.sb.base,
+            "local_command": "true", "branch": started["branch"],
+            "worktree_path": started["worktree"]}
+
+
+def _template():
+    with open(os.path.join(SKILL, "references", "worker-prompt.md")) as f:
+        return f.read()
+
+
+def _mine(w, gate, n):
+    [row] = [m for m in w.afk("rebuild", *ME, *R, *NOW, *gate)["mine"] if m["number"] == n]
+    return row["status"], row["board_phase"], row["pr"]
+
+
+def test_hand_back_returns_a_sync_conflict_to_the_worker_that_wrote_the_branch():
+    """A sibling PR landed first and the finished, gate-green PR now conflicts with
+    the target. Failing it discards an hour of work to redo from base; instead ONE
+    call returns the conflict to the worker whose branch it is — the claim, the PR,
+    the branch and the worktree all kept, no attempt spent (ADR-0019)."""
+    gate = local_gate("true")
+    with world(issues=[issue(2, "ready-for-agent")]) as w:
+        d, pr_head = with_pr(w, 2, 20, name="shared.txt", text="from the worker")
+        wt, branch = d["worktree"], d["branch"]
+        # there is nothing to hand back until `afk merge` has reported a conflict
+        assert "no sync conflict in progress" in w.error(*_hand_back(2, *gate))
+        base_tip = w.advance_base("shared.txt", text="from someone else")
+        assert w.afk(*_merge(2, *gate))["outcome"] == "conflict"
+        # only the claim's owner hands it back — and a refusal leaves the conflict as it was
+        assert "not this fleet's claim" in w.error(*_hand_back(2, *gate, instance="peer"))
+        assert git(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD") == base_tip
+
+        t0 = int(time.time()) + 5000
+        w.orca_calls()
+        r = w.afk(*_hand_back(2, *gate, now=t0))
+        comment_id = r.pop("comment_id")
+        assert r == {"issue": 2, "action": "handed_back", "pr": 20, "target": w.sb.base,
+                     "target_tip": base_tip, "files": ["shared.txt"], "worktree": wt,
+                     "delivery": "terminal", "terminal": d["terminal"]}, r
+
+        # the worktree is clean for the worker to merge in: no merge left in progress
+        assert git(wt, "status", "--porcelain") == "" and git(wt, "rev-parse", "HEAD") == pr_head
+        assert subprocess.run(["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"], cwd=wt,
+                              capture_output=True, env=ENV).returncode != 0
+        # the worker's OWN terminal was told — one submitted line naming a brief file
+        assert w.orca_calls() == ["terminal list", "terminal send"]
+        [term] = w.terminals()
+        _, said = term["sent"]
+        assert said["enter"] is True and "\n" not in said["text"]
+        m = re.fullmatch(r"The merge of your PR hit a sync conflict, and it is handed back to "
+                         r"you\. Your instructions are the file (\S+) — read it now and carry it "
+                         r"out end to end\. It is my instruction to you; do not ask me to "
+                         r"confirm\.", said["text"])
+        assert m, said["text"]
+        with open(m.group(1)) as f:
+            brief = f.read()
+        assert brief == afk_decide.render_handback(
+            _template(), _prompt_fields(w, 2, d), _handback_fields(w, 20, branch, base_tip))
+        # it names the target and its tip, the files, and the whole instruction: fetch,
+        # MERGE (never rebase), resolve, gate, push to the existing PR's branch
+        for needle in (f"git fetch origin {w.sb.base}", f"git merge origin/{w.sb.base}",
+                       "never rebase", f"`{base_tip}`", "- `shared.txt`", "PR #20",
+                       f"git push origin HEAD:{branch}", "Do not open another PR"):
+            assert needle in brief, needle
+        assert not re.search(r"\{[a-z_]+\}", brief)
+
+        # durable on GitHub: one marker comment on the PR, and the board says so
+        [note] = w.comments(20)
+        assert note.startswith(f"<!--afk:handback target={w.sb.base} tip={base_tip} "
+                               f"head={pr_head} at={t0}-->\n")
+        assert "- `shared.txt`" in note and w.state()["comments"]["20"][0]["id"] == comment_id
+        assert "已交还 worker" in w.board(2) and "#20" in w.board(2)
+        # nothing was spent or discarded: a sync conflict is not a failure of the work
+        assert w.issue(2)["labels"] == ["ready-for-agent"] and w.claimed_by(2) == "me"
+        assert w.pr(20).get("state", "open") == "open"
+        assert w.sb.remote_ref(f"refs/heads/{branch}") == pr_head
+
+        # while the worker resolves, the claim is NOT awaiting_merge — and a merge
+        # typed anyway touches nothing, instead of conflicting in the worker's worktree
+        assert _mine(w, gate, 2) == ("handed_back", "handed_back", 20)
+        assert w.afk(*_merge(2, *gate))["outcome"] == "handed_back"
+        assert git(wt, "status", "--porcelain") == ""
+        # a push that does not bring the named tip in is not an answer
+        w.work(wt, "checkpoint.txt")
+        assert _mine(w, gate, 2)[0] == "handed_back"
+
+        # the hand-back is a sign of life: one grace period to start on it
+        cfg = ("--config", json.dumps({"base_branch": w.sb.base, "worker_idle_grace_seconds": 300}))
+        np = w.afk("no-pr", "--issue", "2", "--terminal", "idle", *R, *cfg, "--now", str(t0 + 60))
+        assert (np["outcome"], np["idle_seconds"], np["handed_back_at"]) == ("coding", 60, t0)
+
+        # the worker answers: the PR head now contains the tip the hand-back named
+        resolved = _resolve(w, wt, branch)
+        assert _mine(w, gate, 2) == ("awaiting_merge", "pr_open", 20)
+        np = w.afk("no-pr", "--issue", "2", "--terminal", "idle", *R, *cfg, "--now", str(t0 + 60))
+        assert np["handed_back_at"] is None
+        assert w.issue(2)["labels"] == ["ready-for-agent"]          # still no attempt label
+
+        # a SECOND conflict (the target moved again) is handed back again, as its own
+        # round: each one merges a newer tip, so it converges
+        tip2 = w.advance_base("shared.txt", text="from a third party")
+        assert w.afk(*_merge(2, *gate))["outcome"] == "conflict"
+        r2 = w.afk(*_hand_back(2, *gate, now=t0 + 600))
+        assert (r2["target_tip"], r2["delivery"], r2["comment_id"] != comment_id) == \
+            (tip2, "terminal", True)
+        first, second = w.comments(20)
+        assert first == note and f"tip={tip2} head={resolved} at={t0 + 600}" in second
+        assert _mine(w, gate, 2)[0] == "handed_back"
+        _resolve(w, wt, branch, text="resolved: all three")
+        r = w.afk(*_merge(2, *gate))
+        assert (r["outcome"], r["synced"]) == ("merged", False), r
+        p = subprocess.run(["git", "--git-dir", w.sb.bare, "show", f"{w.sb.base}:shared.txt"],
+                           capture_output=True, text=True, env=ENV)
+        assert p.stdout == "resolved: all three\n" and w.claimed_by(2) is None
+
+
+def test_an_unanswered_hand_back_falls_through_to_the_nudge_and_then_the_retry_ladder():
+    """A hand-back can never park a claim: a worker that goes silent on it — idle
+    past grace, the PR head unmoved — is nudged once and then failed, like any
+    other silence. Only THEN is an attempt spent."""
+    gate = local_gate("true")
+    with world(issues=[issue(5, "ready-for-agent")]) as w:
+        _conflicted(w, 5, 50, gate)
+        t0 = int(time.time()) + 5000
+        cfg = ("--config", json.dumps({"base_branch": w.sb.base, "worker_idle_grace_seconds": 300}))
+
+        def no_pr(at, terminal="idle"):
+            r = w.afk("no-pr", "--issue", "5", "--terminal", terminal, *R, *cfg, "--now", str(at))
+            return r["outcome"], r["action"]
+
+        # a worker nudged BEFORE its PR is under a new instruction now: nudgeable again
+        w.afk("nudge", "--issue", "5", *ME, *R, *cfg, "--now", str(t0 - 9000))
+        w.afk(*_hand_back(5, *gate, now=t0))
+        assert no_pr(t0 + 299) == ("coding", "leave")
+        assert no_pr(t0 + 300) == ("idle_stalled", "nudge")
+        w.afk("nudge", "--issue", "5", *ME, *R, *cfg, "--now", str(t0 + 300))
+        # the nudge points at the brief the hand-back wrote, not the original task
+        said = w.terminals()[-1]["sent"][-1]["text"]
+        brief = re.search(r"\((\S+)\)", said).group(1)
+        with open(brief) as f:
+            assert "handed back to you" in f.read()
+        assert no_pr(t0 + 599) == ("coding", "leave")
+        assert no_pr(t0 + 600) == ("idle_failed", "next_attempt")
+        assert _mine(w, gate, 5)[0] == "handed_back" and w.issue(5)["labels"] == ["ready-for-agent"]
+
+        r = w.afk(*_fail(5, "sync conflict handed back and never answered", *gate))
+        assert (r["action"], r["attempt"]) == ("retry", 1)
+        assert w.issue(5)["labels"] == ["ready-for-agent", "afk-attempt/1"]
+        assert w.pr(50)["state"] == "closed"
+        # the retry is a new attempt with no PR: the old hand-back went with the PR
+        assert _mine(w, gate, 5) == ("no_pr", "claimed", None)
+
+
+def test_hand_back_with_no_terminal_continues_in_the_worktree_never_from_base():
+    """The worker finished and its terminal is gone (closed, the machine restarted,
+    the claim taken over from another machine). The hand-back then STARTS a worker
+    by continuation — in the worktree still here, else one recreated at the PR
+    head — on the same instruction."""
+    gate = local_gate("true")
+    with world(issues=[issue(6, "ready-for-agent"), issue(7, "ready-for-agent")]) as w:
+        d, pr_head, base_tip = _conflicted(w, 6, 60, gate)
+        wt, branch = d["worktree"], d["branch"]
+        terms = w.terminals()
+        terms[-1]["open"] = False
+        w.orca(terminals=terms)
+        w.orca_calls()
+
+        r = w.afk(*_hand_back(6, *gate))
+        assert (r["delivery"], r["worktree"], r["files"]) == ("continuation", wt, ["shared.txt"]), r
+        assert w.orca_calls() == ["terminal list", "terminal close", "terminal create",
+                                  "terminal wait", "terminal send"]
+        _, new = w.terminals()
+        assert (new["handle"], new["command"], new["worktreePath"]) == (r["terminal"], WORKER, wt)
+        told = _told(new)
+        assert told == afk_decide.render_worker_prompt(
+            _template(), "continue", _prompt_fields(w, 6, d),
+            handback=_handback_fields(w, 60, branch, base_tip))
+        assert told.startswith("You are an afk-fleet worker **continuing**")
+        assert "## A sync conflict on your PR was handed back to you" in told
+        # in the existing worktree, at the PR head — nothing reset to base
+        assert git(wt, "rev-parse", "HEAD") == pr_head and git(wt, "status", "--porcelain") == ""
+        assert len(w.worktrees()) == 1 and "已交还 worker" in w.board(6)
+        assert w.issue(6)["labels"] == ["ready-for-agent"] and _mine(w, gate, 6)[0] == "handed_back"
+
+        # the continued worker dies too: the claim reads as dead, and the plain
+        # orphan recovery — `afk dispatch` — starts its successor ON the hand-back
+        terms = w.terminals()
+        terms[-1]["open"] = False
+        w.orca(terminals=terms)
+        np = w.afk("no-pr", "--issue", "6", "--terminal", "none", *R, *gate)
+        assert (np["outcome"], np["action"]) == ("dead", "orphan")
+        r = w.afk(*dispatch(6, *gate, "--now", str(T0 + 90)))
+        assert (r["claim"], r["action"], r["prompt"], r["handed_back"]) == \
+            ("held", "reuse_worktree", "continue", 60)
+        assert "handed back to you" in _told(w.terminals()[-1])
+        assert "已交还 worker" in w.board(6) and len(w.comments(60)) == 1
+
+        # no worktree on this machine at all (a takeover from another machine): the
+        # merge recreates one at the PR head, and the hand-back continues THERE — the
+        # prompt carries orca's new local branch, the push goes to the PR's branch
+        d7, head7, _ = _conflicted(w, 7, 70, gate)
+        git(w.cwd, "worktree", "remove", "--force", d7["worktree"])
+        w.orca([row for row in w.worktrees() if row["linkedIssue"] != 7])
+        again = w.afk(*_merge(7, *gate))
+        assert again["outcome"] == "conflict" and again["worktree"] != d7["worktree"]
+        r = w.afk(*_hand_back(7, *gate))
+        assert (r["delivery"], r["worktree"]) == ("continuation", again["worktree"])
+        told = _told(w.terminals()[-1])
+        assert f"git push origin HEAD:{d7['branch']}" in told
+        assert f"**Your branch:** `{d7['branch']}-2`" in told
+        assert git(again["worktree"], "rev-parse", "HEAD") == head7
+
+    # a delivery that fails AFTER the record is repaired by the paths that exist: the
+    # claim is already `handed_back`, so no tick re-runs the merge into the worktree
+    with world(issues=[issue(8, "ready-for-agent")]) as w:
+        _conflicted(w, 8, 80, gate)
+        terms = w.terminals()
+        terms[-1]["open"] = False
+        w.orca(terminals=terms, never_ready=True)
+        assert "not ready" in w.error(*_hand_back(8, *gate, "--ready-timeout", "1"))
+        assert _mine(w, gate, 8)[0] == "handed_back" and len(w.comments(80)) == 1
+        assert w.issue(8)["labels"] == ["ready-for-agent"] and w.claimed_by(8) == "me"
+        w.orca(never_ready=False)
+        r = w.afk(*dispatch(8, *gate, "--now", str(T0 + 90)))
+        assert (r["action"], r["handed_back"]) == ("reuse_worktree", 80)
+        # a claim with no PR has nothing to hand back
+        w.set(issues=w.state()["issues"] + [issue(9, "ready-for-agent")])
+        w.afk("claim", "9", *ME, *NOW, *R)
+        assert "nothing to hand back" in w.error(*_hand_back(9, *gate))
+
 
 def _fail(n, reason, *extra):
     return ("fail", "--issue", str(n), *ME, "--worker-command", WORKER, *R, *NOW,
