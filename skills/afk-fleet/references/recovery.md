@@ -13,7 +13,7 @@ worktree if it is still on this machine, else the branch tip on GitHub ([ADR-001
 One call decides which, per dead claim:
 
 ```bash
-python3 <skill>/scripts/afk.py recovery --issue <n> --repo <repo> --config '<config json>'
+<skill>/scripts/afk.py recovery --issue <n> --repo <repo> --config '<config json>'
 ```
 
 It asks `orca worktree list` whether a worktree for this issue is still here, recognises the issue's

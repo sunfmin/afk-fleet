@@ -141,14 +141,14 @@ the opening working set differs:
 1. **List what GitHub still remembers.** The dead launcher forgot its own id; the claim markers
    (`instance=<id> host=<host>`) and heartbeat refs did not:
    ```bash
-   python3 <skill>/scripts/afk.py takeover --list --repo <repo> --instance <my instance id> --config '<config json>'
+   <skill>/scripts/afk.py takeover --list --repo <repo> --instance <my instance id> --config '<config json>'
    ```
    Show the human each instance's id, host, claim count and heartbeat age, and ask which to take. Rows
    are flagged so the wrong answer is visible: `fresh: true` (looks alive), `claim_count: 0` (drained
    cleanly — nothing to take), `is_me: true` (this run).
 2. **Force-take the selection:**
    ```bash
-   python3 <skill>/scripts/afk.py takeover --from <dead id> --instance <my instance id> --repo <repo> --config '<config json>'
+   <skill>/scripts/afk.py takeover --from <dead id> --instance <my instance id> --repo <repo> --config '<config json>'
    ```
    The *same* atomic `--force-with-lease` push a stale reclaim uses, only skipping the staleness gate —
    so a fleet that is not actually dead still wins the race and the result reports it under `lost`.
@@ -220,6 +220,12 @@ the claim namespace, the lease, the labels and the gate mode. A call without `--
 (exit 3); it never runs on defaults. The inline examples below abbreviate both away
 (`afk release <n>`) only to stay readable.
 
+**The tool is one executable word.** `<skill>/scripts/afk.py` is executable — call it by its path, with
+no interpreter in front. If you shorten it, hold only the **path** in a variable or define a shell
+function (`afk() { <skill>/scripts/afk.py "$@"; }`); never put a multi-word command (`AFK="python3 …"`)
+in a variable — zsh does not word-split it, so every `$AFK …` in the batch fails with exit 127 while
+the commands chained after it still run.
+
 **Exit 3 is never an outcome.** A subcommand that could not do its job prints `{"error": …}` and exits
 3. That is an operational failure (auth, network, a rejected push, an unreadable remote, a claim that
 could not be deleted, a bad command line) — stop and report it in the tick summary's `note`; do not
@@ -235,7 +241,7 @@ spawns).
 
 1. **Rebuild the working set from GitHub** (never from memory) — **one read-only call** (ADR-0008):
    ```bash
-   python3 <skill>/scripts/afk.py rebuild --repo <repo> --instance <id> --config '<config json>'
+   <skill>/scripts/afk.py rebuild --repo <repo> --instance <id> --config '<config json>'
    ```
    It gathers issues + PRs + claim/heartbeat refs once (the same gatherer the launcher's fingerprint
    gate reads through — the raw 200-issue JSON lives and dies inside the tool) and returns the whole
@@ -254,7 +260,7 @@ spawns).
      **liveness** probe (bounded, never a transcript read) for the one thing code cannot see — is the
      terminal `busy`, `idle`, or is there `none` — then make **one call**:
      ```bash
-     python3 <skill>/scripts/afk.py no-pr --issue <n> --worktree <path> --terminal <busy|idle|none> \
+     <skill>/scripts/afk.py no-pr --issue <n> --worktree <path> --terminal <busy|idle|none> \
           [--terminal-idle-seconds <s>] --repo <repo> --config '<config json>'
      ```
      (`<path>` is orca's — from `orca worktree list` or the create result; omit `--worktree` only when

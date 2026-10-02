@@ -20,7 +20,7 @@ A PR may merge only when **all** configured gates are green. Which **machine gat
   invariant both runs serve: *what lands on the target branch was tested in the form it lands.* One
   call, deliberately the same compact shape as the CI sub-read, so a raw log never enters the tick:
   ```bash
-  python3 <skill>/scripts/afk.py gate-run --worktree <path> --config '<config json>'
+  <skill>/scripts/afk.py gate-run --worktree <path> --config '<config json>'
   # → {status: green|red, exit_code, excerpt, omitted_lines, timed_out}
   ```
   A red run's `excerpt` is **posted as a PR comment** before the retry ladder, so the next attempt
