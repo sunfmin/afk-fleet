@@ -90,21 +90,30 @@ def test_classify_claims_my_own_expired_stays_mine():
 
 
 def test_subclassify_pr():
-    assert d.subclassify_pr("none", None) == "no_pr"
-    assert d.subclassify_pr("open", "green") == "awaiting_merge"
-    assert d.subclassify_pr("open", "red") == "failure"
-    assert d.subclassify_pr("open", "pending") == "awaiting_ci"
-    assert d.subclassify_pr("open", None) == "awaiting_ci"
+    # → (status, board_phase): what the tick does next, and what the board shows
+    assert d.subclassify_pr(False, None, "required") == ("no_pr", "claimed")
+    assert d.subclassify_pr(True, "green", "required") == ("awaiting_merge", "awaiting_merge")
+    assert d.subclassify_pr(True, "red", "required") == ("failure", "ci_failed")
+    assert d.subclassify_pr(True, "pending", "required") == ("awaiting_ci", "pr_open")
+    assert d.subclassify_pr(True, None, "required") == ("awaiting_ci", "pr_open")
+    # with no PR the checks are nobody's: stale rollup data cannot invent a status
+    assert d.subclassify_pr(False, "green", "required") == ("no_pr", "claimed")
 
     # gate.ci: local — there are no checks to WAIT on, because gating is an action
     # the tick takes at merge time (ADR-0012). Any open PR is awaiting_merge, and a
     # red remote run (the repo's own on:push CI, which the fleet does not gate on)
-    # must never park the claim in `failure` forever.
+    # must never park the claim in `failure` forever. But the board stays at
+    # pr_open: the gate that merge sequence runs has not passed, and the board must
+    # not show a green gate nobody has run.
     for checks in ("green", "red", "pending", None):
-        assert d.subclassify_pr("open", checks, "local") == "awaiting_merge", checks
-    assert d.subclassify_pr("none", None, "local") == "no_pr"      # no PR is still no PR
-    # the default is unchanged for every existing repo
-    assert d.subclassify_pr("open", "red") == d.subclassify_pr("open", "red", "required")
+        assert d.subclassify_pr(True, checks, "local") == ("awaiting_merge", "pr_open"), checks
+    assert d.subclassify_pr(False, None, "local") == ("no_pr", "claimed")
+
+    # every board phase it can produce is one the board renders — the tick never translates
+    for ci in d.GATE_CI_MODES:
+        for has_pr in (True, False):
+            for checks in ("green", "red", "pending", None):
+                assert d.subclassify_pr(has_pr, checks, ci)[1] in d.STATUS_PHASES
 
 
 def test_validate_config():
@@ -124,10 +133,15 @@ def test_validate_config():
         except ValueError as e:
             assert "local_command" in str(e)
 
-    # the claim namespace is a ref PREFIX: a branch name or a trailing slash would
-    # silently build refs no scan ever reads back
-    d.validate_config(d.resolve_config({"claim_namespace": "refs/heads"}))
-    for bad_ns in ("afk", "heads/afk", "refs/afk/", ""):
+    # the claim namespace is one of exactly two layouts. Anything else — even a
+    # well-formed prefix — would be a third one no probe or warning describes:
+    # `refs/heads/afk` builds ordinary branches that `on: push` CI fires on
+    for ns in d.CLAIM_NAMESPACES:
+        d.validate_config(d.resolve_config({"claim_namespace": ns}))
+    assert set(d.CLAIM_NAMESPACES) == {"refs/afk", "refs/heads"}
+    assert d.BRANCH_NAMESPACE in d.CLAIM_NAMESPACES
+    assert d.CONFIG_DEFAULTS["claim_namespace"] in d.CLAIM_NAMESPACES
+    for bad_ns in ("afk", "heads/afk", "refs/afk/", "", "refs/heads/afk", "refs/x", None):
         try:
             d.validate_config(d.resolve_config({"claim_namespace": bad_ns}))
             assert False, f"expected ValueError for claim_namespace {bad_ns!r}"
@@ -526,21 +540,36 @@ def test_select_recovery():
     assert d.select_recovery({"present": False}, {"name": "b", "commits_ahead": None})["tier"] == 3
 
 
+def test_current_attempt_is_the_one_reader_of_the_label():
+    assert d.current_attempt([]) == 0 and d.current_attempt(None) == 0
+    assert d.current_attempt(["ready-for-agent"]) == 0          # never retried
+    assert d.current_attempt(["afk-attempt/1", "ready-for-agent"]) == 1
+    # highest label wins even if out of order; junk suffixes are not attempts
+    assert d.current_attempt(["afk-attempt/x", "afk-attempt/1", "afk-attempt/3"]) == 3
+    assert d.current_attempt(["afk-attempt/", "afk-attempt/-2", "afk-attempt/1.5", 7]) == 0
+    assert d.current_attempt(["xafk-attempt/9", "afk-attempt/2"]) == 2
+
+
 def test_next_attempt():
-    assert d.next_attempt([], 2) == {"action": "retry", "from_label": None, "to_label": "afk-attempt/1"}
-    assert d.next_attempt(["afk-attempt/1", "ready-for-agent"], 2) == \
+    assert d.next_attempt(0, 2) == {"action": "retry", "from_label": None, "to_label": "afk-attempt/1"}
+    assert d.next_attempt(1, 2) == \
         {"action": "retry", "from_label": "afk-attempt/1", "to_label": "afk-attempt/2"}
-    assert d.next_attempt(["afk-attempt/2"], 2) == {"action": "escalate", "from_label": "afk-attempt/2"}
-    # highest label wins even if out of order; junk suffix ignored
-    assert d.next_attempt(["afk-attempt/x", "afk-attempt/1", "afk-attempt/3"], 2) == \
-        {"action": "escalate", "from_label": "afk-attempt/3"}
+    assert d.next_attempt(2, 2) == {"action": "escalate", "from_label": "afk-attempt/2"}
+    assert d.next_attempt(3, 2) == {"action": "escalate", "from_label": "afk-attempt/3"}
+    # retry: 0 escalates the first failure, with no label to remove
+    assert d.next_attempt(0, 0) == {"action": "escalate", "from_label": None}
+    # the label it hands back is one current_attempt reads as the next number —
+    # the two are a round trip, so the ladder cannot stall on its own output
+    n = 0
+    for _ in range(3):
+        n = d.current_attempt([d.next_attempt(n, 9)["to_label"]])
+    assert n == 3
 
 
 def test_render_status_board():
     # ci_failed: PR opened, gate red, retrying — the two happy steps ticked, the
     # rest open, and the current-line names the attempt count.
-    body = d.render_status_board({"phase": "ci_failed", "instance": "fl-abc",
-                                  "pr": 123, "attempt": 2, "retry_max": 2})
+    body = d.render_status_board("ci_failed", "required", 2, instance="fl-abc", pr=123, attempt=2)
     assert body.startswith(d.STATUS_MARKER)          # marker leads → find-or-create anchor
     assert "认领方 `fl-abc`" in body
     assert "- [x] 已认领 · worker 实现中" in body
@@ -548,62 +577,47 @@ def test_render_status_board():
     assert "- [ ] 门已绿 · 待合并" in body
     assert "- [ ] 已合并" in body
     assert "CI 失败,修复重试中(2/2)" in body
+    # retry_max is the caller's (config `retry`), never a number of the renderer's own
+    assert "(1/7)" in d.render_status_board("ci_failed", "required", 7, attempt=1)
 
     # claimed: the invisible phase this whole feature exists to surface.
-    claimed = d.render_status_board({"phase": "claimed", "instance": "x"})
+    claimed = d.render_status_board("claimed", "required", 2, instance="x")
     assert claimed.count("- [x]") == 1 and "尚无 PR" in claimed
+    assert "认领方" not in d.render_status_board("claimed", "required", 2)   # no instance, no header tail
 
     # merged: every step ticked, none open.
-    merged = d.render_status_board({"phase": "merged", "pr": 7})
+    merged = d.render_status_board("merged", "required", 2, pr=7)
     assert merged.count("- [x]") == 4 and "- [ ]" not in merged
     assert "已合并,完成" in merged
 
     # escalated: terminal give-up — only what truly happened stays ticked.
-    esc = d.render_status_board({"phase": "escalated", "pr": 9})
+    esc = d.render_status_board("escalated", "required", 2, pr=9)
     assert esc.count("- [x]") == 2 and "已升级给人处理" in esc      # 认领 + PR
-    assert d.render_status_board({"phase": "escalated"}).count("- [x]") == 1  # no PR → only 认领
+    assert d.render_status_board("escalated", "required", 2).count("- [x]") == 1  # no PR → only 认领
 
     # gate.ci: local — the board names the gate actually being waited on, and a
     # failed one is not blamed on a CI the fleet never read (ADR-0012)
-    local = d.render_status_board({"phase": "pr_open", "pr": 5, "ci": "local"})
+    local = d.render_status_board("pr_open", "local", 2, pr=5)
     assert "- [x] PR 已开 (#5) · 等 本地门" in local and "▸ 当前:等 本地门" in local
     assert "CI" not in local
-    assert "本地门 失败,修复重试中(1/2)" in d.render_status_board(
-        {"phase": "ci_failed", "pr": 5, "attempt": 1, "ci": "local"})
-    # required is the default, and its wording is unchanged
-    assert d.render_status_board({"phase": "pr_open", "pr": 5, "ci": "required"}) == \
-        d.render_status_board({"phase": "pr_open", "pr": 5})
-    assert "- [x] PR 已开 · 等 CI" in d.render_status_board({"phase": "pr_open"})   # no PR number
-    # retry_max defaults to the config table's `retry`, not a second hardcoded number
-    assert f"(1/{d.CONFIG_DEFAULTS['retry']})" in d.render_status_board(
-        {"phase": "ci_failed", "attempt": 1})
+    assert "本地门 失败,修复重试中(1/2)" in d.render_status_board("ci_failed", "local", 2, pr=5, attempt=1)
+    assert "- [x] PR 已开 · 等 CI" in d.render_status_board("pr_open", "required", 2)   # no PR number
 
     # determinism: identical state → identical body (write-only-on-change relies on it).
-    assert d.render_status_board({"phase": "pr_open", "pr": 5}) == \
-        d.render_status_board({"phase": "pr_open", "pr": 5})
+    assert d.render_status_board("pr_open", "required", 2, pr=5) == \
+        d.render_status_board("pr_open", "required", 2, pr=5)
+    # every phase renders under every gate mode
+    for phase in d.STATUS_PHASES:
+        for ci in d.GATE_CI_MODES:
+            assert d.render_status_board(phase, ci, 2).startswith(d.STATUS_MARKER)
 
-    # unknown phase is rejected, not silently rendered.
-    try:
-        d.render_status_board({"phase": "bogus"})
-        assert False, "expected ValueError for unknown phase"
-    except ValueError:
-        pass
-
-
-def test_board_phase():
-    # every status rebuild can emit has a board phase — the tick never translates
-    for status, phase in (("no_pr", "claimed"), ("awaiting_ci", "pr_open"),
-                          ("failure", "ci_failed"), ("awaiting_merge", "awaiting_merge")):
-        assert d.board_phase(status) == phase == d.board_phase(status, "required")
-        assert phase in d.STATUS_PHASES
-    # local mode: an open PR is ready for the merge SEQUENCE, but the gate that
-    # sequence runs has not passed — the board must not show a green gate
-    assert d.board_phase("awaiting_merge", "local") == "pr_open"
-    assert d.board_phase("no_pr", "local") == "claimed"
-    for ci in d.GATE_CI_MODES:                # and it covers subclassify_pr's whole range
-        for pr in ("open", "none"):
-            for checks in ("green", "red", "pending", None):
-                assert d.board_phase(d.subclassify_pr(pr, checks, ci), ci) in d.STATUS_PHASES
+    # an unknown phase or gate mode is rejected, not silently rendered as the default
+    for bad in (("bogus", "required", 2), ("claimed", None, 2), ("claimed", "optional", 2)):
+        try:
+            d.render_status_board(*bad)
+            assert False, f"expected an error for {bad}"
+        except (ValueError, KeyError):
+            pass
 
 
 def test_pace():
@@ -711,11 +725,12 @@ def test_assemble_working_set():
     assert "1 open blocker" in reasons[2]
     assert "already claimed" in reasons[3] and "already claimed" in reasons[5]
 
-    # mine: subclassified with PR + checks + attempt labels — Act consumes this directly
+    # mine: subclassified with PR + checks + the attempt number — Act consumes this directly
     mine = {m["number"]: m for m in ws["mine"]}
     assert mine[3]["status"] == "awaiting_merge" and mine[3]["pr"] == 30 and mine[3]["checks"] == "green"
     assert mine[4]["status"] == "no_pr" and mine[4]["pr"] is None
-    assert mine[4]["attempt_labels"] == ["afk-attempt/1"]
+    assert mine[4]["attempt"] == 1 and mine[3]["attempt"] == 0
+    assert "attempt_labels" not in mine[4]            # one shape: the number
     # each row carries the board phase it renders as — the tick never translates
     assert mine[3]["board_phase"] == "awaiting_merge" and mine[4]["board_phase"] == "claimed"
 
@@ -821,12 +836,72 @@ def test_resolve_config():
     assert d.resolve_config(r) == r
 
 
-def test_pace_omission_is_uniform():
-    # pace resolves partial config through the one defaults table (ADR-0009):
-    # omission defaults instead of crashing, and the ttl/2 cap can no longer
-    # be silently disabled by a missing claim_lease_ttl_seconds.
-    assert d.pace({"in_flight": 0, "empty_streak": 9}, {}) == 1500
-    assert d.pace({"in_flight": 1, "empty_streak": 0}, {"busy_interval_seconds": 999999}) == TTL // 2
+def test_pace_reads_the_config_it_is_given():
+    # pace resolves nothing itself: `_cfg` is the one resolution point, so a config
+    # arriving here is canonical and a missing key is a bug upstream, not a default
+    full = d.resolve_config({})
+    assert d.pace({"in_flight": 0, "empty_streak": 9}, full) == full["idle_interval_seconds"]
+    assert d.pace({"in_flight": 1, "empty_streak": 0},
+                  {**full, "busy_interval_seconds": 999999}) == TTL // 2
+    try:
+        d.pace({"in_flight": 0, "empty_streak": 9}, {})
+        assert False, "expected a KeyError: pace must not re-apply defaults"
+    except KeyError:
+        pass
+
+
+def _leaves(table, prefix=""):
+    for k, v in table.items():
+        if isinstance(v, dict):
+            yield from _leaves(v, f"{k}.")
+        else:
+            yield prefix + k, v
+
+
+def test_override_config_types_every_key_like_the_file_does():
+    """`--set key=value` reaches EVERY key the schema has, dotted for sections, and
+    types it by the key's default — so there is no per-flag table to forget."""
+    samples = {bool: ("false", False), int: ("123", 123), list: ("[a, b]", ["a", "b"]),
+               str: ("some value", "some value")}
+    seen = 0
+    for dotted, default in _leaves(d.CONFIG_DEFAULTS):
+        raw, want = samples[type(default)]
+        if default == want:                               # make the override visible
+            raw, want = ("true", True) if isinstance(default, bool) else (raw + "x", want + "x")
+        cfg = d.resolve_config({})
+        assert d.override_config(cfg, [f"{dotted}={raw}"]) is cfg     # in place, returned
+        section, _, key = dotted.rpartition(".")
+        got = (cfg[section] if section else cfg)[key]
+        assert got == want and type(got) is type(default), (dotted, got)
+        # …and nothing else moved
+        other = d.resolve_config({})
+        (other[section] if section else other)[key] = want
+        assert cfg == other, dotted
+        seen += 1
+    assert seen == len(list(_leaves(d.CONFIG_DEFAULTS))) > 25
+
+    cfg = d.resolve_config({})
+    assert d.override_config(cfg, None) == d.resolve_config({}) == d.override_config(cfg, [])
+    # several at once, later wins; a string value is verbatim — `=`, quotes and all
+    d.override_config(cfg, ["retry=1", "retry=5", 'gate.local_command=make X="a b" && echo \'ok\''])
+    assert cfg["retry"] == 5 and cfg["gate"]["local_command"] == 'make X="a b" && echo \'ok\''
+    assert d.override_config(cfg, ["escalate_label="])["escalate_label"] == ""
+
+    for bad in ("retry",                # no `=`
+                "retyr=3",              # unknown key
+                "gate=x",               # a section is not a value
+                "gate.cii=local",       # unknown key in a section
+                "nope.ci=local",        # unknown section
+                "retry.ci=1",           # a scalar is not a section
+                "retry=soon",           # wrong type, by the file's own rules
+                "worktree_cleanup=yes",
+                "epic_labels=a,b",
+                "=3", ""):
+        try:
+            d.override_config(d.resolve_config({}), [bad])
+            assert False, f"expected ValueError for --set {bad!r}"
+        except ValueError:
+            pass
 
 
 KIMI = "https://api.kimi.com/coding/"

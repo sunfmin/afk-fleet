@@ -8,8 +8,9 @@ Run: python3 test_afk_cli.py   (or under pytest, beside the other two suites)
 `test_afk_decide.py` pins the pure verdicts and `test_afk_refs.py` the ref races;
 what neither reaches is the seam between them: that `afk rebuild` asks gh for the
 fields its verdicts read, that `afk no-pr` derives its inputs from a real worktree
-and real comments, that a flag beats `--config` beats the defaults table on every
-subcommand, and that the docs name subcommands and flags that exist.
+and real comments, that `--set` beats `--config` beats the defaults table — and that
+a call with no `--config` is refused — on every subcommand, and that the docs name
+subcommands and flags that exist.
 
 Nothing is injected into afk.py to make that possible. The outside world is faked
 where it actually lives — executables on PATH:
@@ -34,7 +35,7 @@ from contextlib import contextmanager
 
 import afk
 import afk_decide
-from test_afk_refs import ENV, T0, TTL, afk as run, afk_error, git, sandbox
+from test_afk_refs import ENV, NO_CONFIG, T0, TTL, afk as run, afk_error, git, sandbox
 
 REPO = "acme/widgets"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -209,8 +210,8 @@ class World:
     def afk(self, *args, env=None):
         return run(self.cwd, *args, env={**self.env, **(env or {})})
 
-    def error(self, *args, env=None):
-        return afk_error(self.cwd, *args, env={**self.env, **(env or {})})
+    def error(self, *args, env=None, bare=False):
+        return afk_error(self.cwd, *args, env={**self.env, **(env or {})}, bare=bare)
 
     def commit(self, name, branch=None):
         if branch:
@@ -265,7 +266,7 @@ def test_rebuild_assembles_the_working_set_from_gh_and_refs():
         assert set(mine) == {3, 4}
         assert (mine[3]["status"], mine[3]["board_phase"], mine[3]["pr"], mine[3]["checks"]) == \
             ("awaiting_merge", "awaiting_merge", 30, "green")
-        assert mine[3]["attempt_labels"] == ["afk-attempt/1"]      # read off gh's label objects
+        assert mine[3]["attempt"] == 1 and mine[4]["attempt"] == 0  # read off gh's label objects
         assert (mine[4]["status"], mine[4]["board_phase"], mine[4]["pr"]) == ("no_pr", "claimed", None)
         assert ws["peer_live"] == [{"number": 5, "instance": "peer-live"}]
         assert [(s["number"], s["instance"]) for s in ws["stale"]] == [(6, "peer-dead")]
@@ -285,7 +286,7 @@ def test_rebuild_assembles_the_working_set_from_gh_and_refs():
         assert [m["number"] for m in ws["mine"]] == [3, 4, 6] and ws["stale"] == []
 
 
-def test_rebuild_reads_the_dispatch_contract_from_config_and_flags():
+def test_rebuild_reads_the_dispatch_contract_from_config_and_set():
     issues = [issue(1, "go"), issue(2, "go", "big"), issue(3, "ready-for-agent")]
     with world(issues=issues, prs=[pr(30, closes=1, conclusion="FAILURE")]) as w:
         w.afk("claim", "1", "--instance", "me", "--now", str(T0), *R)
@@ -300,14 +301,29 @@ def test_rebuild_reads_the_dispatch_contract_from_config_and_flags():
         # claim a green gate the merge sequence has not run yet
         assert (ws["mine"][0]["status"], ws["mine"][0]["board_phase"]) == ("awaiting_merge", "pr_open")
 
-        # a flag beats the config it was given alongside
+        # --set beats the config it was given alongside
         ws = w.afk("rebuild", "--instance", "me", "--now", str(T0), *R, "--config", cfg,
-                   "--ready-label", "ready-for-agent", "--epic-labels", "x,y", "--ci", "required")
+                   "--set", "ready_label=ready-for-agent", "--set", "epic_labels=[x, y]",
+                   "--set", "gate.ci=required")
         assert ws["frontier"]["dispatch"] == [{"number": 3, "title": "issue 3"}]
         assert (ws["mine"][0]["status"], ws["mine"][0]["board_phase"]) == ("failure", "ci_failed")
 
         # --repo is the one repo handle, and a wrong one is an error, not an empty fleet
         assert "unknown repo" in w.error("rebuild", "--instance", "me", "--repo", "acme/other")
+
+
+def test_rebuild_and_fingerprint_fail_when_the_claim_refs_cannot_be_read():
+    """gh answering while git cannot fetch (an expired git credential beside a live
+    gh token) used to assemble a working set with NO claims in it: nothing of mine
+    in flight, every claimed issue back on the frontier, and a fingerprint that
+    never moves. It is an error, on both commands that share the gatherer."""
+    with world(issues=[issue(1, "ready-for-agent")]) as w:
+        w.afk("claim", "1", "--instance", "me", "--now", str(T0), *R)
+        assert [m["number"] for m in w.afk("rebuild", "--instance", "me", *R)["mine"]] == [1]
+
+        git(w.cwd, "config", "--unset", f"url.{w.sb.bare}.insteadOf")   # git loses the remote
+        assert "fetch" in w.error("rebuild", "--instance", "me", *R)
+        assert "fetch" in w.error("fingerprint", *R)
 
 
 def test_fingerprint_gate_skips_until_observable_state_moves():
@@ -321,12 +337,12 @@ def test_fingerprint_gate_skips_until_observable_state_moves():
         skip = w.afk("fingerprint", *R, "--last", fp, "--skips", "0")
         assert (skip["action"], skip["reason"], skip["skips"], skip["fingerprint"]) == \
             ("skip", "unchanged", 1, fp)
-        # the forced full tick: default every 6, from --config, or the flag — flag wins
+        # the forced full tick: default every 6, from --config, or --set — --set wins
         assert w.afk("fingerprint", *R, "--last", fp, "--skips", "5")["reason"] == "forced"
         short = json.dumps({"force_tick_after_skips": 2})
         assert w.afk("fingerprint", *R, "--last", fp, "--skips", "1", "--config", short)["reason"] == "forced"
         assert w.afk("fingerprint", *R, "--last", fp, "--skips", "1", "--config", short,
-                     "--force-after", "9")["action"] == "skip"
+                     "--set", "force_tick_after_skips=9")["action"] == "skip"
 
         # each kind of movement a tick would act on moves the digest
         w.afk("claim", "1", "--instance", "peer", "--now", str(T0), *R)
@@ -366,7 +382,11 @@ def test_no_pr_gathers_every_signal_and_decides_in_one_call():
         r = w.afk(*base, "--terminal", "idle", "--now", soon)
         assert (r["outcome"], r["action"]) == ("coding", "leave"), r
         assert r["progress"]["commits_ahead"] == 0 and r["progress"]["dirty"] is False
-        assert 0 <= r["idle_seconds"] < 300 and r["verdict"]["found"] is False
+        assert 0 <= r["idle_seconds"] < 300 and r["worker_verdict"]["found"] is False
+        # the tool's conclusion is `outcome`/`action`; what the WORKER declared is
+        # `worker_verdict` — never one bare "verdict" that could be read as either
+        assert set(r) == {"issue", "outcome", "action", "idle_seconds", "open_blockers",
+                          "progress", "worker_verdict"}
         assert r["issue"] == 4 and r["open_blockers"] == []
 
         # idle_seconds is derived HERE, from the freshest of commit / file / terminal
@@ -379,8 +399,9 @@ def test_no_pr_gathers_every_signal_and_decides_in_one_call():
         # busy and none are the terminal's alone to say
         assert w.afk(*base, "--terminal", "busy", "--now", later)["outcome"] == "coding"
         assert w.afk(*base, "--terminal", "none", "--now", soon)["action"] == "orphan"
-        # grace: flag beats config
-        r = w.afk(*base, "--terminal", "idle", "--now", later, "--grace", "99999")
+        # grace: --set beats config
+        r = w.afk(*base, "--terminal", "idle", "--now", later,
+                  "--set", "worker_idle_grace_seconds=99999")
         assert r["outcome"] == "coding"
 
         # the worker declared itself blocked on #41 and #42: their REAL state routes it
@@ -390,8 +411,9 @@ def test_no_pr_gathers_every_signal_and_decides_in_one_call():
         w.calls()
         r = w.afk(*base, "--terminal", "idle", "--now", later)
         assert (r["outcome"], r["action"], r["open_blockers"]) == ("idle_blocked", "escalate", [41, 42])
-        assert r["verdict"]["phase"] == "blocked" and r["verdict"]["reason"] == "needs both"
-        assert r["verdict"]["comment_url"] == "https://gh/c/3"     # the LATEST marker wins
+        assert r["worker_verdict"]["phase"] == "blocked"
+        assert r["worker_verdict"]["reason"] == "needs both"
+        assert r["worker_verdict"]["comment_url"] == "https://gh/c/3"   # the LATEST marker wins
         states = sorted(c[1] for c in w.calls() if "--jq" in c and ".state" in c)
         assert states == [f"repos/{REPO}/issues/41", f"repos/{REPO}/issues/42"]
 
@@ -421,8 +443,8 @@ def test_no_pr_gathers_every_signal_and_decides_in_one_call():
         r = w.afk(*base, "--terminal", "idle", "--now", later)
         assert r["progress"]["commits_ahead"] == 2 - 1 and r["progress"]["dirty"] is False
         assert (r["outcome"], r["action"]) == ("idle_failed", "next_attempt")
-        # the base it counts against is config's, and --base overrides it
-        r = w.afk(*base, "--terminal", "idle", "--now", later, "--base", "HEAD")
+        # the base it counts against is the config's
+        r = w.afk(*base, "--terminal", "idle", "--now", later, "--set", "base_branch=HEAD")
         assert r["progress"]["commits_ahead"] == 0 and r["outcome"] == "idle_done"
 
 
@@ -520,7 +542,7 @@ def test_probe_checks_branch_protection_only_for_a_local_gate():
         assert r["protection"]["verdict"] == "error"
         assert r["protection"]["required_checks"] == ["ci/build", "ci/lint"]
         # an unreadable protection is a warning, never a guess; --target picks the branch
-        r = w.afk("probe", *R, "--config", local, "--target", "release", "--now", str(T0))
+        r = w.afk("probe", *R, "--config", local, "--set", "merge.target=release", "--now", str(T0))
         assert (r["protection"]["verdict"], r["protection"]["branch"]) == ("warn", "release")
         assert "403" in r["protection"]["detail"]
         # no --repo → the refs still probe (via origin), protection is flagged unchecked
@@ -587,11 +609,13 @@ def test_config_file_loads_validates_and_round_trips():
         assert cfg["retry"] == 4 and cfg["claim_namespace"] == "refs/heads"
         assert cfg["gate"] == {**defaults["gate"], "ci": "local", "local_command": "make test"}
         # canonical JSON fed back as --config is a fixed point for every consumer
-        assert w.afk("next-attempt", "--labels", "afk-attempt/3", "--config", json.dumps(cfg))["action"] == "retry"
+        assert w.afk("next-attempt", "--attempt", "3", "--config", json.dumps(cfg))["action"] == "retry"
+        assert w.afk("probe", "--config", json.dumps(cfg), "--now", str(T0))["config"] == cfg
 
         for bad, why in (("retyr: 4", "unknown key"),
                          ("gate:\n  ci: local", "local_command"),
                          ("claim_namespace: afk", "claim_namespace"),
+                         ("claim_namespace: refs/heads/afk", "claim_namespace"),
                          ("authorize: true", "per-run")):
             assert why in w.error("config", "--file", load(bad)), bad
         assert "--file" in w.error("config")
@@ -625,12 +649,11 @@ def test_recovery_finds_this_machines_worktree_through_orca():
         assert (r["tier"], r["action"], r["prompt"]) == (1, "reuse_worktree", "continue"), r
         assert r["worktree"]["path"] == w.cwd and r["worktree"]["dirty"] is True
         assert r["worktree"]["commits_ahead"] == 1
-        assert r["branch"] == {"name": "sunfmin/issue-31-x", "commits_ahead": 1,
-                               "candidates": [], "detail": ""}
+        assert r["branch"] == {"name": "sunfmin/issue-31-x", "commits_ahead": 1, "candidates": []}
 
         # --no-worktree overrides orca: only what was PUSHED counts → tier 2
         r = w.afk("recovery", "--issue", "31", "--no-worktree", *R, *cfg)
-        assert (r["tier"], r["worktree"]["present"]) == (2, False)
+        assert r["tier"] == 2 and r["worktree"] == {"present": False, "path": None}
 
         # orca is a SOFT dependency: absent rows, a failing orca, or garbage output all
         # degrade to "no local worktree" (tier 2 here) — never an aborted recovery
@@ -656,13 +679,16 @@ def test_gate_run_is_green_only_on_exit_zero():
         assert r["excerpt"] == "built\ntested" and r["command"] == "echo built && echo tested"
 
         # it runs IN the worktree, and stderr is part of the log
-        r = w.afk("gate-run", "--worktree", w.cwd, "--command", "ls README.md && echo oops >&2 && exit 7")
+        r = w.afk("gate-run", "--worktree", w.cwd,
+                  "--set", "gate.local_command=ls README.md && echo oops >&2 && exit 7")
         assert (r["status"], r["exit_code"]) == ("red", 7) and r["excerpt"] == "README.md\noops"
         # the excerpt is a bounded tail
-        r = w.afk("gate-run", "--worktree", w.cwd, "--command", "seq 1 200; exit 1", "--excerpt-lines", "3")
+        r = w.afk("gate-run", "--worktree", w.cwd, "--set", "gate.local_command=seq 1 200; exit 1",
+                  "--excerpt-lines", "3")
         assert r["excerpt"] == "198\n199\n200" and r["omitted_lines"] == 197
         # a hung gate is RED, never green-by-default
-        r = w.afk("gate-run", "--worktree", w.cwd, "--command", "sleep 30", "--timeout", "1")
+        r = w.afk("gate-run", "--worktree", w.cwd, "--set", "gate.local_command=sleep 30",
+                  "--timeout", "1")
         assert (r["status"], r["timed_out"]) == ("red", True) and "timed out after 1s" in r["excerpt"]
 
         assert "no gate command" in w.error("gate-run", "--worktree", w.cwd)
@@ -675,10 +701,11 @@ def test_gate_run_is_green_only_on_exit_zero():
 
 def test_pure_subcommands_and_the_json_error_contract():
     with world() as w:
-        assert w.afk("next-attempt", "--labels", "ready-for-agent,afk-attempt/1") == \
+        assert w.afk("next-attempt", "--attempt", "1") == \
             {"action": "retry", "from_label": "afk-attempt/1", "to_label": "afk-attempt/2"}
-        assert w.afk("next-attempt", "--labels", "afk-attempt/2")["action"] == "escalate"
-        assert w.afk("next-attempt", "--labels", "")["to_label"] == "afk-attempt/1"
+        assert w.afk("next-attempt", "--attempt", "2")["action"] == "escalate"
+        assert w.afk("next-attempt", "--attempt", "0")["to_label"] == "afk-attempt/1"
+        assert w.afk("next-attempt", "--attempt", "2", "--set", "retry=3")["action"] == "retry"
 
         busy = json.dumps({"merged": [3], "in_flight": 1, "empty_streak": 0})
         idle = json.dumps({"in_flight": 0, "empty_streak": 9})
@@ -692,57 +719,82 @@ def test_pure_subcommands_and_the_json_error_contract():
         w.error("pace", "--summary", "{not json")
         w.error("pace", "--summary", busy, "--config", "{not json")
         assert "gh issue list failed" in w.error("fingerprint", "--repo", "acme/other")
+        # …and so is a bad command line: argparse's usage error is the same one shape
+        assert "--attempt" in w.error("next-attempt")
+        assert "invalid choice" in w.error("status", "4", "--phase", "bogus", *R)
+        assert "invalid choice" in w.error("no-such-subcommand", bare=True)
 
 
-def test_flag_beats_config_beats_defaults_on_every_override():
-    """ADR-0009's one resolution order, checked for EVERY override flag the CLI has —
-    so a new flag cannot quietly resolve its own way."""
-    parser = afk.build_parser()
-    sample = {"ns": "refs/x", "ttl": "7", "ready_label": "go", "epic_labels": "a,b", "ci": "local",
-              "command": "make", "target": "rel", "base": "dev", "retry": "9", "grace": "8",
-              "force_after": "4"}
-    positional = {"claim": ["1"], "reclaim": ["1", "--expect-sha", "s"], "release": ["1"],
-                  "status": ["1", "--phase", "claimed"]}
+def _minimal_argv(name, sub):
+    """The shortest valid command line for one subcommand, minus `--config`."""
+    positional = {"claim": ["1"], "reclaim": ["1"], "release": ["1"], "status": ["1"]}
     required = {"--instance": "me", "--repo": REPO, "--issue": "1", "--terminal": "idle",
-                "--worktree": ".", "--labels": "x", "--summary": "{}", "--expect-sha": "s",
+                "--worktree": ".", "--attempt": "0", "--summary": "{}", "--expect-sha": "s",
                 "--phase": "claimed"}
-    seen = set()
+    argv = [name, *positional.get(name, [])]
+    for act in sub._actions:
+        if act.required and act.option_strings and act.option_strings[0] != "--config":
+            argv += [act.option_strings[0], required[act.option_strings[0]]]
+    return argv
+
+
+def test_config_is_required_and_resolves_one_way_on_every_subcommand():
+    """ADR-0009's one resolution order — `--set` → `--config` → the defaults table —
+    holds on EVERY subcommand that reads config, because there is one mechanism
+    (`_cfg`) and no per-subcommand flag to wire or forget. And the carrier itself
+    cannot be dropped: a call with no `--config` is refused, not run on defaults."""
+    parser = afk.build_parser()
+    takes_config = [n for n in parser.subcommands if n not in NO_CONFIG]
+    assert len(takes_config) == len(parser.subcommands) - 2 >= 15
+
+    with world() as w:
+        for name in takes_config:
+            sub = parser.subcommands[name]
+            argv = _minimal_argv(name, sub)
+            # refused through the real CLI: exit 3, one JSON error, naming the flag
+            err = w.error(*argv, bare=True)
+            assert "--config" in err and name in err, (name, err)
+
+            def cfg(*extra, sub_argv=argv):
+                return afk._cfg(parser.parse_args([*sub_argv, *extra]))
+
+            assert cfg("--config", "{}") == afk_decide.resolve_config({}), name
+            given = ("--config", json.dumps({"retry": 7, "gate": {"adversarial_verify": True}}))
+            got = cfg(*given)
+            assert got["retry"] == 7 and got["gate"]["adversarial_verify"] is True, name
+            assert got["gate"]["ci"] == "required" and got["concurrency"] == 3      # omitted → default
+            got = cfg(*given, "--set", "retry=9", "--set", "merge.target=rel")
+            assert (got["retry"], got["merge"]["target"]) == (9, "rel"), name
+            assert got["gate"]["adversarial_verify"] is True                  # --set is an overlay
+            # the three inputs are the whole interface: no per-key override flags
+            flags = set(sub._option_string_actions)
+            assert {"--config", "--set", "--now"} <= flags, name
+            assert not flags & {"--ns", "--ttl", "--retry", "--base", "--grace", "--ci", "--target",
+                                "--command", "--force-after", "--ready-label", "--epic-labels"}, name
+        # the two bootstrap subcommands run before a config exists, and take none
+        for name in NO_CONFIG:
+            assert not {"--config", "--set"} & set(parser.subcommands[name]._option_string_actions)
+
+        # what `_cfg` hands a subcommand is always a config `afk config` would accept:
+        # --config and --set are validated like the file is
+        for bad, why in ((("--config", json.dumps({"gate": {"ci": "local"}})), "local_command"),
+                         (("--config", json.dumps({"claim_namespace": "refs/x"})), "claim_namespace"),
+                         (("--config", "{}", "--set", "gate.ci=optional"), "gate.ci"),
+                         (("--config", "{}", "--set", "retyr=3"), "--set"),
+                         (("--config", "{}", "--set", "retry=soon"), "retry"),
+                         (("--config", "{not json"), "")):
+            assert why in w.error("pace", "--summary", "{}", *bad), bad
+        # …while a valid combination split across the two is accepted as a whole
+        assert w.afk("pace", "--summary", "{}", "--config", json.dumps({"gate": {"ci": "local"}}),
+                     "--set", "gate.local_command=make test") == {"seconds": 90}
+
+    # only ref ops have a second way to name the remote; gh ops need --repo, full stop
     for name, sub in parser.subcommands.items():
-        need = [f for act in sub._actions if act.required for f in act.option_strings[:1]]
-        argv = [name, *positional.get(name, [])]
-        for f in need:
-            if f not in argv:
-                argv += [f, required[f]]
-        for act in sub._actions:
-            if act.dest not in afk._FLAG_OVERRIDES:
-                continue
-            seen.add(act.dest)
-            path = afk._FLAG_OVERRIDES[act.dest]
-
-            def read(cfg):
-                for key in path:
-                    cfg = cfg[key]
-                return cfg
-
-            default = read(afk_decide.CONFIG_DEFAULTS)             # the path must exist
-            from_config = "cfg-value" if isinstance(default, str) else 123
-            partial = from_config
-            for key in reversed(path):
-                partial = {key: partial}
-            with_cfg = ["--config", json.dumps(partial)]
-
-            assert read(afk._cfg(parser.parse_args(argv))) == default, (name, act.dest)
-            assert read(afk._cfg(parser.parse_args(argv + with_cfg))) == from_config, (name, act.dest)
-            flagged = read(afk._cfg(parser.parse_args(
-                argv + with_cfg + [act.option_strings[0], sample[act.dest]])))
-            assert flagged not in (default, from_config), (name, act.dest, flagged)
-            assert type(flagged) is type(default), (name, act.dest, flagged)
-    # every declared override is reachable from some subcommand
-    assert seen == set(afk._FLAG_OVERRIDES), set(afk._FLAG_OVERRIDES) - seen
-
-    # and every subcommand takes --config and --now, so "pass the config" has no exceptions
-    for name, sub in parser.subcommands.items():
-        assert {"--config", "--now"} <= set(sub._option_string_actions), name
+        flags = set(sub._option_string_actions)
+        if "--remote" in flags:
+            assert "--repo" in flags and not sub._option_string_actions["--repo"].required, name
+        elif "--repo" in flags:
+            assert sub._option_string_actions["--repo"].required, name
 
 
 def _documented_invocations(text):

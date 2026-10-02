@@ -7,17 +7,19 @@ it shells out to one of these subcommands and reads back JSON (ADR-0004).
 Every subcommand prints one JSON object to stdout:
 
   exit 0  it ran. A lost claim race is an outcome, not an error: `{"won": false}`.
-  exit 3  an operational error (git/gh failed, bad input) → `{"error": "..."}`.
-          A push that failed for any reason OTHER than losing the race is exit 3,
-          never `won: false` — a fleet that cannot push must not look merely unlucky.
+  exit 3  it could not do its job (git/gh failed, bad input, a bad command line)
+          → `{"error": "..."}`. An error is never dressed as an outcome: a push
+          that failed for any reason OTHER than losing the race is exit 3, never
+          `won: false`; a remote that cannot be read is exit 3, never an empty
+          fleet; a claim that could not be deleted is exit 3, never `released`.
 
 Two layers. Every decision is a pure function in afk_decide.py (no I/O, time
 injected, fixture-tested). This file only gathers their inputs — git refs, a
 worktree's git, gh, orca, the login shell — and applies their effects.
 
-Every subcommand takes the same `--config` (the canonical JSON from `afk config`,
-then `afk probe`) and resolves it one way, in `_cfg`: flag → `--config` →
-CONFIG_DEFAULTS (ADR-0009).
+Every subcommand that reads config REQUIRES the same `--config` (the canonical
+JSON from `afk config`, then `afk probe`) and resolves it one way, in `_cfg`:
+`--set key=value` → `--config` → CONFIG_DEFAULTS for the keys it omits (ADR-0009).
 
 Invoked as:  python3 <skill>/scripts/afk.py <subcommand> [flags]
 """
@@ -36,36 +38,12 @@ import afk_decide
 # config + clock                                                              #
 # --------------------------------------------------------------------------- #
 
-# Override flags, by argparse dest → the config key (path) each one overrides.
-_FLAG_OVERRIDES = {
-    "ns": ("claim_namespace",),
-    "ttl": ("claim_lease_ttl_seconds",),
-    "ready_label": ("ready_label",),
-    "epic_labels": ("epic_labels",),
-    "ci": ("gate", "ci"),
-    "command": ("gate", "local_command"),
-    "target": ("merge", "target"),
-    "base": ("base_branch",),
-    "retry": ("retry",),
-    "grace": ("worker_idle_grace_seconds",),
-    "force_after": ("force_tick_after_skips",),
-}
-
-
 def _cfg(a):
-    """The effective config for a subcommand: `--config` JSON (canonical or
-    partial) resolved through CONFIG_DEFAULTS, with any override flag this
-    subcommand was given laid on top."""
-    cfg = afk_decide.resolve_config(json.loads(a.config) if a.config else {})
-    for dest, path in _FLAG_OVERRIDES.items():
-        value = getattr(a, dest, None)
-        if value is None:
-            continue
-        node = cfg
-        for key in path[:-1]:
-            node = node[key]
-        node[path[-1]] = value
-    return cfg
+    """The effective config for a subcommand: the `--config` JSON (canonical or
+    partial) resolved through CONFIG_DEFAULTS, any `--set key=value` laid on top,
+    then validated — no subcommand runs on a config `afk config` would refuse."""
+    cfg = afk_decide.resolve_config(json.loads(a.config))
+    return afk_decide.validate_config(afk_decide.override_config(cfg, a.set))
 
 
 def _now(a):
@@ -87,12 +65,12 @@ _LOCAL_SCAN = "refs/afk-scan"  # where `scan` mirrors remote refs, read-only, di
 _LOCAL_RECOVERY = "refs/afk-recovery"  # ditto for `recovery`'s branch-vs-base compare
 
 
-def _ns_paths(base):
-    """Map the claim base namespace to (claim_ns, heartbeat_ns).
-    `refs/afk` → hidden namespace; `refs/heads` → the branch fallback (ADR-0003)."""
-    if base == "refs/heads":
-        return "refs/heads/afk-claim", "refs/heads/afk-heartbeat"
-    return base + "/claim", base + "/heartbeat"
+def _claim_ref(cfg, number):
+    return f"{afk_decide.CLAIM_NAMESPACES[cfg['claim_namespace']][0]}/{number}"
+
+
+def _heartbeat_ref(cfg, instance):
+    return f"{afk_decide.CLAIM_NAMESPACES[cfg['claim_namespace']][1]}/{instance}"
 
 
 def _remote(a):
@@ -195,32 +173,27 @@ def _worktree_progress(wt, base):
 
 
 def _remote_heads(remote):
-    """Every branch name on the remote (one `ls-remote`), or None if it failed."""
-    p = _git(["ls-remote", "--heads", remote], check=False)
-    if p.returncode != 0:
-        return None
-    heads = []
-    for line in p.stdout.splitlines():
-        parts = line.split()
-        if len(parts) == 2 and parts[1].startswith("refs/heads/"):
-            heads.append(parts[1][len("refs/heads/"):])
-    return heads
+    """Every branch name on the remote (one `ls-remote`). Raises when the remote
+    cannot be read — an unreadable remote is not one with no branches."""
+    rows = [ln.split() for ln in _git(["ls-remote", "--heads", remote]).stdout.splitlines()]
+    return [r[1][len("refs/heads/"):] for r in rows
+            if len(r) == 2 and r[1].startswith("refs/heads/")]
 
 
 def _branch_ahead(remote, branch, base, slot):
     """How many commits `branch` is ahead of `base` ON THE REMOTE — the tier-2
-    signal. git only (no gh), mirrored into a disposable local namespace, so it
-    reads the same whether the remote is a GitHub URL or a bare path. `slot` (the
-    issue number) keeps those temp refs per-issue, so two recoveries sharing one
-    clone cannot read each other's mirror. Returns (count|None, detail)."""
+    signal — or None when the branch was never pushed. git only (no gh), mirrored
+    into a disposable local namespace, so it reads the same whether the remote is
+    a GitHub URL or a bare path. `slot` (the issue number) keeps those temp refs
+    per-issue, so two recoveries sharing one clone cannot read each other's mirror.
+    Raises when the remote cannot be read or has no `base`: "could not look" must
+    never read as "nothing pushed", which is what sends a claim to tier 3."""
+    if not _remote_sha(remote, f"refs/heads/{branch}"):
+        return None
     ours = f"{_LOCAL_RECOVERY}/{slot}"
-    p = _git(["fetch", "--force", remote,
-              f"{branch}:{ours}/branch", f"{base}:{ours}/base"], check=False)
-    if p.returncode != 0:
-        return None, p.stderr.strip()
-    out = _git(["rev-list", "--count", f"{ours}/base..{ours}/branch"],
-               check=False).stdout.strip()
-    return (int(out) if out.isdigit() else None), ""
+    _git(["fetch", "--force", remote,
+          f"refs/heads/{branch}:{ours}/branch", f"refs/heads/{base}:{ours}/base"])
+    return int(_git(["rev-list", "--count", f"{ours}/base..{ours}/branch"]).stdout.strip())
 
 
 def _newest_mtime(root):
@@ -256,11 +229,12 @@ def _mirrored_markers(local_ns):
 
 def _scan(remote, ns):
     """Mirror the remote claim+heartbeat refs into a disposable local namespace and
-    read every marker. Returns (claims, heartbeats)."""
-    claim_ns, hb_ns = _ns_paths(ns)
+    read every marker. Returns (claims, heartbeats). Raises when the remote cannot
+    be read: a fleet whose claims are unreadable must not look like one holding none."""
+    claim_ns, hb_ns = afk_decide.CLAIM_NAMESPACES[ns]
     _git(["fetch", "--prune", remote,
           f"+{claim_ns}/*:{_LOCAL_SCAN}/claim/*",
-          f"+{hb_ns}/*:{_LOCAL_SCAN}/heartbeat/*"], check=False)
+          f"+{hb_ns}/*:{_LOCAL_SCAN}/heartbeat/*"])
     claims = [{"number": int(name), "instance": m.get("instance"), "host": m.get("host"),
                "ts": m.get("ts"), "sha": sha}
               for name, sha, m in _mirrored_markers(f"{_LOCAL_SCAN}/claim") if name.isdigit()]
@@ -280,10 +254,6 @@ def cmd_classify_claims(a):
     return {**afk_decide.classify_claims(claims, heartbeats, a.instance, now,
                                          cfg["claim_lease_ttl_seconds"]),
             "now": now}
-
-
-def _claim_ref(cfg, number):
-    return f"{_ns_paths(cfg['claim_namespace'])[0]}/{number}"
 
 
 def cmd_claim(a):
@@ -366,16 +336,19 @@ def cmd_takeover(a):
 
 
 def cmd_release(a):
-    ref = _claim_ref(_cfg(a), a.number)
-    p = _git(["push", _remote(a), "--delete", ref], check=False)
-    # Already gone counts as released — idempotent cleanup.
-    ok = p.returncode == 0 or "remote ref does not exist" in p.stderr or "deleted" in p.stderr
-    return {"released": bool(ok), "issue": a.number, "ref": ref, "detail": p.stderr.strip()}
+    ref, rem = _claim_ref(_cfg(a), a.number), _remote(a)
+    p = _git(["push", rem, "--delete", ref], check=False)
+    # Already gone counts as released — idempotent cleanup. A delete that failed
+    # with the claim still there is a phantom lock in the making, so it is an error.
+    if p.returncode != 0 and _remote_sha(rem, ref):
+        raise RuntimeError(f"release failed and {ref} is still on the remote: "
+                           f"{p.stderr.strip()}")
+    return {"released": True, "issue": a.number, "ref": ref}
 
 
 def cmd_heartbeat(a):
     cfg, rem, now = _cfg(a), _remote(a), _now(a)
-    ref = f"{_ns_paths(cfg['claim_namespace'])[1]}/{a.instance}"
+    ref = _heartbeat_ref(cfg, a.instance)
     last = (_read_marker(rem, ref) or {}).get("ts")
     if not afk_decide.heartbeat_due(last, now, cfg["claim_lease_ttl_seconds"]):
         return {"refreshed": False, "reason": "not due", "ts": last, "ref": ref}
@@ -400,7 +373,7 @@ def cmd_config(a):
         raise ValueError("--file <path to docs/agents/afk-fleet.md> is required unless --defaults")
     with open(a.file) as f:
         cfg = afk_decide.resolve_config(afk_decide.parse_config_yaml(f.read()))
-    # Load time is the ONE place semantic validation runs (ADR-0009/ADR-0012): the
+    # Load time is where semantic validation matters most (ADR-0009/ADR-0012): the
     # human is present here, so `gate.ci: local` with no local_command is refused
     # where it can be fixed — not discovered by a tick about to merge unverified.
     return afk_decide.validate_config(cfg)
@@ -425,13 +398,13 @@ def _branch_protection(repo, branch):
 
 def _usable_namespace(rem, wanted, now):
     """The first claim namespace the remote lets us push under — `wanted`, else
-    the `refs/heads` branch fallback — as (namespace, rejection|None). Only a
+    the branch fallback — as (namespace, rejection|None). Only a
     push the SERVER rejected (an org ruleset forbidding `refs/afk/*`) moves on
     to the fallback; a push that never reached a verdict (auth, network) raises,
     because that says nothing about which namespace is allowed."""
     rejection = None
-    for ns in dict.fromkeys([wanted, "refs/heads"]):
-        ref = f"{_ns_paths(ns)[0]}/probe"
+    for ns in dict.fromkeys([wanted, afk_decide.BRANCH_NAMESPACE]):
+        ref = _claim_ref({"claim_namespace": ns}, "probe")
         sha = _marker_commit("afk-probe", "probe", now)
         p = _git(["push", rem, f"{sha}:{ref}"], check=False)
         if p.returncode == 0:
@@ -440,8 +413,8 @@ def _usable_namespace(rem, wanted, now):
         if "[remote rejected]" not in p.stderr:
             raise RuntimeError(f"probe push to {ref} failed: {p.stderr.strip()}")
         rejection = rejection or p.stderr.strip()
-    raise RuntimeError(f"the remote rejects claim refs under both {wanted} and refs/heads: "
-                       f"{rejection}")
+    raise RuntimeError(f"the remote rejects claim refs under both {wanted} and "
+                       f"{afk_decide.BRANCH_NAMESPACE}: {rejection}")
 
 
 def cmd_probe(a):
@@ -449,10 +422,11 @@ def cmd_probe(a):
     human present so a misfit is fixed here rather than mid-run (ADR-0009's tradition):
 
     1. **Claim namespace** — can we push under the configured `claim_namespace`
-       (`refs/afk`)? Else fall back to branches (`refs/heads/afk-claim/*`) and flag
-       that `on: push` CI will fire. The result's `config` is the canonical config
-       with the namespace that actually works: the launcher holds THAT config from
-       here on, so every later call inherits the namespace through `--config`.
+       (`refs/afk`)? Else fall back to branches (`refs/heads/afk-claim/*`) and say
+       so: `blocked`, with the server's rejection as `detail` — claim churn will
+       then fire `on: push` CI. The result's `config` is the canonical config with
+       the namespace that actually works: the launcher holds THAT config from here
+       on, so every later call inherits the namespace through `--config`.
     2. **Branch protection** (only when `gate.ci: local`, ADR-0012) — does the merge
        target REQUIRE status checks? Then `gh pr merge` is rejected however green the
        local gate is, so that combination is a hard `error` at bootstrap; an
@@ -460,8 +434,7 @@ def cmd_probe(a):
     cfg = _cfg(a)
     ns, rejection = _usable_namespace(_remote(a), cfg["claim_namespace"], _now(a))
     cfg["claim_namespace"] = ns
-    result = {"namespace": ns, "hidden": ns != "refs/heads", "ci_on_push": ns == "refs/heads",
-              "blocked": rejection is not None, "config": cfg}
+    result = {"blocked": rejection is not None, "config": cfg}
     if rejection:
         result["detail"] = rejection
 
@@ -571,24 +544,25 @@ def cmd_rebuild(a):
 
 def cmd_no_pr(a):
     """Why does one of my claims have no PR — is its worker still coding, or did it
-    finish without one? One call gathers everything the 5-way verdict needs: the
+    finish without one? One call gathers everything the outcome is decided from: the
     worktree's git progress, the worker's `afk:verdict` marker on the issue, and
     the state of each issue that marker says it is blocked by. The tick supplies
     only what code cannot see — the orca terminal probe. Returns
-    `afk_decide.classify_no_pr`'s verdict plus the signals it was decided from."""
+    `afk_decide.classify_no_pr`'s outcome plus the two signals it was decided
+    from: `progress`, and `worker_verdict` (what the worker declared)."""
     cfg = _cfg(a)
     progress = {}
     if a.worktree:
         if not os.path.isdir(a.worktree):
             raise ValueError(f"worktree not found: {a.worktree} (omit --worktree if there is none)")
         progress = _worktree_progress(a.worktree, cfg["base_branch"])
-    verdict = afk_decide.latest_verdict(_issue_comments(a.repo, a.number))
-    blocker_states = {n: _issue_state(a.repo, n) for n in verdict["blocked_by"]}
+    declared = afk_decide.latest_verdict(_issue_comments(a.repo, a.number))
+    blocker_states = {n: _issue_state(a.repo, n) for n in declared["blocked_by"]}
     return {"issue": a.number,
-            **afk_decide.classify_no_pr(progress, a.terminal, a.terminal_idle_seconds, verdict,
+            **afk_decide.classify_no_pr(progress, a.terminal, a.terminal_idle_seconds, declared,
                                         blocker_states, _now(a),
                                         cfg["worker_idle_grace_seconds"]),
-            "progress": progress, "verdict": verdict}
+            "progress": progress, "worker_verdict": declared}
 
 
 def cmd_recovery(a):
@@ -615,20 +589,17 @@ def cmd_recovery(a):
     if path is None and not a.no_worktree:
         hit = afk_decide.find_orca_worktree(_orca_worktree_rows(), a.number, a.repo)
         path, branch = hit["path"], branch or hit["branch"]
-    worktree = {"present": False, "path": path, "commits_ahead": None,
-                "dirty": False, "last_commit_ts": None, "worktree_mtime_ts": None}
-    if path and os.path.isdir(path):
-        worktree = {"present": True, "path": path, **_worktree_progress(path, base)}
+    present = bool(path and os.path.isdir(path))
+    worktree = {"present": present, "path": path,
+                **(_worktree_progress(path, base) if present else {})}
 
     # --- tier-2 signal: the branch the dead worker pushed ---
     candidates = [] if branch else afk_decide.branch_candidates(
         _remote_heads(rem), cfg["branch_pattern"], a.number)
-    measured = {b: _branch_ahead(rem, b, base, a.number)
-                for b in ([branch] if branch else candidates)}
-    branch = branch or afk_decide.furthest_ahead({b: n for b, (n, _) in measured.items()})
-    ahead, detail = measured.get(branch, (None, "no branch on the remote matches this issue"))
-    branch_sig = {"name": branch, "commits_ahead": ahead, "candidates": candidates,
-                  "detail": detail}
+    ahead = {b: _branch_ahead(rem, b, base, a.number)
+             for b in ([branch] if branch else candidates)}
+    branch = branch or afk_decide.furthest_ahead(ahead)
+    branch_sig = {"name": branch, "commits_ahead": ahead.get(branch), "candidates": candidates}
 
     return {"issue": a.number, "base": base, "worktree": worktree, "branch": branch_sig,
             **afk_decide.select_recovery(worktree, branch_sig)}
@@ -650,8 +621,8 @@ def cmd_gate_run(a):
     that times out is red, never green-by-default."""
     cmd = _cfg(a)["gate"]["local_command"]
     if not (cmd or "").strip():
-        raise ValueError("no gate command to run: pass --command, or set gate.local_command "
-                         "(required whenever gate.ci is 'local')")
+        raise ValueError("no gate command to run: set gate.local_command (required "
+                         "whenever gate.ci is 'local')")
     if not os.path.isdir(a.worktree):
         raise ValueError(f"worktree not found: {a.worktree}")
 
@@ -676,9 +647,8 @@ def cmd_status(a):
     and write ONLY when the body changed — so re-entrant/disposable ticks and
     retry re-dispatches never spam the issue."""
     cfg = _cfg(a)
-    body = afk_decide.render_status_board(
-        {"phase": a.phase, "instance": a.instance, "pr": a.pr, "attempt": a.attempt,
-         "retry_max": cfg["retry"], "ci": cfg["gate"]["ci"]})
+    body = afk_decide.render_status_board(a.phase, cfg["gate"]["ci"], cfg["retry"],
+                                          instance=a.instance, pr=a.pr, attempt=a.attempt)
     comments = f"repos/{a.repo}/issues/{a.number}/comments"
     board = next((c for c in _issue_comments(a.repo, a.number)
                   if afk_decide.STATUS_MARKER in (c["body"] or "")), None)
@@ -693,7 +663,7 @@ def cmd_status(a):
 
 
 def cmd_next_attempt(a):
-    return afk_decide.next_attempt(a.labels, _cfg(a)["retry"])
+    return afk_decide.next_attempt(a.attempt, _cfg(a)["retry"])
 
 
 def cmd_pace(a):
@@ -704,35 +674,45 @@ def cmd_pace(a):
 # arg wiring                                                                  #
 # --------------------------------------------------------------------------- #
 
-def _csv(s):
-    return [x for x in s.split(",") if x]
+class _Parser(argparse.ArgumentParser):
+    """argparse whose usage errors are the CLI's one error shape — `{"error": …}`,
+    exit 3 — so a missing `--config` reads exactly like any other failure."""
+
+    def error(self, message):
+        print(json.dumps({"error": f"{self.prog}: {message}"}, ensure_ascii=False))
+        sys.exit(3)
 
 
 def build_parser():
     """The whole CLI. `.subcommands` maps each subcommand name to its parser —
     the interface the docs are checked against (test_afk_cli.py)."""
-    ap = argparse.ArgumentParser(prog="afk", description="afk-fleet deterministic tool")
+    ap = _Parser(prog="afk", description="afk-fleet deterministic tool")
     sub = ap.add_subparsers(dest="cmd", required=True)
     ap.subcommands = sub.choices
 
-    def command(name, fn, help, remote=None):
-        """One subcommand. Every one takes --config and --now; `remote` adds the
-        repo handle: "refs" for git-ref ops (--repo optional), "gh" when gh needs
-        it (--repo required)."""
+    def command(name, fn, help, remote=None, needs_config=True):
+        """One subcommand. All but the two that run before a config exists
+        (`needs_config=False`) require --config and take --set / --now. `remote`
+        adds the repo handle: "refs" for git-ref ops (--repo, else --remote),
+        "gh" when gh needs it (--repo required)."""
         p = sub.add_parser(name, help=help)
         p.set_defaults(fn=fn)
-        p.add_argument("--config", default=None,
-                       help="canonical config JSON from `afk config` / `afk probe` (override "
-                            "flags win; omitted keys fall back to the defaults table — ADR-0009)")
-        p.add_argument("--now", type=int, default=None, help="epoch override (tests)")
+        if needs_config:
+            p.add_argument("--config", required=True,
+                           help="the run's config JSON, from `afk config` / `afk probe` (keys "
+                                "it omits fall back to the defaults table — ADR-0009)")
+            p.add_argument("--set", action="append", metavar="KEY=VALUE",
+                           help="override one config key for this call, e.g. "
+                                "claim_lease_ttl_seconds=60 or gate.ci=local (repeatable; "
+                                "for tests and hand-debugging)")
+            p.add_argument("--now", type=int, default=None, help="epoch override (tests)")
         if remote:
             p.add_argument("--repo", default=None, required=(remote == "gh"),
                            help="owner/name of the target repo — the one repo handle: git-ref "
                                 "ops push/fetch to its GitHub URL, gh ops read it directly")
+        if remote == "refs":
             p.add_argument("--remote", default="origin",
                            help="git remote for ref ops when --repo is not given")
-            p.add_argument("--ns", default=None,
-                           help="claim namespace override (default: config claim_namespace)")
         return p
 
     def mine(p):
@@ -742,32 +722,29 @@ def build_parser():
         mine(p)
         p.add_argument("--host", default=socket.gethostname())
 
-    ttl_help = "claim_lease_ttl_seconds override"
-
     # --- bootstrap ---
-    p = command("config", cmd_config, "parse + validate the repo config file → canonical JSON")
+    p = command("config", cmd_config, "parse + validate the repo config file → canonical JSON",
+                needs_config=False)
     p.add_argument("--file", default=None, help="path to the target repo's docs/agents/afk-fleet.md")
     p.add_argument("--defaults", action="store_true", help="print the pure defaults table")
 
-    p = command("probe", cmd_probe, remote="refs",
-                help="bootstrap probe: the usable claim namespace (folded into the returned "
-                     "config), and target-branch protection when gate.ci is local")
-    p.add_argument("--target", default=None, help="merge.target override")
+    command("probe", cmd_probe, remote="refs",
+            help="bootstrap probe: the usable claim namespace (folded into the returned "
+                 "config), and target-branch protection when gate.ci is local")
 
-    p = command("worker-command", cmd_worker_command,
-                "settle the command workers are started with: ask-or-not + candidates, "
-                "or --check a human's answer")
+    p = command("worker-command", cmd_worker_command, needs_config=False,
+                help="settle the command workers are started with: ask-or-not + candidates, "
+                     "or --check a human's answer")
     p.add_argument("--check", default=None,
                    help="a candidate command: resolve its first word in the login shell "
                         "and report whether it runs (and looks unattended)")
 
     # --- claim refs ---
-    p = command("scan", cmd_scan, "debug: read all claim + heartbeat refs", remote="refs")
+    command("scan", cmd_scan, "debug: read all claim + heartbeat refs", remote="refs")
 
     p = command("classify-claims", cmd_classify_claims, remote="refs",
                 help="debug: partition claims into mine/peer_live/stale (rebuild does this)")
     mine(p)
-    p.add_argument("--ttl", type=int, default=None, help=ttl_help)
 
     p = command("claim", cmd_claim, "atomically create a claim ref → {won}", remote="refs")
     p.add_argument("number", type=int)
@@ -790,31 +767,22 @@ def build_parser():
     p.add_argument("--yes", action="store_true",
                    help="confirm a takeover of an instance whose heartbeat is still FRESH "
                         "(it looks alive; you are asserting you know it is dead)")
-    p.add_argument("--ttl", type=int, default=None, help=ttl_help)
 
     p = command("release", cmd_release, "delete a claim ref (idempotent)", remote="refs")
     p.add_argument("number", type=int)
 
     p = command("heartbeat", cmd_heartbeat, "refresh my heartbeat if due", remote="refs")
     mine(p)
-    p.add_argument("--ttl", type=int, default=None, help=ttl_help)
 
     # --- observation ---
     p = command("fingerprint", cmd_fingerprint, remote="gh",
                 help="digest observable state; skip-or-tick verdict for the launcher")
     p.add_argument("--last", default="", help="the previous cycle's digest (empty on the first cycle)")
     p.add_argument("--skips", type=int, default=0, help="consecutive skipped cycles so far")
-    p.add_argument("--force-after", type=int, default=None,
-                   help="force_tick_after_skips override")
 
     p = command("rebuild", cmd_rebuild, "gather + assemble the tick's working set (read-only)",
                 remote="gh")
     mine(p)
-    p.add_argument("--ttl", type=int, default=None, help=ttl_help)
-    p.add_argument("--ready-label", default=None, help="ready_label override")
-    p.add_argument("--epic-labels", type=_csv, default=None, help="epic_labels override (csv)")
-    p.add_argument("--ci", default=None, choices=list(afk_decide.GATE_CI_MODES),
-                   help="gate.ci override")
 
     p = command("no-pr", cmd_no_pr, remote="gh",
                 help="why one of my claims has no PR → coding / idle_done / idle_blocked / "
@@ -826,14 +794,11 @@ def build_parser():
                    help="seconds since the terminal last showed activity, if the probe says")
     p.add_argument("--worktree", default=None,
                    help="the worker's worktree (omit only if none exists)")
-    p.add_argument("--base", default=None, help="base_branch override")
-    p.add_argument("--grace", type=int, default=None, help="worker_idle_grace_seconds override")
 
     p = command("recovery", cmd_recovery, remote="refs",
                 help="does a dead claim have recoverable progress, and where? → the "
                      "tiered continuation verdict")
     p.add_argument("--issue", dest="number", type=int, required=True)
-    p.add_argument("--base", default=None, help="base_branch override")
     p.add_argument("--branch", default=None,
                    help="the issue's work branch, when already known (skips discovery)")
     p.add_argument("--worktree", default=None,
@@ -845,7 +810,6 @@ def build_parser():
     p = command("gate-run", cmd_gate_run,
                 "run the configured local gate in a worktree → {status, excerpt}")
     p.add_argument("--worktree", required=True, help="worktree to run the gate in")
-    p.add_argument("--command", default=None, help="gate.local_command override")
     p.add_argument("--timeout", type=int, default=1800,
                    help="seconds before the run is called red (default 1800)")
     p.add_argument("--excerpt-lines", type=int, default=afk_decide.GATE_EXCERPT_LINES,
@@ -858,11 +822,11 @@ def build_parser():
                    help="the lifecycle phase — a `mine` row's board_phase, or merged / escalated")
     p.add_argument("--instance", default=None, help="owning fleet instance id (shown in the header)")
     p.add_argument("--pr", type=int, default=None, help="the PR number, once one is open")
-    p.add_argument("--attempt", type=int, default=0, help="current attempt n (shown for ci_failed)")
+    p.add_argument("--attempt", type=int, default=0,
+                   help="the `mine` row's attempt (shown for ci_failed)")
 
-    p = command("next-attempt", cmd_next_attempt, "retry-or-escalate from afk-attempt labels")
-    p.add_argument("--labels", type=_csv, required=True, help="the issue's label names (csv)")
-    p.add_argument("--retry", type=int, default=None, help="retry override")
+    p = command("next-attempt", cmd_next_attempt, "retry-or-escalate from the current attempt")
+    p.add_argument("--attempt", type=int, required=True, help="the `mine` row's attempt")
 
     p = command("pace", cmd_pace, "next launcher sleep in seconds")
     p.add_argument("--summary", required=True, help="the last tick summary JSON")

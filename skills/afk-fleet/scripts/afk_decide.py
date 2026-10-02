@@ -77,6 +77,18 @@ CONFIG_DEFAULTS = {
 }
 
 
+# The two places claim + heartbeat refs can live, as namespace → (claim ref prefix,
+# heartbeat ref prefix). `refs/afk` is hidden from branch listings and `on: push`
+# CI; `refs/heads` is the fallback for a remote whose rules forbid non-branch refs,
+# where the same markers are ordinary `afk-claim/*` / `afk-heartbeat/*` branches
+# (ADR-0003). A closed set: any other prefix would be a third layout no probe,
+# warning or doc describes.
+CLAIM_NAMESPACES = {
+    "refs/afk": ("refs/afk/claim", "refs/afk/heartbeat"),
+    "refs/heads": ("refs/heads/afk-claim", "refs/heads/afk-heartbeat"),
+}
+BRANCH_NAMESPACE = "refs/heads"
+
 # The completion gate's two modes (ADR-0012). `required` waits for the PR's GitHub
 # checks; `local` never reads them and makes `gate.local_command` the gate, re-run
 # at merge time against the exact tree that lands.
@@ -106,14 +118,15 @@ def _renamed(dotted):
 def validate_config(cfg):
     """
     The semantic checks a per-key type cannot express, run on the CANONICAL config
-    at load time (`afk config`) — i.e. at bootstrap, with the human present, where
-    a bad combination can still be fixed instead of surfacing mid-run inside a
-    tick. Raises ValueError; returns `cfg` unchanged so it can be used inline.
+    every time one is resolved — first at load time (`afk config`), at bootstrap,
+    with the human present, where a bad combination can still be fixed; and again
+    on every subcommand, so nothing downstream ever sees an invalid config.
+    Raises ValueError; returns `cfg` unchanged so it can be used inline.
     """
-    ns = cfg.get("claim_namespace") or ""
-    if not ns.startswith("refs/") or ns.endswith("/"):
-        raise ValueError(f"config claim_namespace: expected a ref prefix like refs/afk or "
-                         f"refs/heads, got {ns!r}")
+    ns = cfg.get("claim_namespace")
+    if ns not in CLAIM_NAMESPACES:
+        raise ValueError(f"config claim_namespace: expected one of "
+                         f"{' | '.join(CLAIM_NAMESPACES)}, got {ns!r}")
     gate = cfg.get("gate") or {}
     ci = gate.get("ci")
     if ci not in GATE_CI_MODES:
@@ -238,6 +251,24 @@ def resolve_config(partial):
             out[k] = list(dv) if isinstance(dv, list) else dv
     return out
 
+
+def override_config(cfg, assignments):
+    """Lay `key=value` overrides (the CLI's `--set`) onto a canonical config, in
+    place, and return it. Keys are the config file's own — dotted for a section
+    (`gate.ci=local`) — and values are typed by the key's default exactly as the
+    file's are, except that a string is taken verbatim (the shell already
+    unquoted it). An unknown key, or an item with no `=`, raises ValueError."""
+    for item in assignments or []:
+        dotted, eq, raw = item.partition("=")
+        section, _, key = dotted.strip().rpartition(".")
+        table = CONFIG_DEFAULTS.get(section) if section else CONFIG_DEFAULTS
+        if not eq or not isinstance(table, dict) or isinstance(table.get(key), (dict, type(None))):
+            raise ValueError(f"--set: expected <config key>=<value>, got {item!r}")
+        default = table[key]
+        value = raw if isinstance(default, str) else _coerce(dotted.strip(), raw.strip(), default)
+        (cfg[section] if section else cfg)[key] = value
+    return cfg
+
 # --------------------------------------------------------------------------- #
 # Dispatch eligibility — "can a worker take this issue right now?"             #
 # --------------------------------------------------------------------------- #
@@ -355,46 +386,42 @@ def classify_claims(claims, heartbeats, me, now, ttl):
     return {"mine": sorted(mine), "peer_live": sorted(peer_live), "stale": sorted(stale)}
 
 
-def subclassify_pr(pr_state, checks_state, ci_mode="required"):
+def subclassify_pr(has_pr, checks_state, ci_mode):
     """
-    Classify one of MY in-flight claims from its PR + checks. Whether a "no_pr"
-    claim is an *orphan* needs the worker liveness probe (orca-cli) — that stays
-    the tick's judgment, combining this verdict with the probe result.
+    Classify one of MY in-flight claims from its PR + checks → `(status,
+    board_phase)`: what the tick does next, and what the status board shows a human
+    meanwhile. Decided together because `gate.ci` bends both, in different ways.
 
-      pr_state:     "open" if an open PR closes the issue, else anything (→ no_pr)
-      checks_state: "green" | "red" | "pending" | None
+      has_pr:       an open PR closes the issue
+      checks_state: "green" | "red" | "pending" | None  (`pr_checks_state`)
       ci_mode:      gate.ci — "required" reads the checks; "local" never does
-    Returns: "awaiting_merge" | "failure" | "awaiting_ci" | "no_pr".
 
-    In `local` mode (ADR-0012) an open PR is always *awaiting_merge*: there are no
-    checks to wait on, because gating is an **action the tick takes at merge time**
-    (sync → re-run the local gate → merge), not an observation it waits for. A red
-    remote run — the repo's own `on: push` workflow, which the fleet does not gate
-    on — must not park the claim in `failure` forever.
+      status           the tick…                                board_phase
+      no_pr            asks `afk no-pr` why                      claimed
+      awaiting_ci      leaves it                                 pr_open
+      failure          runs failure handling                     ci_failed
+      awaiting_merge   runs the merge sequence                   awaiting_merge
+                       (`local`: an open PR, whatever its        (`local`: pr_open)
+                       remote checks say)
+
+    In `local` mode (ADR-0012) there are no checks to wait on: gating is an
+    **action the tick takes at merge time** (sync → re-run the local gate → merge),
+    not an observation it waits for. So every open PR is `awaiting_merge` — a red
+    remote run, the repo's own `on: push` workflow the fleet does not gate on, must
+    not park the claim in `failure` forever — while its board stays at `pr_open`:
+    the gate that sequence runs has not passed yet, and the board must not show a
+    green gate nobody has run. (`merged` / `escalated`, the two terminal board
+    phases, are set by the merge and escalate steps themselves.)
     """
-    if pr_state != "open":
-        return "no_pr"
+    if not has_pr:
+        return "no_pr", "claimed"
     if ci_mode == "local":
-        return "awaiting_merge"
+        return "awaiting_merge", "pr_open"
     if checks_state == "green":
-        return "awaiting_merge"
+        return "awaiting_merge", "awaiting_merge"
     if checks_state == "red":
-        return "failure"
-    return "awaiting_ci"
-
-
-def board_phase(status, ci_mode="required"):
-    """The status-board phase a claim's `subclassify_pr` status renders as, while
-    its worker is alive and nothing terminal has happened (`merged` / `escalated`
-    are set by the merge and escalate steps themselves).
-
-    In `local` mode an open PR is `pr_open`, not `awaiting_merge`: its status says
-    "ready for the merge sequence", but the gate that sequence runs has not passed
-    yet, and the board must not show a green gate nobody has run."""
-    if status == "awaiting_merge" and ci_mode == "local":
-        return "pr_open"
-    return {"no_pr": "claimed", "awaiting_ci": "pr_open", "failure": "ci_failed",
-            "awaiting_merge": "awaiting_merge"}[status]
+        return "failure", "ci_failed"
+    return "awaiting_ci", "pr_open"
 
 
 # --------------------------------------------------------------------------- #
@@ -486,7 +513,10 @@ def protection_verdict(ci_mode, protection, unavailable=None):
 #      no PR: `already-satisfied` (done in base, empty diff), `blocked` (a
 #      dependency gap, see blocked_by) or `giving-up` (a failure it could not fix);
 #   3. the terminal's busy / idle / none state from the orca probe.
-# `classify_no_pr` is the pure join. Whether to TRUST the marker stays the tick's call.
+# `classify_no_pr` is the pure join. Two words are kept apart throughout: the
+# VERDICT is what the worker declared in its marker (an input); the OUTCOME is
+# what this code concludes from all three signals. Whether to TRUST the marker
+# stays the tick's call.
 
 _VERDICT_MARKER_RE = re.compile(r"<!--\s*afk:verdict\b(.*?)-->", re.DOTALL)
 
@@ -549,10 +579,10 @@ def latest_verdict(comments):
     return result
 
 
-def classify_no_pr(progress, terminal, terminal_idle_seconds, verdict, blocker_states,
+def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, blocker_states,
                    now, grace_seconds):
     """
-    The 5-way verdict for one of MY `no_pr` claims, from the raw signals.
+    The outcome for one of MY `no_pr` claims, from the raw signals.
 
       progress:        the worktree's git progress {"commits_ahead", "dirty",
                        "last_commit_ts", "worktree_mtime_ts"}; {} / None if unreadable.
@@ -560,12 +590,13 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, verdict, blocker_s
                        "none" (no live worker/terminal at all).
       terminal_idle_seconds: seconds since the terminal last showed activity;
                        None if the probe could not say.
-      verdict:         the `latest_verdict` dict (or None).
+      worker_verdict:  the `latest_verdict` dict (or None) — what the worker declared.
       blocker_states:  {issue number: "open"|"closed"} for the verdict's blocked_by.
                        Anything not provably "closed" counts as still open.
       now, grace_seconds: epoch seconds / `worker_idle_grace_seconds`.
 
-    Returns {"outcome", "action", "idle_seconds", "open_blockers"}:
+    Returns {"outcome", "action", "idle_seconds", "open_blockers"} — `action` is
+    what the tick does, `outcome` the reason it is grouped under:
       coding       leave         — busy, OR last activity within grace.
       idle_done    close_release — idle past grace + `already-satisfied` + NO changes
                                    on the branch: the tick verifies the empty diff,
@@ -602,7 +633,7 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, verdict, blocker_s
         return out("coding", "leave")
 
     # idle past grace: route on the declared reason.
-    verdict = verdict or {}
+    verdict = worker_verdict or {}
     phase = verdict.get("phase") if verdict.get("found") else None
     if phase == "already-satisfied":
         # "nothing needed doing" is refuted by work sitting on the branch.
@@ -912,7 +943,7 @@ def _status_current_line(phase, gate, attempt, retry_max):
     return "⚠️ 已升级给人处理 —— 见下方评论"   # escalated
 
 
-def render_status_board(state):
+def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attempt=0):
     """
     Render the human-facing progress *status board* comment body. Pure: a function
     of the discrete lifecycle state the tick already derived from fleet state; no
@@ -920,24 +951,18 @@ def render_status_board(state):
     upsert write only when it changed, and keeps re-entrant ticks from spamming).
     Human-read only — never parsed back as a source of truth.
 
-      state = {
-        "phase":     one of STATUS_PHASES (required),
-        "instance":  owning fleet-instance id (str, optional — shown in the header),
-        "pr":        PR number (int) or None,
-        "attempt":   current attempt n (int, default 0)  — shown only for ci_failed,
-        "retry_max": max retries (int, default: config `retry`) — ditto,
-        "ci":        gate.ci mode (default "required") — names the gate being waited on,
-      }
+      phase:     one of STATUS_PHASES
+      gate_ci:   config `gate.ci` — names the gate being waited on
+      retry_max: config `retry` — shown with `attempt`, for ci_failed only
+      instance:  owning fleet-instance id, shown in the header when given
+      pr:        the PR number, once one is open
+      attempt:   the claim's current attempt (`current_attempt`)
+
     Returns the full markdown body, led by STATUS_MARKER (the find-or-create anchor).
     """
-    phase = state.get("phase")
     if phase not in STATUS_PHASES:
         raise ValueError(f"unknown status phase: {phase!r}")
-    pr = state.get("pr")
-    attempt = int(state.get("attempt", 0) or 0)
-    retry_max = int(state.get("retry_max", CONFIG_DEFAULTS["retry"]) or 0)
-    gate = _GATE_NAME[state.get("ci") or "required"]
-    inst = state.get("instance")
+    gate = _GATE_NAME[gate_ci]
     reached = _PHASE_REACHED[phase]
     escalated = phase == "escalated"
 
@@ -946,7 +971,7 @@ def render_status_board(state):
             return i == 0 or (key == "pr_open" and bool(pr))
         return i <= reached
 
-    header = "**afk-fleet 进度**" + (f" · 认领方 `{inst}`" if inst else "")
+    header = "**afk-fleet 进度**" + (f" · 认领方 `{instance}`" if instance else "")
     lines = [STATUS_MARKER, header, ""]
     for i, (key, label) in enumerate(_STATUS_STEPS):
         label = label.format(pr=f" (#{pr})" if pr else "", gate=gate)
@@ -960,26 +985,37 @@ def render_status_board(state):
 # Retry accounting + launcher pacing                                          #
 # --------------------------------------------------------------------------- #
 
-def next_attempt(attempt_labels, retry_max):
+_ATTEMPT_PREFIX = "afk-attempt/"
+
+
+def current_attempt(labels):
+    """The attempt an issue is on, from its label names: the highest n across its
+    `afk-attempt/<n>` labels, 0 when it has none (never retried). The ONE reader
+    of that label format — `afk rebuild` puts the number on every `mine` row, and
+    everything downstream (`next_attempt`, the status board) takes the number."""
+    attempts = [0]
+    for lb in labels or []:
+        if isinstance(lb, str) and lb.startswith(_ATTEMPT_PREFIX):
+            n = lb[len(_ATTEMPT_PREFIX):]
+            if n.isdigit():
+                attempts.append(int(n))
+    return max(attempts)
+
+
+def next_attempt(attempt, retry_max):
     """
-    Retry-or-escalate from the `afk-attempt/<n>` labels on a failed issue. The
-    current attempt is the max n across those labels (none → 0).
+    Retry-or-escalate for a failed issue on attempt `attempt` (`current_attempt`).
 
       {"action":"retry","from_label":<cur|None>,"to_label":"afk-attempt/<n+1>"}
       {"action":"escalate","from_label":<cur|None>}   when n >= retry_max
+
+    `from_label` is the label the issue carries now (None on attempt 0, which has
+    no label) — the one to swap for `to_label`, or to remove on escalate.
     """
-    n, cur = 0, None
-    for lb in attempt_labels or []:
-        if isinstance(lb, str) and lb.startswith("afk-attempt/"):
-            try:
-                v = int(lb.split("/", 1)[1])
-            except ValueError:
-                continue
-            if v >= n:
-                n, cur = v, lb
-    if n >= retry_max:
+    cur = f"{_ATTEMPT_PREFIX}{attempt}" if attempt > 0 else None
+    if attempt >= retry_max:
         return {"action": "escalate", "from_label": cur}
-    return {"action": "retry", "from_label": cur, "to_label": f"afk-attempt/{n + 1}"}
+    return {"action": "retry", "from_label": cur, "to_label": f"{_ATTEMPT_PREFIX}{attempt + 1}"}
 
 
 def pace(summary, config):
@@ -988,19 +1024,15 @@ def pace(summary, config):
 
       summary: {"merged":[],"dispatched":[],"reclaimed":[],"in_flight":int,
                 "empty_streak":int}   (empty_streak: consecutive empty ticks so far)
-      config:  {"busy_interval_seconds","idle_interval_seconds",
-                "idle_ticks_before_sleep","claim_lease_ttl_seconds"}
+      config:  the canonical config — read for busy_interval_seconds,
+               idle_interval_seconds, idle_ticks_before_sleep and
+               claim_lease_ttl_seconds
 
     - did work (merged/dispatched/reclaimed) or in_flight>0 → busy interval;
     - else stay busy until `idle_ticks_before_sleep` empty ticks, then idle interval;
     - HARD CAP: while holding any claim (in_flight>0), never exceed ttl/2, so the
       per-instance heartbeat cannot lapse and get a live claim reclaimed (ADR-0003).
-
-    `config` may be partial — it is resolved through CONFIG_DEFAULTS, so an
-    omitted key defaults rather than crashing, and the ttl/2 cap can never be
-    silently disabled by a missing key (ADR-0009).
     """
-    config = resolve_config(config)
     busy = int(config["busy_interval_seconds"])
     idle = int(config["idle_interval_seconds"])
     threshold = int(config["idle_ticks_before_sleep"])
@@ -1294,14 +1326,14 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
     Returns:
       {"frontier": {"dispatch": [{"number","title"}...], "excluded": [...]},
        "mine": [{"number","title","status","board_phase","pr","checks",
-                 "attempt_labels"}...],
+                 "attempt"}...],
        "peer_live": [{"number","instance"}...],
        "stale": [{"number","instance","sha"}...],   # sha feeds reclaim --expect-sha
        "fingerprint": <digest of the same observables the gate hashes>,
        "now": now}
 
-    `status` is subclassify_pr's verdict (awaiting_merge / awaiting_ci /
-    failure / no_pr) and `board_phase` the status-board phase it renders as.
+    `status` and `board_phase` are `subclassify_pr`'s pair; `attempt` is
+    `current_attempt` — the number `afk next-attempt` and `afk status` take.
     """
     ttl, ci_mode = config["claim_lease_ttl_seconds"], config["gate"]["ci"]
     by_num = {i.get("number"): i for i in issues}
@@ -1320,12 +1352,11 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
         pr = pr_for.get(n)
         checks = pr_checks_state(pr.get("statusCheckRollup")) if pr else None
         issue = by_num.get(n, {})
-        status = subclassify_pr("open" if pr else "none", checks, ci_mode)
+        status, board_phase = subclassify_pr(pr is not None, checks, ci_mode)
         mine.append({"number": n, "title": issue.get("title"),
-                     "status": status, "board_phase": board_phase(status, ci_mode),
+                     "status": status, "board_phase": board_phase,
                      "pr": pr.get("number") if pr else None, "checks": checks,
-                     "attempt_labels": [lb for lb in issue.get("labels") or []
-                                        if lb.startswith("afk-attempt/")]})
+                     "attempt": current_attempt(issue.get("labels"))})
 
     return {"frontier": frontier,
             "mine": mine,

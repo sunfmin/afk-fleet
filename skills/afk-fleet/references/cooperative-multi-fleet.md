@@ -41,16 +41,17 @@ each one runs is shown so the mechanism is legible, but the tick calls the tool.
   A peer with a *fresh* heartbeat is left strictly alone — it reconciles its own dead workers locally.
   A reclaimed claim is then recovered by **continuation**, not restarted (ADR-0011). The
   lease-skipping, human-authorized sibling is [`--takeover`](../SKILL.md#takeover-mode---takeover).
-- **Release / cleanup → `afk release <n>`** (idempotent) on **merge**, **escalate**, and
-  **orphan-release**. On **graceful stop**, the drain tick releases claims with **no PR yet** and
+- **Release / cleanup → `afk release <n>`** (idempotent: a claim already gone counts as released) on
+  **merge**, **escalate**, and **orphan-release**. A delete that fails with the claim still on the
+  remote exits 3 — `released` is never reported for a claim that is still there. On **graceful stop**, the drain tick releases claims with **no PR yet** and
   **retains** those with an open PR (a peer inherits it once the lease expires — merging it if it is
   finished, **continuing** it if it is not).
   The **open-PR guard** — an issue with an open linked PR is never in the frontier — is what makes
   releasing safe: a still-finishing orphan's PR is never re-dispatched, and a human's PR is left alone.
   A skipped delete is a **phantom lock** that silently starves an issue — the canonical definition of
   that failure lives here.
-- **Namespace fallback** — where the refs live is the config key `claim_namespace` (default
-  `refs/afk`). If bootstrap's `afk probe` finds an org ruleset rejecting `refs/afk/*`, it returns the
-  config with `claim_namespace: refs/heads` — claims become `refs/heads/afk-claim/*`, heartbeats
+- **Namespace fallback** — where the refs live is the config key `claim_namespace`: `refs/afk`
+  (default) or `refs/heads`, and nothing else. If bootstrap's `afk probe` finds an org ruleset
+  rejecting `refs/afk/*`, it reports `blocked` and returns the config with `claim_namespace: refs/heads` — claims become `refs/heads/afk-claim/*`, heartbeats
   `refs/heads/afk-heartbeat/*` — and the launcher warns that `on: push` CI fires on claim churn. Every
   later call inherits the namespace through `--config`; there is no separate flag to carry.

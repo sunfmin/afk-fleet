@@ -22,7 +22,8 @@ ready_label: ready-for-agent          # a child issue is dispatchable when it ca
 epic_labels: [epic, prd, wayfinder:map]   # never dispatched (a PRD is not a worker task)
 claim: ref                            # atomic lock ref refs/afk/claim/<n> marks an issue as taken —
                                       #   replaces assignee; required for cooperating multi-fleet (ADR-0003)
-claim_namespace: refs/afk             # where claim + heartbeat refs live. Leave it: bootstrap's `afk probe`
+claim_namespace: refs/afk             # where claim + heartbeat refs live: refs/afk | refs/heads, nothing
+                                      #   else. Leave it: bootstrap's `afk probe`
                                       #   switches the run to refs/heads (ordinary afk-claim/* branches, so
                                       #   `on: push` CI fires) when an org ruleset forbids non-branch refs.
                                       #   Set refs/heads here only to skip that probe-and-warn every run.
