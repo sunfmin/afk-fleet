@@ -9,11 +9,13 @@ A PR may merge only when **all** configured gates are green. Which **machine gat
 `gate.ci` ([ADR-0012](../../../docs/adr/0012-local-completion-gate.md)):
 
 - **`required` (default) — the CI machine gate.** Wait for the PR's GitHub checks. `afk merge` lands
-  a PR only when they are green **on the head that lands**: if its sync moved the head, the old
-  checks describe a tree that will not merge, so it returns `awaiting_ci` and a later tick merges.
+  a PR only when they are green **on the head that lands**: the PR/check snapshot's `headRefOid`
+  must equal the commit passed to `gh pr merge --match-head-commit`. If a worker push or the sync
+  moved that head, it returns `awaiting_ci` and a later tick reads the current head's checks.
   On red, read the failing-log excerpt for the `afk fail` reason in an **ephemeral sub-read** that
   returns only `{status: red, reason}`; raw logs never enter the tick. Progressive: before CI exists a
-  PR has no checks at all — `afk merge` returns `no_checks`, the gate is then the issue's acceptance
+  PR has no checks at all — rebuild routes it to `awaiting_merge` (board: `pr_open`), so `afk merge`
+  can return `no_checks`; the gate is then the issue's acceptance
   criteria + whatever local build/test exists, and `--allow-no-checks` is how you say it passed.
 - **`local` — `gate.local_command` *is* the completion gate.** GitHub checks are **never read** in this
   mode (`rebuild` reports every open PR as `awaiting_merge`: gating is an **action taken at merge
@@ -38,3 +40,18 @@ A PR may merge only when **all** configured gates are green. Which **machine gat
   exact head that would land: `afk merge` returns `needs_verify` with that `head`; verify it, then
   re-run `afk merge --verified <head>`. A verification of any other head does not count — a sync that
   moved the branch asks again.
+
+## Local worktree and environment requirements
+
+`afk merge` refuses staged/unstaged tracked changes and non-ignored untracked files before it
+gates or pushes, including with `merge.sync_before_merge: false`. After the local gate, and again
+before requesting the merge, it checks that HEAD is unchanged and the worktree/index remain clean.
+Gate commands that leave source edits or untracked output stop the transition; no worker files are
+automatically deleted. Commit intended source changes and explicitly ignore disposable build output.
+
+This is a clean-worktree guard, not a hermetic sandbox. Stop concurrent writers while gating; a
+temporary edit that is restored between checks cannot be detected. Ignored dependencies, build
+artifacts and the process environment remain the repository's responsibility: use a command that
+rebuilds from committed inputs, or use `required` CI when local environment parity is uncertain.
+Head pinning also does not atomically pin the target branch; server-side protection/merge-queue
+policy is needed to enforce integration against a concurrently advancing target.
