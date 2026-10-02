@@ -46,6 +46,7 @@ import afk_decide
 from test_afk_refs import ENV, NO_CONFIG, T0, TTL, afk as run, afk_error, git, sandbox
 
 REPO = "acme/widgets"
+LAUNCHER = "term_launcher"      # the orca terminal the launcher runs in (ADR-0020)
 HERE = os.path.dirname(os.path.abspath(__file__))
 SKILL = os.path.dirname(HERE)
 
@@ -408,7 +409,9 @@ class World:
         self.orca_file = os.path.join(sb.root, "orca.json")
         self.env = {**ENV, "PATH": bindir + os.pathsep + ENV["PATH"],
                     "AFK_FAKE_GH": self.gh_file, "AFK_FAKE_ORCA": self.orca_file,
-                    "SHELL": os.path.join(bindir, "fakeshell")}
+                    "SHELL": os.path.join(bindir, "fakeshell"),
+                    # the terminal the launcher (and so every tick) runs in
+                    "ORCA_TERMINAL_HANDLE": LAUNCHER}
         for leak in ("QODERCN_CLI", "ANTHROPIC_BASE_URL"):
             self.env.pop(leak, None)
         self.set(**{"repo": REPO, "bare": sb.bare, "base": sb.base, "issues": [], "prs": [],
@@ -1239,7 +1242,8 @@ def _prompt(w, variant, n, title, started, reason=None):
         return afk_decide.render_worker_prompt(
             f.read(), variant,
             {"n": n, "title": title, "repo": REPO, "base_branch": w.sb.base, "local_command": "",
-             "branch": started["branch"], "worktree_path": started["worktree"]}, reason=reason)
+             "branch": started["branch"], "worktree_path": started["worktree"],
+             "launcher_terminal": LAUNCHER}, reason=reason)
 
 
 def test_dispatch_starts_a_worker_on_the_remote_base_tip_and_submits_its_prompt():
@@ -1270,6 +1274,8 @@ def test_dispatch_starts_a_worker_on_the_remote_base_tip_and_submits_its_prompt(
         assert told == _prompt(w, "fresh", 1, "Names inspector: tab!", r)
         assert f"`{r['branch']}`" in told and f"`{wt}`" in told
         assert "Closes #1" in told and "{" + "branch" + "}" not in told
+        # and it is told how to wake the launcher that dispatched it (ADR-0020)
+        assert f'orca terminal send --terminal {LAUNCHER} --text "afk-wake #1" --enter' in told
         # the brief lives in the worktree's git dir: a worker's `git add -A` never stages it
         assert git(wt, "status", "--porcelain") == ""
 
@@ -1625,7 +1631,7 @@ def _handback_fields(w, pr_number, pr_branch, tip, files=("shared.txt",)):
 def _prompt_fields(w, n, started):
     return {"n": n, "title": f"issue {n}", "repo": REPO, "base_branch": w.sb.base,
             "local_command": "true", "branch": started["branch"],
-            "worktree_path": started["worktree"]}
+            "worktree_path": started["worktree"], "launcher_terminal": LAUNCHER}
 
 
 def _template():
