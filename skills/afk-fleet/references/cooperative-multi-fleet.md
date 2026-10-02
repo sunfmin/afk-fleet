@@ -18,16 +18,18 @@ each one runs is shown so the mechanism is legible, but the tick calls the tool.
 - **Claim → `afk claim <n> --instance <id>`.** Internally it creates `afk-claim/<n>` pointing at a
   marker commit carrying `instance=<id> host=<host>`; the ref name is the issue number *only*. Creating
   a ref that already exists is **rejected by the server** — that rejection *is* the compare-and-swap.
-  `{"won": true}` → proceed; `{"won": false}` (with the current `owner`) → a peer has it, skip. The
-  claim ref is immutable after creation.
+  `{"won": true}` → proceed; `{"won": false}` (with the current `owner`) → a peer has it, skip. A
+  push that failed with **no** claim on the remote is not a lost race: the tool exits 3 with
+  `{"error": …}` instead, so an auth or network failure can never pass for bad luck. The claim ref is
+  immutable after creation.
   ```bash
   sha=$(git commit-tree $(git hash-object -t tree /dev/null) -m "afk-claim instance=$ID host=$(hostname)")
-  git push origin "$sha:refs/afk/claim/$n"    # nonzero exit ⇒ lost the race, back off
+  git push origin "$sha:refs/afk/claim/$n"    # rejected because the ref exists ⇒ lost the race
   ```
 - **Owner check → rides in `afk rebuild`.** The ref scan reads every `afk-claim/*` marker, and the
   working set arrives already partitioned into `mine` / `peer_live` / `stale` (in-flight = `mine`).
   (`afk scan` / `afk classify-claims` remain as standalone debug surfaces over the same core.)
-- **Heartbeat (the lease) → `afk heartbeat --instance <id> --ttl <s>`.** One ref `afk-heartbeat/<id>`
+- **Heartbeat (the lease) → `afk heartbeat --instance <id>`.** One ref `afk-heartbeat/<id>`
   carries a timestamp; the tool refreshes it **only if due** (`now - ts > ttl/3`) by force-pushing a
   new marker (it reads the old ts itself, so this stays stateless). **Per instance, not per claim**
   (claim refs never churn); a fleet holding no claims never beats.
@@ -47,6 +49,8 @@ each one runs is shown so the mechanism is legible, but the tick calls the tool.
   releasing safe: a still-finishing orphan's PR is never re-dispatched, and a human's PR is left alone.
   A skipped delete is a **phantom lock** that silently starves an issue — the canonical definition of
   that failure lives here.
-- **Namespace fallback** — if bootstrap's probe shows an org ruleset forbids `refs/afk/*`, fall back to
-  `refs/heads/afk-claim/*` + `refs/heads/afk-heartbeat/*` and warn that `on: push` CI fires on claim
-  churn.
+- **Namespace fallback** — where the refs live is the config key `claim_namespace` (default
+  `refs/afk`). If bootstrap's `afk probe` finds an org ruleset rejecting `refs/afk/*`, it returns the
+  config with `claim_namespace: refs/heads` — claims become `refs/heads/afk-claim/*`, heartbeats
+  `refs/heads/afk-heartbeat/*` — and the launcher warns that `on: push` CI fires on claim churn. Every
+  later call inherits the namespace through `--config`; there is no separate flag to carry.

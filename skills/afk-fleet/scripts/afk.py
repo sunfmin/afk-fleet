@@ -3,35 +3,74 @@
 afk.py — the afk-fleet tool: deterministic muscle the LLM tick calls.
 
 The tick (an LLM) orchestrates and judges; when it needs a *deterministic* action
-it shells out to one of these subcommands and reads back JSON (ADR-0004, choice 甲).
-Every subcommand prints one JSON object to stdout. Exit 0 = ran (a lost claim race
-is `{"won": false}`, still exit 0); exit 3 = an operational/git error.
+it shells out to one of these subcommands and reads back JSON (ADR-0004).
+Every subcommand prints one JSON object to stdout:
 
-Two layers:
-  - pure verdicts (`config`, `frontier`, `pace`, `next-attempt`, `subclassify`,
-    `classify-no-pr`, and the decision halves of `rebuild`, `classify-claims`,
-    `recovery`, `takeover`, `gate-run`, `probe`, `verdict`, `worker-command`, and
-    `fingerprint`) come from afk_decide.py — no I/O, fixture-tested; time is always
-    injected, never read here. Config resolution is one order everywhere:
-    flag → `--config` JSON → CONFIG_DEFAULTS (ADR-0009).
-  - effectful ops (`scan`, `claim`, `reclaim`, `release`, `heartbeat`, `probe`,
-    `takeover`, `worker-status`, `recovery`, `gate-run`, `verdict`,
-    `worker-command`) drive git refs / worktree git / gh / orca / the login shell.
-    The ref ops among them (`scan`/`claim`/`reclaim`/`release`/`heartbeat`/`probe`/
-    `takeover`/`recovery`) are covered by `test_afk_refs.py` — a bare local repo
-    standing in for GitHub, so the races are asserted offline, without gh.
+  exit 0  it ran. A lost claim race is an outcome, not an error: `{"won": false}`.
+  exit 3  an operational error (git/gh failed, bad input) → `{"error": "..."}`.
+          A push that failed for any reason OTHER than losing the race is exit 3,
+          never `won: false` — a fleet that cannot push must not look merely unlucky.
+
+Two layers. Every decision is a pure function in afk_decide.py (no I/O, time
+injected, fixture-tested). This file only gathers their inputs — git refs, a
+worktree's git, gh, orca, the login shell — and applies their effects.
+
+Every subcommand takes the same `--config` (the canonical JSON from `afk config`,
+then `afk probe`) and resolves it one way, in `_cfg`: flag → `--config` →
+CONFIG_DEFAULTS (ADR-0009).
 
 Invoked as:  python3 <skill>/scripts/afk.py <subcommand> [flags]
 """
 import argparse
 import json
 import os
+import shlex
 import socket
 import subprocess
 import sys
 import time
 
 import afk_decide
+
+# --------------------------------------------------------------------------- #
+# config + clock                                                              #
+# --------------------------------------------------------------------------- #
+
+# Override flags, by argparse dest → the config key (path) each one overrides.
+_FLAG_OVERRIDES = {
+    "ns": ("claim_namespace",),
+    "ttl": ("claim_lease_ttl_seconds",),
+    "ready_label": ("ready_label",),
+    "epic_labels": ("epic_labels",),
+    "ci": ("gate", "ci"),
+    "command": ("gate", "local_command"),
+    "target": ("merge", "target"),
+    "base": ("base_branch",),
+    "retry": ("retry",),
+    "grace": ("worker_idle_grace_seconds",),
+    "force_after": ("force_tick_after_skips",),
+}
+
+
+def _cfg(a):
+    """The effective config for a subcommand: `--config` JSON (canonical or
+    partial) resolved through CONFIG_DEFAULTS, with any override flag this
+    subcommand was given laid on top."""
+    cfg = afk_decide.resolve_config(json.loads(a.config) if a.config else {})
+    for dest, path in _FLAG_OVERRIDES.items():
+        value = getattr(a, dest, None)
+        if value is None:
+            continue
+        node = cfg
+        for key in path[:-1]:
+            node = node[key]
+        node[path[-1]] = value
+    return cfg
+
+
+def _now(a):
+    return a.now if a.now is not None else int(time.time())
+
 
 # --------------------------------------------------------------------------- #
 # git/gh plumbing                                                             #
@@ -61,8 +100,7 @@ def _remote(a):
     op works from anywhere the gh commands do — no clone-with-the-right-origin
     required (falls back to the named `--remote`, default origin). One repo handle,
     whether git or gh reads it."""
-    repo = getattr(a, "repo", None)
-    return f"https://github.com/{repo}.git" if repo else a.remote
+    return f"https://github.com/{a.repo}.git" if a.repo else a.remote
 
 
 def _git(args, check=True):
@@ -79,18 +117,13 @@ def _gh(args, check=True):
     return p
 
 
-def _marker_commit(message):
-    """A parentless commit on the empty tree, carrying `message`. Its sha is what
-    we push to a ref; it drags none of the repo history along."""
+def _marker_commit(kind, instance, ts, host=None):
+    """A parentless commit on the empty tree whose subject is the marker
+    `<kind> instance=<id> [host=<host>] ts=<epoch>` (`_parse_marker` reads it
+    back). Its sha is what we push to a ref; it drags no repo history along."""
+    parts = [kind, f"instance={instance}", *([f"host={host}"] if host else []), f"ts={int(ts)}"]
     empty_tree = _git(["hash-object", "-t", "tree", "/dev/null"]).stdout.strip()
-    return _git(["commit-tree", empty_tree, "-m", message]).stdout.strip()
-
-
-def _marker_text(kind, instance, ts, host=None):
-    parts = [kind, f"instance={instance}", f"ts={int(ts)}"]
-    if host:
-        parts.insert(2, f"host={host}")
-    return " ".join(parts)
+    return _git(["commit-tree", empty_tree, "-m", " ".join(parts)]).stdout.strip()
 
 
 def _parse_marker(subject):
@@ -104,7 +137,8 @@ def _parse_marker(subject):
 
 
 def _read_marker(remote, refname):
-    """Fetch one ref by name and return its parsed marker, or None if absent."""
+    """Fetch one ref by name and return its parsed marker, or None if it could
+    not be fetched (absent, or the remote is unreachable)."""
     p = _git(["fetch", remote, refname], check=False)
     if p.returncode != 0:
         return None
@@ -112,32 +146,38 @@ def _read_marker(remote, refname):
     return _parse_marker(subject)
 
 
-def _orca_worktree_rows(injected=None):
+def _remote_sha(remote, refname):
+    """The sha the remote has for one ref, "" if it has none. Raises when the
+    remote cannot be read at all."""
+    out = _git(["ls-remote", remote, refname]).stdout.split()
+    return out[0] if out else ""
+
+
+def _issue_comments(repo, number):
+    """An issue's comments, oldest first, as [{"id", "body", "url"}...]."""
+    p = _gh(["api", "--paginate", f"repos/{repo}/issues/{number}/comments",
+             "--jq", ".[] | {id, body, url: .html_url}"])
+    return [json.loads(ln) for ln in p.stdout.splitlines() if ln.strip()]
+
+
+def _issue_state(repo, number):
+    """"open" | "closed", or None if the issue could not be read."""
+    p = _gh(["api", f"repos/{repo}/issues/{number}", "--jq", ".state"], check=False)
+    return p.stdout.strip() or None if p.returncode == 0 else None
+
+
+def _orca_worktree_rows():
     """The `result.worktrees` rows of `orca worktree list --json`, or [] when orca
     can't be reached. SOFT by design: the worktree signal is one input to a tiered
     recovery whose last tier needs no orca at all, so a machine without orca (or a
     momentarily unhappy one) must degrade to "no local worktree", never abort a
-    recovery. `injected` accepts the whole doc, its `result`, or the bare rows."""
-    doc = injected
-    if doc is None:
-        try:
-            p = subprocess.run(["orca", "worktree", "list", "--json"],
-                               capture_output=True, text=True, timeout=30)
-        except (OSError, subprocess.SubprocessError):
-            return []
-        if p.returncode != 0:
-            return []
-        try:
-            doc = json.loads(p.stdout)
-        except json.JSONDecodeError:
-            return []
-    if isinstance(doc, list):
-        return doc
-    if not isinstance(doc, dict):
+    recovery."""
+    try:
+        p = subprocess.run(["orca", "worktree", "list", "--json"],
+                           capture_output=True, text=True, timeout=30)
+        return list(json.loads(p.stdout)["result"]["worktrees"]) if p.returncode == 0 else []
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
         return []
-    inner = doc.get("result") if isinstance(doc.get("result"), dict) else doc
-    rows = inner.get("worktrees")
-    return rows if isinstance(rows, list) else []
 
 
 def _worktree_progress(wt, base):
@@ -183,11 +223,6 @@ def _branch_ahead(remote, branch, base, slot):
     return (int(out) if out.isdigit() else None), ""
 
 
-def _issue_num_from_ref(refname):
-    tail = refname.rstrip("/").rsplit("/", 1)[-1]
-    return int(tail) if tail.isdigit() else None
-
-
 def _newest_mtime(root):
     """The newest file/dir mtime anywhere under `root`, excluding .git — a
     filesystem-level 'when did this worktree last change' independent of git
@@ -206,148 +241,132 @@ def _newest_mtime(root):
 
 
 # --------------------------------------------------------------------------- #
-# effectful: scan / claim / reclaim / release / heartbeat / probe             #
+# claim refs: scan / claim / reclaim / takeover / release / heartbeat          #
 # --------------------------------------------------------------------------- #
 
-def _scan(remote, base):
+def _mirrored_markers(local_ns):
+    """(ref's last path segment, sha, parsed marker) for each mirrored ref."""
+    rows = _git(["for-each-ref", "--format=%(refname) %(objectname)", local_ns],
+                check=False).stdout.splitlines()
+    for row in rows:
+        refname, sha = row.split(" ", 1)
+        subject = _git(["log", "-1", "--format=%s", sha], check=False).stdout.strip()
+        yield refname.rsplit("/", 1)[-1], sha, _parse_marker(subject)
+
+
+def _scan(remote, ns):
     """Mirror the remote claim+heartbeat refs into a disposable local namespace and
     read every marker. Returns (claims, heartbeats)."""
-    claim_ns, hb_ns = _ns_paths(base)
+    claim_ns, hb_ns = _ns_paths(ns)
     _git(["fetch", "--prune", remote,
           f"+{claim_ns}/*:{_LOCAL_SCAN}/claim/*",
           f"+{hb_ns}/*:{_LOCAL_SCAN}/heartbeat/*"], check=False)
-
-    claims = []
-    rows = _git(["for-each-ref", "--format=%(refname) %(objectname)",
-                 f"{_LOCAL_SCAN}/claim"], check=False).stdout.splitlines()
-    for row in rows:
-        refname, sha = (row.split(" ", 1) + [""])[:2]
-        n = _issue_num_from_ref(refname)
-        if n is None:
-            continue
-        subj = _git(["log", "-1", "--format=%s", sha], check=False).stdout.strip()
-        m = _parse_marker(subj)
-        claims.append({"number": n, "instance": m.get("instance"),
-                       "host": m.get("host"), "ts": m.get("ts"), "sha": sha})
-
-    heartbeats = {}
-    rows = _git(["for-each-ref", "--format=%(refname) %(objectname)",
-                 f"{_LOCAL_SCAN}/heartbeat"], check=False).stdout.splitlines()
-    for row in rows:
-        refname, sha = (row.split(" ", 1) + [""])[:2]
-        inst = refname.rstrip("/").rsplit("/", 1)[-1]
-        subj = _git(["log", "-1", "--format=%s", sha], check=False).stdout.strip()
-        ts = _parse_marker(subj).get("ts")
-        if ts is not None:
-            heartbeats[inst] = ts
+    claims = [{"number": int(name), "instance": m.get("instance"), "host": m.get("host"),
+               "ts": m.get("ts"), "sha": sha}
+              for name, sha, m in _mirrored_markers(f"{_LOCAL_SCAN}/claim") if name.isdigit()]
+    heartbeats = {name: m["ts"]
+                  for name, _, m in _mirrored_markers(f"{_LOCAL_SCAN}/heartbeat") if "ts" in m}
     return claims, heartbeats
 
 
 def cmd_scan(a):
-    claims, heartbeats = _scan(_remote(a), a.ns)
+    claims, heartbeats = _scan(_remote(a), _cfg(a)["claim_namespace"])
     return {"claims": claims, "heartbeats": heartbeats}
 
 
 def cmd_classify_claims(a):
-    if a.claims_json is not None:              # test-injected — no git
-        claims = json.loads(a.claims_json)
-        heartbeats = json.loads(a.heartbeats_json or "{}")
-    else:
-        claims, heartbeats = _scan(_remote(a), a.ns)
-    now = a.now if a.now is not None else int(time.time())
-    ttl = a.ttl if a.ttl is not None else _cfg(a)["claim_lease_ttl_seconds"]
-    result = afk_decide.classify_claims(claims, heartbeats, a.instance, now, ttl)
-    result["now"] = now
-    return result
+    cfg, now = _cfg(a), _now(a)
+    claims, heartbeats = _scan(_remote(a), cfg["claim_namespace"])
+    return {**afk_decide.classify_claims(claims, heartbeats, a.instance, now,
+                                         cfg["claim_lease_ttl_seconds"]),
+            "now": now}
+
+
+def _claim_ref(cfg, number):
+    return f"{_ns_paths(cfg['claim_namespace'])[0]}/{number}"
 
 
 def cmd_claim(a):
-    claim_ns, _ = _ns_paths(a.ns)
-    ref = f"{claim_ns}/{a.number}"
-    rem = _remote(a)
-    now = a.now if a.now is not None else int(time.time())
-    sha = _marker_commit(_marker_text("afk-claim", a.instance, now, host=a.host))
+    ref, rem = _claim_ref(_cfg(a), a.number), _remote(a)
+    sha = _marker_commit("afk-claim", a.instance, _now(a), host=a.host)
     # Create-only: the server rejects a ref that already exists → that is the CAS.
     p = _git(["push", rem, f"{sha}:{ref}"], check=False)
     if p.returncode == 0:
         return {"won": True, "issue": a.number, "ref": ref, "sha": sha, "instance": a.instance}
     owner = _read_marker(rem, ref)  # who beat us
+    if owner is None:
+        raise RuntimeError(f"claim push to {ref} failed and no such claim exists on the "
+                           f"remote, so this is not a lost race: {p.stderr.strip()}")
     return {"won": False, "issue": a.number, "ref": ref,
             "owner": owner, "detail": p.stderr.strip()}
 
 
-def _force_take(rem, ns, number, expect_sha, instance, now, host):
+def _force_take(rem, ref, number, expect_sha, instance, now, host):
     """The atomic re-stamp of ONE existing claim ref to `instance`: rejected unless
     the ref still points at the sha we read. The single mechanism behind both an
     unattended stale reclaim and a human-authorized takeover — they differ only in
     what gates the *choice* of claim (an expired lease vs a present human), never
     in the push, so a takeover is exactly as safe against a live peer."""
-    ref = f"{ns}/{number}"
-    sha = _marker_commit(_marker_text("afk-claim", instance, now, host=host))
+    sha = _marker_commit("afk-claim", instance, now, host=host)
     p = _git(["push", rem, f"--force-with-lease={ref}:{expect_sha}", f"{sha}:{ref}"], check=False)
     if p.returncode == 0:
         return {"won": True, "issue": number, "ref": ref, "sha": sha, "instance": instance}
+    if _remote_sha(rem, ref) == expect_sha:
+        raise RuntimeError(f"reclaim push to {ref} failed although the claim has not moved, "
+                           f"so this is not a lost race: {p.stderr.strip()}")
     return {"won": False, "issue": number, "ref": ref, "detail": p.stderr.strip()}
 
 
 def cmd_reclaim(a):
-    claim_ns, _ = _ns_paths(a.ns)
-    now = a.now if a.now is not None else int(time.time())
-    return _force_take(_remote(a), claim_ns, a.number, a.expect_sha, a.instance, now, a.host)
+    return _force_take(_remote(a), _claim_ref(_cfg(a), a.number), a.number, a.expect_sha,
+                       a.instance, _now(a), a.host)
 
 
 def cmd_takeover(a):
     """The human-authorized, lease-skipping reclaim of a DEAD fleet instance's
     claims (ADR-0011). Two shapes:
 
-      --list                  every instance GitHub still remembers — from the claim
-                              markers (`instance=<id> host=<host>`) and the heartbeat
-                              refs — with heartbeat age, host and claim count. A
-                              launcher forgets its own id when it dies; the repo does
-                              not, so the human need not have written it down.
-      --instance <dead-id>    force-take that instance's claims with the SAME atomic
-                              --force-with-lease push a stale reclaim uses, only
-                              skipping the staleness gate, re-stamping each with
-                              `--as <my-id>`. A target whose heartbeat is still fresh
-                              returns `confirm` and takes nothing until `--yes`.
+      --list              every instance GitHub still remembers — from the claim
+                          markers and the heartbeat refs — with heartbeat age, host
+                          and claim count. A launcher forgets its own id when it
+                          dies; the repo does not.
+      --from <dead-id>    force-take that instance's claims with the SAME atomic
+                          --force-with-lease push a stale reclaim uses, only
+                          skipping the staleness gate, re-stamping each with
+                          `--instance` (mine). A target whose heartbeat is still
+                          fresh returns `confirm` and takes nothing until `--yes`.
 
-    NOTE the flag asymmetry, unique to this subcommand: `--instance` is the
-    instance being taken FROM (the dead one), `--as` is mine. Takeover neither
-    reads nor increments `afk-attempt/<n>`: it answers "did the fleet die?", not
-    "is this work failing?". What each taken claim then *does* is continuation
-    (`afk recovery`), not a fresh re-dispatch."""
-    claim_ns, _ = _ns_paths(a.ns)
-    rem = _remote(a)
-    claims, heartbeats = _scan(rem, a.ns)
-    now = a.now if a.now is not None else int(time.time())
-    ttl = a.ttl if a.ttl is not None else _cfg(a)["claim_lease_ttl_seconds"]
+    Takeover neither reads nor increments `afk-attempt/<n>`: it answers "did the
+    fleet die?", not "is this work failing?". What each taken claim then *does* is
+    continuation (`afk recovery`), not a fresh re-dispatch."""
+    cfg, rem, now = _cfg(a), _remote(a), _now(a)
+    ttl = cfg["claim_lease_ttl_seconds"]
+    claims, heartbeats = _scan(rem, cfg["claim_namespace"])
 
     if a.list:
-        return {"instances": afk_decide.group_instances(claims, heartbeats, a.me, now, ttl),
-                "me": a.me, "now": now, "ttl": ttl}
-    if not a.instance:
-        raise ValueError("--instance <dead instance id> is required unless --list")
-    if not a.me:
-        raise ValueError("--as <my instance id> is required: every taken claim is re-stamped with it")
+        return {"instances": afk_decide.group_instances(claims, heartbeats, a.instance, now, ttl),
+                "me": a.instance, "now": now, "ttl": ttl}
+    if not a.source:
+        raise ValueError("--from <dead instance id> is required unless --list")
 
-    plan = afk_decide.plan_takeover(claims, heartbeats, a.instance, a.me, now, ttl, a.yes)
+    plan = afk_decide.plan_takeover(claims, heartbeats, a.source, a.instance, now, ttl, a.yes)
     if plan["action"] != "take":
         return {**plan, "taken": [], "lost": []}
 
     taken, lost = [], []
     for c in plan["claims"]:
-        r = _force_take(rem, claim_ns, c["number"], c["sha"], a.me, now, a.host)
+        r = _force_take(rem, _claim_ref(cfg, c["number"]), c["number"], c["sha"],
+                        a.instance, now, a.host)
         (taken if r["won"] else lost).append(r)
-    return {**plan, "action": "taken", "as": a.me,
+    return {**plan, "action": "taken", "as": a.instance,
             "taken": [t["issue"] for t in taken], "lost": lost,
-            "detail": f"took {len(taken)}/{len(plan['claims'])} claim(s) from {a.instance}"
+            "detail": f"took {len(taken)}/{len(plan['claims'])} claim(s) from {a.source}"
                       + ("; a lost one means that fleet is not dead — its ref moved under us"
                          if lost else "")}
 
 
 def cmd_release(a):
-    claim_ns, _ = _ns_paths(a.ns)
-    ref = f"{claim_ns}/{a.number}"
+    ref = _claim_ref(_cfg(a), a.number)
     p = _git(["push", _remote(a), "--delete", ref], check=False)
     # Already gone counts as released — idempotent cleanup.
     ok = p.returncode == 0 or "remote ref does not exist" in p.stderr or "deleted" in p.stderr
@@ -355,29 +374,19 @@ def cmd_release(a):
 
 
 def cmd_heartbeat(a):
-    _, hb_ns = _ns_paths(a.ns)
-    ref = f"{hb_ns}/{a.instance}"
-    rem = _remote(a)
-    now = a.now if a.now is not None else int(time.time())
-    ttl = a.ttl if a.ttl is not None else _cfg(a)["claim_lease_ttl_seconds"]
-    cur = _read_marker(rem, ref)
-    last = cur.get("ts") if cur else None
-    if not afk_decide.heartbeat_due(last, now, ttl):
+    cfg, rem, now = _cfg(a), _remote(a), _now(a)
+    ref = f"{_ns_paths(cfg['claim_namespace'])[1]}/{a.instance}"
+    last = (_read_marker(rem, ref) or {}).get("ts")
+    if not afk_decide.heartbeat_due(last, now, cfg["claim_lease_ttl_seconds"]):
         return {"refreshed": False, "reason": "not due", "ts": last, "ref": ref}
-    sha = _marker_commit(_marker_text("afk-heartbeat", a.instance, now))
-    p = _git(["push", rem, "--force", f"{sha}:{ref}"], check=False)
-    if p.returncode != 0:
-        raise RuntimeError(p.stderr.strip())
+    sha = _marker_commit("afk-heartbeat", a.instance, now)
+    _git(["push", rem, "--force", f"{sha}:{ref}"])
     return {"refreshed": True, "ts": now, "ref": ref}
 
 
-def _cfg(a):
-    """The effective config for a subcommand: `--config` JSON (canonical or
-    partial — resolved through CONFIG_DEFAULTS either way; ADR-0009), else pure
-    defaults. Individual flags override on top: flag → config → defaults."""
-    partial = json.loads(a.config) if getattr(a, "config", None) else {}
-    return afk_decide.resolve_config(partial)
-
+# --------------------------------------------------------------------------- #
+# bootstrap: config / probe / worker-command                                   #
+# --------------------------------------------------------------------------- #
 
 def cmd_config(a):
     """One home for config (ADR-0009): read the target repo's config file (the
@@ -397,112 +406,76 @@ def cmd_config(a):
     return afk_decide.validate_config(cfg)
 
 
-def _gather(a):
-    """The ONE gatherer of the observable fleet inputs (ADR-0008): open issues,
-    open PRs, and the claim/heartbeat ref scan. Both `rebuild` and the
-    launcher's `fingerprint` gate read through here, so their views cannot
-    drift. Raw JSON lives and dies in this process; fields beyond what the
-    digest canonicalizes are harmless — afk_decide.fingerprint ignores them."""
-    issues = json.loads(_gh(["issue", "list", "--repo", a.repo, "--state", "open",
-                             "--limit", "200", "--json", "number,title,labels,updatedAt"]).stdout)
-    prs = json.loads(_gh(["pr", "list", "--repo", a.repo, "--state", "open",
-                          "--json",
-                          "number,headRefOid,updatedAt,statusCheckRollup,closingIssuesReferences"]).stdout)
-    claims, heartbeats = _scan(_remote(a), a.ns)
-    return issues, prs, claims, heartbeats
+def _branch_protection(repo, branch):
+    """One branch's protection → (protection|None, unavailable_detail|None). A
+    branch with NO protection is a successful read of "nothing", not an error —
+    only a read that genuinely failed (no admin rights, an API error) is
+    inconclusive, and `protection_verdict` warns rather than guesses on those."""
+    p = _gh(["api", f"repos/{repo}/branches/{branch}/protection"], check=False)
+    if p.returncode == 0:
+        try:
+            return json.loads(p.stdout), None
+        except json.JSONDecodeError:
+            return None, "unparseable branch-protection response"
+    err = ((p.stderr or "") + (p.stdout or "")).strip()
+    if "Branch not protected" in err:
+        return None, None
+    return None, err or f"gh exited {p.returncode}"
 
 
-def cmd_fingerprint(a):
-    """The launcher's zero-LLM cycle gate (ADR-0007): digest what `rebuild`
-    would observe (same gatherer, no blocked_by reads — updatedAt covers those)
-    and return skip-or-tick. Only the digest + verdict ever reach a context."""
-    if a.state_json is not None:               # test-injected — no gh/git
-        st = json.loads(a.state_json)
-        issues, prs, claims = st.get("issues", []), st.get("prs", []), st.get("claims", [])
-    else:
-        if not a.repo:
-            raise ValueError("--repo owner/name is required unless --state-json")
-        issues, prs, claims, _ = _gather(a)  # heartbeats deliberately
-        # unused — see afk_decide.fingerprint
-    fp = afk_decide.fingerprint(issues, prs, claims)
-    force_after = a.force_after if a.force_after is not None else _cfg(a)["force_tick_after_skips"]
-    verdict = afk_decide.fingerprint_gate(a.last, fp, a.skips, force_after)
-    return {"fingerprint": fp, **verdict}
+def _usable_namespace(rem, wanted, now):
+    """The first claim namespace the remote lets us push under — `wanted`, else
+    the `refs/heads` branch fallback — as (namespace, rejection|None). Only a
+    push the SERVER rejected (an org ruleset forbidding `refs/afk/*`) moves on
+    to the fallback; a push that never reached a verdict (auth, network) raises,
+    because that says nothing about which namespace is allowed."""
+    rejection = None
+    for ns in dict.fromkeys([wanted, "refs/heads"]):
+        ref = f"{_ns_paths(ns)[0]}/probe"
+        sha = _marker_commit("afk-probe", "probe", now)
+        p = _git(["push", rem, f"{sha}:{ref}"], check=False)
+        if p.returncode == 0:
+            _git(["push", rem, "--delete", ref], check=False)
+            return ns, rejection
+        if "[remote rejected]" not in p.stderr:
+            raise RuntimeError(f"probe push to {ref} failed: {p.stderr.strip()}")
+        rejection = rejection or p.stderr.strip()
+    raise RuntimeError(f"the remote rejects claim refs under both {wanted} and refs/heads: "
+                       f"{rejection}")
 
 
-def cmd_rebuild(a):
-    """One read-only call → the tick's whole working set (ADR-0008). Gather,
-    run a provisional frontier with blockers assumed 0, fetch open-blocker
-    counts for just those candidates, then assemble. The per-issue blocked_by
-    read is paid only by issues that pass every cheaper eligibility check.
-    Strictly observation: nothing here writes a ref, a comment, or a PR."""
+def cmd_probe(a):
+    """The bootstrap compatibility probe — two questions, both answered with the
+    human present so a misfit is fixed here rather than mid-run (ADR-0009's tradition):
+
+    1. **Claim namespace** — can we push under the configured `claim_namespace`
+       (`refs/afk`)? Else fall back to branches (`refs/heads/afk-claim/*`) and flag
+       that `on: push` CI will fire. The result's `config` is the canonical config
+       with the namespace that actually works: the launcher holds THAT config from
+       here on, so every later call inherits the namespace through `--config`.
+    2. **Branch protection** (only when `gate.ci: local`, ADR-0012) — does the merge
+       target REQUIRE status checks? Then `gh pr merge` is rejected however green the
+       local gate is, so that combination is a hard `error` at bootstrap; an
+       inconclusive read is a `warn`."""
     cfg = _cfg(a)
-    ready = a.ready_label or cfg["ready_label"]
-    epic = a.epic_labels.split(",") if a.epic_labels else cfg["epic_labels"]
-    ttl = a.ttl if a.ttl is not None else cfg["claim_lease_ttl_seconds"]
-    if a.state_json is not None:               # test-injected — no gh/git
-        st = json.loads(a.state_json)
-        issues, prs = st.get("issues", []), st.get("prs", [])
-        claims, heartbeats = st.get("claims", []), st.get("heartbeats", {})
-        blocked = {int(k): v for k, v in (st.get("blocked_by") or {}).items()}
-    else:
+    ns, rejection = _usable_namespace(_remote(a), cfg["claim_namespace"], _now(a))
+    cfg["claim_namespace"] = ns
+    result = {"namespace": ns, "hidden": ns != "refs/heads", "ci_on_push": ns == "refs/heads",
+              "blocked": rejection is not None, "config": cfg}
+    if rejection:
+        result["detail"] = rejection
+
+    ci_mode, target = cfg["gate"]["ci"], cfg["merge"]["target"]
+    if ci_mode == "local":
         if not a.repo:
-            raise ValueError("--repo owner/name is required unless --state-json")
-        issues, prs, claims, heartbeats = _gather(a)
-        claimed = {c.get("number") for c in claims}
-        pr_nums = {r.get("number") for p in prs
-                   for r in (p.get("closingIssuesReferences") or [])}
-        prov = afk_decide.select_frontier(
-            [{**i, "claimed": i.get("number") in claimed,
-              "has_open_pr": i.get("number") in pr_nums, "open_blockers": 0}
-             for i in issues], ready, epic)
-        blocked = {}
-        for n in prov["dispatch"]:
-            v = _gh(["api", f"repos/{a.repo}/issues/{n}",
-                     "--jq", ".issue_dependencies_summary.blocked_by"]).stdout.strip()
-            blocked[n] = 0 if v in ("", "null") else int(v)
-    now = a.now if a.now is not None else int(time.time())
-    return afk_decide.assemble_working_set(issues, prs, claims, heartbeats, blocked,
-                                           a.instance, now, ttl, ready, epic,
-                                           a.ci or cfg["gate"]["ci"])
-
-
-def _find_status_comment(repo, number):
-    """Find the fleet's existing status-board comment by its marker.
-    Returns (comment_id, body), or (None, None) if there isn't one yet."""
-    jq = f'.[] | select((.body // "") | contains("{afk_decide.STATUS_MARKER}")) | {{id, body}}'
-    p = _gh(["api", "--paginate", f"repos/{repo}/issues/{number}/comments", "--jq", jq], check=False)
-    if p.returncode != 0:
-        raise RuntimeError(p.stderr.strip())
-    for line in p.stdout.splitlines():
-        line = line.strip()
-        if line:
-            obj = json.loads(line)
-            return obj.get("id"), obj.get("body", "")
-    return None, None
-
-
-def cmd_status(a):
-    """Upsert the human-facing progress status board comment (idempotent, ADR-0006).
-    Renders the body from the injected discrete state (pure), then find-or-create by
-    marker and write ONLY when the body changed — so re-entrant/disposable ticks and
-    retry re-dispatches never spam the issue. `--print` renders without touching gh."""
-    state = json.loads(a.state)
-    body = afk_decide.render_status_board(state)
-    if a.print_only:
-        return {"action": "render-only", "issue": a.number, "body": body}
-    if not a.repo:
-        raise ValueError("--repo owner/name is required unless --print")
-    cid, cur = _find_status_comment(a.repo, a.number)
-    if cid is None:
-        p = _gh(["api", "--method", "POST", f"repos/{a.repo}/issues/{a.number}/comments",
-                 "-f", f"body={body}"], check=True)
-        return {"action": "created", "issue": a.number, "comment_id": json.loads(p.stdout).get("id")}
-    if (cur or "").strip() == body.strip():
-        return {"action": "unchanged", "issue": a.number, "comment_id": cid}
-    _gh(["api", "--method", "PATCH", f"repos/{a.repo}/issues/comments/{cid}",
-         "-f", f"body={body}"], check=True)
-    return {"action": "updated", "issue": a.number, "comment_id": cid}
+            result["protection"] = {"branch": target, "verdict": "warn", "required_checks": [],
+                                    "detail": "gate.ci is 'local' but --repo was not given, so "
+                                              "branch protection could not be checked"}
+        else:
+            prot, unavailable = _branch_protection(a.repo, target)
+            result["protection"] = {"branch": target,
+                                    **afk_decide.protection_verdict(ci_mode, prot, unavailable)}
+    return result
 
 
 def _login_shell(script, timeout=20):
@@ -526,93 +499,144 @@ def _login_shell(script, timeout=20):
 def cmd_worker_command(a):
     """Settle the one command every worker is started with, so a launcher on a
     custom provider does not dispatch workers that silently fall back to stock
-    Anthropic (ADR-0010), and so a qoderclicn launcher dispatches qoderclicn
-    workers (ADR-0014).
+    Anthropic (ADR-0010), and a qoderclicn launcher dispatches qoderclicn workers
+    (ADR-0014).
 
-    Bare: detect the runtime (qoderclicn or claude) from the launcher's own
-    environment. qoderclicn is always stock (no wrapping, no custom provider) —
-    return its default and never ask. Claude: read ANTHROPIC_BASE_URL and report
-    `stock` (nothing to ask) or `ask` — with the Claude-starting aliases found in
-    the user's login shell, so the human picks rather than types. `--check
-    "<cmd>"` resolves the human's answer's first word in that same shell and
-    reports whether it runs at all, plus whether an unattended flag is visible.
+    Bare: `stock` (nothing to ask) or `ask` — with the Claude-starting aliases
+    found in the user's login shell, so the human picks rather than types.
+    `--check "<cmd>"` resolves the human's answer's first word in that same shell
+    and reports whether it runs at all, plus whether an unattended flag is visible.
 
     The command is OPAQUE: never parsed, never composed, never appended to. That is
     what keeps every credential inside whatever wrapper the human already trusts —
     the fleet copies no env, writes no file, and puts no key on any command line."""
-    runtime = afk_decide.detect_runtime(os.environ)
-    if runtime == "qoderclicn":
-        return {"status": "stock", "command": afk_decide.WORKER_COMMAND_DEFAULT_QODERCN,
-                "base_url": None, "first_word": "qoderclicn", "yolo": True,
-                "detail": "", "runtime": runtime}
-    base = a.base_url if a.base_url is not None else os.environ.get("ANTHROPIC_BASE_URL")
-    if a.check:
-        fw = afk_decide.first_word(a.check)
-        resolved = _login_shell(f"type -- {fw}") if fw else ""
-        result = afk_decide.resolve_worker_command(base, a.check, resolved)
-        result["runtime"] = runtime
-        return result
-    result = afk_decide.resolve_worker_command(base)
-    result["runtime"] = runtime
+    fw = afk_decide.first_word(a.check)
+    resolved = _login_shell(f"type -- {shlex.quote(fw)}") if fw else None
+    result = afk_decide.resolve_worker_command(
+        os.environ.get("ANTHROPIC_BASE_URL"), a.check, resolved,
+        afk_decide.detect_runtime(os.environ))
     if result["status"] == "ask":
-        aliases = afk_decide.parse_aliases(_login_shell("alias"))
-        result["candidates"] = afk_decide.launch_candidates(aliases)
+        result["candidates"] = afk_decide.launch_candidates(
+            afk_decide.parse_aliases(_login_shell("alias")))
     return result
 
 
-def _branch_protection(repo, branch):
-    """One branch's protection → (protection|None, unavailable_detail|None). A
-    branch with NO protection is a successful read of "nothing", not an error —
-    only a read that genuinely failed (no admin rights, an API error) is
-    inconclusive, and `protection_verdict` warns rather than guesses on those."""
-    p = _gh(["api", f"repos/{repo}/branches/{branch}/protection"], check=False)
-    if p.returncode == 0:
-        try:
-            return json.loads(p.stdout), None
-        except json.JSONDecodeError:
-            return None, "unparseable branch-protection response"
-    err = ((p.stderr or "") + (p.stdout or "")).strip()
-    if "Branch not protected" in err:
-        return None, None
-    return None, err or f"gh exited {p.returncode}"
+# --------------------------------------------------------------------------- #
+# observation: fingerprint / rebuild / no-pr / recovery                        #
+# --------------------------------------------------------------------------- #
+
+def _gather(a, cfg):
+    """The ONE gatherer of the observable fleet inputs (ADR-0008): open issues,
+    open PRs, and the claim/heartbeat ref scan. Both `rebuild` and the
+    launcher's `fingerprint` gate read through here, so their views cannot
+    drift. Issues leave here with `labels` as a list of names — the one shape
+    afk_decide reads; the raw JSON lives and dies in this process."""
+    issues = json.loads(_gh(["issue", "list", "--repo", a.repo, "--state", "open",
+                             "--limit", "200", "--json", "number,title,labels,updatedAt"]).stdout)
+    issues = [{**i, "labels": [lb["name"] for lb in i.get("labels") or []]} for i in issues]
+    prs = json.loads(_gh(["pr", "list", "--repo", a.repo, "--state", "open",
+                          "--json",
+                          "number,headRefOid,updatedAt,statusCheckRollup,closingIssuesReferences"]).stdout)
+    claims, heartbeats = _scan(_remote(a), cfg["claim_namespace"])
+    return issues, prs, claims, heartbeats
 
 
-def cmd_probe(a):
-    """The bootstrap compatibility probe — two questions, both answered with the
-    human present so a misfit is fixed here rather than mid-run (ADR-0009's tradition):
-
-    1. **Claim namespace** — can we push under `refs/afk/*`? Else fall back to
-       branches (`refs/heads/afk-claim/*`) and flag that `on: push` CI will fire.
-    2. **Branch protection** (only when `gate.ci: local`, ADR-0012) — does the merge
-       target REQUIRE status checks? Then `gh pr merge` is rejected however green the
-       local gate is, so that combination is a hard `error` at bootstrap; an
-       inconclusive read is a `warn`."""
-    ref = f"{a.ns}/probe"
-    rem = _remote(a)
-    sha = _marker_commit(_marker_text("afk-probe", "probe", a.now if a.now is not None else int(time.time())))
-    p = _git(["push", rem, f"{sha}:{ref}"], check=False)
-    if p.returncode == 0:
-        _git(["push", rem, "--delete", ref], check=False)
-        hidden = a.ns != "refs/heads"          # report the namespace actually probed
-        result = {"namespace": a.ns, "hidden": hidden, "ci_on_push": not hidden, "blocked": False}
-    else:
-        result = {"namespace": "refs/heads", "hidden": False, "ci_on_push": True,
-                  "blocked": True, "detail": p.stderr.strip()}
-
+def cmd_fingerprint(a):
+    """The launcher's zero-LLM cycle gate (ADR-0007): digest what `rebuild`
+    would observe (same gatherer, no blocked_by reads — updatedAt covers those)
+    and return skip-or-tick. Only the digest + verdict ever reach a context."""
     cfg = _cfg(a)
-    ci_mode = cfg["gate"]["ci"]
-    if ci_mode == "local":
-        target = a.target or cfg["merge"]["target"]
-        if not a.repo:
-            result["protection"] = {"branch": target, "verdict": "warn", "required_checks": [],
-                                    "detail": "gate.ci is 'local' but --repo was not given, so "
-                                              "branch protection could not be checked"}
-        else:
-            prot, unavailable = _branch_protection(a.repo, target)
-            result["protection"] = {"branch": target,
-                                    **afk_decide.protection_verdict(ci_mode, prot, unavailable)}
-    return result
+    issues, prs, claims, _ = _gather(a, cfg)  # heartbeats: see afk_decide.fingerprint
+    fp = afk_decide.fingerprint(issues, prs, claims)
+    return {"fingerprint": fp,
+            **afk_decide.fingerprint_gate(a.last, fp, a.skips, cfg["force_tick_after_skips"])}
 
+
+def cmd_rebuild(a):
+    """One read-only call → the tick's whole working set (ADR-0008). The
+    per-issue blocked_by read is paid only by issues that pass every cheaper
+    eligibility check. Strictly observation: nothing here writes a ref, a
+    comment, or a PR."""
+    cfg = _cfg(a)
+    issues, prs, claims, heartbeats = _gather(a, cfg)
+    blocked = {}
+    for n in afk_decide.frontier_candidates(issues, prs, claims,
+                                            cfg["ready_label"], cfg["epic_labels"]):
+        v = _gh(["api", f"repos/{a.repo}/issues/{n}",
+                 "--jq", ".issue_dependencies_summary.blocked_by"]).stdout.strip()
+        blocked[n] = 0 if v in ("", "null") else int(v)
+    return afk_decide.assemble_working_set(issues, prs, claims, heartbeats, blocked,
+                                           a.instance, _now(a), cfg)
+
+
+def cmd_no_pr(a):
+    """Why does one of my claims have no PR — is its worker still coding, or did it
+    finish without one? One call gathers everything the 5-way verdict needs: the
+    worktree's git progress, the worker's `afk:verdict` marker on the issue, and
+    the state of each issue that marker says it is blocked by. The tick supplies
+    only what code cannot see — the orca terminal probe. Returns
+    `afk_decide.classify_no_pr`'s verdict plus the signals it was decided from."""
+    cfg = _cfg(a)
+    progress = {}
+    if a.worktree:
+        if not os.path.isdir(a.worktree):
+            raise ValueError(f"worktree not found: {a.worktree} (omit --worktree if there is none)")
+        progress = _worktree_progress(a.worktree, cfg["base_branch"])
+    verdict = afk_decide.latest_verdict(_issue_comments(a.repo, a.number))
+    blocker_states = {n: _issue_state(a.repo, n) for n in verdict["blocked_by"]}
+    return {"issue": a.number,
+            **afk_decide.classify_no_pr(progress, a.terminal, a.terminal_idle_seconds, verdict,
+                                        blocker_states, _now(a),
+                                        cfg["worker_idle_grace_seconds"]),
+            "progress": progress, "verdict": verdict}
+
+
+def cmd_recovery(a):
+    """Per DEAD claim: does recoverable progress exist, and where? → the tiered
+    continuation verdict (ADR-0011). This is what makes an orphaned-claim
+    reconciliation, a stale-claim reclaim, and a takeover *continue* the dead
+    worker's work instead of restarting it.
+
+    Two signals, both mechanics: (1) is a worktree for this issue still on THIS
+    machine — asked of `orca worktree list` (soft: no orca → "no worktree", never
+    an abort), overridable with `--worktree`/`--no-worktree`; (2) is the issue's
+    branch ahead of base on the remote — the branch is recognised from
+    `branch_pattern` (the claim ref records the issue, not the branch) and the
+    compare is plain git. `afk_decide.select_recovery` then picks the tier.
+
+    Both signals are always gathered, even when the worktree already settles the
+    tier: a *pristine* worktree over a branch that carries pushed commits still has
+    something to continue, and the honest prompt depends on knowing that."""
+    cfg, rem = _cfg(a), _remote(a)
+    base = cfg["base_branch"]
+
+    # --- tier-1 signal: a worktree for this issue, still on this machine ---
+    path, branch = a.worktree, a.branch
+    if path is None and not a.no_worktree:
+        hit = afk_decide.find_orca_worktree(_orca_worktree_rows(), a.number, a.repo)
+        path, branch = hit["path"], branch or hit["branch"]
+    worktree = {"present": False, "path": path, "commits_ahead": None,
+                "dirty": False, "last_commit_ts": None, "worktree_mtime_ts": None}
+    if path and os.path.isdir(path):
+        worktree = {"present": True, "path": path, **_worktree_progress(path, base)}
+
+    # --- tier-2 signal: the branch the dead worker pushed ---
+    candidates = [] if branch else afk_decide.branch_candidates(
+        _remote_heads(rem), cfg["branch_pattern"], a.number)
+    measured = {b: _branch_ahead(rem, b, base, a.number)
+                for b in ([branch] if branch else candidates)}
+    branch = branch or afk_decide.furthest_ahead({b: n for b, (n, _) in measured.items()})
+    ahead, detail = measured.get(branch, (None, "no branch on the remote matches this issue"))
+    branch_sig = {"name": branch, "commits_ahead": ahead, "candidates": candidates,
+                  "detail": detail}
+
+    return {"issue": a.number, "base": base, "worktree": worktree, "branch": branch_sig,
+            **afk_decide.select_recovery(worktree, branch_sig)}
+
+
+# --------------------------------------------------------------------------- #
+# act: gate-run / status / next-attempt / pace                                 #
+# --------------------------------------------------------------------------- #
 
 def cmd_gate_run(a):
     """Run the configured local gate in a worktree → `{status, excerpt}` — the
@@ -624,8 +648,7 @@ def cmd_gate_run(a):
     Mechanics all the way down (ADR-0004): *what* to run is config, *where* is the
     branch's worktree, and *whether it passed* is an exit code — no judgment. A run
     that times out is red, never green-by-default."""
-    cfg = _cfg(a)
-    cmd = a.command or cfg["gate"]["local_command"]
+    cmd = _cfg(a)["gate"]["local_command"]
     if not (cmd or "").strip():
         raise ValueError("no gate command to run: pass --command, or set gate.local_command "
                          "(required whenever gate.ci is 'local')")
@@ -647,378 +670,202 @@ def cmd_gate_run(a):
             "command": cmd, "worktree": a.worktree}
 
 
-def cmd_worker_status(a):
-    """The decisive PROGRESS signal for a `no_pr` claim, read straight from the
-    worker's worktree with git only (no gh, no orca) — independent of terminal
-    chrome, so it disambiguates a worker still coding from one that finished and
-    went idle. Returns {commits_ahead, dirty, last_commit_ts, worktree_mtime_ts};
-    the tick feeds it to `afk classify-no-pr`."""
-    wt = a.worktree
-    if not os.path.isdir(wt):
-        raise ValueError(f"worktree not found: {wt}")
-    base = a.base or _cfg(a)["base_branch"]
-    return _worktree_progress(wt, base)
-
-
-def cmd_recovery(a):
-    """Per DEAD claim: does recoverable progress exist, and where? → the tiered
-    continuation verdict (ADR-0011). This is what makes an orphaned-claim
-    reconciliation, a stale-claim reclaim, and a takeover *continue* the dead
-    worker's work instead of restarting it.
-
-    Two signals, both mechanics: (1) is a worktree for this issue still on THIS
-    machine — asked of `orca worktree list` (soft: no orca → "no worktree", never
-    an abort), overridable with `--worktree`/`--no-worktree`; (2) is the issue's
-    branch ahead of base on the remote — the branch is recognised from
-    `branch_pattern` (the claim ref records the issue, not the branch) and the
-    compare is plain git. `afk_decide.select_recovery` then picks the tier.
-
-    Both signals are always gathered, even when the worktree already settles the
-    tier: a *pristine* worktree over a branch that carries pushed commits still has
-    something to continue, and the honest prompt depends on knowing that."""
+def cmd_status(a):
+    """Upsert the human-facing progress status board comment (idempotent, ADR-0006).
+    Renders the body from the given phase (pure), then find-or-create by marker
+    and write ONLY when the body changed — so re-entrant/disposable ticks and
+    retry re-dispatches never spam the issue."""
     cfg = _cfg(a)
-    base = a.base or cfg["base_branch"]
-    rem = _remote(a)
-
-    # --- tier-1 signal: a worktree for this issue, still on this machine ---
-    path, branch = a.worktree, a.branch
-    if path is None and not a.no_worktree:
-        hit = afk_decide.find_orca_worktree(_orca_worktree_rows(
-            json.loads(a.orca_json) if a.orca_json is not None else None), a.number, a.repo)
-        path = hit["path"]
-        branch = branch or hit["branch"]
-    worktree = {"present": False, "path": path, "commits_ahead": None,
-                "dirty": False, "last_commit_ts": None, "worktree_mtime_ts": None}
-    if path and os.path.isdir(path):
-        worktree = {"present": True, "path": path, **_worktree_progress(path, base)}
-
-    # --- tier-2 signal: the branch the dead worker pushed ---
-    candidates = []
-    if not branch:
-        candidates = afk_decide.branch_candidates(_remote_heads(rem),
-                                                  cfg["branch_pattern"], a.number)
-    ahead, detail = None, ""
-    if branch:
-        ahead, detail = _branch_ahead(rem, branch, base, a.number)
-    elif candidates:
-        # Several branches can match one issue (an earlier attempt left one behind):
-        # take the one furthest ahead of base, ties by name (candidates are sorted).
-        for cand in candidates:
-            n, d = _branch_ahead(rem, cand, base, a.number)
-            if branch is None or (n or 0) > (ahead or 0):
-                branch, ahead, detail = cand, n, d
-    else:
-        detail = "no branch on the remote matches this issue"
-    branch_sig = {"name": branch, "commits_ahead": ahead, "candidates": candidates,
-                  "detail": detail}
-
-    return {"issue": a.number, "base": base, "worktree": worktree, "branch": branch_sig,
-            **afk_decide.select_recovery(worktree, branch_sig)}
-
-
-def cmd_verdict(a):
-    """Fetch an issue's comments and return the LATEST parsed afk:verdict marker
-    (afk_decide.latest_verdict) — the worker's machine-readable reason for opening
-    no PR, the single source of truth the `no_pr` classification routes on. gh
-    fetch here, deterministic parse in afk_decide. `--comments-json` injects
-    comments to skip gh (tests)."""
-    if a.comments_json is not None:                # test-injected — no gh
-        comments = json.loads(a.comments_json)
-    else:
-        if not a.repo:
-            raise ValueError("--repo owner/name is required unless --comments-json")
-        jq = '.[] | {body: .body, comment_url: .html_url, created_at: .created_at}'
-        p = _gh(["api", "--paginate", f"repos/{a.repo}/issues/{a.number}/comments",
-                 "--jq", jq], check=True)
-        comments = [json.loads(ln) for ln in p.stdout.splitlines() if ln.strip()]
-    return afk_decide.latest_verdict(comments)
-
-
-# --------------------------------------------------------------------------- #
-# pure passthroughs                                                           #
-# --------------------------------------------------------------------------- #
-
-def _issues_in(a):
-    raw = sys.stdin.read() if a.stdin else open(a.fixture).read()
-    issues = json.loads(raw)
-    if not isinstance(issues, list):
-        raise ValueError("expected a JSON array of issues")
-    return issues
-
-
-def cmd_frontier(a):
-    issues = _issues_in(a)
-    cfg = _cfg(a)
-    ready = a.ready_label or cfg["ready_label"]
-    epic = a.epic_labels.split(",") if a.epic_labels else cfg["epic_labels"]
-    return afk_decide.select_frontier(issues, ready, epic)
-
-
-def cmd_pace(a):
-    summary = json.loads(sys.stdin.read()) if a.stdin else json.loads(a.summary)
-    config = json.loads(a.config)
-    return {"seconds": afk_decide.pace(summary, config)}
+    body = afk_decide.render_status_board(
+        {"phase": a.phase, "instance": a.instance, "pr": a.pr, "attempt": a.attempt,
+         "retry_max": cfg["retry"], "ci": cfg["gate"]["ci"]})
+    comments = f"repos/{a.repo}/issues/{a.number}/comments"
+    board = next((c for c in _issue_comments(a.repo, a.number)
+                  if afk_decide.STATUS_MARKER in (c["body"] or "")), None)
+    if board is None:
+        p = _gh(["api", "--method", "POST", comments, "-f", f"body={body}"])
+        return {"action": "created", "issue": a.number, "comment_id": json.loads(p.stdout).get("id")}
+    if board["body"].strip() == body.strip():
+        return {"action": "unchanged", "issue": a.number, "comment_id": board["id"]}
+    _gh(["api", "--method", "PATCH", f"repos/{a.repo}/issues/comments/{board['id']}",
+         "-f", f"body={body}"])
+    return {"action": "updated", "issue": a.number, "comment_id": board["id"]}
 
 
 def cmd_next_attempt(a):
-    labels = json.loads(sys.stdin.read()) if a.stdin else \
-        [s for s in (a.labels or "").split(",") if s]
-    retry = a.retry if a.retry is not None else _cfg(a)["retry"]
-    return afk_decide.next_attempt(labels, retry)
+    return afk_decide.next_attempt(a.labels, _cfg(a)["retry"])
 
 
-def cmd_subclassify(a):
-    return {"status": afk_decide.subclassify_pr(a.pr, a.checks, a.ci or _cfg(a)["gate"]["ci"])}
-
-
-def cmd_classify_no_pr(a):
-    """The 5-way verdict for one of my `no_pr` claims (coding / idle_done /
-    idle_blocked / idle_failed / dead), from the three disambiguating signals the
-    tick gathered: git progress (`afk worker-status`), the declared verdict (`afk
-    verdict`), and the orca liveness probe. `--terminal busy|idle|none` maps to the
-    pure function's `terminal_idle` (False / True / None). Grace resolves flag →
-    --config worker_idle_grace_seconds → default."""
-    progress = json.loads(a.progress) if a.progress else {}
-    verdict = json.loads(a.verdict) if a.verdict else None
-    grace = a.grace if a.grace is not None else _cfg(a)["worker_idle_grace_seconds"]
-    terminal_idle = {"busy": False, "idle": True, "none": None}[a.terminal]
-    return afk_decide.classify_no_pr(progress, terminal_idle, a.idle_seconds,
-                                     verdict, a.blocked_by_open, grace)
+def cmd_pace(a):
+    return {"seconds": afk_decide.pace(json.loads(a.summary), _cfg(a))}
 
 
 # --------------------------------------------------------------------------- #
 # arg wiring                                                                  #
 # --------------------------------------------------------------------------- #
 
+def _csv(s):
+    return [x for x in s.split(",") if x]
+
+
 def build_parser():
+    """The whole CLI. `.subcommands` maps each subcommand name to its parser —
+    the interface the docs are checked against (test_afk_cli.py)."""
     ap = argparse.ArgumentParser(prog="afk", description="afk-fleet deterministic tool")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    ap.subcommands = sub.choices
 
-    def add_ns(p):
-        p.add_argument("--repo", default=None,
-                       help="owner/name of the target repo — the one repo handle: git-ref ops "
-                            "push/fetch to its GitHub URL, gh ops read it directly "
-                            "(falls back to --remote, default origin)")
-        p.add_argument("--remote", default="origin")
-        p.add_argument("--ns", default="refs/afk", help="claim base namespace (or refs/heads fallback)")
-
-    def add_cfg(p):
+    def command(name, fn, help, remote=None):
+        """One subcommand. Every one takes --config and --now; `remote` adds the
+        repo handle: "refs" for git-ref ops (--repo optional), "gh" when gh needs
+        it (--repo required)."""
+        p = sub.add_parser(name, help=help)
+        p.set_defaults(fn=fn)
         p.add_argument("--config", default=None,
-                       help="canonical config JSON from `afk config` (individual flags override; "
-                            "omitted values fall back to the one defaults table — ADR-0009)")
+                       help="canonical config JSON from `afk config` / `afk probe` (override "
+                            "flags win; omitted keys fall back to the defaults table — ADR-0009)")
+        p.add_argument("--now", type=int, default=None, help="epoch override (tests)")
+        if remote:
+            p.add_argument("--repo", default=None, required=(remote == "gh"),
+                           help="owner/name of the target repo — the one repo handle: git-ref "
+                                "ops push/fetch to its GitHub URL, gh ops read it directly")
+            p.add_argument("--remote", default="origin",
+                           help="git remote for ref ops when --repo is not given")
+            p.add_argument("--ns", default=None,
+                           help="claim namespace override (default: config claim_namespace)")
+        return p
 
-    # config — one home for every key and default (ADR-0009)
-    p = sub.add_parser("config", help="parse + validate the repo config file → canonical JSON")
+    def mine(p):
+        p.add_argument("--instance", required=True, help="my fleet instance id")
+
+    def stamp(p):
+        mine(p)
+        p.add_argument("--host", default=socket.gethostname())
+
+    ttl_help = "claim_lease_ttl_seconds override"
+
+    # --- bootstrap ---
+    p = command("config", cmd_config, "parse + validate the repo config file → canonical JSON")
     p.add_argument("--file", default=None, help="path to the target repo's docs/agents/afk-fleet.md")
     p.add_argument("--defaults", action="store_true", help="print the pure defaults table")
-    p.set_defaults(fn=cmd_config)
 
-    # frontier
-    p = sub.add_parser("frontier", help="dispatchable set (pure)")
-    src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--fixture"); src.add_argument("--stdin", action="store_true")
-    add_cfg(p)
-    p.add_argument("--ready-label", default=None)
-    p.add_argument("--epic-labels", default=None)
-    p.set_defaults(fn=cmd_frontier)
+    p = command("probe", cmd_probe, remote="refs",
+                help="bootstrap probe: the usable claim namespace (folded into the returned "
+                     "config), and target-branch protection when gate.ci is local")
+    p.add_argument("--target", default=None, help="merge.target override")
 
-    # scan
-    p = sub.add_parser("scan", help="read all claim + heartbeat refs (effectful)")
-    add_ns(p); p.set_defaults(fn=cmd_scan)
-
-    # classify-claims
-    p = sub.add_parser("classify-claims", help="partition claims into mine/peer_live/stale")
-    add_ns(p); add_cfg(p)
-    p.add_argument("--instance", required=True)
-    p.add_argument("--ttl", type=int, default=None)
-    p.add_argument("--now", type=int, default=None, help="epoch override (tests)")
-    p.add_argument("--claims-json", default=None, help="inject claims, skip git (tests)")
-    p.add_argument("--heartbeats-json", default=None)
-    p.set_defaults(fn=cmd_classify_claims)
-
-    # claim / reclaim / release
-    p = sub.add_parser("claim", help="atomically create a claim ref (effectful)")
-    add_ns(p); p.add_argument("number", type=int)
-    p.add_argument("--instance", required=True)
-    p.add_argument("--host", default=socket.gethostname())
-    p.add_argument("--now", type=int, default=None)
-    p.set_defaults(fn=cmd_claim)
-
-    p = sub.add_parser("reclaim", help="force-with-lease takeover of a stale claim (effectful)")
-    add_ns(p); p.add_argument("number", type=int)
-    p.add_argument("--instance", required=True)
-    p.add_argument("--expect-sha", required=True, help="the sha you read; takeover fails if it moved")
-    p.add_argument("--host", default=socket.gethostname())
-    p.add_argument("--now", type=int, default=None)
-    p.set_defaults(fn=cmd_reclaim)
-
-    p = sub.add_parser("release", help="delete a claim ref (effectful, idempotent)")
-    add_ns(p); p.add_argument("number", type=int); p.set_defaults(fn=cmd_release)
-
-    # heartbeat
-    p = sub.add_parser("heartbeat", help="refresh my heartbeat if due (effectful)")
-    add_ns(p); add_cfg(p)
-    p.add_argument("--instance", required=True)
-    p.add_argument("--ttl", type=int, default=None)
-    p.add_argument("--now", type=int, default=None)
-    p.set_defaults(fn=cmd_heartbeat)
-
-    # worker-command — launcher/worker provider parity (ADR-0010)
-    p = sub.add_parser("worker-command",
-                       help="settle the command workers are started with: ask-or-not + candidates, "
-                            "or --check a human's answer")
+    p = command("worker-command", cmd_worker_command,
+                "settle the command workers are started with: ask-or-not + candidates, "
+                "or --check a human's answer")
     p.add_argument("--check", default=None,
                    help="a candidate command: resolve its first word in the login shell "
                         "and report whether it runs (and looks unattended)")
-    p.add_argument("--base-url", default=None,
-                   help="override the launcher's ANTHROPIC_BASE_URL (tests)")
-    p.set_defaults(fn=cmd_worker_command)
 
-    # probe — claim namespace + (in local-gate mode) target branch protection
-    p = sub.add_parser("probe", help="bootstrap probe: claim namespace, and target-branch "
-                                     "protection when gate.ci is local (effectful)")
-    add_ns(p); add_cfg(p)
-    p.add_argument("--target", default=None,
-                   help="branch whose protection to check (default: config merge.target)")
-    p.add_argument("--now", type=int, default=None)
-    p.set_defaults(fn=cmd_probe)
+    # --- claim refs ---
+    p = command("scan", cmd_scan, "debug: read all claim + heartbeat refs", remote="refs")
 
-    # gate-run — the local completion gate, run at merge time (ADR-0012)
-    p = sub.add_parser("gate-run", help="run the configured local gate in a worktree → "
-                                        "{status, excerpt} (effectful)")
-    add_cfg(p)
-    p.add_argument("--worktree", required=True, help="worktree to run the gate in")
-    p.add_argument("--command", default=None,
-                   help="override the command (default: config gate.local_command)")
-    p.add_argument("--timeout", type=int, default=1800,
-                   help="seconds before the run is called red (default 1800)")
-    p.add_argument("--excerpt-lines", type=int, default=afk_decide.GATE_EXCERPT_LINES,
-                   help="how many trailing log lines the excerpt keeps")
-    p.set_defaults(fn=cmd_gate_run)
+    p = command("classify-claims", cmd_classify_claims, remote="refs",
+                help="debug: partition claims into mine/peer_live/stale (rebuild does this)")
+    mine(p)
+    p.add_argument("--ttl", type=int, default=None, help=ttl_help)
 
-    # status — human-facing progress board (effectful, idempotent; ADR-0006)
-    p = sub.add_parser("status", help="upsert the human-facing progress status board comment (effectful, idempotent)")
+    p = command("claim", cmd_claim, "atomically create a claim ref → {won}", remote="refs")
     p.add_argument("number", type=int)
-    p.add_argument("--repo", default=None, help="owner/name (for gh api; required unless --print)")
-    p.add_argument("--state", required=True,
-                   help='JSON: {"phase":…,"instance":…,"pr":…,"attempt":…,"retry_max":…}')
-    p.add_argument("--print", dest="print_only", action="store_true",
-                   help="render the body only, do not touch GitHub")
-    p.set_defaults(fn=cmd_status)
+    stamp(p)
 
-    # rebuild — one read-only call returns the tick's whole working set (ADR-0008)
-    p = sub.add_parser("rebuild", help="gather + assemble the tick's working set (read-only)")
-    add_ns(p); add_cfg(p)  # --repo (required here unless --state-json) comes from add_ns
-    p.add_argument("--instance", required=True)
-    p.add_argument("--ttl", type=int, default=None)
-    p.add_argument("--ready-label", default=None)
-    p.add_argument("--epic-labels", default=None)
-    p.add_argument("--ci", default=None, choices=list(afk_decide.GATE_CI_MODES),
-                   help="gate.ci override: in 'local' an open PR is awaiting_merge outright, "
-                        "since gating is a merge-time action, not an observation (ADR-0012)")
-    p.add_argument("--now", type=int, default=None, help="epoch override (tests)")
-    p.add_argument("--state-json", default=None,
-                   help='inject {"issues","prs","claims","heartbeats","blocked_by"}, skip gh/git (tests)')
-    p.set_defaults(fn=cmd_rebuild)
+    p = command("reclaim", cmd_reclaim, "force-with-lease take of a stale claim → {won}",
+                remote="refs")
+    p.add_argument("number", type=int)
+    stamp(p)
+    p.add_argument("--expect-sha", required=True, help="the sha you read; the take fails if it moved")
 
-    # fingerprint — the launcher's zero-LLM cycle gate (ADR-0007)
-    p = sub.add_parser("fingerprint", help="digest observable state; skip-or-tick verdict for the launcher")
-    add_ns(p); add_cfg(p)  # --repo (required here unless --state-json) comes from add_ns
-    p.add_argument("--last", default="", help="the previous cycle's digest (empty on the first cycle)")
-    p.add_argument("--skips", type=int, default=0, help="consecutive skipped cycles so far")
-    p.add_argument("--force-after", type=int, default=None, help="full tick at least every N skips")
-    p.add_argument("--state-json", default=None,
-                   help='inject {"issues":[…],"prs":[…],"claims":[…]}, skip gh/git (tests)')
-    p.set_defaults(fn=cmd_fingerprint)
-
-    # pace
-    p = sub.add_parser("pace", help="next launcher sleep in seconds (pure)")
-    g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("--summary"); g.add_argument("--stdin", action="store_true")
-    p.add_argument("--config", required=True, help="JSON config object")
-    p.set_defaults(fn=cmd_pace)
-
-    # next-attempt
-    p = sub.add_parser("next-attempt", help="retry-or-escalate from afk-attempt labels (pure)")
-    g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("--labels", help="comma-separated label names"); g.add_argument("--stdin", action="store_true")
-    add_cfg(p)
-    p.add_argument("--retry", type=int, default=None)
-    p.set_defaults(fn=cmd_next_attempt)
-
-    # subclassify
-    p = sub.add_parser("subclassify", help="classify one of my claims from its PR + checks (pure)")
-    add_cfg(p)
-    p.add_argument("--pr", default="none", help='"open" if an open PR closes it, else none')
-    p.add_argument("--checks", default=None, help="green|red|pending")
-    p.add_argument("--ci", default=None, choices=list(afk_decide.GATE_CI_MODES),
-                   help="gate.ci (default: from --config) — 'local' never reads checks")
-    p.set_defaults(fn=cmd_subclassify)
-
-    # worker-status — the decisive git PROGRESS signal for a no_pr claim (effectful, git-only)
-    p = sub.add_parser("worker-status", help="read a worker worktree's git progress (effectful, git-only)")
-    add_cfg(p)  # for the base_branch fallback
-    p.add_argument("--worktree", required=True, help="path to the worker's worktree")
-    p.add_argument("--base", default=None, help="base branch to count commits ahead of (default: config base_branch)")
-    p.set_defaults(fn=cmd_worker_status)
-
-    # takeover — the human-authorized, lease-skipping reclaim of a dead fleet (ADR-0011)
-    p = sub.add_parser("takeover",
-                       help="list the fleet instances GitHub remembers, or force-take a dead "
-                            "one's claims (skips the staleness gate; effectful)")
-    add_ns(p); add_cfg(p)
+    p = command("takeover", cmd_takeover, remote="refs",
+                help="list the fleet instances GitHub remembers, or force-take a dead "
+                     "one's claims (skips the staleness gate)")
+    stamp(p)
     p.add_argument("--list", action="store_true",
                    help="show every discoverable instance: heartbeat age, host, claim count")
-    p.add_argument("--instance", default=None,
-                   help="the instance to take FROM (the dead one). NOTE: every other subcommand's "
-                        "--instance is your own id; here yours is --as")
-    p.add_argument("--as", dest="me", default=None,
-                   help="my instance id — every taken claim is re-stamped with it")
+    p.add_argument("--from", dest="source", default=None,
+                   help="the dead instance whose claims to take")
     p.add_argument("--yes", action="store_true",
                    help="confirm a takeover of an instance whose heartbeat is still FRESH "
                         "(it looks alive; you are asserting you know it is dead)")
-    p.add_argument("--host", default=socket.gethostname())
-    p.add_argument("--ttl", type=int, default=None)
-    p.add_argument("--now", type=int, default=None)
-    p.set_defaults(fn=cmd_takeover)
+    p.add_argument("--ttl", type=int, default=None, help=ttl_help)
 
-    # recovery — the tiered continuation verdict for one DEAD claim (ADR-0011)
-    p = sub.add_parser("recovery",
-                       help="does a dead claim have recoverable progress, and where? → the "
-                            "tiered continuation verdict (effectful: orca list + git)")
-    add_ns(p); add_cfg(p)
+    p = command("release", cmd_release, "delete a claim ref (idempotent)", remote="refs")
+    p.add_argument("number", type=int)
+
+    p = command("heartbeat", cmd_heartbeat, "refresh my heartbeat if due", remote="refs")
+    mine(p)
+    p.add_argument("--ttl", type=int, default=None, help=ttl_help)
+
+    # --- observation ---
+    p = command("fingerprint", cmd_fingerprint, remote="gh",
+                help="digest observable state; skip-or-tick verdict for the launcher")
+    p.add_argument("--last", default="", help="the previous cycle's digest (empty on the first cycle)")
+    p.add_argument("--skips", type=int, default=0, help="consecutive skipped cycles so far")
+    p.add_argument("--force-after", type=int, default=None,
+                   help="force_tick_after_skips override")
+
+    p = command("rebuild", cmd_rebuild, "gather + assemble the tick's working set (read-only)",
+                remote="gh")
+    mine(p)
+    p.add_argument("--ttl", type=int, default=None, help=ttl_help)
+    p.add_argument("--ready-label", default=None, help="ready_label override")
+    p.add_argument("--epic-labels", type=_csv, default=None, help="epic_labels override (csv)")
+    p.add_argument("--ci", default=None, choices=list(afk_decide.GATE_CI_MODES),
+                   help="gate.ci override")
+
+    p = command("no-pr", cmd_no_pr, remote="gh",
+                help="why one of my claims has no PR → coding / idle_done / idle_blocked / "
+                     "idle_failed / dead, gathered and decided in one call")
     p.add_argument("--issue", dest="number", type=int, required=True)
-    p.add_argument("--base", default=None, help="base branch (default: config base_branch)")
+    p.add_argument("--terminal", choices=["busy", "idle", "none"], required=True,
+                   help="the orca probe: busy | idle | none (no live worker)")
+    p.add_argument("--terminal-idle-seconds", type=int, default=None,
+                   help="seconds since the terminal last showed activity, if the probe says")
+    p.add_argument("--worktree", default=None,
+                   help="the worker's worktree (omit only if none exists)")
+    p.add_argument("--base", default=None, help="base_branch override")
+    p.add_argument("--grace", type=int, default=None, help="worker_idle_grace_seconds override")
+
+    p = command("recovery", cmd_recovery, remote="refs",
+                help="does a dead claim have recoverable progress, and where? → the "
+                     "tiered continuation verdict")
+    p.add_argument("--issue", dest="number", type=int, required=True)
+    p.add_argument("--base", default=None, help="base_branch override")
     p.add_argument("--branch", default=None,
                    help="the issue's work branch, when already known (skips discovery)")
     p.add_argument("--worktree", default=None,
                    help="path to the issue's worktree, when already known (skips the orca read)")
     p.add_argument("--no-worktree", action="store_true",
                    help="assert no local worktree survives (skips the orca read)")
-    p.add_argument("--orca-json", default=None,
-                   help="inject `orca worktree list --json` (tests / no orca)")
-    p.set_defaults(fn=cmd_recovery)
 
-    # verdict — the worker's declared reason for opening no PR (effect gather + pure parse)
-    p = sub.add_parser("verdict", help="latest parsed afk:verdict marker on an issue (effectful)")
-    p.add_argument("--repo", default=None, help="owner/name (for gh api; required unless --comments-json)")
-    p.add_argument("--issue", dest="number", type=int, required=True)
-    p.add_argument("--comments-json", default=None, help="inject issue comments, skip gh (tests)")
-    p.set_defaults(fn=cmd_verdict)
+    # --- act ---
+    p = command("gate-run", cmd_gate_run,
+                "run the configured local gate in a worktree → {status, excerpt}")
+    p.add_argument("--worktree", required=True, help="worktree to run the gate in")
+    p.add_argument("--command", default=None, help="gate.local_command override")
+    p.add_argument("--timeout", type=int, default=1800,
+                   help="seconds before the run is called red (default 1800)")
+    p.add_argument("--excerpt-lines", type=int, default=afk_decide.GATE_EXCERPT_LINES,
+                   help="how many trailing log lines the excerpt keeps")
 
-    # classify-no-pr — the 5-way no_pr verdict (pure) from the tick's gathered signals
-    p = sub.add_parser("classify-no-pr", help="5-way no_pr verdict: coding/idle_done/idle_blocked/idle_failed/dead (pure)")
-    add_cfg(p)
-    p.add_argument("--progress", default=None, help="JSON from `afk worker-status` ({} if unknown)")
-    p.add_argument("--terminal", choices=["busy", "idle", "none"], required=True,
-                   help="orca liveness probe: busy | idle | none (no live worker)")
-    p.add_argument("--idle-seconds", type=int, default=None,
-                   help="seconds since the worker's last observable activity")
-    p.add_argument("--verdict", default=None, help="JSON from `afk verdict` (omit if none)")
-    p.add_argument("--blocked-by-open", action="store_true",
-                   help="set iff any blocked_by issue is still open (blocked verdict only)")
-    p.add_argument("--grace", type=int, default=None, help="worker_idle_grace_seconds override")
-    p.set_defaults(fn=cmd_classify_no_pr)
+    p = command("status", cmd_status, remote="gh",
+                help="upsert the human-facing progress status board comment (idempotent)")
+    p.add_argument("number", type=int)
+    p.add_argument("--phase", required=True, choices=list(afk_decide.STATUS_PHASES),
+                   help="the lifecycle phase — a `mine` row's board_phase, or merged / escalated")
+    p.add_argument("--instance", default=None, help="owning fleet instance id (shown in the header)")
+    p.add_argument("--pr", type=int, default=None, help="the PR number, once one is open")
+    p.add_argument("--attempt", type=int, default=0, help="current attempt n (shown for ci_failed)")
+
+    p = command("next-attempt", cmd_next_attempt, "retry-or-escalate from afk-attempt labels")
+    p.add_argument("--labels", type=_csv, required=True, help="the issue's label names (csv)")
+    p.add_argument("--retry", type=int, default=None, help="retry override")
+
+    p = command("pace", cmd_pace, "next launcher sleep in seconds")
+    p.add_argument("--summary", required=True, help="the last tick summary JSON")
 
     return ap
 
@@ -1027,7 +874,7 @@ def main():
     a = build_parser().parse_args()
     try:
         result = a.fn(a)
-    except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as e:
+    except (OSError, ValueError, RuntimeError) as e:
         print(json.dumps({"error": str(e)}, ensure_ascii=False))
         sys.exit(3)
     print(json.dumps(result, ensure_ascii=False, indent=2))
