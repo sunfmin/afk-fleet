@@ -360,12 +360,22 @@ def heartbeat_due(last_ts, now, ttl):
     return (now - int(last_ts)) > ttl / 3.0
 
 
+def claim_last_seen(claim, heartbeat_ts):
+    """A new claim grants its owner one bounded TTL to write its first heartbeat.
+    Later heartbeats renew that lease; immutable claim timestamps cannot extend
+    it forever. Legacy/malformed claims without a timestamp still need a beat."""
+    if claim.get("instance") is None:
+        return None
+    timestamps = [ts for ts in (claim.get("ts"), heartbeat_ts) if isinstance(ts, int)]
+    return max(timestamps) if timestamps else None
+
+
 def classify_claims(claims, heartbeats, me, now, ttl):
     """
     Partition every afk-claim ref by ownership and owner-liveness — the verdict a
     wrong answer would silently corrupt (ADR-0003).
 
-      claims:     [{"number": int, "instance": str}, ...]  (from refs/afk/claim/*)
+      claims:     [{"number": int, "instance": str, "ts": int}, ...] (claim refs)
       heartbeats: {instance_id: last_ts_epoch}             (from refs/afk/heartbeat/*)
       me:         my instance id
       now, ttl:   epoch seconds / claim_lease_ttl seconds
@@ -374,8 +384,8 @@ def classify_claims(claims, heartbeats, me, now, ttl):
       mine       — stamped with my instance; I reconcile these locally (a no-PR/
                    no-live-worker one is an *orphaned claim*, decided by the tick
                    with the worker liveness probe — not here).
-      peer_live  — a peer owns it AND its heartbeat is within ttl → never touch.
-      stale      — a peer owns it AND its heartbeat is missing/expired → the only
+      peer_live  — a peer owns it AND its heartbeat or claim is within ttl.
+      stale      — a peer owns it AND both timestamps are missing/expired → the only
                    foreign claim I may reclaim (--force-with-lease takeover).
     A claim whose marker names no instance is treated as a peer's and, lacking a
     heartbeat, is reclaimable.
@@ -386,7 +396,7 @@ def classify_claims(claims, heartbeats, me, now, ttl):
         inst = c.get("instance")
         if inst is not None and inst == me:
             mine.append(n)
-        elif is_stale(heartbeats.get(inst), now, ttl):
+        elif is_stale(claim_last_seen(c, heartbeats.get(inst)), now, ttl):
             stale.append(n)
         else:
             peer_live.append(n)
@@ -419,6 +429,10 @@ def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=Fals
                        (`local`: an open PR, whatever its        (`local`: pr_open)
                        remote checks say)
 
+    In `required` mode absent checks also route to `awaiting_merge`, with board
+    phase `pr_open`. `merge` returns `no_checks` for explicit progressive-gate
+    judgment; the absence of CI is never a green verdict by itself.
+
     In `local` mode (ADR-0012) there are no checks to wait on: gating is an
     **action the tick takes at merge time** (sync → re-run the local gate → merge),
     not an observation it waits for. So every open PR is `awaiting_merge` — a red
@@ -436,7 +450,10 @@ def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=Fals
         # whatever the checks say: re-running the merge against the same head would
         # hit the same conflict and hand it back again, every cycle
         return "handed_back", "handed_back"
-    if ci_mode == "local":
+    if ci_mode == "local" or checks_state is None:
+        # Absent checks need the explicit progressive-gate judgment in `merge`
+        # (`no_checks` / --allow-no-checks), not an endless wait for existing CI.
+        # Keep the board at pr_open: no machine gate has passed yet.
         return "awaiting_merge", "pr_open"
     if checks_state == "green":
         return "awaiting_merge", "awaiting_merge"
@@ -879,7 +896,9 @@ def group_instances(claims, heartbeats, me, now, ttl):
                     "claim_count": len(nums),
                     "heartbeat_ts": ts,
                     "heartbeat_age": None if ts is None else int(now) - int(ts),
-                    "fresh": ts is not None and not is_stale(ts, now, ttl),
+                    "fresh": (inst is not None and (not is_stale(ts, now, ttl) or any(
+                        not is_stale(claim_last_seen(c, ts), now, ttl)
+                        for c in claims or [] if c.get("instance") == inst))),
                     "is_me": inst is not None and inst == me})
     out.sort(key=lambda r: (-r["claim_count"], r["instance"] is None, str(r["instance"])))
     return out
@@ -906,7 +925,9 @@ def plan_takeover(claims, heartbeats, target, me, now, ttl, confirmed=False):
                    for c in claims or [] if c.get("instance") == target),
                   key=lambda r: (r["number"] is None, r["number"]))
     ts = (heartbeats or {}).get(target)
-    fresh = ts is not None and not is_stale(ts, now, ttl)
+    fresh = target is not None and (not is_stale(ts, now, ttl) or any(
+        not is_stale(claim_last_seen(c, ts), now, ttl)
+        for c in claims or [] if c.get("instance") == target))
     known = ts is not None or bool(rows)
 
     def out(action, detail):
@@ -921,10 +942,10 @@ def plan_takeover(claims, heartbeats, target, me, now, ttl, confirmed=False):
                            else "that instance holds no claims (nothing to take)")
     if fresh and not confirmed:
         return out("confirm",
-                   f"that fleet's heartbeat is only {int(now) - int(ts)}s old (lease {int(ttl)}s) — "
+                   f"that fleet has a fresh heartbeat or claim (lease {int(ttl)}s) — "
                    f"it looks ALIVE; forcing a takeover steals its live work if you are wrong")
     return out("take", f"taking {len(rows)} claim(s) from {target}"
-                       + (" (fresh heartbeat, human-confirmed)" if fresh else ""))
+                       + (" (fresh lease, human-confirmed)" if fresh else ""))
 
 
 # --------------------------------------------------------------------------- #
@@ -1605,7 +1626,7 @@ def resolve_worker_command(base_url, supplied=None, resolved=None, runtime="clau
                 supplied command is ignored (ADR-0014).
       base_url: the launcher's own ANTHROPIC_BASE_URL (None/"" = stock Anthropic).
       supplied: the human's answer, verbatim, or None if they haven't been asked.
-      resolved: what the shell says `first_word(supplied)` is — the `type` output
+      resolved: what the shell says `first_word(supplied)` is — `command -V` output
                 (an alias's full expansion, a function body, a path), or None if
                 it resolves to nothing. Only meaningful when `supplied` is given.
 
@@ -1644,7 +1665,8 @@ def resolve_worker_command(base_url, supplied=None, resolved=None, runtime="clau
         # An alias resolution shows its whole expansion and `claude` is its own
         # whole story, so a missing flag there is a fact. A path or a function in
         # another file could carry the flag inside — that is unknown, not absent.
-        seen_whole = " is an alias for " in resolved or fw == "claude"
+        seen_whole = (" is an alias for " in resolved or " is aliased to " in resolved
+                      or fw == "claude")
         visible = f"{supplied}\n{resolved}"
         yolo = True if any(f in visible for f in YOLO_FLAGS) else (False if seen_whole else None)
         return out("confirmed", command=supplied.strip(), yolo=yolo, detail=resolved.strip())
@@ -1809,7 +1831,7 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
     Returns:
       {"frontier": {"dispatch": [{"number","title"}...], "excluded": [...]},
        "mine": [{"number","title","status","board_phase","pr","checks",
-                 "attempt"}...],
+                 "attempt","sha"}...],  # sha feeds release --expect-sha
        "peer_live": [{"number","instance"}...],
        "stale": [{"number","instance","sha"}...],   # sha feeds reclaim --expect-sha
        "free_slots": <how many workers may be dispatched: concurrency - len(mine)>,
@@ -1840,6 +1862,7 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
                                              closed=n in set(closed),
                                              handed_back=n in set(handed_back))
         mine.append({"number": n, "title": issue.get("title"),
+                     "sha": by_claim.get(n, {}).get("sha"),
                      "status": status, "board_phase": board_phase,
                      "pr": pr.get("number") if pr else None, "checks": checks,
                      "attempt": current_attempt(issue.get("labels"))})

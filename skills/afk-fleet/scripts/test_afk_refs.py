@@ -174,7 +174,8 @@ def test_classify_claims_partitions_real_refs():
     with sandbox() as sb:
         w = sb.clones[0]
         for n, inst in ((1, "me"), (2, "peer-live"), (3, "peer-dead"), (4, "peer-silent")):
-            assert afk(w, "claim", str(n), "--instance", inst, "--now", str(T0))["won"], n
+            assert afk(w, "claim", str(n), "--instance", inst,
+                       "--now", str(T0 - TTL - 60))["won"], n
 
         # heartbeats written at pinned times: fresh, long expired, and (peer-silent)
         # never written at all — an owner that never beat counts as dead
@@ -189,7 +190,7 @@ def test_classify_claims_partitions_real_refs():
         # the scan behind it reports each claim's owner, host and the sha reclaim needs
         claims = {c["number"]: c for c in afk(w, "scan")["claims"]}
         assert claims[3]["instance"] == "peer-dead" and claims[3]["sha"]
-        assert claims[3]["host"] and claims[3]["ts"] == T0
+        assert claims[3]["host"] and claims[3]["ts"] == T0 - TTL - 60
         assert afk(w, "scan")["heartbeats"]["peer-dead"] == T0 - TTL - 60
 
 
@@ -198,7 +199,8 @@ def test_stale_reclaim_is_an_atomic_compare_and_swap():
     fleets that both saw the same stale claim cannot both take it."""
     with sandbox(clones=2) as sb:
         a, b = sb.clones
-        assert afk(a, "claim", "5", "--instance", "dead-peer", "--now", str(T0))["won"]
+        assert afk(a, "claim", "5", "--instance", "dead-peer",
+                   "--now", str(T0 - TTL - 1))["won"]
 
         # both fleets read the same sha (the same stale claim, seen at the same time)
         seen = {c["number"]: c["sha"] for c in afk(a, "scan")["claims"]}[5]
@@ -256,14 +258,15 @@ def test_release_is_idempotent_and_the_claim_is_really_gone():
     issue, so release must be safe to repeat and must actually disappear."""
     with sandbox() as sb:
         w = sb.clones[0]
-        afk(w, "claim", "9", "--instance", "me", "--now", str(T0))
+        claim = afk(w, "claim", "9", "--instance", "me", "--now", str(T0))
         afk(w, "claim", "10", "--instance", "me", "--now", str(T0))
 
-        first = afk(w, "release", "9")
+        guard = ("--expect-sha", claim["sha"])
+        first = afk(w, "release", "9", *guard)
         assert first == {"released": True, "issue": 9, "ref": "refs/afk/claim/9"}
         # already gone counts as released — the terminal transitions call this blind
-        assert afk(w, "release", "9")["released"] is True
-        assert afk(w, "release", "404")["released"] is True
+        assert afk(w, "release", "9", *guard)["released"] is True
+        assert afk(w, "release", "404", *guard)["released"] is True
 
         assert sb.remote_ref("refs/afk/claim/9") == ""
         # the scan's local mirror is pruned too, so a later tick cannot see a ghost
@@ -282,16 +285,17 @@ def test_a_release_that_did_not_delete_the_claim_is_an_error():
         w = sb.clones[0]
         claim = afk(w, "claim", "9", "--instance", "me", "--now", str(T0))
 
-        err = afk_error(w, "release", "9", "--remote", "no-such-remote")
+        guard = ("--expect-sha", claim["sha"])
+        err = afk_error(w, "release", "9", *guard, "--remote", "no-such-remote")
         assert "no-such-remote" in err
         sb.forbid("refs/afk/")                                  # the server refuses the delete
-        err = afk_error(w, "release", "9")
+        err = afk_error(w, "release", "9", *guard)
         assert "still on the remote" in err and "refs/afk/claim/9" in err
         assert sb.remote_ref("refs/afk/claim/9") == claim["sha"]      # and it really is
 
         # the refusal is about THIS ref still existing, not about the push failing:
         # with the same server rule in force, a claim that is already gone is released
-        assert afk(w, "release", "404")["released"] is True
+        assert afk(w, "release", "404", *guard)["released"] is True
 
 
 def test_an_unreadable_remote_is_an_error_not_an_empty_fleet():
@@ -348,7 +352,7 @@ def test_probe_falls_back_when_the_server_rejects_the_hidden_namespace():
         hb = afk(w, "heartbeat", "--instance", "me", "--now", str(T0), *cfg)
         assert hb["refreshed"] and hb["ref"] == "refs/heads/afk-heartbeat/me"
         assert afk(w, "classify-claims", "--instance", "me", "--now", str(T0), *cfg)["mine"] == [12]
-        assert afk(w, "release", "12", *cfg)["released"] is True
+        assert afk(w, "release", "12", "--expect-sha", claim["sha"], *cfg)["released"] is True
         assert sb.remote_ref("refs/heads/afk-claim/12") == ""
 
         # on the config the probe was GIVEN, the blocked namespace is an error —
@@ -381,7 +385,7 @@ def test_a_failed_push_is_an_error_not_a_lost_race():
     with sandbox() as sb:
         w = sb.clones[0]
         bad = ("--remote", "no-such-remote")
-        assert "not a lost race" in afk_error(w, "claim", "7", "--instance", "me", *bad)
+        assert "lost race" in afk_error(w, "claim", "7", "--instance", "me", *bad)
         assert sb.remote_ref("refs/afk/claim/7") == ""
 
         # same for a reclaim: the claim has NOT moved, so a failed push is not a loss
@@ -454,12 +458,12 @@ def test_every_ref_op_round_trips_under_the_refs_heads_fallback():
         # a losing create and a lease-checked takeover both behave the same here
         assert afk(w, "claim", "12", "--instance", "peer", *NS, "--now", str(T0))["won"] is False
         taken = afk(w, "reclaim", "12", "--instance", "peer", *NS,
-                    "--expect-sha", scan["claims"][0]["sha"], "--now", str(T0 + 1))
+                    "--expect-sha", scan["claims"][0]["sha"], "--now", str(T0 + TTL + 1))
         assert taken["won"] is True
         assert afk(w, "reclaim", "12", "--instance", "third", *NS,
-                   "--expect-sha", scan["claims"][0]["sha"], "--now", str(T0 + 2))["won"] is False
+                   "--expect-sha", scan["claims"][0]["sha"], "--now", str(T0 + TTL + 2))["won"] is False
 
-        assert afk(w, "release", "12", *NS)["released"] is True
+        assert afk(w, "release", "12", "--expect-sha", taken["sha"], *NS)["released"] is True
         assert afk(w, "scan", *NS)["claims"] == []
         assert sb.remote_ref("refs/heads/afk-claim/12") == ""
 
@@ -471,7 +475,8 @@ def test_takeover_lists_and_force_takes_a_dead_fleet():
     with sandbox() as sb:
         w = sb.clones[0]
         for n in (21, 22):
-            assert afk(w, "claim", str(n), "--instance", "dead-fleet", "--now", str(T0))["won"]
+            assert afk(w, "claim", str(n), "--instance", "dead-fleet",
+                       "--now", str(T0 - TTL - 99))["won"]
         assert afk(w, "claim", "23", "--instance", "live-fleet", "--now", str(T0))["won"]
         afk(w, "heartbeat", "--instance", "dead-fleet",
             "--now", str(T0 - TTL - 99))

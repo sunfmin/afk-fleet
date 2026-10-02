@@ -359,14 +359,14 @@ finish(error="fake orca: unsupported call %%r" %% (argv,))
 # "not found" on STDOUT and exits 1 — the trap `_login_shell` exists to avoid.
 FAKE_SHELL = r'''#!%(python)s
 import sys
-assert sys.argv[1] == "-ic", sys.argv
+assert sys.argv[1] == "-lic", sys.argv
 script = sys.argv[2]
 ALIASES = {"ckimi": "(eval x && claude --dangerously-skip-permissions)", "cplain": "claude"}
 if script == "alias":
     print("\n".join("%%s='%%s'" %% kv for kv in ALIASES.items()) + "\nll='ls -lah'")
     sys.exit(0)
-assert script.startswith("type -- "), script
-word = script[len("type -- "):]
+assert script.startswith("command -V "), script
+word = script[len("command -V "):]
 if word in ALIASES:
     print("%%s is an alias for %%s" %% (word, ALIASES[word]))
     sys.exit(0)
@@ -558,9 +558,7 @@ WORKER = "ckimi --dangerously-skip-permissions"     # the run's worker launch co
 
 
 def dispatch(n, *extra, instance="me"):
-    """The argv of one `afk dispatch`. A claim marker is a commit of (instance, host,
-    ts), so a re-dispatch at the very same `--now` pushes the identical sha and reads
-    as `won` again; a test asserting `held` passes a later one, as a later tick would."""
+    """The argv of one `afk dispatch`; every new claim has a unique generation."""
     return ("dispatch", "--issue", str(n), "--instance", instance, "--worker-command", WORKER,
             *R, *NOW, *extra)
 
@@ -594,7 +592,8 @@ def test_rebuild_assembles_the_working_set_from_gh_and_refs():
               issue(9, "ready-for-agent", state="closed")]        # gh never lists it
     with world(issues=issues, prs=[pr(30, closes=3)]) as w:
         for n, inst in ((3, "me"), (4, "me"), (5, "peer-live"), (6, "peer-dead")):
-            assert w.afk("claim", str(n), "--instance", inst, "--now", str(T0), *R)["won"]
+            assert w.afk("claim", str(n), "--instance", inst,
+                         "--now", str(T0 - TTL - 60), *R)["won"]
         w.afk("heartbeat", "--instance", "peer-live", "--now", str(T0 - 60), *R)
         w.afk("heartbeat", "--instance", "peer-dead", "--now", str(T0 - TTL - 60), *R)
         w.calls()
@@ -682,7 +681,8 @@ def test_rebuild_reports_free_slots_and_a_claim_whose_issue_is_closed():
         assert w.afk("rebuild", *ME, *R, *NOW, "--set", "concurrency=1")["free_slots"] == 0
 
         # the one thing left to do for it
-        w.afk("release", "2", *R)
+        w.afk("release", "2", "--expect-sha", next(m["sha"] for m in ws["mine"]
+                                                     if m["number"] == 2), *R)
         ws = w.afk("rebuild", *ME, *R, *NOW)
         assert [m["number"] for m in ws["mine"]] == [3] and ws["free_slots"] == 2
 
@@ -764,7 +764,7 @@ def test_cycle_gates_paces_and_beats_through_a_whole_run():
         assert top(red["state"])["reason"] == "changed"
 
         # the fleet goes quiet: #1 merged and released, nothing left on the frontier
-        w.afk("release", "1", *R)
+        w.afk("release", "1", "--expect-sha", w.sb.remote_ref("refs/afk/claim/1"), *R)
         st = top(red["state"])["state"]
         idle = ticked(st, merged=[1])                                 # work was done: not empty
         assert (idle["state"]["empty_streak"], idle["sleep_seconds"]) == (0, 90)
@@ -1926,7 +1926,7 @@ def test_fail_retries_from_a_clean_base_then_escalates_when_exhausted():
     with world(issues=[issue(6, "ready-for-agent")]) as w:
         w.afk("claim", "6", "--instance", "peer", *NOW, *R)
         assert "not this fleet's claim" in w.error(*_fail(6, "x"))
-        w.afk("release", "6", *R)
+        w.afk("release", "6", "--expect-sha", w.sb.remote_ref("refs/afk/claim/6"), *R)
         w.afk("claim", "6", *ME, *NOW, *R)
         r = w.afk(*_fail(6, "gave up", "--set", "retry=0"))
         assert (r["action"], r["attempt"], r["pr"]) == ("escalate", 0, None)

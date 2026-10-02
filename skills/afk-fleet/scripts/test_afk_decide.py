@@ -98,7 +98,7 @@ def test_subclassify_pr():
     assert d.subclassify_pr(True, "green", "required") == ("awaiting_merge", "awaiting_merge")
     assert d.subclassify_pr(True, "red", "required") == ("failure", "ci_failed")
     assert d.subclassify_pr(True, "pending", "required") == ("awaiting_ci", "pr_open")
-    assert d.subclassify_pr(True, None, "required") == ("awaiting_ci", "pr_open")
+    assert d.subclassify_pr(True, None, "required") == ("awaiting_merge", "pr_open")
     # with no PR the checks are nobody's: stale rollup data cannot invent a status
     assert d.subclassify_pr(False, "green", "required") == ("no_pr", "claimed")
 

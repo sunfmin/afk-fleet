@@ -37,6 +37,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 
 import afk_decide
 
@@ -104,11 +105,13 @@ def _gh(args, check=True):
     return p
 
 
-def _marker_commit(kind, instance, ts, host=None):
+def _marker_commit(kind, instance, ts, host=None, generation=None):
     """A parentless commit on the empty tree whose subject is the marker
     `<kind> instance=<id> [host=<host>] ts=<epoch>` (`_parse_marker` reads it
     back). Its sha is what we push to a ref; it drags no repo history along."""
     parts = [kind, f"instance={instance}", *([f"host={host}"] if host else []), f"ts={int(ts)}"]
+    if generation:
+        parts.append(f"generation={generation}")
     empty_tree = _git(["hash-object", "-t", "tree", "/dev/null"]).stdout.strip()
     return _git(["commit-tree", empty_tree, "-m", " ".join(parts)]).stdout.strip()
 
@@ -124,13 +127,28 @@ def _parse_marker(subject):
 
 
 def _read_marker(remote, refname):
-    """Fetch one ref by name and return its parsed marker, or None if it could
-    not be fetched (absent, or the remote is unreachable)."""
-    p = _git(["fetch", remote, refname], check=False)
-    if p.returncode != 0:
-        return None
-    subject = _git(["log", "-1", "--format=%s", "FETCH_HEAD"], check=False).stdout.strip()
-    return _parse_marker(subject)
+    """Read a marker from one fetched snapshot; absent is None, unreadable raises."""
+    return _read_ref_marker(remote, refname)[1]
+
+
+def _read_ref_marker(remote, refname):
+    """Read an exact (sha, marker) pair without sharing FETCH_HEAD with a peer.
+    A ref removed during the fetch is absent; network/permission errors must not
+    masquerade as a missing heartbeat and authorize stealing a live claim."""
+    if not _remote_sha(remote, refname):
+        return "", None
+    local = f"refs/afk-read/{uuid.uuid4().hex}"
+    try:
+        p = _git(["fetch", "--no-write-fetch-head", remote, f"{refname}:{local}"], check=False)
+        if p.returncode != 0:
+            if not _remote_sha(remote, refname):
+                return "", None
+            raise RuntimeError(f"fetch of {refname} failed: {p.stderr.strip()}")
+        sha = _git(["rev-parse", local]).stdout.strip()
+        subject = _git(["log", "-1", "--format=%s", sha]).stdout.strip()
+        return sha, _parse_marker(subject)
+    finally:
+        _git(["update-ref", "-d", local])
 
 
 def _remote_sha(remote, refname):
@@ -344,12 +362,15 @@ def cmd_classify_claims(a):
 def _claim(rem, cfg, number, instance, now, host):
     """Atomically create one claim ref → {"won", …}; `won: false` names the `owner`."""
     ref = _claim_ref(cfg, number)
-    sha = _marker_commit("afk-claim", instance, now, host=host)
+    sha = _marker_commit("afk-claim", instance, now, host=host, generation=uuid.uuid4().hex)
     # Create-only: the server rejects a ref that already exists → that is the CAS.
-    p = _git(["push", rem, f"{sha}:{ref}"], check=False)
+    p = _git(["push", rem, f"--force-with-lease={ref}:", f"{sha}:{ref}"], check=False)
     if p.returncode == 0:
         return {"won": True, "issue": number, "ref": ref, "sha": sha, "instance": instance}
-    owner = _read_marker(rem, ref)  # who beat us
+    try:
+        owner = _read_marker(rem, ref)  # who beat us
+    except RuntimeError as e:
+        raise RuntimeError(f"claim push to {ref} failed; cannot establish a lost race: {e}") from e
     if owner is None:
         raise RuntimeError(f"claim push to {ref} failed and no such claim exists on the "
                            f"remote, so this is not a lost race: {p.stderr.strip()}")
@@ -366,8 +387,9 @@ def _force_take(rem, ref, number, expect_sha, instance, now, host):
     the ref still points at the sha we read. The single mechanism behind both an
     unattended stale reclaim and a human-authorized takeover — they differ only in
     what gates the *choice* of claim (an expired lease vs a present human), never
-    in the push, so a takeover is exactly as safe against a live peer."""
-    sha = _marker_commit("afk-claim", instance, now, host=host)
+    in the push. The CAS protects this claim's generation, not the separately
+    stored heartbeat or already-started external actions."""
+    sha = _marker_commit("afk-claim", instance, now, host=host, generation=uuid.uuid4().hex)
     p = _git(["push", rem, f"--force-with-lease={ref}:{expect_sha}", f"{sha}:{ref}"], check=False)
     if p.returncode == 0:
         return {"won": True, "issue": number, "ref": ref, "sha": sha, "instance": instance}
@@ -378,8 +400,21 @@ def _force_take(rem, ref, number, expect_sha, instance, now, host):
 
 
 def cmd_reclaim(a):
-    return _force_take(_remote(a), _claim_ref(_cfg(a), a.number), a.number, a.expect_sha,
-                       a.instance, _now(a), a.host)
+    cfg, rem, now = _cfg(a), _remote(a), _now(a)
+    ref = _claim_ref(cfg, a.number)
+    sha, owner = _read_ref_marker(rem, ref)
+    if sha != a.expect_sha or owner is None:
+        return {"won": False, "issue": a.number, "ref": ref, "reason": "claim changed"}
+    heartbeat = (_read_marker(rem, _heartbeat_ref(cfg, owner["instance"])) or {}).get("ts") \
+        if owner.get("instance") else None
+    if not afk_decide.is_stale(afk_decide.claim_last_seen(owner, heartbeat), now,
+                               cfg["claim_lease_ttl_seconds"]):
+        return {"won": False, "issue": a.number, "ref": ref,
+                "reason": "owner live", "owner": owner}
+    # This fresh liveness read is not an atomic transaction with the heartbeat
+    # ref. The claim CAS and transition fences protect ownership generations;
+    # they cannot serialize git refs with an already-started GitHub mutation.
+    return _force_take(rem, ref, a.number, a.expect_sha, a.instance, now, a.host)
 
 
 def cmd_takeover(a):
@@ -425,31 +460,52 @@ def cmd_takeover(a):
                          if lost else "")}
 
 
-def _release(rem, cfg, number):
-    """Delete one claim ref. Already gone counts as released — idempotent cleanup.
-    A delete that failed with the claim still there is a phantom lock in the
-    making, so it raises."""
+def _release(rem, cfg, number, expect_sha):
+    """Compare-and-delete the observed generation, never a successor's claim.
+    Absence is idempotent success; ownership loss is distinct from a failed push."""
     ref = _claim_ref(cfg, number)
-    p = _git(["push", rem, "--delete", ref], check=False)
-    if p.returncode != 0 and _remote_sha(rem, ref):
+    if not expect_sha:
+        raise ValueError("release requires the observed claim SHA")
+    p = _git(["push", rem, f"--force-with-lease={ref}:{expect_sha}", f":{ref}"], check=False)
+    current = _remote_sha(rem, ref)
+    if current and current != expect_sha:
+        return {"released": False, "issue": number, "ref": ref, "reason": "claim changed"}
+    if current:
         raise RuntimeError(f"release failed and {ref} is still on the remote: "
                            f"{p.stderr.strip()}")
     return {"released": True, "issue": number, "ref": ref}
 
 
 def cmd_release(a):
-    return _release(_remote(a), _cfg(a), a.number)
+    return _release(_remote(a), _cfg(a), a.number, a.expect_sha)
+
+
+class ClaimLostError(RuntimeError):
+    """The observed claim generation is no longer owned by this transition."""
 
 
 def _require_mine(rem, cfg, number, instance):
     """Refuse to settle a claim this fleet does not hold: every transition that
     merges, relabels or releases an issue acts on MY claim only (ADR-0003)."""
     ref = _claim_ref(cfg, number)
-    owner = _read_marker(rem, ref) if _remote_sha(rem, ref) else None
+    sha, owner = _read_ref_marker(rem, ref)
     if owner is None or owner.get("instance") != instance:
         held = f"held by {owner.get('instance')!r}" if owner else "not claimed at all"
-        raise RuntimeError(f"issue #{number} is not this fleet's claim ({ref} is {held}); "
+        raise ClaimLostError(f"issue #{number} is not this fleet's claim ({ref} is {held}); "
                            f"nothing was changed")
+    return sha
+
+
+def _require_claim(rem, cfg, number, instance, expect_sha):
+    """Fence a later step against the exact generation captured at entry.
+    `_require_mine` already authenticated the immutable marker, so the same SHA
+    proves the same owner without fetching/parsing it again. This pre-action
+    check is not atomic exclusion across GitHub API calls."""
+    sha = _remote_sha(rem, _claim_ref(cfg, number))
+    if not expect_sha or sha != expect_sha:
+        raise ClaimLostError(f"issue #{number}'s claim generation changed; "
+                             f"stopping {instance}'s transition")
+    return sha
 
 
 def _beat(rem, cfg, instance, now):
@@ -568,12 +624,12 @@ def _login_shell(script, timeout=20):
     (verified: orca terminals run `zsh -l` with `-i` set). Never raises: a shell
     that is missing, slow, or noisy must degrade to "unknown", not abort bootstrap.
 
-    Empty on a NON-ZERO exit, which is the whole point for `type`: zsh prints
+    Supports POSIX-style sh, bash and zsh. Empty on a NON-ZERO exit: zsh prints
     "ckim not found" on **stdout** and exits 1, so trusting stdout alone would
     wave the one typo this check exists to catch straight through to dispatch."""
     shell = os.environ.get("SHELL") or "/bin/zsh"
     try:
-        p = subprocess.run([shell, "-ic", script], capture_output=True, text=True,
+        p = subprocess.run([shell, "-lic", script], capture_output=True, text=True,
                            timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -595,7 +651,11 @@ def cmd_worker_command(a):
     what keeps every credential inside whatever wrapper the human already trusts —
     the fleet copies no env, writes no file, and puts no key on any command line."""
     fw = afk_decide.first_word(a.check)
-    resolved = _login_shell(f"type -- {shlex.quote(fw)}") if fw else None
+    # `type --` fails on dash/sh; command -V preserves alias/function descriptions
+    # across sh/bash/zsh. Never execute the candidate, and reject option-shaped
+    # names rather than let a shell interpret them as command's flags.
+    resolved = (_login_shell(f"command -V {shlex.quote(fw)}")
+                if fw and not fw.startswith("-") else None)
     result = afk_decide.resolve_worker_command(
         os.environ.get("ANTHROPIC_BASE_URL"), a.check, resolved,
         afk_decide.detect_runtime(os.environ))
@@ -856,7 +916,7 @@ def _remove_worktree(path):
         return {"removed": False, "path": path, "detail": str(e)}
 
 
-def _discard_attempt(a, cfg, rem, number):
+def _discard_attempt(a, cfg, rem, number, claim_sha):
     """Throw the previous attempt away, for a FRESH start: close the PRs the fleet
     opened for the issue, delete its work branches on the remote, remove its
     worktree. What a retry means (the previous attempt is the thing that failed),
@@ -867,15 +927,18 @@ def _discard_attempt(a, cfg, rem, number):
     continuation from resuming the attempt that was discarded."""
     closed = []
     for pr in afk_decide.superseded_prs(_open_prs(a.repo), number, cfg["branch_pattern"]):
+        _require_claim(rem, cfg, number, a.instance, claim_sha)
         _gh(["pr", "close", str(pr["number"]), "--repo", a.repo, "--delete-branch", "--comment",
              "afk-fleet: superseded — this attempt failed and the issue is being retried "
              "from a clean base."])
         closed.append(pr["number"])
     deleted = []
     for branch in afk_decide.branch_candidates(_remote_heads(rem), cfg["branch_pattern"], number):
+        _require_claim(rem, cfg, number, a.instance, claim_sha)
         _git(["push", rem, "--delete", f"refs/heads/{branch}"])
         deleted.append(branch)
     path, _ = _issue_worktree(a.repo, number)
+    _require_claim(rem, cfg, number, a.instance, claim_sha)
     removed = _remove_worktree(path) if path else None
     if removed and not removed["removed"]:
         raise RuntimeError(f"could not remove the previous attempt's worktree {path}: "
@@ -941,7 +1004,7 @@ def _terminal_tail(handle):
     return afk_decide.stall_tail(shown.get("tail"))
 
 
-def _start_terminal(path, worker_command, prompt, ready_timeout):
+def _start_terminal(path, worker_command, prompt, ready_timeout, check_claim):
     """Start the worker in a worktree and submit its prompt → the terminal handle.
     Four steps, each of which has failed silently when a tick typed it: the agent
     is started with the run's OPAQUE worker launch command (never `--agent`,
@@ -951,6 +1014,7 @@ def _start_terminal(path, worker_command, prompt, ready_timeout):
     to have confirmed instead of starting — and that pointer is sent WITH
     `--enter` — typed but unsubmitted, a worker sits idle forever, indistinguishable
     from one that finished."""
+    check_claim()
     brief = _write_brief(path, prompt)
     prompt = _BRIEF_POINTER.format(brief=brief)
     term = _orca(["terminal", "create", "--worktree", f"path:{path}",
@@ -964,6 +1028,7 @@ def _start_terminal(path, worker_command, prompt, ready_timeout):
     if not wait.get("satisfied"):
         raise RuntimeError(f"the worker in {path} was not ready for a prompt within "
                            f"{ready_timeout}s (terminal {handle})")
+    check_claim()
     sent = _orca(["terminal", "send", "--terminal", handle, "--text", prompt,
                   "--enter"]).get("send") or {}
     if not sent.get("accepted"):
@@ -988,7 +1053,7 @@ def _prompt_fields(a, cfg, issue, path, branch):
             "launcher_terminal": os.environ.get("ORCA_TERMINAL_HANDLE", "")}
 
 
-def _start_worker(a, cfg, rem, issue, start, reason=None):
+def _start_worker(a, cfg, rem, issue, start, reason=None, claim_sha=None):
     """Put a worker on an issue this fleet already holds the claim for.
 
     `start` is "auto" — continue from whatever progress survives (the worktree
@@ -1000,12 +1065,17 @@ def _start_worker(a, cfg, rem, issue, start, reason=None):
     plus where the worker now is: {tier, action, prompt, reason, worktree, branch,
     terminal}."""
     number = issue["number"]
+    claim_sha = claim_sha or _require_mine(rem, cfg, number, a.instance)
+    def check_claim():
+        return _require_claim(rem, cfg, number, a.instance, claim_sha)
+    check_claim()
+    _beat(rem, cfg, a.instance, _now(a))
     if issue["state"] != "open":
         raise RuntimeError(f"issue #{number} is {issue['state']}, not open — there is nothing "
                            f"to retry (release the claim instead)")
     discarded, pr, handback = None, None, None
     if start == "fresh":
-        discarded = _discard_attempt(a, cfg, rem, number)
+        discarded = _discard_attempt(a, cfg, rem, number, claim_sha)
         plan = {"tier": 3, "action": "dispatch_fresh", "prompt": "fresh",
                 "reason": "fresh start: the previous attempt was discarded"}
     else:
@@ -1014,6 +1084,7 @@ def _start_worker(a, cfg, rem, issue, start, reason=None):
         pr = afk_decide.closing_pr(_open_prs(a.repo), number)
         handback = _open_handback(a.repo, pr) if pr else None
 
+    check_claim()
     if plan["action"] == "reuse_worktree":
         path = rec["worktree"]["path"]
         branch = _git(["-C", path, "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
@@ -1030,8 +1101,9 @@ def _start_worker(a, cfg, rem, issue, start, reason=None):
         prompt = afk_decide.render_worker_prompt(
             f.read(), plan["prompt"], _prompt_fields(a, cfg, issue, path, branch), reason=reason,
             handback=_handback_fields(pr, handback) if handback else None)
-    handle = _start_terminal(path, a.worker_command, prompt, a.ready_timeout)
+    handle = _start_terminal(path, a.worker_command, prompt, a.ready_timeout, check_claim)
     if cfg["progress_comment"]:
+        check_claim()
         if handback:
             _upsert_board(a.repo, number, cfg, "handed_back", instance=a.instance,
                           pr=pr["number"])
@@ -1066,7 +1138,8 @@ def cmd_dispatch(a):
     claim = _claim(rem, cfg, a.number, a.instance, _now(a), a.host)
     if not claim["won"] and claim["owner"].get("instance") != a.instance:
         return {"issue": a.number, "started": False, "claim": "lost", "owner": claim["owner"]}
-    started = _start_worker(a, cfg, rem, issue, a.start)
+    claim_sha = claim["sha"] if claim["won"] else _require_mine(rem, cfg, a.number, a.instance)
+    started = _start_worker(a, cfg, rem, issue, a.start, claim_sha=claim_sha)
     return {"issue": a.number, "started": True,
             "claim": "won" if claim["won"] else "held", **started}
 
@@ -1132,6 +1205,25 @@ def _unmerged(path):
     return [ln for ln in out.splitlines() if ln]
 
 
+def _require_clean_worktree(path, head=None):
+    """Reject code absent from the commit, including untracked inputs, without
+    deleting worker progress. Ignore build/dependency artifacts per gitignore;
+    their reproducibility remains the local gate command's responsibility.
+    With `head`, also detect commits/checkouts made during the gate."""
+    if head is not None:
+        current = _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip()
+        if current != head:
+            raise RuntimeError(f"the worktree {path} HEAD changed during the gate "
+                               f"({head} -> {current}); re-run against the new committed head")
+    dirty = _git(["-C", path, "status", "--porcelain", "--untracked-files=all",
+                  "--ignore-submodules=none"]).stdout.strip()
+    if dirty:
+        raise RuntimeError(f"the worktree {path} has uncommitted changes or untracked files — "
+                           f"what would be gated is not what would land. Commit them (a "
+                           f"resolved sync conflict must be committed) or move/discard them "
+                           f"yourself before retrying:\n{dirty}")
+
+
 def _sync(rem, path, target):
     """Merge the remote's `target` tip into the worktree's branch — never a rebase
     (ADR-0012) → the conflicted file list, empty when the sync is clean. A
@@ -1142,11 +1234,7 @@ def _sync(rem, path, target):
     files = _unmerged(path)
     if files:
         return files
-    dirty = _git(["-C", path, "status", "--porcelain", "--untracked-files=no"]).stdout.strip()
-    if dirty:
-        raise RuntimeError(f"the worktree {path} has uncommitted changes to tracked files — "
-                           f"what would be gated is not what would land. Commit them (a "
-                           f"resolved sync conflict must be committed) or discard them:\n{dirty}")
+    _require_clean_worktree(path)
     sha = _fetch_tip(rem, target, cwd=path)
     p = subprocess.run(["git", "-C", path, "merge", "--no-edit", sha],
                        capture_output=True, text=True)
@@ -1181,11 +1269,15 @@ def cmd_merge(a):
       needs_verify  `gate.adversarial_verify` is on and `--verified` does not name
                     the head that would land. Run the verifier on `head`, then
                     re-run with `--verified <head>`.
+      claim_lost    ownership changed during this transition; leave the successor's
+                    claim and worktree alone. `merged` says whether the merge call
+                    had already succeeded before that loss was observed.
 
-    The invariant every path keeps: what lands on the target was gated in the form
-    it lands (ADR-0012) — `gh pr merge` is pinned to the gated head."""
+    Gate evidence is bound to the observed committed head, and `gh pr merge` is
+    pinned to that head. Clean-worktree checks are not hermetic isolation and do
+    not atomically pin an independently advancing target branch; see completion-gate.md."""
     cfg, rem = _cfg(a), _remote(a)
-    _require_mine(rem, cfg, a.number, a.instance)
+    claim_sha = _require_mine(rem, cfg, a.number, a.instance)
     pr = afk_decide.closing_pr(_open_prs(a.repo), a.number)
     if pr is None:
         raise RuntimeError(f"no open PR closes issue #{a.number} — nothing to merge")
@@ -1202,6 +1294,8 @@ def cmd_merge(a):
     if recreated:
         path, _, pr_tip = _create_worktree(a, cfg, rem, _issue(a.repo, a.number), branch)
     else:
+        if not _unmerged(path):
+            _require_clean_worktree(path)  # before any fast-forward, even with sync disabled
         pr_tip = _fetch_tip(rem, branch, cwd=path)
         here = _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip()
         if here != pr_tip and _git(["-C", path, "merge-base", "--is-ancestor", here, pr_tip],
@@ -1217,21 +1311,40 @@ def cmd_merge(a):
                     "detail": f"merging {target} into {branch} conflicted; the merge is in "
                               f"progress in the worktree — `afk hand-back` returns it to the "
                               f"worker"}
+    _require_clean_worktree(path)  # sync=false is not permission to gate uncommitted code
     head = _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip()
     pushed = head != pr_tip
+    try:
+        _require_claim(rem, cfg, a.number, a.instance, claim_sha)
+    except ClaimLostError as e:
+        return {**out, "outcome": "claim_lost", "merged": False, "released": False,
+                "detail": str(e)}
     if pushed:
-        _git(["-C", path, "push", rem, f"HEAD:refs/heads/{branch}"])
+        _git(["-C", path, "push", rem, f"{head}:refs/heads/{branch}"])
     out.update(head=head, synced=pushed)
 
     # --- the machine gate, against exactly `head` ---
+    _beat(rem, cfg, a.instance, _now(a))
     if cfg["gate"]["ci"] == "local":
+        _require_clean_worktree(path, head)
         gate = _run_gate(cfg, path, a.gate_timeout, a.excerpt_lines)
+        _require_clean_worktree(path, head)
+        try:
+            _require_claim(rem, cfg, a.number, a.instance, claim_sha)
+        except ClaimLostError as e:
+            return {**out, "outcome": "claim_lost", "merged": False, "released": False,
+                    "detail": str(e)}
         if gate["status"] != "green":
             _gh(["pr", "comment", str(pr["number"]), "--repo", a.repo, "--body",
                  afk_decide.gate_comment(gate, gate["command"])])
             return {**out, "outcome": "gate_red", "gate": gate}
     else:
         checks = afk_decide.pr_checks_state(pr.get("statusCheckRollup"))
+        if pr.get("headRefOid") != head:
+            return {**out, "outcome": "awaiting_ci", "checks": checks,
+                    "checks_head": pr.get("headRefOid"),
+                    "detail": "the PR/check snapshot describes a different head; re-read "
+                              "checks on the current head before merging"}
         verdict = afk_decide.checks_gate(checks, pushed, a.allow_no_checks)
         if verdict != "green":
             return {**out, "outcome": verdict, "checks": checks}
@@ -1241,12 +1354,26 @@ def cmd_merge(a):
                           "--verified <head>"}
 
     # --- land it, then settle the claim: board → release → worktree ---
+    _require_clean_worktree(path, head)
+    try:
+        _require_claim(rem, cfg, a.number, a.instance, claim_sha)
+    except ClaimLostError as e:
+        return {**out, "outcome": "claim_lost", "merged": False, "released": False,
+                "detail": str(e)}
     _gh(["pr", "merge", str(pr["number"]), "--repo", a.repo, f"--{cfg['merge']['strategy']}",
          "--match-head-commit", head,
          *(["--delete-branch"] if cfg["merge"]["delete_branch"] else [])])
+    try:
+        _require_claim(rem, cfg, a.number, a.instance, claim_sha)
+    except ClaimLostError as e:
+        return {**out, "outcome": "claim_lost", "merged": True, "released": False,
+                "detail": str(e)}
     if cfg["progress_comment"]:
         _upsert_board(a.repo, a.number, cfg, "merged", instance=a.instance, pr=pr["number"])
-    _release(rem, cfg, a.number)
+    release = _release(rem, cfg, a.number, claim_sha)
+    if not release["released"]:
+        return {**out, "outcome": "claim_lost", "merged": True, "released": False,
+                "detail": release["reason"]}
     cleanup = _remove_worktree(path) if (cfg["worktree_cleanup"] or recreated) else None
     return {**out, "outcome": "merged", "released": True,
             **({"cleanup": cleanup} if cleanup else {})}
@@ -1335,7 +1462,7 @@ def cmd_hand_back(a):
     return {**out, "delivery": "terminal", "terminal": handle}
 
 
-def _escalate(a, cfg, rem, issue, attempt):
+def _escalate(a, cfg, rem, issue, attempt, claim_sha):
     """Hand an issue to a human, in the one order that leaves no gap: status board
     → labels → comment → release. The claim is released LAST: released first, a
     PR-less issue still carrying `ready_label` is back on the frontier for a peer
@@ -1343,21 +1470,25 @@ def _escalate(a, cfg, rem, issue, attempt):
     number = issue["number"]
     pr = afk_decide.closing_pr(_open_prs(a.repo), number)
     pr_number = pr["number"] if pr else None
+    _require_claim(rem, cfg, number, a.instance, claim_sha)
     if cfg["progress_comment"]:
         _upsert_board(a.repo, number, cfg, "escalated", instance=a.instance,
                       pr=pr_number, attempt=attempt)
     add, remove = afk_decide.escalation_labels(issue["labels"], cfg)
     _ensure_label(a.repo, add[0])
+    _require_claim(rem, cfg, number, a.instance, claim_sha)
     _edit_labels(a.repo, number, add, remove)
     comment_id = None
     if cfg["escalate_comment"]:
+        _require_claim(rem, cfg, number, a.instance, claim_sha)
         p = _gh(["api", "--method", "POST", f"repos/{a.repo}/issues/{number}/comments", "-f",
                  f"body={afk_decide.escalation_comment(a.reason, attempt, pr_number)}"])
         comment_id = json.loads(p.stdout).get("id")
-    _release(rem, cfg, number)
+    released = _release(rem, cfg, number, claim_sha)
     return {"issue": number, "action": "escalate", "attempt": attempt, "pr": pr_number,
             "labels": {"added": add, "removed": remove}, "comment_id": comment_id,
-            "released": True}
+            "released": released["released"],
+            **({"reason": released["reason"]} if not released["released"] else {})}
 
 
 def _ensure_label(repo, name):
@@ -1393,17 +1524,18 @@ def cmd_fail(a):
     This is the one writer of the attempt label, as `current_attempt` is its one
     reader."""
     cfg, rem = _cfg(a), _remote(a)
-    _require_mine(rem, cfg, a.number, a.instance)
+    claim_sha = _require_mine(rem, cfg, a.number, a.instance)
     issue = _issue(a.repo, a.number)
     a.reason = _stalled_reason(a.repo, a.number, a.reason)   # before the worktree is discarded
     decision = afk_decide.next_attempt(afk_decide.current_attempt(issue["labels"]), cfg["retry"])
     if decision["action"] == "escalate":
-        return _escalate(a, cfg, rem, issue, decision["attempt"])
+        return _escalate(a, cfg, rem, issue, decision["attempt"], claim_sha)
     _ensure_label(a.repo, decision["to_label"])
+    _require_claim(rem, cfg, a.number, a.instance, claim_sha)
     _edit_labels(a.repo, a.number, [decision["to_label"]],
                  [lb for lb in afk_decide.attempt_labels(issue["labels"])
                   if lb != decision["to_label"]])
-    worker = _start_worker(a, cfg, rem, issue, "fresh", a.reason)
+    worker = _start_worker(a, cfg, rem, issue, "fresh", a.reason, claim_sha=claim_sha)
     return {"issue": a.number, "action": "retry", "attempt": decision["attempt"],
             "retry_max": cfg["retry"], "worker": worker}
 
@@ -1414,9 +1546,9 @@ def cmd_escalate(a):
     none named). Same ordered transition `afk fail` ends in; the attempt count is
     reported, not consulted."""
     cfg, rem = _cfg(a), _remote(a)
-    _require_mine(rem, cfg, a.number, a.instance)
+    claim_sha = _require_mine(rem, cfg, a.number, a.instance)
     issue = _issue(a.repo, a.number)
-    return _escalate(a, cfg, rem, issue, afk_decide.current_attempt(issue["labels"]))
+    return _escalate(a, cfg, rem, issue, afk_decide.current_attempt(issue["labels"]), claim_sha)
 
 
 def cmd_close(a):
@@ -1424,11 +1556,15 @@ def cmd_close(a):
     `idle_done`), after the tick has verified the empty diff against base: status
     board → close the issue → release the claim → remove the worktree."""
     cfg, rem = _cfg(a), _remote(a)
-    _require_mine(rem, cfg, a.number, a.instance)
+    claim_sha = _require_mine(rem, cfg, a.number, a.instance)
     if cfg["progress_comment"]:
         _upsert_board(a.repo, a.number, cfg, "closed", instance=a.instance)
+    _require_claim(rem, cfg, a.number, a.instance, claim_sha)
     _gh(["issue", "close", str(a.number), "--repo", a.repo, "--reason", "completed"])
-    _release(rem, cfg, a.number)
+    released = _release(rem, cfg, a.number, claim_sha)
+    if not released["released"]:
+        return {"issue": a.number, "action": "closed", "released": False,
+                "reason": released["reason"]}
     path, _ = _issue_worktree(a.repo, a.number)
     cleanup = _remove_worktree(path) if (path and cfg["worktree_cleanup"]) else None
     return {"issue": a.number, "action": "closed", "released": True,
@@ -1559,6 +1695,8 @@ def build_parser():
 
     p = command("release", cmd_release, "delete a claim ref (idempotent)", remote="refs")
     p.add_argument("number", type=int)
+    p.add_argument("--expect-sha", required=True,
+                   help="the claim generation observed in scan/rebuild; never delete a successor")
 
     p = command("heartbeat", cmd_heartbeat, "refresh my heartbeat if due", remote="refs")
     mine(p)
@@ -1679,4 +1817,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
