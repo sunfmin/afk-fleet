@@ -143,9 +143,10 @@ _Avoid_: queue, backlog (the backlog is the whole issue set; the frontier is onl
 The atomic lock that marks one issue as owned by one **fleet instance**: a git ref `afk-claim/<n>` in
 the hidden `refs/afk/*` namespace, whose creation the server accepts for exactly one fleet and rejects
 for every other (that rejection is the compare-and-swap; a push that fails for any *other* reason is
-an error, never a lost race — ADR-0015). Where the refs live is the config key `claim_namespace`:
-bootstrap's probe switches it to `refs/heads` when an org ruleset forbids non-branch refs, and every
-later call inherits it through the config. Its marker commit names the owning instance.
+an error, never a lost race — ADR-0015). Where the refs live is the config key `claim_namespace`,
+one of exactly two layouts: `refs/afk` (`refs/afk/claim/<n>`), or `refs/heads` (ordinary
+`afk-claim/<n>` branches), which bootstrap's probe switches to when an org ruleset forbids non-branch
+refs. Every later call inherits it through the config, which every call must carry (ADR-0016). Its marker commit names the owning instance.
 It is the single source of truth for "taken" — replacing the assignee, which under a shared account
 cannot say *who* owns an issue. Deleted at every terminal transition; a leaked claim is a phantom lock
 that silently starves an issue.
@@ -167,8 +168,9 @@ same working set from the same GitHub; this equivalence is the re-entrancy invar
 disposable ticks safe. Its deterministic half is one read-only tool call — `afk rebuild`, which
 gathers and assembles the working set (plus its fingerprint digest) in code. Why a `no_pr` claim has
 no PR is a second, machine-dependent call — `afk no-pr`, which reads the worktree, the worker's
-verdict marker and its blockers and returns the 5-way verdict; only the terminal liveness probe it
-takes as input stays tick judgment (ADR-0008, ADR-0015).
+verdict marker and its blockers and returns the **outcome** (what the tick does about it — distinct
+from the worker's *verdict*, which is only what the worker declared); only the terminal liveness
+probe it takes as input stays tick judgment (ADR-0008, ADR-0015).
 _Avoid_: refresh, resync, reload
 
 **Orphaned claim**:
