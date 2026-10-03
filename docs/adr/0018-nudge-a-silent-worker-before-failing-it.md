@@ -2,7 +2,8 @@
 
 **Status:** accepted — narrows one clause of the "read workers through GitHub, never their
 transcripts" guardrail ([ADR-0001](0001-disposable-coordinator-context.md)), and adds an outcome to
-`classify_no_pr` beside [ADR-0013](0013-liveness-is-recency-not-accumulated-work.md).
+`classify_no_pr` beside [ADR-0013](0013-liveness-is-recency-not-accumulated-work.md). The "liveness
+probe" it mentions is read in code since [ADR-0021](0021-worker-state-is-mechanics.md).
 
 ## Context
 

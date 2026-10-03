@@ -349,6 +349,62 @@ def _no_pr(progress, terminal, idle, verdict=None, blockers=None):
     return r["outcome"], r["action"]
 
 
+def _ps(state=None, started=None, output=None, terminals=1, parent=None):
+    """One `orca worktree ps` row: an agent in `state` since `started` s ago, the
+    terminal's last output `output` s ago (orca speaks milliseconds)."""
+    ms = lambda ago: (NOW - ago) * 1000 if ago is not None else None   # noqa: E731
+    agents = [{"state": state, "stateStartedAt": ms(started), "parentPaneKey": parent}] \
+        if state else []
+    return {"liveTerminalCount": terminals, "lastOutputAt": ms(output), "agents": agents}
+
+
+def _reading(row, tui_idle=None):
+    r = d.read_worker_state(row, NOW, GRACE, tui_idle)
+    return r["terminal"], r["terminal_idle_seconds"], r["state"]
+
+
+def test_read_worker_state_takes_the_runtimes_own_report():
+    """ADR-0021: whether a worker is busy is read from what its runtime reported to
+    orca — never from what its screen looks like — and checked against the
+    terminal's output, so a lost stop report cannot read `working` forever."""
+    # working, and the terminal is still producing output: busy
+    assert _reading(_ps("working", 900, 5)) == ("busy", 5, "working")
+    # working, but nothing on the terminal for a whole grace period: a stop report
+    # the runtime lost. Not busy; the silence is timed from the last output
+    assert _reading(_ps("working", 900, GRACE)) == ("idle", GRACE, "working")
+    assert _reading(_ps("working", 900, None)) == ("idle", None, "working")
+    # stopped — its turn ended, or it is waiting on a question — is timed from WHEN
+    # it stopped, whatever the terminal redraws after
+    assert _reading(_ps("done", 700, 3)) == ("idle", 700, "done")
+    assert _reading(_ps("waiting", 40, 3)) == ("idle", 40, "waiting")
+    assert _reading(_ps("blocked", 40, 3)) == ("idle", 40, "blocked")
+    # a runtime that reports nothing (qoderclicn, hooks not installed): orca's own
+    # idle detection for that terminal decides. Its output is no clock — an idle
+    # qoderclicn redraws every minute, and would read as alive forever
+    assert _reading(_ps(None, None, 12), tui_idle=True) == ("idle", None, None)
+    assert _reading(_ps(None, None, 12), tui_idle=False) == ("busy", None, None)
+    assert _reading(_ps(None, None, 12)) == ("idle", None, None)
+    # a runtime that DOES report is never second-guessed by it
+    assert _reading(_ps("done", 700, 3), tui_idle=False) == ("idle", 700, "done")
+    # no live terminal, no row at all: the worker is gone
+    assert _reading(_ps("working", 1, 1, terminals=0)) == ("none", None, None)
+    assert _reading(None) == ("none", None, None)
+
+    # several agents in one worktree (a restarted worker beside a dead pane's last
+    # report, a subagent): the top-level one that changed state LAST speaks
+    row = _ps("working", 9000, 5)
+    row["agents"] += [{"state": "done", "stateStartedAt": (NOW - 60) * 1000, "parentPaneKey": None},
+                      {"state": "working", "stateStartedAt": (NOW - 1) * 1000, "parentPaneKey": "p"}]
+    assert _reading(row) == ("idle", 60, "done")
+
+    # and the reading is what classify_no_pr takes: busy → coding, a stop within
+    # grace → coding, a stop past grace → routed on the verdict
+    for row, outcome in ((_ps("working", 900, 5), "coding"), (_ps("done", 10, 10), "coding"),
+                         (_ps("done", GRACE, 1), "idle_stalled"), (None, "dead")):
+        t, idle, _ = _reading(row)
+        assert _no_pr(ZERO, t, idle)[0] == outcome, row
+
+
 def test_classify_no_pr_coding_needs_a_live_signal():
     # terminal busy: left alone even with a giving-up verdict + zero progress
     assert _no_pr(ZERO, "busy", 9999, _verdict("giving-up")) == ("coding", "leave")

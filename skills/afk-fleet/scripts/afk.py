@@ -151,6 +151,14 @@ def _fetch_tip(rem, branch, cwd=None):
     return sha
 
 
+class OrcaError(RuntimeError):
+    """An orca call that ran and answered `ok: false`; `code` is orca's own."""
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+
 def _orca(args, timeout=60):
     """One `orca … --json` call → its `result` object. HARD: raises when orca
     cannot be run, exits non-zero, or answers `ok: false` — the Act half cannot
@@ -169,7 +177,8 @@ def _orca(args, timeout=60):
     if p.returncode != 0 or not isinstance(doc, dict) or not doc.get("ok"):
         err = doc.get("error") if isinstance(doc, dict) else None
         code = err.get("code") if isinstance(err, dict) else None
-        raise RuntimeError(f"{what} failed: {code or p.stderr.strip() or p.stdout.strip()[:200]}")
+        raise OrcaError(f"{what} failed: {code or p.stderr.strip() or p.stdout.strip()[:200]}",
+                        code)
     return doc.get("result") or {}
 
 
@@ -691,34 +700,71 @@ def _issue_worktree(repo, number):
 
 
 def cmd_no_pr(a):
-    """Why does one of my claims have no PR — is its worker still coding, or did it
-    finish without one? And, for a `handed_back` claim, the same question about
-    the conflict its worker was handed: still resolving, or gone quiet? One call
-    gathers everything the outcome is decided from: the
-    issue's worktree on this machine (found through orca) and its git progress, the
-    worker's `afk:verdict` marker on the issue, and the state of each issue that
-    marker says it is blocked by. The tick supplies only what code cannot see — the
-    orca terminal probe. Returns `afk_decide.classify_no_pr`'s outcome plus the
-    signals it was decided from: `worktree`, `progress`, `worker_verdict` (what
-    the worker declared), and when it was last told something — `nudged_at`,
-    `handed_back_at`."""
+    """For each of my claims waiting on its worker — no PR yet, or a hand-back
+    not answered — is the worker still at it, or did it stop, and why? One call
+    for every such claim of the tick.
+
+    The worker state is read first, from orca's own record of what the worker's
+    runtime reported (ADR-0021): a worker that is busy, or one that is gone, is
+    decided from that alone — nothing on GitHub or in git is read for it. Only a
+    worker that stopped gets the rest gathered: the worktree's git progress, its
+    `afk:verdict` marker, the state of each issue that marker says it is blocked
+    by, and when it was last told something (`nudged_at`, `handed_back_at`).
+    Returns {"workers": [`afk_decide.classify_no_pr`'s outcome plus those signals
+    and the `worker_state` it was read from, one per --issue, in order]}."""
     cfg = _cfg(a)
-    path = a.worktree
-    if path is not None and not os.path.isdir(path):
-        raise ValueError(f"worktree not found: {path} (omit --worktree to let orca find it)")
-    if path is None:
-        found, _ = _issue_worktree(a.repo, a.number)
-        path = found if found and os.path.isdir(found) else None
-    progress = _worktree_progress(path, _remote(a), cfg["base_branch"]) if path else {}
-    declared = afk_decide.latest_verdict(_issue_comments(a.repo, a.number))
-    blocker_states = {n: _issue_state(a.repo, n) for n in declared["blocked_by"]}
+    if a.worktree is not None:
+        if len(a.numbers) != 1:
+            raise ValueError("--worktree names one worker's worktree: give it with one --issue")
+        if not os.path.isdir(a.worktree):
+            raise ValueError(f"worktree not found: {a.worktree} (omit --worktree to let orca find it)")
+    # HARD reads: an orca that cannot be asked is never "the worker is gone" —
+    # read that way it would start a second worker beside a live one
+    rows = _orca(["worktree", "list"]).get("worktrees") or []
+    ps = _orca(["worktree", "ps", "--limit", str(_PS_LIMIT)])
+    if ps.get("truncated"):
+        raise RuntimeError(f"orca worktree ps truncated at {_PS_LIMIT} rows")
+    states = {r.get("path"): r for r in ps.get("worktrees") or []}
+    now, grace = _now(a), cfg["worker_idle_grace_seconds"]
+    workers = []
+    for number in a.numbers:
+        path = a.worktree
+        if path is None:
+            found = afk_decide.find_orca_worktree(rows, number, a.repo)["path"]
+            path = found if found and os.path.isdir(found) else None
+        row = states.get(path) if path else None
+        reading = afk_decide.read_worker_state(row, now, grace)
+        if reading["terminal"] != "none" and reading["state"] is None:
+            # a runtime that reports nothing: ask orca whether its terminal is idle
+            reading = afk_decide.read_worker_state(row, now, grace, _tui_idle(path))
+        workers.append({"issue": number,
+                        **_worker_outcome(a, cfg, number, path, reading, now, grace),
+                        "worker_state": reading["state"]})
+    return {"workers": workers}
+
+
+# Far above any one machine's worktree count: a page that stops short is an error.
+_PS_LIMIT = 10000
+
+
+def _worker_outcome(a, cfg, number, path, reading, now, grace):
+    """`classify_no_pr` for one worker, gathering only what its reading leaves
+    open: busy or gone is settled by the reading alone, so it costs no git and
+    no GitHub."""
     nudged_at = (_nudge(path) or {}).get("at")
-    pr = afk_decide.closing_pr(_open_prs(a.repo), a.number)
+    settled = afk_decide.classify_no_pr({}, reading["terminal"], reading["terminal_idle_seconds"],
+                                        None, {}, now, grace, nudged_at=nudged_at)
+    if settled["outcome"] in ("coding", "dead"):
+        return {**settled, "worktree": path, "progress": {}, "worker_verdict": None,
+                "nudged_at": nudged_at, "handed_back_at": None}
+    progress = _worktree_progress(path, _remote(a), cfg["base_branch"]) if path else {}
+    declared = afk_decide.latest_verdict(_issue_comments(a.repo, number))
+    blocker_states = {n: _issue_state(a.repo, n) for n in declared["blocked_by"]}
+    pr = afk_decide.closing_pr(_open_prs(a.repo), number)
     handed_back_at = ((_open_handback(a.repo, pr) if pr else None) or {}).get("at")
-    return {"issue": a.number,
-            **afk_decide.classify_no_pr(progress, a.terminal, a.terminal_idle_seconds, declared,
-                                        blocker_states, _now(a),
-                                        cfg["worker_idle_grace_seconds"],
+    return {**afk_decide.classify_no_pr(progress, reading["terminal"],
+                                        reading["terminal_idle_seconds"], declared,
+                                        blocker_states, now, grace,
                                         nudged_at=nudged_at, can_nudge=path is not None,
                                         handed_back_at=handed_back_at),
             "worktree": path, "progress": progress, "worker_verdict": declared,
@@ -931,6 +977,28 @@ def _live_terminal(path):
     rows = _orca(["terminal", "list", "--worktree", f"path:{path}"]).get("terminals") or []
     live = [t for t in rows if t.get("connected", True) and t.get("writable", True)]
     return max(live, key=lambda t: t.get("lastOutputAt") or 0)["handle"] if live else None
+
+
+# How long orca is given to say a terminal is idle; it answers at once when it is.
+_TUI_IDLE_PROBE_MS = 2000
+
+
+def _tui_idle(path):
+    """Does orca see the worker terminal in a worktree idle? Its own reading of
+    the terminal (title, prompt), for a runtime that reports no state. True when
+    it answers within the probe, False when the probe times out — the worker is
+    at it. No live terminal reads as idle: there is nothing busy to wait for."""
+    handle = _live_terminal(path)
+    if handle is None:
+        return True
+    try:
+        wait = _orca(["terminal", "wait", "--terminal", handle, "--for", "tui-idle",
+                      "--timeout-ms", str(_TUI_IDLE_PROBE_MS)]).get("wait") or {}
+    except OrcaError as e:
+        if e.code == "timeout":
+            return False
+        raise
+    return bool(wait.get("satisfied"))
 
 
 def _terminal_tail(handle):
@@ -1573,17 +1641,13 @@ def build_parser():
     mine(p)
 
     p = command("no-pr", cmd_no_pr, remote="gh",
-                help="why one of my claims has no PR (or has not answered a hand-back) → "
+                help="why my claims have no PR (or have not answered a hand-back) → "
                      + " / ".join(dict.fromkeys(o for o, _ in afk_decide.NO_PR_ROUTES))
-                     + ", gathered and decided in one call")
-    issue(p)
-    p.add_argument("--terminal", choices=list(afk_decide.TERMINAL_STATES), required=True,
-                   help="the orca probe: " + " | ".join(afk_decide.TERMINAL_STATES)
-                        + " (none = no live worker)")
-    p.add_argument("--terminal-idle-seconds", type=int, default=None, metavar="s",
-                   help="seconds since the terminal last showed activity, if the probe says")
+                     + " for each, read from orca's worker state and decided in one call")
+    p.add_argument("--issue", dest="numbers", type=int, action="append", required=True,
+                   metavar="n", help="one of my claims waiting on its worker; repeat for each")
     p.add_argument("--worktree", default=None, metavar="path",
-                   help="the worker's worktree, to override the one orca reports for the issue")
+                   help="the worker's worktree, to override the one orca reports (one --issue)")
 
     p = command("recovery", cmd_recovery, remote="refs",
                 help="read-only: does a dead claim have recoverable progress, and where? → "

@@ -61,6 +61,18 @@ the in-flight step; that pushed branch tip is the durable progress a later **con
 from when this worker's machine is gone (ADR-0011).
 _Avoid_: agent (too generic), subagent, child
 
+**Worker state**:
+Whether a **worker** is busy or has stopped, as its **runtime** reports it to orca — *working*,
+*waiting* (on a question or a permission), or *done* (its turn ended) — never inferred from what its
+screen shows. It is a reading, not a conclusion: *done* means only that the worker stopped, not that it
+finished — a stopped worker may have left a verdict, be waiting on a question nobody will answer, or
+have given up, and telling those apart is what the rest of the **no-PR** check is for. A *working*
+state counts only while the terminal is still producing output, so a lost stop report cannot hold a
+claim forever; a runtime that reports no state is read through orca's own view of whether its
+terminal is idle (ADR-0021).
+_Avoid_: liveness (that is the **heartbeat**, per fleet instance), status (the **status board**),
+terminal busy/idle (the screen is not the source)
+
 **Runtime**:
 The agent binary that executes a **worker** session. One **fleet instance** runs one runtime, detected
 at bootstrap from the launcher's own environment (`QODERCN_CLI=1` → `qoderclicn`; otherwise →
@@ -115,10 +127,10 @@ _Avoid_: rebase (retired from the merge path), rebase onto latest, update branch
 The line that divides the fleet's work into what code owns and what the LLM owns. **Mechanics** are
 the deterministic steps whose inputs uniquely fix the correct action, so a wrong result is a defect,
 not a difference of opinion — selecting the **frontier**, claiming/reclaiming/releasing, the
-mine/live-peer/stale partition, lease arithmetic, retry accounting, pacing. They are extracted into
-tested **tools**. **Judgment** is everything that must read context and can be reasonably contested —
-whether an implementation is correct (the gate), whether a refutation holds, whether a PR-less claim
-is an **orphaned claim** or a live worker still coding, how to word an escalation, granting the run
+mine/live-peer/stale partition, lease arithmetic, retry accounting, pacing, reading a worker's
+**worker state**. They are extracted into tested **tools**. **Judgment** is everything that must read
+context and can be reasonably contested — whether an implementation is correct (the gate), whether a
+refutation holds, whether an empty diff really is empty, how to word an escalation, granting the run
 authorization. It stays with the **tick** (an LLM). "Extract mechanics to code, keep judgment in the
 LLM" is the fleet's core build rule.
 _Avoid_: automation vs decision, deterministic vs heuristic (near, but this is specifically the
@@ -179,8 +191,8 @@ The liveness signal a **fleet instance** publishes for itself — one ref `afk-h
 a timestamp, refreshed while it holds any claim (per instance, not per claim; roughly once per
 `claim_lease_ttl_seconds`/3, not once per tick). A claim is leased-live while its owner's heartbeat is within
 `claim_lease_ttl_seconds`; its freshness is the only thing that lets a peer tell a live owner from a dead one.
-_Avoid_: ping, keepalive, liveness probe (that name is the local orca-cli worker check — a different
-thing, at a different granularity)
+_Avoid_: ping, keepalive, liveness probe, **worker state** (that is per worker, read from orca — a
+different thing, at a different granularity)
 
 **Rebuild**:
 The bounded pass, run at the top of every tick, that re-derives the whole working set from fleet
@@ -191,8 +203,8 @@ disposable ticks safe. Its deterministic half is one read-only tool call — `af
 gathers and assembles the working set (plus its fingerprint digest) in code. Why a `no_pr` claim has
 no PR is a second, machine-dependent call — `afk no-pr`, which reads the worktree, the worker's
 verdict marker and its blockers and returns the **outcome** (what the tick does about it — distinct
-from the worker's *verdict*, which is only what the worker declared); only the terminal liveness
-probe it takes as input stays tick judgment (ADR-0008, ADR-0015).
+from the worker's *verdict*, which is only what the worker declared); it reads the **worker state**
+first and gathers nothing more for a worker that is busy (ADR-0008, ADR-0015, ADR-0021).
 _Avoid_: refresh, resync, reload
 
 **Orphaned claim**:

@@ -2,7 +2,9 @@
 
 **Status:** accepted — applies the [ADR-0004](0004-deterministic-mechanics-as-tools.md) bar to the
 tick's *gather*, and closes the second-gatherer drift opened by
-[ADR-0007](0007-fingerprint-gated-ticks.md).
+[ADR-0007](0007-fingerprint-gated-ticks.md). Narrowed by
+[ADR-0021](0021-worker-state-is-mechanics.md): the orca liveness probe is no longer tick judgment —
+`afk no-pr` reads it. Rebuild itself stays machine-independent.
 
 ## Context
 
