@@ -163,6 +163,9 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 - The tick judges the surviving state not worth continuing: a fresh start discards it instead,
   `skills/afk-fleet/scripts/afk.py:_discard_attempt`.
 - The peer's heartbeat is fresh: the claim is left strictly alone, ADR-0003.
+- The dead fleet had already merged or closed the issue: the claim is a phantom lock with no work
+  behind it, listed as `stale_closed` and deleted under the same lease instead of taken,
+  `skills/afk-fleet/scripts/afk.py:_clear`.
 - Two peers reclaim at once: one push wins, the other reports a lost race,
   `skills/afk-fleet/scripts/afk.py:_force_take`.
 
@@ -220,6 +223,10 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   left the ref on the remote is an error, never "released". (ADR-0016, ADR-0017;
   `test_a_release_that_did_not_delete_the_claim_is_an_error`,
   `test_escalate_relabels_before_it_releases`)
+- A release deletes only the caller's own claim, or — shown its sha — a dead peer's claim on a closed
+  issue; a stale claim on a closed issue is never reclaimed or dispatched.
+  (`test_release_deletes_only_my_claim_or_the_exact_claim_it_was_shown`,
+  `test_rebuild_sets_a_dead_peers_claim_on_a_closed_issue_apart_from_work_to_reclaim`)
 - A dependency a worker discovers is recorded on GitHub and waited on, never handed to a human, while
   the backlog will resolve it; a parked issue keeps its ready label, costs no attempt, and cannot be
   dispatched again while a blocker it named is open. (ADR-0022;

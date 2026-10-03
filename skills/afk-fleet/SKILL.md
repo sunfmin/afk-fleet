@@ -211,7 +211,7 @@ streak, what is in flight — lives in there, maintained by code.
    gate and the tick read GitHub as always, and a cycle it opens may well `skip`. A wake that arrives
    while a tick is running needs nothing until that cycle closes; then open the next one at once
    instead of sleeping.
-5. **Stop** on the user's word: run one final **drain** tick that `afk release <n>`s claims with no PR
+5. **Stop** on the user's word: run one final **drain** tick that `afk release <n> --instance <id>`s claims with no PR
    yet and retains those with an open PR (see [Cooperative multi-fleet](references/cooperative-multi-fleet.md)), then
    spawn no more ticks. In-flight workers finish on their own; their PRs are inherited and merged by a
    peer (or a later run) once the lease expires; escalated issues stay labelled for the human.
@@ -240,7 +240,7 @@ the two bootstrap ones that run before a config exists — `afk config`, `afk wo
 one that touches GitHub takes `--repo <repo>`. **Pass both on every call** — the config is what carries
 the claim namespace, the lease, the labels and the gate mode. A call without `--config` is refused
 (exit 3); it never runs on defaults. The inline examples below abbreviate both away
-(`afk release <n>`) only to stay readable.
+(`afk release <n> --instance <id>`) only to stay readable.
 
 **The tool is one executable word.** `<skill>/scripts/afk.py` is executable — call it by its path, with
 no interpreter in front. If you shorten it, hold only the **path** in a variable or define a shell
@@ -268,7 +268,8 @@ spawns).
    It gathers issues + PRs + claim/heartbeat refs once (the same gatherer the launcher's cycle
    gate reads through — the raw 200-issue JSON lives and dies inside the tool) and returns the whole
    working set: `{frontier: {dispatch, excluded}, mine: [{number, status, board_phase, pr, checks,
-   attempt}…], peer_live, stale: [{number, sha}…], free_slots, fingerprint, now}`. Then act on it:
+   attempt}…], peer_live, stale: [{number, sha}…], stale_closed: [{number, sha}…], free_slots,
+   fingerprint, now}`. Then act on it:
    - **Frontier** — `frontier.dispatch` is the dispatchable set (`open` + `ready_label` + no
      `epic_labels` + **unclaimed** + **no open linked PR** + zero open `blocked_by`) — the published
      contract; `--plan` and live agree because both are this one code path. `free_slots` is how many
@@ -277,7 +278,7 @@ spawns).
      next: *awaiting_merge* → `afk merge` (see [Merge](#merge-serialized)); *awaiting_ci* → leave;
      *failure* → `afk fail` (see [Failure handling](#failure-handling--bounded-retry--escalate-never-silently-drop));
      *closed* → the issue is already closed but its claim outlived it (a merge or close that died
-     before releasing): `afk release <n>`, nothing else; *handed_back* → a sync conflict on its PR is
+     before releasing): `afk release <n> --instance <id>`, nothing else — count it in `cleared`; *handed_back* → a sync conflict on its PR is
      with its worker and the PR head does not contain the target tip yet: **never `afk merge` it** —
      ask `afk no-pr` about it, exactly as for *no_pr* (see [Hand-back](#hand-back--a-sync-conflict-goes-back-to-its-worker));
      *no_pr* → see below. (In `gate.ci: local` only *awaiting_merge*, *handed_back*, *closed* and
@@ -338,7 +339,7 @@ spawns).
        - **dead** / `orphan` (no live worker/terminal at all) → **orphaned claim**: `afk dispatch
          --issue <n>` recovers it by **continuation** — it resumes from the worktree still here, else
          from the pushed branch, and starts from base only when nothing survived (see
-         [Recovery by continuation](references/recovery.md)). Or `afk release <n>` if the issue should
+         [Recovery by continuation](references/recovery.md)). Or `afk release <n> --instance <id>` if the issue should
          go back to the frontier instead.
      The empty-diff verification stays judgment; `no-pr` is a separate call from
      `rebuild` because it asks *this machine* about a worktree, and `rebuild` stays machine-independent
@@ -348,8 +349,14 @@ spawns).
      <id> --expect-sha <the sha rebuild reported>` (atomic — fails if it moved), then `afk dispatch
      --issue <n>` — a reclaimed claim's worker is dead by definition, so it is recovered by
      **continuation** like any dead claim of mine (the worktree is reused when the dead peer ran on
-     *this* box). **`peer_live`** is left strictly alone. The human-gated, lease-skipping sibling of
-     this reclaim is [`--takeover`](#takeover-mode---takeover).
+     *this* box). Count it in `reclaimed`. **`peer_live`** is left strictly alone. The human-gated,
+     lease-skipping sibling of this reclaim is [`--takeover`](#takeover-mode---takeover).
+   - **Phantom locks** — **`stale_closed`** is a stale peer claim whose issue is **already closed**:
+     its fleet merged or closed the issue and died before releasing. There is no work behind it, so it
+     is **never reclaimed, never dispatched, and never part of a dispatch plan** — one call deletes
+     it: `afk release <n> --instance <id> --expect-sha <the sha rebuild reported>` (the same lease as
+     a reclaim: it deletes nothing if somebody took the claim meanwhile). Count it in `cleared`, not
+     `reclaimed`. It holds no slot of mine and frees none.
 2. **Act**, in this order — every step is one `afk` call that performs its whole sequence:
    - **Merge** each *awaiting_merge* claim, one at a time: `afk merge --issue <n> --instance <id>`
      (see [Merge](#merge-serialized) for its outcomes). A `merged` outcome has already upserted the
@@ -593,7 +600,8 @@ touch shared root config are naturally throttled by the DAG — chain them with 
   `afk merge`, `afk escalate`, `afk park` and `afk close` each delete it as their last step; an orphan-release and a
   *closed* row are yours to `afk release`. A leaked ref is a phantom lock. Reconcile only your own claims, and take a peer's
   only when its heartbeat is expired (a **stale claim**) — the single exception is an explicit human
-  [`--takeover`](#takeover-mode---takeover).
+  [`--takeover`](#takeover-mode---takeover). A stale claim on a closed issue (`stale_closed`) is not
+  taken at all: it is deleted, with `afk release --expect-sha`.
 - **Preserve a dead worker's progress.** Recover a dead claim by **continuation** (a plain
   `afk dispatch`), and discard an attempt only where discarding is the point — `afk fail`'s retry, or
   an explicit `--start fresh`. A finished PR that merely conflicts with a moved target is **handed

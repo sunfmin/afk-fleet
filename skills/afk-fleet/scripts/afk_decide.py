@@ -395,7 +395,9 @@ def classify_claims(claims, heartbeats, me, now, ttl):
                    with the worker liveness probe — not here).
       peer_live  — a peer owns it AND its heartbeat is within ttl → never touch.
       stale      — a peer owns it AND its heartbeat is missing/expired → the only
-                   foreign claim I may reclaim (--force-with-lease takeover).
+                   foreign claim I may reclaim (--force-with-lease takeover), or —
+                   when its issue is already closed — delete (`assemble_working_set`
+                   splits those out as `stale_closed`).
     A claim whose marker names no instance is treated as a peer's and, lacking a
     heartbeat, is reclaimable.
     """
@@ -1701,7 +1703,9 @@ CYCLE_START = {"fingerprint": "", "skips": 0, "empty_streak": 0,
 SUMMARY_WORK = {
     "merged": "the issues whose PR this tick merged",
     "dispatched": "the issues this tick started a worker on",
-    "reclaimed": "the issues this tick took over from a stale peer claim",
+    "reclaimed": "the issues this tick took over from a stale peer claim, to continue the work",
+    "cleared": "the phantom locks this tick deleted: claims (its own or a dead peer's) "
+               "whose issue was already closed",
     "escalated": "the issues this tick handed to a human",
     "parked": "the issues this tick left waiting on an open blocker",
 }
@@ -1776,7 +1780,7 @@ def cycle_ticked(state, summary, config):
     state and say how long to sleep.
 
       summary: the tick's return — {"merged":[], "escalated":[], "parked":[],
-               "dispatched":[], "reclaimed":[], "in_flight": int,
+               "dispatched":[], "reclaimed":[], "cleared":[], "in_flight": int,
                "frontier_remaining": int, ...}
 
     `in_flight` and `frontier_remaining` are REQUIRED: a summary missing either
@@ -2082,9 +2086,10 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
       me, now:     my instance id / epoch seconds
       config:      the canonical config — read for ready_label, epic_labels,
                    claim_lease_ttl_seconds, gate.ci and concurrency
-      closed:      the numbers of MY claims whose issue is closed (`issues` holds
-                   only open ones, so `afk rebuild` asks about each of mine that is
-                   missing from it)
+      closed:      the numbers of the claims whose issue is closed (`issues` holds
+                   only open ones, so `afk rebuild` asks about each claim that is
+                   missing from it). One of mine becomes a `closed` row; a stale
+                   peer's moves from `stale` to `stale_closed`
       handed_back: the numbers of MY claims whose PR carries an open hand-back
                    (`handback_open` — `afk rebuild` asks about each of mine that
                    has a PR)
@@ -2095,12 +2100,18 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
                  "attempt"}...],
        "peer_live": [{"number","instance"}...],
        "stale": [{"number","instance","sha"}...],   # sha feeds reclaim --expect-sha
+       "stale_closed": [{"number","instance","sha"}...],  # sha feeds release --expect-sha
        "free_slots": <how many workers may be dispatched: concurrency - len(mine)>,
        "fingerprint": <digest of the same observables the gate hashes>,
        "now": now}
 
     `status` and `board_phase` are `subclassify_pr`'s pair; `attempt` is
     `current_attempt` — the number `afk status` takes.
+
+    `stale` holds only work to continue: a stale claim on an OPEN issue. One whose
+    issue is already closed — its fleet merged or closed it and died before
+    releasing — is a phantom lock with nothing behind it, and is listed in
+    `stale_closed` instead, to be deleted rather than taken and dispatched.
     """
     ttl, ci_mode = config["claim_lease_ttl_seconds"], config["gate"]["ci"]
     by_num = {i.get("number"): i for i in issues}
@@ -2113,6 +2124,11 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
 
     part = classify_claims(claims, heartbeats, me, now, ttl)
     by_claim = {c.get("number"): c for c in claims}
+    closed = set(closed)
+
+    def stale_rows(numbers):
+        return [{"number": n, "instance": by_claim.get(n, {}).get("instance"),
+                 "sha": by_claim.get(n, {}).get("sha")} for n in numbers]
 
     mine = []
     for n in part["mine"]:
@@ -2120,7 +2136,7 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
         checks = pr_checks_state(pr.get("statusCheckRollup")) if pr else None
         issue = by_num.get(n, {})
         status, board_phase = subclassify_pr(pr is not None, checks, ci_mode,
-                                             closed=n in set(closed),
+                                             closed=n in closed,
                                              handed_back=n in set(handed_back))
         mine.append({"number": n, "title": issue.get("title"),
                      "status": status, "board_phase": board_phase,
@@ -2131,9 +2147,8 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
             "mine": mine,
             "peer_live": [{"number": n, "instance": by_claim.get(n, {}).get("instance")}
                           for n in part["peer_live"]],
-            "stale": [{"number": n, "instance": by_claim.get(n, {}).get("instance"),
-                       "sha": by_claim.get(n, {}).get("sha")}
-                      for n in part["stale"]],
+            "stale": stale_rows(n for n in part["stale"] if n not in closed),
+            "stale_closed": stale_rows(n for n in part["stale"] if n in closed),
             "free_slots": max(0, int(config["concurrency"]) - len(mine)),
             "fingerprint": fingerprint(issues, prs, claims),
             "now": now}
