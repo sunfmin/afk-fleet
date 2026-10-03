@@ -59,7 +59,7 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
   authorization its launcher injects; invoked cold without it, it dispatches but calls no
   `afk merge`.
 - `/afk-fleet --takeover` — a **launcher bootstrap variant** for when a fleet hard-stopped (quota) and
-  you will not wait ~75 min for its lease to lapse: the *full* bootstrap, then the opening working set
+  you will not wait for its lease to lapse: the *full* bootstrap, then the opening working set
   is seeded from a dead peer's claims instead of the frontier alone. Thereafter an ordinary standing
   fleet. See [Takeover mode](#takeover-mode---takeover).
 
@@ -129,8 +129,8 @@ written to a file, gone when the launcher stops.
 ### Takeover mode (`--takeover`)
 
 For when a fleet **hard-stopped** — its provider quota ran out, its process was killed — and you are
-standing right there. The lease will hand its claims to a peer, but only after `claim_lease_ttl`
-(~75 min), because a heartbeat is the only *machine-visible* line between "dead" and "alive but slow".
+standing right there. The lease will hand its claims to a peer, but only after
+`claim_lease_ttl_seconds` (default 4500), because a heartbeat is the only *machine-visible* line between "dead" and "alive but slow".
 The present human is the oracle that knows *now*; the dying fleet cannot help, since a hard stop runs no
 code at all (no drain, no release) — [ADR-0011](../../docs/adr/0011-takeover-and-progress-preservation.md).
 
@@ -179,15 +179,16 @@ streak, what is in flight — lives in there, maintained by code.
    ```
    (No `--state` on the very first cycle.) It gathers what a tick's Rebuild would observe
    (issues+labels, PRs+checks, claim refs) **inside the tool** — the raw JSON never enters the
-   launcher — and returns `{action, reason, state}`:
+   launcher — and returns `{action, reason, state}` (plus `summary_schema` on a tick):
    - `"action": "skip"` (nothing observable moved) → spawn nothing. A skipped cycle owes two things and
      the result already carries both: the lease was refreshed **inside this call** if the fleet holds
      claims (`heartbeat`), so a skipped cycle can never lapse a lease; and `sleep_seconds` is the pace.
      Keep `state` and go to step 4.
    - `"action": "tick"` (`first` / `changed` / `forced` / `gate_off`) → continue.
 2. **Spawn a tick** — call the [Agent] tool (fresh context) to run one reconciliation pass, passing
-   only `{repo, config, authorized: true, instance_id, worker_command}`. Constrain its return with a schema:
-   `{merged:[…], escalated:[…], dispatched:[…], reclaimed:[…], in_flight:N, frontier_remaining:N, note}`.
+   only `{repo, config, authorized: true, instance_id, worker_command}`. Constrain its return with the
+   **`summary_schema`** step 1 returned, verbatim — the JSON schema of a tick's summary, written by
+   the code that reads the summary back, so never compose one yourself.
    `in_flight` (claims the fleet still holds) and `frontier_remaining` (dispatchable issues it did not
    take) are **integers and mandatory** — the next step refuses a summary without them rather than
    pace a fleet holding claims as if it held none.
@@ -199,10 +200,10 @@ streak, what is in flight — lives in there, maintained by code.
    → `{state, sleep_seconds}`. Keep `state`; surface a short progress line to the user from the summary,
    then discard the summary.
 4. **Sleep `sleep_seconds`** (`ScheduleWakeup`). The number already encodes the pacing rules — you
-   apply none yourself: `busy_interval` (~1–2 min) while the last tick did anything or anything is in
-   flight, so green PRs merge promptly; `idle_interval` (~25 min) once `idle_ticks_before_sleep`
+   apply none yourself: `busy_interval_seconds` (default 90) while the last tick did anything or anything is in
+   flight, so green PRs merge promptly; `idle_interval_seconds` (default 1500) once `idle_ticks_before_sleep`
    consecutive cycles were **empty** (a tick that did nothing, or a skip, with nothing in flight and
-   nothing left on the frontier); and never past `claim_lease_ttl`/2 while the fleet holds any claim.
+   nothing left on the frontier); and never past `claim_lease_ttl_seconds`/2 while the fleet holds any claim.
    **A wake ends the sleep early.** A line `afk-wake #<n>` arriving in this terminal is a worker
    saying its outcome is on GitHub (ADR-0020): go to step 1 **now** instead of waiting the sleep out,
    and let the sleep this new cycle ends with replace the one you were in. That is all it means — it
@@ -329,7 +330,7 @@ spawns).
      `rebuild` because it asks *this machine* about a worktree, and `rebuild` stays machine-independent
      (ADR-0008).
    - **Stale peer claims** — **`stale`** (a peer owns it and its `afk-heartbeat/<id>` is expired past
-     `claim_lease_ttl`) is the only foreign claim I may take *unattended*: `afk reclaim <n> --instance
+     `claim_lease_ttl_seconds`) is the only foreign claim I may take *unattended*: `afk reclaim <n> --instance
      <id> --expect-sha <the sha rebuild reported>` (atomic — fails if it moved), then `afk dispatch
      --issue <n>` — a reclaimed claim's worker is dead by definition, so it is recovered by
      **continuation** like any dead claim of mine (the worktree is reused when the dead peer ran on
@@ -378,7 +379,8 @@ spawns).
      `claimed` are written by the transition that reaches them — `afk merge`, `afk escalate`, `afk
      close`, `afk dispatch` — before it releases the claim. The board is human-read only — no tick ever
      parses it back (ADR-0006).
-3. **Return** the compact summary and **exit**. Count `in_flight` (claims still mine) and
+3. **Return** the compact summary — in the shape your launcher constrained you to (the
+   `summary_schema` of `afk cycle`) — and **exit**. Count `in_flight` (claims still mine) and
    `frontier_remaining` (dispatchable issues not taken) as integers — the launcher's pacing reads them.
    Freshly-dispatched workers' PRs are picked up by a later tick.
 

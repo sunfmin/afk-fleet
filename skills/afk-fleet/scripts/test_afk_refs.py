@@ -26,8 +26,10 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
+import afk_decide
+
 AFK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "afk.py")
-TTL = 4500          # the default lease, ~75 min
+TTL = afk_decide.CONFIG_DEFAULTS["claim_lease_ttl_seconds"]   # the default lease
 T0 = 1_000_000      # the pinned clock
 
 # A hermetic git: no user/system config, no credential prompt, a fixed identity —

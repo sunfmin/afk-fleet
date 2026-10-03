@@ -89,10 +89,11 @@ CLAIM_NAMESPACES = {
 }
 BRANCH_NAMESPACE = "refs/heads"
 
-# The completion gate's two modes (ADR-0012). `required` waits for the PR's GitHub
-# checks; `local` never reads them and makes `gate.local_command` the gate, re-run
-# at merge time against the exact tree that lands.
-GATE_CI_MODES = ("required", "local")
+# The completion gate's two modes (ADR-0012), each with what the status board calls
+# that gate. `required` waits for the PR's GitHub checks; `local` never reads them
+# and makes `gate.local_command` the gate, re-run at merge time against the exact
+# tree that lands.
+GATE_CI_MODES = {"required": "CI", "local": "本地门"}
 
 # How `afk merge` lands a PR — each is a `gh pr merge` flag of the same name.
 MERGE_STRATEGIES = ("squash", "merge", "rebase")
@@ -368,7 +369,7 @@ def classify_claims(claims, heartbeats, me, now, ttl):
       claims:     [{"number": int, "instance": str}, ...]  (from refs/afk/claim/*)
       heartbeats: {instance_id: last_ts_epoch}             (from refs/afk/heartbeat/*)
       me:         my instance id
-      now, ttl:   epoch seconds / claim_lease_ttl seconds
+      now, ttl:   epoch seconds / `claim_lease_ttl_seconds`
 
     Returns {"mine":[n...], "peer_live":[n...], "stale":[n...]}:
       mine       — stamped with my instance; I reconcile these locally (a no-PR/
@@ -391,6 +392,11 @@ def classify_claims(claims, heartbeats, me, now, ttl):
         else:
             peer_live.append(n)
     return {"mine": sorted(mine), "peer_live": sorted(peer_live), "stale": sorted(stale)}
+
+
+# Every `status` a `mine` row can carry — what `subclassify_pr` returns, and the
+# vocabulary the tick's instructions route on (a test holds the docs to it).
+CLAIM_STATUSES = ("awaiting_merge", "awaiting_ci", "failure", "handed_back", "no_pr", "closed")
 
 
 def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=False):
@@ -522,6 +528,20 @@ def protection_verdict(ci_mode, protection, unavailable=None):
             "detail": "target branch requires no status checks — a local gate can merge"}
 
 
+# Every `outcome` `afk merge` can stop with — the vocabulary the tick's
+# instructions route on (a test holds the docs to it).
+MERGE_OUTCOMES = ("merged", "conflict", "handed_back", "gate_red", "awaiting_ci", "no_checks",
+                  "needs_verify")
+
+
+def merge_outcome(outcome):
+    """`outcome`, refused unless it is one of MERGE_OUTCOMES: `afk merge` cannot
+    stop with a word the tick was never told how to act on."""
+    if outcome not in MERGE_OUTCOMES:
+        raise ValueError(f"not a merge outcome: {outcome!r}")
+    return outcome
+
+
 def checks_gate(checks_state, pushed, allow_no_checks=False):
     """
     The `gate.ci: required` half of `afk merge`'s gate: may this PR merge on what
@@ -575,13 +595,49 @@ def gate_comment(verdict, command):
 
 _VERDICT_MARKER_RE = re.compile(r"<!--\s*afk:verdict\b(.*?)-->", re.DOTALL)
 
+# The phases a worker may declare in its marker (worker-prompt.md asks for exactly
+# these; anything else `classify_no_pr` treats as a failure).
+VERDICT_PHASES = ("already-satisfied", "blocked", "giving-up")
+_SATISFIED, _BLOCKED, _ = VERDICT_PHASES
+
+# What the orca liveness probe can say about a worker's terminal.
+TERMINAL_STATES = ("busy", "idle", "none")
+
+# Every (outcome, action) `classify_no_pr` can return — the vocabulary the tick's
+# instructions route on (a test holds the docs to it).
+NO_PR_ROUTES = (("coding", "leave"), ("idle_done", "close_release"),
+                ("idle_blocked", "redispatch"), ("idle_blocked", "escalate"),
+                ("idle_stalled", "nudge"), ("idle_failed", "next_attempt"),
+                ("dead", "orphan"))
+
+
+def _verdict_text(n, phase, blocked_by, reason, optional=str):
+    """The marker's one spelling: its fields, their names and their order."""
+    parts = [f"n={n}", f"phase={phase}",
+             *([optional(f"blocked_by={blocked_by}")] if blocked_by else []),
+             *([optional(f"reason={reason}")] if reason else [])]
+    return f"<!--afk:verdict {' '.join(parts)}-->"
+
+
+def verdict_marker(n, phase, blocked_by=(), reason=None):
+    """The marker a worker posts for one verdict — what `parse_verdict_marker`
+    reads back (a test round-trips every phase)."""
+    return _verdict_text(n, phase, ",".join(str(b) for b in blocked_by), reason)
+
+
+def verdict_marker_format(n):
+    """The marker as the worker prompt shows it to issue <n>'s worker: its own
+    number filled in, the rest as placeholders, optional fields in brackets."""
+    return _verdict_text(n, f"<{'|'.join(VERDICT_PHASES)}>", "<csv of issue numbers>", "<short>",
+                         optional=lambda field: f"[{field}]")
+
 
 def parse_verdict_marker(body):
     """
     Parse the FIRST afk:verdict marker in one comment body → a verdict dict, or
-    None if the body carries no marker. The marker (worker-prompt.md, LAYER 1) is:
+    None if the body carries no marker. The marker is `verdict_marker`'s:
 
-      <!--afk:verdict n=<issue> phase=<already-satisfied|blocked|giving-up> \
+      <!--afk:verdict n=<issue> phase=<one of VERDICT_PHASES> \
           [blocked_by=<csv of issue numbers>] [reason=<short>]-->
 
     LENIENT — a marker with a missing/unknown field still parses
@@ -750,6 +806,7 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
     idle_seconds = max(0, int(now) - int(max(seen))) if seen else None
 
     def out(outcome, action, open_blockers=()):
+        assert (outcome, action) in NO_PR_ROUTES, (outcome, action)
         return {"outcome": outcome, "action": action, "idle_seconds": idle_seconds,
                 "open_blockers": list(open_blockers)}
 
@@ -765,13 +822,13 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
     # idle past grace: route on the declared reason.
     verdict = worker_verdict or {}
     phase = verdict.get("phase") if verdict.get("found") else None
-    if phase == "already-satisfied":
+    if phase == _SATISFIED:
         # "nothing needed doing" is refuted by work sitting on the branch.
         has_changes = int(progress.get("commits_ahead") or 0) > 0 or bool(progress.get("dirty"))
         if has_changes:
             return out("idle_failed", "next_attempt")
         return out("idle_done", "close_release")
-    if phase == "blocked":
+    if phase == _BLOCKED:
         named = verdict.get("blocked_by") or []
         still_open = [n for n in named if (blocker_states or {}).get(n) != "closed"]
         if still_open or not named:
@@ -1020,6 +1077,13 @@ def branch_candidates(heads, branch_pattern, number):
     return sorted(h for h in (heads or []) if h and rx.match(h))
 
 
+def short_branch(ref):
+    """`refs/heads/x/y` → `x/y`; a name that is already short is returned as is.
+    orca reports a worktree's branch either way."""
+    ref = ref or ""
+    return ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+
+
 def find_orca_worktree(worktrees, number, repo=None):
     """
     The orca worktree belonging to issue <number> on THIS machine, from
@@ -1052,10 +1116,8 @@ def find_orca_worktree(worktrees, number, repo=None):
     if not hits:
         return {"found": False, "path": None, "branch": None}
     best = max(hits, key=lambda w: int(w.get("lastActivityAt") or 0))
-    branch = best.get("branch") or None
-    if branch and branch.startswith("refs/heads/"):
-        branch = branch[len("refs/heads/"):]
-    return {"found": True, "path": best.get("path") or None, "branch": branch}
+    return {"found": True, "path": best.get("path") or None,
+            "branch": short_branch(best.get("branch")) or None}
 
 
 def find_orca_repo(repos, repo):
@@ -1163,9 +1225,11 @@ def select_recovery(worktree, branch):
 # is handed over, and {handback}, filled from the `handback` block only when the
 # worker is started on a sync conflict that was handed back (ADR-0019). That
 # block is also a brief of its own — `render_handback` — for a worker that is
-# still there to be told. Everything else in braces is a field — one of them
+# still there to be told. Everything else in braces is a field — two of them
 # derived: {wake_command}, the line a worker runs to wake the launcher once its
-# outcome is on GitHub, built from the `launcher_terminal` field (ADR-0020).
+# outcome is on GitHub, built from the `launcher_terminal` field (ADR-0020), and
+# {verdict_marker}, the marker a worker that opens no PR must post
+# (`verdict_marker_format`).
 
 _BLOCK_RE = re.compile(r"<!--afk:block ([a-z0-9_.]+)-->\n(.*?)\n?<!--/afk:block-->", re.DOTALL)
 PROMPT_VARIANTS = ("fresh", "continue")
@@ -1173,6 +1237,7 @@ PROMPT_FIELDS = ("n", "title", "repo", "base_branch", "local_command", "branch",
                  "launcher_terminal")
 HANDBACK_FIELDS = ("pr", "pr_branch", "target", "target_tip", "files")
 _PROMPT_SLOTS = ("opening", "step1", "retry_reason", "handback")
+_PROMPT_DERIVED = ("wake_command", "verdict_marker")
 _NO_LOCAL_COMMAND = "true   # (no gate.local_command configured: run the repo's own build/test, if any)"
 _NO_WAKE = "true   # (no coordinator terminal to wake: it finds your outcome at its next poll)"
 _TERMINAL_HANDLE_RE = re.compile(r"[A-Za-z0-9_.:-]+")
@@ -1226,6 +1291,7 @@ def _fill_prompt(text, fields, handback, reason=None):
     values = {k: str(fields[k]) for k in PROMPT_FIELDS}
     values["local_command"] = values["local_command"].strip() or _NO_LOCAL_COMMAND
     values["wake_command"] = wake_command(values.pop("launcher_terminal"), fields["n"])
+    values["verdict_marker"] = verdict_marker_format(fields["n"])
     free_text = {"title": values.pop("title"), "reason": (reason or "").strip()}
     if handback is not None:
         values.update({k: str(handback[k]) for k in HANDBACK_FIELDS if k != "files"})
@@ -1233,7 +1299,7 @@ def _fill_prompt(text, fields, handback, reason=None):
                               or "- (the sync reported none — the merge itself will list them)")
     for name, value in values.items():
         text = text.replace("{" + name + "}", value)
-    known = (*PROMPT_FIELDS, *HANDBACK_FIELDS, *_PROMPT_SLOTS, "wake_command")
+    known = (*PROMPT_FIELDS, *HANDBACK_FIELDS, *_PROMPT_SLOTS, *_PROMPT_DERIVED)
     left = sorted(set(re.findall(r"\{(?:%s)\}" % "|".join(known), text))
                   - {"{%s}" % k for k in free_text})
     if left:
@@ -1304,13 +1370,6 @@ def render_handback(template, fields, handback):
 
 STATUS_MARKER = "<!--afk:status-->"
 
-# The closed set of lifecycle phases the board renders. Happy path plus four
-# off-ramps that reuse the same checkboxes + an annotation: ci_failed, handed_back
-# (a sync conflict returned to the worker — `afk hand-back`), escalated, and
-# closed (the worker found the issue already satisfied — `afk close`).
-STATUS_PHASES = ("claimed", "pr_open", "ci_failed", "handed_back", "awaiting_merge", "merged",
-                 "escalated", "closed")
-
 # Happy-path milestones, in order — these are the task-list checkboxes.
 _STATUS_STEPS = (
     ("claimed",        "已认领 · worker 实现中"),
@@ -1319,34 +1378,24 @@ _STATUS_STEPS = (
     ("merged",         "已合并"),
 )
 
-# What the board calls the machine gate, per gate.ci mode (ADR-0012).
-_GATE_NAME = {"required": "CI", "local": "本地门"}
-
-# How far along the happy path each phase has reached (index of the last DONE
-# step). escalated is a terminal give-up handled specially in `render_status_board`.
-_PHASE_REACHED = {
-    "claimed": 0, "pr_open": 1, "ci_failed": 1, "handed_back": 1, "awaiting_merge": 2,
-    "merged": 3, "escalated": 1, "closed": 0,
+# The closed set of lifecycle phases the board renders, each with everything the
+# board says about it: how far along the happy path it has reached (the index of
+# the last DONE step) and its single ▸/✅/⚠️ 'where are we now' line. Happy path
+# plus four off-ramps that reuse the same checkboxes + an annotation: ci_failed,
+# handed_back (a sync conflict returned to the worker — `afk hand-back`), escalated
+# (a terminal give-up, ticked specially in `render_status_board`), and closed (the
+# worker found the issue already satisfied — `afk close`).
+_PHASES = {
+    "claimed":        (0, "▸ 当前:worker 实现中,尚无 PR"),
+    "pr_open":        (1, "▸ 当前:等 {gate}"),
+    "ci_failed":      (1, "▸ 当前:{gate} 失败,修复重试中({attempt}/{retry_max}) —— 见下方 {gate} 与评论"),
+    "handed_back":    (1, "▸ 当前:与目标分支同步冲突,已交还 worker 解决 —— 见 PR 评论"),
+    "awaiting_merge": (2, "▸ 当前:门已绿,待合并"),
+    "merged":         (3, "✅ 已合并,完成"),
+    "escalated":      (1, "⚠️ 已升级给人处理 —— 见下方评论"),
+    "closed":         (0, "✅ 主干已满足此需求,无需改动 —— 已关闭"),
 }
-
-
-def _status_current_line(phase, gate, attempt, retry_max):
-    """The single ▸/✅/⚠️ 'where are we now' line under the checklist."""
-    if phase == "claimed":
-        return "▸ 当前:worker 实现中,尚无 PR"
-    if phase == "pr_open":
-        return f"▸ 当前:等 {gate}"
-    if phase == "ci_failed":
-        return f"▸ 当前:{gate} 失败,修复重试中({attempt}/{retry_max}) —— 见下方 {gate} 与评论"
-    if phase == "handed_back":
-        return "▸ 当前:与目标分支同步冲突,已交还 worker 解决 —— 见 PR 评论"
-    if phase == "awaiting_merge":
-        return "▸ 当前:门已绿,待合并"
-    if phase == "merged":
-        return "✅ 已合并,完成"
-    if phase == "closed":
-        return "✅ 主干已满足此需求,无需改动 —— 已关闭"
-    return "⚠️ 已升级给人处理 —— 见下方评论"   # escalated
+STATUS_PHASES = tuple(_PHASES)
 
 
 def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attempt=0):
@@ -1368,8 +1417,8 @@ def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attem
     """
     if phase not in STATUS_PHASES:
         raise ValueError(f"unknown status phase: {phase!r}")
-    gate = _GATE_NAME[gate_ci]
-    reached = _PHASE_REACHED[phase]
+    gate = GATE_CI_MODES[gate_ci]
+    reached, current = _PHASES[phase]
     escalated = phase == "escalated"
 
     def done(i, key):
@@ -1383,7 +1432,7 @@ def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attem
         label = label.format(pr=f" (#{pr})" if pr else "", gate=gate)
         lines.append(f"- [{'x' if done(i, key) else ' '}] {label}")
     lines.append("")
-    lines.append(_status_current_line(phase, gate, attempt, retry_max))
+    lines.append(current.format(gate=gate, attempt=attempt, retry_max=retry_max))
     return "\n".join(lines)
 
 
@@ -1495,7 +1544,32 @@ def pace(did_work, in_flight, empty_streak, config):
 CYCLE_START = {"fingerprint": "", "skips": 0, "empty_streak": 0,
                "in_flight": 0, "frontier_remaining": 0}
 
-_SUMMARY_WORK = ("merged", "dispatched", "reclaimed", "escalated")
+# The tick summary's keys this code reads, each with what the tick puts there:
+# the lists that mean a tick did work, and the two integers pacing needs.
+# `summary_schema` is built from these, and it is what the launcher constrains a
+# tick's return with — so the writer and the reader of a summary share one shape.
+SUMMARY_WORK = {
+    "merged": "the issues whose PR this tick merged",
+    "dispatched": "the issues this tick started a worker on",
+    "reclaimed": "the issues this tick took over from a stale peer claim",
+    "escalated": "the issues this tick handed to a human",
+}
+SUMMARY_COUNTS = {
+    "in_flight": "claims this fleet still holds as the tick ends",
+    "frontier_remaining": "dispatchable issues this tick did not take",
+}
+
+
+def summary_schema():
+    """The JSON schema of a tick's summary — what `cycle_ticked` takes back."""
+    props = {k: {"type": "array", "items": {"type": "integer"}, "description": why}
+             for k, why in SUMMARY_WORK.items()}
+    props.update({k: {"type": "integer", "description": why}
+                  for k, why in SUMMARY_COUNTS.items()})
+    props["note"] = {"type": "string",
+                     "description": "anything the human should hear: an error, a judgment call"}
+    return {"type": "object", "properties": props,
+            "required": [*SUMMARY_WORK, *SUMMARY_COUNTS]}
 
 
 def cycle_state(raw):
@@ -1519,7 +1593,8 @@ def cycle_wake(state, current_fp, config):
       current_fp: `fingerprint` of what a rebuild would observe now; None when
                   `fingerprint_gate` is off (nothing was gathered)
 
-    Returns {"action": "tick"|"skip", "reason", "state"} and, on a skip, the two
+    Returns {"action": "tick"|"skip", "reason", "state"}. A tick also carries
+    `summary_schema`, the shape its summary must come back in. A skip carries the two
     things a skipped cycle still owes: `sleep_seconds`, and `heartbeat` — True when
     the fleet holds claims, so the effect layer refreshes the lease no tick will.
     On a tick the launcher spawns one and reports back through `cycle_ticked`,
@@ -1529,12 +1604,14 @@ def cycle_wake(state, current_fp, config):
     nothing is left on the frontier: unchanged state then proves the cycle empty.
     """
     if not config["fingerprint_gate"]:
-        return {"action": "tick", "reason": "gate_off", "state": {**state, "skips": 0}}
+        return {"action": "tick", "reason": "gate_off", "state": {**state, "skips": 0},
+                "summary_schema": summary_schema()}
     gate = fingerprint_gate(state["fingerprint"], current_fp, state["skips"],
                             config["force_tick_after_skips"])
     new = {**state, "fingerprint": current_fp, "skips": gate["skips"]}
     if gate["action"] == "tick":
-        return {"action": "tick", "reason": gate["reason"], "state": new}
+        return {"action": "tick", "reason": gate["reason"], "state": new,
+                "summary_schema": summary_schema()}
     if new["in_flight"] == 0 and new["frontier_remaining"] == 0:
         new["empty_streak"] += 1
     return {"action": "skip", "reason": gate["reason"], "state": new,
@@ -1556,10 +1633,10 @@ def cycle_ticked(state, summary, config):
     """
     if not isinstance(summary, dict):
         raise ValueError(f"--summary must be the tick's summary object, got {summary!r}")
-    for key in ("in_flight", "frontier_remaining"):
+    for key in SUMMARY_COUNTS:
         if not isinstance(summary.get(key), int) or isinstance(summary.get(key), bool):
             raise ValueError(f"--summary needs an integer {key!r} (the tick's return schema)")
-    did_work = any(summary.get(k) for k in _SUMMARY_WORK)
+    did_work = any(summary.get(k) for k in SUMMARY_WORK)
     in_flight, remaining = summary["in_flight"], summary["frontier_remaining"]
     empty = not did_work and in_flight == 0 and remaining == 0
     new = {**state, "in_flight": in_flight, "frontier_remaining": remaining,

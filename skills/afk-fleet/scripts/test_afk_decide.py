@@ -11,7 +11,7 @@ import re
 
 import afk_decide as d
 
-TTL = 4500  # ~75 min, the default lease
+TTL = d.CONFIG_DEFAULTS["claim_lease_ttl_seconds"]  # the default lease
 
 
 def test_select_frontier():
@@ -117,6 +117,14 @@ def test_subclassify_pr():
         for has_pr in (True, False):
             for checks in ("green", "red", "pending", None):
                 assert d.subclassify_pr(has_pr, checks, ci)[1] in d.STATUS_PHASES
+
+    # CLAIM_STATUSES is exactly what it can return: no status the docs were never
+    # held to, and none listed that cannot happen
+    seen = {d.subclassify_pr(has_pr, checks, ci, closed=closed, handed_back=handed_back)[0]
+            for ci in d.GATE_CI_MODES for has_pr in (True, False)
+            for checks in ("green", "red", "pending", None)
+            for closed in (True, False) for handed_back in (True, False)}
+    assert seen == set(d.CLAIM_STATUSES)
 
     # the issue is CLOSED but the claim is still mine — a merge or `afk close` that
     # crashed before releasing. Nothing else about it matters, and there is no board
@@ -263,6 +271,20 @@ def test_protection_verdict():
     # in required mode, required checks are the gate itself — never an obstacle
     assert d.protection_verdict("required", checks_required)["verdict"] == "ok"
     assert d.protection_verdict("required", None, unavailable="boom")["verdict"] == "ok"
+
+
+def test_the_verdict_marker_round_trips_through_its_parser():
+    # one writer, one reader: whatever `verdict_marker` spells, the parser reads back
+    for phase in d.VERDICT_PHASES:
+        got = d.parse_verdict_marker(d.verdict_marker(12, phase, [3, 4], "needs pages from #3"))
+        assert got == {"found": True, "n": 12, "phase": phase, "blocked_by": [3, 4],
+                       "reason": "needs pages from #3"}, phase
+        bare = d.parse_verdict_marker(d.verdict_marker(7, phase))
+        assert (bare["n"], bare["phase"], bare["blocked_by"], bare["reason"]) == (7, phase, [], None)
+    # what the worker is shown is that same spelling, with placeholders
+    shown = d.verdict_marker_format(31)
+    assert shown == ("<!--afk:verdict n=31 phase=<already-satisfied|blocked|giving-up> "
+                     "[blocked_by=<csv of issue numbers>] [reason=<short>]-->")
 
 
 def test_parse_verdict_marker():
@@ -907,6 +929,15 @@ def test_cycle_wake_gates_beats_and_paces_a_skipped_cycle():
     assert first["state"]["fingerprint"] == "aaa"
     # a tick owes its sleep to cycle_ticked, not to the gate
     assert "sleep_seconds" not in first and "heartbeat" not in first
+    # …and comes with the shape its summary must return in: every key cycle_ticked
+    # reads, the two counts as integers, all of them required
+    schema = first["summary_schema"]
+    assert set(schema["properties"]) == {*d.SUMMARY_WORK, *d.SUMMARY_COUNTS, "note"}
+    assert set(schema["required"]) == {*d.SUMMARY_WORK, *d.SUMMARY_COUNTS}
+    assert all(schema["properties"][k]["type"] == "integer" for k in d.SUMMARY_COUNTS)
+    assert "summary_schema" not in d.cycle_wake(
+        d.cycle_ticked(first["state"], {"in_flight": 0, "frontier_remaining": 0}, cfg)["state"],
+        "aaa", cfg)                                           # a skip spawns no tick
 
     # unchanged + idle fleet → skip; each such skip is itself an empty cycle
     idle = d.cycle_ticked(first["state"], {"in_flight": 0, "frontier_remaining": 0}, cfg)["state"]
@@ -1507,7 +1538,11 @@ def test_template_matches_defaults():
     tpl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "..", "references", "config-template.md")
     with open(tpl) as f:
-        parsed = d.parse_config_yaml(f.read())
+        text = f.read()
+    parsed = d.parse_config_yaml(text)
+    # a key with a closed set of values spells that set out, exactly
+    for choices in (d.CLAIM_NAMESPACES, d.GATE_CI_MODES, d.MERGE_STRATEGIES):
+        assert " | ".join(choices) in text, f"template does not list {' | '.join(choices)}"
     full = d.resolve_config({})
     for k, v in parsed.items():
         if isinstance(v, dict):
