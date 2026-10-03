@@ -16,7 +16,8 @@ subcommands and flags that exist.
 Nothing is injected into afk.py to make that possible. The outside world is faked
 where it actually lives — executables on PATH:
 
-  gh    a stand-in backed by one JSON state file. It projects exactly the fields
+  gh    a stand-in backed by one JSON state file (native dependency edges
+        included: an issue's open-blocker count is derived from them). It projects exactly the fields
         asked for (asking for one GitHub does not have is a KeyError), applies only
         the `--jq` filters it knows (a changed filter fails loudly rather than
         silently diverging), refuses what GitHub refuses (an unknown label, a merge
@@ -195,17 +196,52 @@ if parts[0] == "issues" and parts[2:] == ["comments"]:
     finish("\n".join(json.dumps({"id": c["id"], "body": c["body"], "url": c["html_url"]})
                      for c in rows))
 
-if parts[0] == "issues" and len(parts) == 2:
-    row = next((r for r in st["issues"] if str(r["number"]) == parts[1]), None)
+def issue_row(number):
+    row = next((r for r in st["issues"] if str(r["number"]) == str(number)), None)
     if row is None:
         finish(code=1, err="gh: Not Found (HTTP 404)\n")
+    return row
+
+
+def issue_id(row):
+    return row.get("id", 9000 + row["number"])
+
+
+if parts[0] == "issues" and parts[2:] == ["dependencies", "blocked_by"]:
+    issue_row(parts[1])
+    edges = st.setdefault("deps", {}).setdefault(parts[1], [])        # blocker numbers
+    if method == "POST":
+        new = next((x[len("issue_id="):] for x in argv if x.startswith("issue_id=")), None)
+        assert new is not None and argv[argv.index("issue_id=" + new) - 1] == "-F", argv
+        blocker = next((r for r in st["issues"] if str(issue_id(r)) == new), None)
+        if blocker is None or blocker["number"] in edges:               # as GitHub: 422
+            finish(code=1, err="gh: Validation Failed (HTTP 422)\n")
+        edges.append(blocker["number"])
+        finish(json.dumps({"id": issue_id(blocker)}))
+    assert jq == ".[] | {number, state}", "fake gh: unsupported jq %%r" %% jq
+    finish("\n".join(json.dumps({"number": n, "state": issue_row(n).get("state", "open")})
+                     for n in edges))
+
+if parts[0] == "issues" and len(parts) == 2:
+    row = issue_row(parts[1])
     if jq == ".state":
         finish(row.get("state", "open"))
+    if jq == ".id":
+        finish(str(issue_id(row)))
+    if jq == ("{id, state, state_reason, labels: [.labels[].name], "
+              "pull_request: (.pull_request != null)}"):
+        finish(json.dumps({"id": issue_id(row), "state": row.get("state", "open"),
+                           "state_reason": row.get("state_reason"),
+                           "labels": [lb["name"] for lb in row["labels"]],
+                           "pull_request": "pull_request" in row}))
     if jq == "{title, state, labels: [.labels[].name]}":
         finish(json.dumps({"title": row["title"], "state": row.get("state", "open"),
                            "labels": [lb["name"] for lb in row["labels"]]}))
     assert jq == ".issue_dependencies_summary.blocked_by", "fake gh: unsupported jq %%r" %% jq
-    finish(json.dumps(row.get("blocked_by")))
+    edges = st.get("deps", {}).get(parts[1])
+    if edges is None:                     # a count the test set by hand, or none at all
+        finish(json.dumps(row.get("blocked_by")))
+    finish(json.dumps(len([n for n in edges if issue_row(n).get("state", "open") == "open"])))
 
 if parts[0] == "branches" and parts[2:] == ["protection"]:
     prot = st.get("protection", {}).get(parts[1])
@@ -866,9 +902,10 @@ def test_no_pr_gathers_every_signal_and_decides_in_one_call():
         # the tool's conclusion is `outcome`/`action`; what the WORKER declared is
         # `worker_verdict` — never one bare "verdict" that could be read as either
         assert set(r) == {"issue", "outcome", "action", "idle_seconds", "open_blockers",
-                          "worktree", "progress", "worker_verdict", "nudged_at",
+                          "worktree", "progress", "worker_verdict", "blockers", "nudged_at",
                           "handed_back_at", "worker_state"}
         assert r["issue"] == 4 and r["open_blockers"] == [] and r["worktree"] == w.cwd
+        assert r["blockers"] == []
         assert r["worker_state"] is None
 
         # idle_seconds is derived HERE, from the freshest of commit / file / terminal
@@ -921,6 +958,7 @@ def test_no_pr_gathers_every_signal_and_decides_in_one_call():
         w.worker()
 
         # the worker declared itself blocked on #41 and #42: their REAL state routes it
+        # (neither is anything a fleet will work — the parkable case has its own test)
         w.set(comments={"4": [_comment(1, "a human note"),
                               _comment(2, _marker("giving-up")),
                               _comment(3, _marker("blocked", " blocked_by=41,42 reason=needs both"))]})
@@ -930,8 +968,10 @@ def test_no_pr_gathers_every_signal_and_decides_in_one_call():
         assert r["worker_verdict"]["phase"] == "blocked"
         assert r["worker_verdict"]["reason"] == "needs both"
         assert r["worker_verdict"]["comment_url"] == "https://gh/c/3"   # the LATEST marker wins
-        states = sorted(c[1] for c in w.calls() if "--jq" in c and ".state" in c)
-        assert states == [f"repos/{REPO}/issues/41", f"repos/{REPO}/issues/42"]
+        assert [(b["number"], b["standing"]) for b in r["blockers"]] == [(41, "unmet"), (42, "unmet")]
+        assert "no ready-for-agent label" in r["blockers"][0]["reason"]
+        reads = sorted(c[1] for c in w.calls() if "--jq" in c and "state_reason" in c[-1])
+        assert reads == [f"repos/{REPO}/issues/41", f"repos/{REPO}/issues/42"]
 
         w.set(issues=[issue(4), issue(41, state="closed"), issue(42)])
         r = w.no_pr(*base, "--now", later)
@@ -1992,6 +2032,105 @@ def test_escalate_relabels_before_it_releases():
                             "--set", "escalate_label=needs-human"))
         assert r["comment_id"] is None and w.comments(9) == []
         assert w.issue(9)["labels"] == ["needs-human"] and "needs-human" in w.state()["labels"]
+
+
+def _park(n, *extra, instance="me"):
+    return ("park", "--issue", str(n), "--instance", instance, *R, *NOW, *extra)
+
+
+def test_a_worker_blocked_on_workable_backlog_is_parked_until_the_blocker_closes():
+    """A `blocked` verdict names a dependency the backlog never declared. When the
+    blocker is ordinary, workable backlog — most visibly one this same fleet is
+    already working — handing the issue to a human is the wrong outcome: the edge
+    is recorded on GitHub and the frontier contract does the waiting (ADR-0022)."""
+    issues = [issue(135, "ready-for-agent"), issue(136, "ready-for-agent", "afk-attempt/1"),
+              issue(137), issue(138), issue(139, "ready-for-agent"),
+              issue(140, "ready-for-agent", "epic"), issue(141, "ready-for-agent")]
+    with world(issues=issues) as w:
+        cfg = ("--config", json.dumps({"base_branch": w.sb.base, "worker_idle_grace_seconds": 300}))
+        w.afk(*dispatch(135))
+        d136, d141 = w.afk(*dispatch(136)), w.afk(*dispatch(141))
+        w.afk("claim", "137", "--instance", "peer", *NOW, *R)
+        later = str(int(time.time()) + 5000)
+        marks = iter(range(1, 100))
+
+        def stops_blocked(n, by):
+            """Issue n's worker stops, declaring itself blocked by `by`."""
+            comments = w.state()["comments"]
+            extra = f" blocked_by={by}" if by else ""
+            comments.setdefault(str(n), []).append(
+                _comment(next(marks), f"<!--afk:verdict n={n} phase=blocked{extra}-->"))
+            w.set(comments=comments)
+            r = w.no_pr("--issue", str(n), *R, *cfg, "--now", later)
+            assert r["outcome"] == "idle_blocked", r
+            return r["action"], r["open_blockers"], [b["standing"] for b in r["blockers"]]
+
+        # --- what nothing will resolve is still a human's -------------------------
+        # no blocker named; unclaimed with no ready label; an epic; a dependency cycle
+        assert stops_blocked(136, "") == ("escalate", [], [])
+        assert stops_blocked(136, "138") == ("escalate", [138], ["unmet"])
+        assert stops_blocked(136, "140") == ("escalate", [140], ["unmet"])
+        w.set(deps={"139": [136]})                                   # #139 waits on #136…
+        assert stops_blocked(136, "139") == ("escalate", [139], ["unmet"])   # …so not vice versa
+        r = w.no_pr("--issue", "136", *R, *cfg, "--now", later)
+        assert "cycle" in r["blockers"][0]["reason"]                 # the reason names the gap
+        # one workable blocker does not excuse another that is not
+        assert stops_blocked(136, "135,138") == ("escalate", [135, 138], ["waiting", "unmet"])
+        # …and `afk park` refuses what `afk no-pr` would not call parkable, touching nothing
+        assert "not this fleet's claim" in w.error(*_park(136, instance="peer"))
+        err = w.error(*_park(136))
+        assert "not parkable" in err and "#138" in err and "nothing was changed" in err
+        assert w.claimed_by(136) == "me" and "136" not in w.state()["deps"]
+
+        # --- a blocker a fleet is working is waited on ------------------------------
+        assert stops_blocked(136, "137") == ("park", [137], ["waiting"])     # a live peer holds it
+        assert stops_blocked(136, "135") == ("park", [135], ["waiting"])     # in flight under ME
+
+        # the edge FAILS to record → the claim must still be held: released without
+        # it, an issue still carrying the ready label is straight back on the frontier
+        w.set(fail=["api --method"])
+        assert "failed" in w.error(*_park(136))
+        assert w.claimed_by(136) == "me"
+        w.set(fail=[])
+
+        w.calls()
+        r = w.afk(*_park(136))
+        assert r == {"issue": 136, "action": "parked", "blocked_by": [135], "edges_added": [135],
+                     "released": True, "cleanup": {"removed": True, "path": d136["worktree"]}}
+        # one order: the dependency edge, then the status board (the release is last)
+        writes = [(c[c.index("--method") + 1], c[3].split("/", 4)[-1])
+                  for c in w.calls() if "--method" in c]
+        assert [m for m, _ in writes] == ["POST", "PATCH"], writes
+        assert writes[0][1] == "136/dependencies/blocked_by" and "comments" in writes[1][1], writes
+        assert w.state()["deps"]["136"] == [135]                     # the fact lives in GitHub
+        assert "等待依赖 #135 关闭" in w.board(136) and "认领方" not in w.board(136)
+        assert w.claimed_by(136) is None and not os.path.isdir(d136["worktree"])
+        # neither the ready label nor the attempt count was touched: nobody re-adds anything
+        assert w.issue(136)["labels"] == ["ready-for-agent", "afk-attempt/1"]
+
+        # from here the ordinary frontier contract does the rest. While #135 is open,
+        # #136 is excluded — so a worker that would only report `blocked` again is
+        # never started: the park cannot loop
+        ws = w.afk("rebuild", *ME, *R, *NOW)
+        assert 136 not in [i["number"] for i in ws["frontier"]["dispatch"]]
+        assert {"number": 136, "reason": "1 open blocker(s)"} in ws["frontier"]["excluded"]
+        assert 136 not in [m["number"] for m in ws["mine"]]
+        # …and the tick after #135 closes it is dispatchable again, with no human touch
+        w.set(issues=[{**i, "state": "closed"} if i["number"] == 135 else i
+                      for i in w.state()["issues"]])
+        ws = w.afk("rebuild", *ME, *R, *NOW)
+        assert 136 in [i["number"] for i in ws["frontier"]["dispatch"]]
+
+        # --- a branch that holds work is kept; an edge already there is not re-added -
+        w.work(d141["worktree"], "half.txt")
+        w.set(deps={**w.state()["deps"], "141": [139]})
+        later = str(int(time.time()) + 5000)
+        assert stops_blocked(141, "139,135") == ("park", [139], ["waiting", "closed"])
+        r = w.afk(*_park(141, "--set", "progress_comment=false"))
+        assert r == {"issue": 141, "action": "parked", "blocked_by": [139], "edges_added": [],
+                     "released": True}
+        assert os.path.isdir(d141["worktree"]) and w.claimed_by(141) is None
+        assert w.state()["deps"]["141"] == [139] and "等待依赖" not in w.board(141)
 
 
 def test_close_settles_an_issue_that_needed_no_change():

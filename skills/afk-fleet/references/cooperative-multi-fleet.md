@@ -47,7 +47,8 @@ each one runs is shown so the mechanism is legible, but the tick calls the tool.
   lease-skipping, human-authorized sibling is [`--takeover`](../SKILL.md#takeover-mode---takeover).
 - **Release / cleanup** — the last step of every transition that ends a claim: `afk merge` (after the
   PR landed), `afk escalate` (after the relabel — released first, a PR-less issue still carrying
-  `ready_label` would be back on the frontier for a peer to dispatch), `afk close`. `afk release <n>`
+  `ready_label` would be back on the frontier for a peer to dispatch), `afk park` (after the
+  `blocked_by` edge is recorded — for the same reason), `afk close`. `afk release <n>`
   (idempotent: a claim already gone counts as released) is the same step on its own, for an
   **orphan-release**, a `closed` row, and the drain. A delete that fails with the claim still on the
   remote exits 3 — `released` is never reported for a claim that is still there. On **graceful stop**, the drain tick releases claims with **no PR yet** and

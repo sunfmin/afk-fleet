@@ -587,6 +587,7 @@ def gate_comment(verdict, command):
 #   2. the worker's VERDICT marker on the issue — its declared reason for opening
 #      no PR: `already-satisfied` (done in base, empty diff), `blocked` (a
 #      dependency gap, see blocked_by) or `giving-up` (a failure it could not fix);
+#      for `blocked`, also the STANDING of each issue it names (`blocker_standings`);
 #   3. the terminal's busy / idle / none state from the orca probe.
 # `classify_no_pr` is the pure join. Two words are kept apart throughout: the
 # VERDICT is what the worker declared in its marker (an input); the OUTCOME is
@@ -606,7 +607,8 @@ TERMINAL_STATES = ("busy", "idle", "none")
 # Every (outcome, action) `classify_no_pr` can return — the vocabulary the tick's
 # instructions route on (a test holds the docs to it).
 NO_PR_ROUTES = (("coding", "leave"), ("idle_done", "close_release"),
-                ("idle_blocked", "redispatch"), ("idle_blocked", "escalate"),
+                ("idle_blocked", "redispatch"), ("idle_blocked", "park"),
+                ("idle_blocked", "escalate"),
                 ("idle_stalled", "nudge"), ("idle_failed", "next_attempt"),
                 ("dead", "orphan"))
 
@@ -690,6 +692,105 @@ def latest_verdict(comments):
     return result
 
 
+# Where one issue a `blocked` verdict names stands (ADR-0022):
+#   closed   done — it no longer blocks anything;
+#   waiting  open, and the backlog will resolve it with no human: a fleet holds
+#            it, a PR is open for it, or it carries `ready_label`;
+#   unmet    nothing will resolve it — `reason` says why.
+BLOCKER_STANDINGS = ("closed", "waiting", "unmet")
+_CLOSED, _WAITING, _UNMET = BLOCKER_STANDINGS
+
+# The `state_reason`s of a closed issue whose work was NOT done.
+_CLOSED_UNDONE = {"not_planned": "was closed as not planned",
+                  "duplicate": "was closed as a duplicate"}
+
+
+def _blocker_standing(blocker, claimed, has_open_pr, ready_label, epic_labels):
+    """One named blocker's `(standing, reason)`, before the cycle check."""
+    if blocker is None:
+        return _UNMET, "could not be read (it may not exist)"
+    if blocker.get("pull_request"):
+        return _UNMET, "is a pull request, not an issue"
+    if blocker.get("state") == "closed":
+        undone = _CLOSED_UNDONE.get(blocker.get("state_reason"))
+        return (_UNMET, undone) if undone else (_CLOSED, None)
+    labels = set(blocker.get("labels") or [])
+    hit_epic = labels & {e.strip() for e in epic_labels if e.strip()}
+    if hit_epic:
+        return _UNMET, f"is an epic ({', '.join(sorted(hit_epic))})"
+    if claimed or has_open_pr or ready_label in labels:
+        return _WAITING, None
+    return _UNMET, f"is open but no fleet will work it (unclaimed, no {ready_label} label)"
+
+
+def depends_on(start, target, edges):
+    """Does issue `start` depend — directly or through any chain of open
+    blockers — on issue `target`? `edges` is {issue number: [its open blockers]}."""
+    seen, todo = set(), [start]
+    while todo:
+        n = todo.pop()
+        if n == target:
+            return True
+        if n not in seen:
+            seen.add(n)
+            todo.extend(edges.get(n) or [])
+    return False
+
+
+def blocker_standings(number, named, blockers, claimed, open_pr, edges, ready_label, epic_labels):
+    """
+    Where each issue a `blocked` verdict names stands — will the dependency
+    issue <number>'s worker discovered resolve on its own, or must a human look?
+
+      named:    the verdict's blocked_by, in order
+      blockers: {n: {"state", "state_reason", "labels": [name...], "pull_request": bool}};
+                a missing or None entry is an issue that could not be read
+      claimed:  the issue numbers a claim ref exists for — ANY owner: mine and a
+                live peer's are being worked, a stale one is reclaimed and continued
+      open_pr:  the issue numbers an open PR closes
+      edges:    {n: [its open blockers]}, covering everything reachable from a
+                `waiting` blocker (`afk.py` walks it) — the cycle check
+      ready_label, epic_labels: config
+
+    Returns [{"number", "standing": one of BLOCKER_STANDINGS, "reason": str|None}...].
+    A `waiting` blocker that itself depends on <number> is `unmet`: recording
+    <number> as blocked by it would close a cycle neither side ever leaves.
+    """
+    rows = []
+    for n in named:
+        standing, reason = _blocker_standing((blockers or {}).get(n), n in claimed, n in open_pr,
+                                             ready_label, epic_labels)
+        if n == number:
+            standing, reason = _UNMET, "is the issue itself"
+        elif standing == _WAITING and depends_on(n, number, edges or {}):
+            standing, reason = _UNMET, (f"already depends on #{number}: waiting on it would "
+                                        f"close a cycle")
+        rows.append({"number": n, "standing": standing, "reason": reason})
+    return rows
+
+
+def blocked_route(named, standings):
+    """
+    What a `blocked` verdict comes to, from the standing of each blocker it names.
+
+      named:     the verdict's blocked_by
+      standings: {issue number: one of BLOCKER_STANDINGS}; anything else — a
+                 missing entry, an unknown word — is `unmet`
+
+    Returns {"action", "open_blockers"}:
+      redispatch  every named blocker is closed: the dependency cleared.
+      park        every named blocker is closed or `waiting`: record the
+                  dependency and wait for it (`afk park`).
+      escalate    one is `unmet`, or none was named — nothing will ever clear it.
+    `open_blockers` is the named blockers not `closed`.
+    """
+    standings = standings or {}
+    pending = [n for n in named if standings.get(n) != _CLOSED]
+    if not named or any(standings.get(n) != _WAITING for n in pending):
+        return {"action": "escalate", "open_blockers": pending}
+    return {"action": "park" if pending else "redispatch", "open_blockers": pending}
+
+
 def read_worker_state(row, now, grace_seconds, tui_idle=None):
     """
     A worker's state, read from its worktree's row of `orca worktree ps --json` —
@@ -757,8 +858,8 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
       terminal_idle_seconds: seconds since the terminal last showed activity;
                        None if the probe could not say.
       worker_verdict:  the `latest_verdict` dict (or None) — what the worker declared.
-      blocker_states:  {issue number: "open"|"closed"} for the verdict's blocked_by.
-                       Anything not provably "closed" counts as still open.
+      blocker_states:  {issue number: one of BLOCKER_STANDINGS} for the verdict's
+                       blocked_by (`blocker_standings`). Anything else is `unmet`.
       now, grace_seconds: epoch seconds / `worker_idle_grace_seconds`.
       nudged_at:       epoch seconds this worker was nudged (`afk nudge`), None if
                        it never was. A nudge is spent once: the second silence fails.
@@ -777,8 +878,12 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
                                    on the branch: the tick verifies the empty diff,
                                    closes + releases.
       idle_blocked redispatch    — …+ `blocked`, and every blocked_by is now closed.
-      idle_blocked escalate      — …+ `blocked`, and a blocked_by is still open (or
-                                   the verdict names none, so nothing can ever clear).
+      idle_blocked park          — …+ `blocked`, and every blocked_by still open is
+                                   one the backlog will resolve: `afk park` records
+                                   the dependency and waits for it (ADR-0022).
+      idle_blocked escalate      — …+ `blocked`, and a blocked_by is one nothing will
+                                   resolve (or the verdict names none, so nothing
+                                   can ever clear).
       idle_stalled nudge         — …+ NO verdict at all, never nudged: the worker
                                    stopped without an outcome — typically waiting on
                                    a question nobody will answer. `afk nudge` tells
@@ -793,7 +898,7 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
     newest file mtime, terminal activity, the nudge, the hand-back — a nudged or
     handed-back worker gets a whole grace period to answer); None when none is
     known, which is never
-    "within grace". `open_blockers` is the still-open subset of blocked_by.
+    "within grace". `open_blockers` is the blocked_by not yet closed (`blocked_route`).
     """
     progress = progress or {}
     seen = [t for t in (progress.get("last_commit_ts"), progress.get("worktree_mtime_ts"))
@@ -829,11 +934,8 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
             return out("idle_failed", "next_attempt")
         return out("idle_done", "close_release")
     if phase == _BLOCKED:
-        named = verdict.get("blocked_by") or []
-        still_open = [n for n in named if (blocker_states or {}).get(n) != "closed"]
-        if still_open or not named:
-            return out("idle_blocked", "escalate", still_open)
-        return out("idle_blocked", "redispatch")
+        route = blocked_route(verdict.get("blocked_by") or [], blocker_states)
+        return out("idle_blocked", route["action"], route["open_blockers"])
     if not verdict.get("found") and nudged_at is None and can_nudge:
         return out("idle_stalled", "nudge")
     return out("idle_failed", "next_attempt")
@@ -1381,10 +1483,11 @@ _STATUS_STEPS = (
 # The closed set of lifecycle phases the board renders, each with everything the
 # board says about it: how far along the happy path it has reached (the index of
 # the last DONE step) and its single ▸/✅/⚠️ 'where are we now' line. Happy path
-# plus four off-ramps that reuse the same checkboxes + an annotation: ci_failed,
+# plus five off-ramps that reuse the same checkboxes + an annotation: ci_failed,
 # handed_back (a sync conflict returned to the worker — `afk hand-back`), escalated
-# (a terminal give-up, ticked specially in `render_status_board`), and closed (the
-# worker found the issue already satisfied — `afk close`).
+# (a terminal give-up, ticked specially in `render_status_board`), closed (the
+# worker found the issue already satisfied — `afk close`), and parked (the worker
+# found an open dependency; the claim is released until it closes — `afk park`).
 _PHASES = {
     "claimed":        (0, "▸ 当前:worker 实现中,尚无 PR"),
     "pr_open":        (1, "▸ 当前:等 {gate}"),
@@ -1394,11 +1497,13 @@ _PHASES = {
     "merged":         (3, "✅ 已合并,完成"),
     "escalated":      (1, "⚠️ 已升级给人处理 —— 见下方评论"),
     "closed":         (0, "✅ 主干已满足此需求,无需改动 —— 已关闭"),
+    "parked":         (-1, "⏸ 等待依赖 {blockers} 关闭 —— 关闭后自动重新派发,无需人工处理"),
 }
 STATUS_PHASES = tuple(_PHASES)
 
 
-def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attempt=0):
+def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attempt=0,
+                        blocked_by=()):
     """
     Render the human-facing progress *status board* comment body. Pure: a function
     of the discrete lifecycle state the tick already derived from fleet state; no
@@ -1412,6 +1517,7 @@ def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attem
       instance:  owning fleet-instance id, shown in the header when given
       pr:        the PR number, once one is open
       attempt:   the claim's current attempt (`current_attempt`)
+      blocked_by: the open blockers the issue waits on, for parked only
 
     Returns the full markdown body, led by STATUS_MARKER (the find-or-create anchor).
     """
@@ -1432,7 +1538,8 @@ def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attem
         label = label.format(pr=f" (#{pr})" if pr else "", gate=gate)
         lines.append(f"- [{'x' if done(i, key) else ' '}] {label}")
     lines.append("")
-    lines.append(current.format(gate=gate, attempt=attempt, retry_max=retry_max))
+    lines.append(current.format(gate=gate, attempt=attempt, retry_max=retry_max,
+                                blockers="、".join(f"#{n}" for n in blocked_by)))
     return "\n".join(lines)
 
 
@@ -1553,6 +1660,7 @@ SUMMARY_WORK = {
     "dispatched": "the issues this tick started a worker on",
     "reclaimed": "the issues this tick took over from a stale peer claim",
     "escalated": "the issues this tick handed to a human",
+    "parked": "the issues this tick left waiting on an open blocker",
 }
 SUMMARY_COUNTS = {
     "in_flight": "claims this fleet still holds as the tick ends",
@@ -1624,8 +1732,9 @@ def cycle_ticked(state, summary, config):
     The bottom of a cycle that ran a tick: fold the tick's summary into the cycle
     state and say how long to sleep.
 
-      summary: the tick's return — {"merged":[], "escalated":[], "dispatched":[],
-               "reclaimed":[], "in_flight": int, "frontier_remaining": int, ...}
+      summary: the tick's return — {"merged":[], "escalated":[], "parked":[],
+               "dispatched":[], "reclaimed":[], "in_flight": int,
+               "frontier_remaining": int, ...}
 
     `in_flight` and `frontier_remaining` are REQUIRED: a summary missing either
     would read as an idle fleet holding nothing, and pace it past its own lease.

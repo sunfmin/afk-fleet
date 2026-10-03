@@ -227,7 +227,7 @@ tick; even the bootstrap preview is a plan-tick subagent. This keeps the launche
 Every **deterministic** step the skill runs is a subcommand of `afk.py`, each printing one JSON object:
 the tick orchestrates and judges, but calls the tool for the fixed mechanics rather than re-deriving
 git/gh/orca incantations from prose each pass (ADR-0004). That holds for the **Act half** too: starting
-a worker, landing a PR, handing a sync conflict back, failing, escalating and closing a claim are each
+a worker, landing a PR, handing a sync conflict back, failing, escalating, parking and closing a claim are each
 **one call that performs the whole ordered sequence** and returns an `outcome` wherever your judgment is needed (ADR-0017). A tick
 therefore runs **no raw `git`, `gh pr merge`, `gh issue edit` or `orca worktree`/`terminal create`** of
 its own — and no orca command at all: even whether a worker is busy is read in code (ADR-0021). The full interface table — every
@@ -295,10 +295,14 @@ spawns).
      worker that is busy, or gone, is settled from that alone, with no GitHub read (ADR-0021). A
      runtime that reports no state (qoderclicn) is asked after through orca's own idle detection.
      Only for a worker that stopped does it gather the rest — the issue's worktree on this machine (asked of orca) and its
-     git progress, the worker's `afk:verdict` marker, the state of every issue that marker says it is
-     blocked by — computes how long the worker has been quiet, and returns `{outcome, action,
-     idle_seconds, open_blockers, worktree, progress, worker_verdict, nudged_at, handed_back_at,
-     worker_state}` (`worker_state` is the runtime's own report; null when it reports none).
+     git progress, the worker's `afk:verdict` marker, where every issue that marker says it is
+     blocked by stands — computes how long the worker has been quiet, and returns `{outcome, action,
+     idle_seconds, open_blockers, worktree, progress, worker_verdict, blockers, nudged_at,
+     handed_back_at, worker_state}` (`worker_state` is the runtime's own report; null when it
+     reports none; `blockers` is `[{number, standing, reason}]` for a `blocked` verdict — each named
+     blocker is `closed`, `waiting` (open, and the backlog will resolve it: a fleet holds its claim,
+     a PR is open for it, or it carries `ready_label`) or `unmet` (nothing will, and `reason` says
+     why)).
      `outcome` / `action` are the
      tool's conclusion; `worker_verdict` is only what the worker *declared* in its marker (one of the
      inputs). Act on `action` — each is one call:
@@ -310,9 +314,18 @@ spawns).
          `afk close --issue <n> --instance <id>`;
        - **idle_blocked** / `redispatch` (verdict `blocked`, every named blocker now closed) →
          `afk dispatch --issue <n>` again (the claim is kept; not a retry);
-       - **idle_blocked** / `escalate` (a blocker in `open_blockers` is still open, or the verdict
-         named none) → **escalate the DAG gap**:
-         `afk escalate --issue <n> --instance <id> --reason "<the unmet dependency>"`;
+       - **idle_blocked** / `park` (every blocker in `open_blockers` is `waiting`: the worker found
+         a dependency the backlog never declared, and the backlog will resolve it — often this very
+         fleet is working the blocker) → **record it and wait**: `afk park --issue <n> --instance
+         <id>` writes a native `blocked_by` edge to each open blocker, sets the status board,
+         releases the claim and removes the worktree if its branch holds no work. `ready_label` stays
+         and no attempt is spent; the issue is excluded from the frontier while a blocker is open and
+         is dispatchable again, by itself, the tick after the last one closes (ADR-0022);
+       - **idle_blocked** / `escalate` (a named blocker is `unmet` — it does not exist, was closed
+         as not planned, is an epic, is open with no fleet to work it, or waiting on it would close a
+         dependency cycle — or the verdict named none) → **escalate the DAG gap**:
+         `afk escalate --issue <n> --instance <id> --reason "<the unmet dependency>"`, wording the
+         reason from the `unmet` rows of `blockers`;
        - **idle_stalled** / `nudge` (idle past grace with **no verdict at all**, not yet nudged) →
          the worker stopped without an outcome — usually it is waiting on a question nobody will
          answer. `afk nudge --issue <n> --instance <id>` tells it to carry on, **once**: no attempt is
@@ -340,7 +353,7 @@ spawns).
    - **Merge** each *awaiting_merge* claim, one at a time: `afk merge --issue <n> --instance <id>`
      (see [Merge](#merge-serialized) for its outcomes). A `merged` outcome has already upserted the
      status board, released the claim and removed the worktree.
-   - **Fail / escalate** what the rebuild and the merges turned up (see
+   - **Fail / escalate / park** what the rebuild and the merges turned up (see
      [Failure handling](#failure-handling--bounded-retry--escalate-never-silently-drop)).
    - **Dispatch** to fill the free slots (`free_slots`, plus one for every claim this tick settled),
      taking `frontier.dispatch` in order:
@@ -375,9 +388,9 @@ spawns).
      <id> [--pr <pr>] [--attempt <k>] --repo <repo>` renders a progress checklist and writes the one
      marker-tagged comment **only when it changed** (idempotent — re-entrant ticks and retries never
      spam). Neither value is yours to derive: pass the `board_phase` and the `attempt` that `rebuild`
-     put on the claim's `mine` row. The **terminal** phases (merged, escalated, closed) and the first
+     put on the claim's `mine` row. The **terminal** phases (merged, escalated, closed, parked) and the first
      `claimed` are written by the transition that reaches them — `afk merge`, `afk escalate`, `afk
-     close`, `afk dispatch` — before it releases the claim. The board is human-read only — no tick ever
+     close`, `afk park`, `afk dispatch` — before it releases the claim. The board is human-read only — no tick ever
      parses it back (ADR-0006).
 3. **Return** the compact summary — in the shape your launcher constrained you to (the
    `summary_schema` of `afk cycle`) — and **exit**. Count `in_flight` (claims still mine) and
@@ -527,15 +540,21 @@ on the PR — never carried in context. The call does the rest and reports which
   (add `escalate_label`, remove `ready_label` and the attempt label) → comment your reason (if
   `escalate_comment`) → release the claim. The PR and the worktree are left for the human.
 
-An issue that should go to a human **without** consuming a retry — a DAG gap — takes the same ordered
-transition directly: `afk escalate --issue <n> --instance <id> --reason "<…>"`. Never silently drop or
-silently merge bad work.
+An issue that should go to a human **without** consuming a retry — a DAG gap nothing will resolve —
+takes the same ordered transition directly: `afk escalate --issue <n> --instance <id> --reason "<…>"`.
+Never silently drop or silently merge bad work.
+
+A dependency a worker *discovered* is not such a gap while the backlog will resolve it: `afk park
+--issue <n> --instance <id>` records it as a native `blocked_by` edge and releases the claim, and the
+frontier contract does the waiting — no label changes, no human (ADR-0022). `afk park` re-reads the
+blockers and refuses (exit 3, nothing changed) a claim `afk no-pr` would not call parkable now.
 
 **`no_pr` idle routing (not all of it is a failure).** Of the six `afk no-pr` outcomes (defined in
 the tick's In-flight list), only **idle_failed** enters the retry ladder above. **idle_stalled** is
 nudged first and costs no attempt. **idle_blocked** skips
-retry accounting entirely — re-dispatched when its `blocked_by` issues resolve, escalated as a DAG gap
-when they don't — and **idle_done** closes the issue after an empty-diff check; neither is a failure.
+retry accounting entirely — re-dispatched when its `blocked_by` issues have closed, parked while the
+open ones are workable backlog, escalated as a DAG gap only when nothing will resolve them — and
+**idle_done** closes the issue after an empty-diff check; neither is a failure.
 
 ## Concurrency
 
@@ -569,7 +588,7 @@ touch shared root config are naturally throttled by the DAG — chain them with 
   stopped — never its result (ADR-0018).
 - **Claim before work; release on every terminal transition.** `afk dispatch` creates the
   `afk-claim/<n>` ref first — if the create is rejected, a peer owns it and nothing is started.
-  `afk merge`, `afk escalate` and `afk close` each delete it as their last step; an orphan-release and a
+  `afk merge`, `afk escalate`, `afk park` and `afk close` each delete it as their last step; an orphan-release and a
   *closed* row are yours to `afk release`. A leaked ref is a phantom lock. Reconcile only your own claims, and take a peer's
   only when its heartbeat is expired (a **stale claim**) — the single exception is an explicit human
   [`--takeover`](#takeover-mode---takeover).
