@@ -179,15 +179,16 @@ streak, what is in flight — lives in there, maintained by code.
    ```
    (No `--state` on the very first cycle.) It gathers what a tick's Rebuild would observe
    (issues+labels, PRs+checks, claim refs) **inside the tool** — the raw JSON never enters the
-   launcher — and returns `{action, reason, state}`:
+   launcher — and returns `{action, reason, state}` (plus `summary_schema` on a tick):
    - `"action": "skip"` (nothing observable moved) → spawn nothing. A skipped cycle owes two things and
      the result already carries both: the lease was refreshed **inside this call** if the fleet holds
      claims (`heartbeat`), so a skipped cycle can never lapse a lease; and `sleep_seconds` is the pace.
      Keep `state` and go to step 4.
    - `"action": "tick"` (`first` / `changed` / `forced` / `gate_off`) → continue.
 2. **Spawn a tick** — call the [Agent] tool (fresh context) to run one reconciliation pass, passing
-   only `{repo, config, authorized: true, instance_id, worker_command}`. Constrain its return with a schema:
-   `{merged:[…], escalated:[…], dispatched:[…], reclaimed:[…], in_flight:N, frontier_remaining:N, note}`.
+   only `{repo, config, authorized: true, instance_id, worker_command}`. Constrain its return with the
+   **`summary_schema`** step 1 returned, verbatim — the JSON schema of a tick's summary, written by
+   the code that reads the summary back, so never compose one yourself.
    `in_flight` (claims the fleet still holds) and `frontier_remaining` (dispatchable issues it did not
    take) are **integers and mandatory** — the next step refuses a summary without them rather than
    pace a fleet holding claims as if it held none.
@@ -375,7 +376,8 @@ spawns).
      `claimed` are written by the transition that reaches them — `afk merge`, `afk escalate`, `afk
      close`, `afk dispatch` — before it releases the claim. The board is human-read only — no tick ever
      parses it back (ADR-0006).
-3. **Return** the compact summary and **exit**. Count `in_flight` (claims still mine) and
+3. **Return** the compact summary — in the shape your launcher constrained you to (the
+   `summary_schema` of `afk cycle`) — and **exit**. Count `in_flight` (claims still mine) and
    `frontier_remaining` (dispatchable issues not taken) as integers — the launcher's pacing reads them.
    Freshly-dispatched workers' PRs are picked up by a later tick.
 

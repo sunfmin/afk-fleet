@@ -626,9 +626,10 @@ def cmd_cycle(a):
     """One launcher cycle's mechanics, in two shapes (ADR-0017):
 
       afk cycle [--state S]             the top: digest what a rebuild would observe
-                                        (ADR-0007) → tick-or-skip. On a skip it also
-                                        refreshes the lease when the fleet holds
-                                        claims, and returns the sleep.
+                                        (ADR-0007) → tick-or-skip. A tick comes with
+                                        the schema its summary must return in. On a
+                                        skip it also refreshes the lease when the
+                                        fleet holds claims, and returns the sleep.
       afk cycle --state S --summary T   the bottom, after a tick returned T: fold it
                                         into the state and return the sleep.
 
@@ -1484,27 +1485,27 @@ def build_parser():
         return p
 
     def mine(p):
-        p.add_argument("--instance", required=True, help="my fleet instance id")
+        p.add_argument("--instance", required=True, metavar="id", help="my fleet instance id")
 
     def stamp(p):
         mine(p)
         p.add_argument("--host", default=socket.gethostname())
 
     def issue(p):
-        p.add_argument("--issue", dest="number", type=int, required=True)
+        p.add_argument("--issue", dest="number", type=int, required=True, metavar="n")
 
     def starts_worker(p):
         """The flags of a subcommand that may start a worker (dispatch, hand-back, fail)."""
         stamp(p)
-        p.add_argument("--worker-command", required=True,
+        p.add_argument("--worker-command", required=True, metavar="cmd",
                        help="the run's worker launch command, verbatim (ADR-0010)")
-        p.add_argument("--ready-timeout", type=int, default=120,
+        p.add_argument("--ready-timeout", type=int, default=120, metavar="s",
                        help="seconds to wait for the started agent to accept a prompt")
 
     # --- bootstrap ---
     p = command("config", cmd_config, "parse + validate the repo config file → canonical JSON",
                 needs_config=False)
-    p.add_argument("--file", default=None, help="path to the target repo's docs/agents/afk-fleet.md")
+    p.add_argument("--file", default=None, metavar="path", help="path to the target repo's docs/agents/afk-fleet.md")
     p.add_argument("--defaults", action="store_true", help="print the pure defaults table")
 
     command("probe", cmd_probe, remote="refs",
@@ -1514,7 +1515,7 @@ def build_parser():
     p = command("worker-command", cmd_worker_command, needs_config=False,
                 help="settle the command workers are started with: ask-or-not + candidates, "
                      "or --check a human's answer")
-    p.add_argument("--check", default=None,
+    p.add_argument("--check", default=None, metavar="cmd",
                    help="a candidate command: resolve its first word in the login shell "
                         "and report whether it runs (and looks unattended)")
 
@@ -1523,10 +1524,10 @@ def build_parser():
                 help="one launcher cycle: tick-or-skip at the top (with the skipped cycle's "
                      "heartbeat and sleep), or — with --summary — the sleep after a tick")
     mine(p)
-    p.add_argument("--state", default=None,
+    p.add_argument("--state", default=None, metavar="json",
                    help="the `state` the previous `afk cycle` returned, verbatim (omit on "
                         "the first cycle)")
-    p.add_argument("--summary", default=None,
+    p.add_argument("--summary", default=None, metavar="json",
                    help="the summary JSON of the tick that just ran: folds it into the "
                         "state and returns the sleep")
 
@@ -1539,14 +1540,14 @@ def build_parser():
 
     p = command("claim", cmd_claim, remote="refs",
                 help="low-level: atomically create a claim ref → {won} (dispatch does this)")
-    p.add_argument("number", type=int)
+    p.add_argument("number", type=int, metavar="n")
     stamp(p)
 
     p = command("reclaim", cmd_reclaim, "force-with-lease take of a stale claim → {won}",
                 remote="refs")
-    p.add_argument("number", type=int)
+    p.add_argument("number", type=int, metavar="n")
     stamp(p)
-    p.add_argument("--expect-sha", required=True, help="the sha you read; the take fails if it moved")
+    p.add_argument("--expect-sha", required=True, metavar="sha", help="the sha you read; the take fails if it moved")
 
     p = command("takeover", cmd_takeover, remote="refs",
                 help="list the fleet instances GitHub remembers, or force-take a dead "
@@ -1554,14 +1555,14 @@ def build_parser():
     stamp(p)
     p.add_argument("--list", action="store_true",
                    help="show every discoverable instance: heartbeat age, host, claim count")
-    p.add_argument("--from", dest="source", default=None,
+    p.add_argument("--from", dest="source", default=None, metavar="dead-id",
                    help="the dead instance whose claims to take")
     p.add_argument("--yes", action="store_true",
                    help="confirm a takeover of an instance whose heartbeat is still FRESH "
                         "(it looks alive; you are asserting you know it is dead)")
 
     p = command("release", cmd_release, "delete a claim ref (idempotent)", remote="refs")
-    p.add_argument("number", type=int)
+    p.add_argument("number", type=int, metavar="n")
 
     p = command("heartbeat", cmd_heartbeat, "refresh my heartbeat if due", remote="refs")
     mine(p)
@@ -1579,18 +1580,18 @@ def build_parser():
     p.add_argument("--terminal", choices=list(afk_decide.TERMINAL_STATES), required=True,
                    help="the orca probe: " + " | ".join(afk_decide.TERMINAL_STATES)
                         + " (none = no live worker)")
-    p.add_argument("--terminal-idle-seconds", type=int, default=None,
+    p.add_argument("--terminal-idle-seconds", type=int, default=None, metavar="s",
                    help="seconds since the terminal last showed activity, if the probe says")
-    p.add_argument("--worktree", default=None,
+    p.add_argument("--worktree", default=None, metavar="path",
                    help="the worker's worktree, to override the one orca reports for the issue")
 
     p = command("recovery", cmd_recovery, remote="refs",
                 help="read-only: does a dead claim have recoverable progress, and where? → "
                      "the tiered continuation verdict `afk dispatch` would act on")
     issue(p)
-    p.add_argument("--branch", default=None,
+    p.add_argument("--branch", default=None, metavar="branch",
                    help="the issue's work branch, when already known (skips discovery)")
-    p.add_argument("--worktree", default=None,
+    p.add_argument("--worktree", default=None, metavar="path",
                    help="path to the issue's worktree, when already known (skips the orca read)")
     p.add_argument("--no-worktree", action="store_true",
                    help="assert no local worktree survives (skips the orca read)")
@@ -1610,14 +1611,14 @@ def build_parser():
                      "release → cleanup, or the outcome that needs the tick's judgment")
     issue(p)
     mine(p)
-    p.add_argument("--verified", default=None, metavar="HEAD",
+    p.add_argument("--verified", default=None, metavar="head",
                    help="the head sha an adversarial verify passed (gate.adversarial_verify)")
     p.add_argument("--allow-no-checks", action="store_true",
                    help="gate.ci required: merge a PR that has no checks at all (the tick's "
                         "progressive-gate judgment)")
-    p.add_argument("--gate-timeout", type=int, default=1800,
+    p.add_argument("--gate-timeout", type=int, default=1800, metavar="s",
                    help="seconds before the local gate is called red (default %(default)s)")
-    p.add_argument("--excerpt-lines", type=int, default=afk_decide.GATE_EXCERPT_LINES,
+    p.add_argument("--excerpt-lines", type=int, default=afk_decide.GATE_EXCERPT_LINES, metavar="k",
                    help="how many trailing log lines a red gate's excerpt keeps")
 
     p = command("hand-back", cmd_hand_back, remote="gh",
@@ -1632,7 +1633,7 @@ def build_parser():
                      "once, spending no attempt; the next silence is a failure")
     issue(p)
     mine(p)
-    p.add_argument("--worktree", default=None,
+    p.add_argument("--worktree", default=None, metavar="path",
                    help="the worker's worktree, to override the one orca reports for the issue")
 
     p = command("fail", cmd_fail, remote="gh",
@@ -1640,7 +1641,7 @@ def build_parser():
                      "escalate it — the whole retry ladder in one call")
     issue(p)
     starts_worker(p)
-    p.add_argument("--reason", required=True,
+    p.add_argument("--reason", required=True, metavar="text",
                    help="why it failed, re-read from where it lives: handed to the retry's "
                         "worker, or — when the attempts are exhausted — commented for a human")
 
@@ -1649,7 +1650,7 @@ def build_parser():
                      "release")
     issue(p)
     mine(p)
-    p.add_argument("--reason", required=True, help="the stuck point, worded for a human")
+    p.add_argument("--reason", required=True, metavar="text", help="the stuck point, worded for a human")
 
     p = command("close", cmd_close, remote="gh",
                 help="close one of my claims whose issue needed no change: status board → "
@@ -1659,12 +1660,12 @@ def build_parser():
 
     p = command("status", cmd_status, remote="gh",
                 help="upsert one claim's status board at a non-terminal phase (idempotent)")
-    p.add_argument("number", type=int)
-    p.add_argument("--phase", required=True, choices=list(afk_decide.STATUS_PHASES),
+    p.add_argument("number", type=int, metavar="n")
+    p.add_argument("--phase", required=True, choices=list(afk_decide.STATUS_PHASES), metavar="phase",
                    help="the lifecycle phase — a `mine` row's board_phase")
-    p.add_argument("--instance", default=None, help="owning fleet instance id (shown in the header)")
-    p.add_argument("--pr", type=int, default=None, help="the PR number, once one is open")
-    p.add_argument("--attempt", type=int, default=0,
+    p.add_argument("--instance", default=None, metavar="id", help="owning fleet instance id (shown in the header)")
+    p.add_argument("--pr", type=int, default=None, metavar="pr", help="the PR number, once one is open")
+    p.add_argument("--attempt", type=int, default=0, metavar="k",
                    help="the `mine` row's attempt (shown for ci_failed)")
 
     return ap

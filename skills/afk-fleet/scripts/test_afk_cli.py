@@ -721,7 +721,8 @@ def test_cycle_gates_paces_and_beats_through_a_whole_run():
         # cycle 1: no state at all → the first tick
         first = w.afk("cycle", *ME, *R, *NOW)
         assert (first["action"], first["reason"]) == ("tick", "first")
-        assert set(first) == {"action", "reason", "state"}            # a tick owes no sleep yet
+        # a tick owes no sleep yet; it carries the schema its summary returns in
+        assert set(first) == {"action", "reason", "state", "summary_schema"}
         st = first["state"]
         # the digest is the SAME one rebuild reports: one gatherer, one function
         assert st["fingerprint"] == w.afk("rebuild", *ME, *R)["fingerprint"]
@@ -2199,16 +2200,34 @@ def test_the_docs_route_on_exactly_the_words_the_code_returns():
     for outcome in afk_decide.MERGE_OUTCOMES:
         assert outcome in row("merge"), outcome
 
-    # the verdict a worker is asked for is spelled with the phases the code routes
-    assert f"phase=<{'|'.join(afk_decide.VERDICT_PHASES)}>" in docs["worker-prompt.md"]
+    # the verdict marker is written into the worker prompt by the code that parses
+    # it — the template never spells it — and each phase is explained to both readers
+    assert "{verdict_marker}" in docs["worker-prompt.md"]
+    assert "<!--afk:verdict n=" not in docs["worker-prompt.md"]
     for phase in afk_decide.VERDICT_PHASES:
-        assert f"`{phase}`" in skill, phase
+        assert f"`{phase}`" in skill and f"**`{phase}`**" in docs["worker-prompt.md"], phase
 
-    # the summary schema the launcher gives a tick names every key `afk cycle` reads
-    for key in afk_decide.SUMMARY_WORK:
-        assert f"{key}:[…]" in skill, key
+    # the tick's summary schema comes from `afk cycle`; the launcher is never given
+    # one to copy, only told which two counts it must not lose
+    assert "`summary_schema`" in skill and "merged:[" not in skill
     for key in afk_decide.SUMMARY_COUNTS:
-        assert f"{key}:N" in skill, key
+        assert f"`{key}`" in skill, key
+
+
+def test_the_tools_table_is_the_one_the_parser_generates():
+    """tools.md's first column is rendered from `build_parser()` by
+    `gen_tools_doc.py`; a flag added without re-running it turns this red."""
+    import gen_tools_doc
+    with open(gen_tools_doc.TOOLS_MD) as f:
+        text = f.read()
+    assert gen_tools_doc.render(text) == text, "run scripts/gen_tools_doc.py"
+    subs = afk.build_parser().subcommands
+    # the generator's own reading of a parser: positionals, required, optional, choices
+    assert gen_tools_doc.usage("reclaim", subs["reclaim"]) == \
+        "afk reclaim <n> --instance <id> --expect-sha <sha>"
+    assert gen_tools_doc.usage("dispatch", subs["dispatch"]) == \
+        ("afk dispatch --issue <n> --instance <id> --worker-command <cmd> "
+         "[--ready-timeout <s>] [--start <auto\\|fresh>]")
 
 
 def test_the_docs_restate_config_only_as_the_schema_has_it():

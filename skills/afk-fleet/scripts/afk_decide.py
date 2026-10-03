@@ -611,10 +611,31 @@ NO_PR_ROUTES = (("coding", "leave"), ("idle_done", "close_release"),
                 ("dead", "orphan"))
 
 
+def _verdict_text(n, phase, blocked_by, reason, optional=str):
+    """The marker's one spelling: its fields, their names and their order."""
+    parts = [f"n={n}", f"phase={phase}",
+             *([optional(f"blocked_by={blocked_by}")] if blocked_by else []),
+             *([optional(f"reason={reason}")] if reason else [])]
+    return f"<!--afk:verdict {' '.join(parts)}-->"
+
+
+def verdict_marker(n, phase, blocked_by=(), reason=None):
+    """The marker a worker posts for one verdict — what `parse_verdict_marker`
+    reads back (a test round-trips every phase)."""
+    return _verdict_text(n, phase, ",".join(str(b) for b in blocked_by), reason)
+
+
+def verdict_marker_format(n):
+    """The marker as the worker prompt shows it to issue <n>'s worker: its own
+    number filled in, the rest as placeholders, optional fields in brackets."""
+    return _verdict_text(n, f"<{'|'.join(VERDICT_PHASES)}>", "<csv of issue numbers>", "<short>",
+                         optional=lambda field: f"[{field}]")
+
+
 def parse_verdict_marker(body):
     """
     Parse the FIRST afk:verdict marker in one comment body → a verdict dict, or
-    None if the body carries no marker. The marker (worker-prompt.md, LAYER 1) is:
+    None if the body carries no marker. The marker is `verdict_marker`'s:
 
       <!--afk:verdict n=<issue> phase=<one of VERDICT_PHASES> \
           [blocked_by=<csv of issue numbers>] [reason=<short>]-->
@@ -1150,9 +1171,11 @@ def select_recovery(worktree, branch):
 # is handed over, and {handback}, filled from the `handback` block only when the
 # worker is started on a sync conflict that was handed back (ADR-0019). That
 # block is also a brief of its own — `render_handback` — for a worker that is
-# still there to be told. Everything else in braces is a field — one of them
+# still there to be told. Everything else in braces is a field — two of them
 # derived: {wake_command}, the line a worker runs to wake the launcher once its
-# outcome is on GitHub, built from the `launcher_terminal` field (ADR-0020).
+# outcome is on GitHub, built from the `launcher_terminal` field (ADR-0020), and
+# {verdict_marker}, the marker a worker that opens no PR must post
+# (`verdict_marker_format`).
 
 _BLOCK_RE = re.compile(r"<!--afk:block ([a-z0-9_.]+)-->\n(.*?)\n?<!--/afk:block-->", re.DOTALL)
 PROMPT_VARIANTS = ("fresh", "continue")
@@ -1160,6 +1183,7 @@ PROMPT_FIELDS = ("n", "title", "repo", "base_branch", "local_command", "branch",
                  "launcher_terminal")
 HANDBACK_FIELDS = ("pr", "pr_branch", "target", "target_tip", "files")
 _PROMPT_SLOTS = ("opening", "step1", "retry_reason", "handback")
+_PROMPT_DERIVED = ("wake_command", "verdict_marker")
 _NO_LOCAL_COMMAND = "true   # (no gate.local_command configured: run the repo's own build/test, if any)"
 _NO_WAKE = "true   # (no coordinator terminal to wake: it finds your outcome at its next poll)"
 _TERMINAL_HANDLE_RE = re.compile(r"[A-Za-z0-9_.:-]+")
@@ -1213,6 +1237,7 @@ def _fill_prompt(text, fields, handback, reason=None):
     values = {k: str(fields[k]) for k in PROMPT_FIELDS}
     values["local_command"] = values["local_command"].strip() or _NO_LOCAL_COMMAND
     values["wake_command"] = wake_command(values.pop("launcher_terminal"), fields["n"])
+    values["verdict_marker"] = verdict_marker_format(fields["n"])
     free_text = {"title": values.pop("title"), "reason": (reason or "").strip()}
     if handback is not None:
         values.update({k: str(handback[k]) for k in HANDBACK_FIELDS if k != "files"})
@@ -1220,7 +1245,7 @@ def _fill_prompt(text, fields, handback, reason=None):
                               or "- (the sync reported none — the merge itself will list them)")
     for name, value in values.items():
         text = text.replace("{" + name + "}", value)
-    known = (*PROMPT_FIELDS, *HANDBACK_FIELDS, *_PROMPT_SLOTS, "wake_command")
+    known = (*PROMPT_FIELDS, *HANDBACK_FIELDS, *_PROMPT_SLOTS, *_PROMPT_DERIVED)
     left = sorted(set(re.findall(r"\{(?:%s)\}" % "|".join(known), text))
                   - {"{%s}" % k for k in free_text})
     if left:
@@ -1465,11 +1490,32 @@ def pace(did_work, in_flight, empty_streak, config):
 CYCLE_START = {"fingerprint": "", "skips": 0, "empty_streak": 0,
                "in_flight": 0, "frontier_remaining": 0}
 
-# The tick summary's keys this code reads (SKILL.md gives the tick its return
-# schema; a test holds that schema to these): the lists that mean a tick did work,
-# and the two integers pacing needs.
-SUMMARY_WORK = ("merged", "dispatched", "reclaimed", "escalated")
-SUMMARY_COUNTS = ("in_flight", "frontier_remaining")
+# The tick summary's keys this code reads, each with what the tick puts there:
+# the lists that mean a tick did work, and the two integers pacing needs.
+# `summary_schema` is built from these, and it is what the launcher constrains a
+# tick's return with — so the writer and the reader of a summary share one shape.
+SUMMARY_WORK = {
+    "merged": "the issues whose PR this tick merged",
+    "dispatched": "the issues this tick started a worker on",
+    "reclaimed": "the issues this tick took over from a stale peer claim",
+    "escalated": "the issues this tick handed to a human",
+}
+SUMMARY_COUNTS = {
+    "in_flight": "claims this fleet still holds as the tick ends",
+    "frontier_remaining": "dispatchable issues this tick did not take",
+}
+
+
+def summary_schema():
+    """The JSON schema of a tick's summary — what `cycle_ticked` takes back."""
+    props = {k: {"type": "array", "items": {"type": "integer"}, "description": why}
+             for k, why in SUMMARY_WORK.items()}
+    props.update({k: {"type": "integer", "description": why}
+                  for k, why in SUMMARY_COUNTS.items()})
+    props["note"] = {"type": "string",
+                     "description": "anything the human should hear: an error, a judgment call"}
+    return {"type": "object", "properties": props,
+            "required": [*SUMMARY_WORK, *SUMMARY_COUNTS]}
 
 
 def cycle_state(raw):
@@ -1493,7 +1539,8 @@ def cycle_wake(state, current_fp, config):
       current_fp: `fingerprint` of what a rebuild would observe now; None when
                   `fingerprint_gate` is off (nothing was gathered)
 
-    Returns {"action": "tick"|"skip", "reason", "state"} and, on a skip, the two
+    Returns {"action": "tick"|"skip", "reason", "state"}. A tick also carries
+    `summary_schema`, the shape its summary must come back in. A skip carries the two
     things a skipped cycle still owes: `sleep_seconds`, and `heartbeat` — True when
     the fleet holds claims, so the effect layer refreshes the lease no tick will.
     On a tick the launcher spawns one and reports back through `cycle_ticked`,
@@ -1503,12 +1550,14 @@ def cycle_wake(state, current_fp, config):
     nothing is left on the frontier: unchanged state then proves the cycle empty.
     """
     if not config["fingerprint_gate"]:
-        return {"action": "tick", "reason": "gate_off", "state": {**state, "skips": 0}}
+        return {"action": "tick", "reason": "gate_off", "state": {**state, "skips": 0},
+                "summary_schema": summary_schema()}
     gate = fingerprint_gate(state["fingerprint"], current_fp, state["skips"],
                             config["force_tick_after_skips"])
     new = {**state, "fingerprint": current_fp, "skips": gate["skips"]}
     if gate["action"] == "tick":
-        return {"action": "tick", "reason": gate["reason"], "state": new}
+        return {"action": "tick", "reason": gate["reason"], "state": new,
+                "summary_schema": summary_schema()}
     if new["in_flight"] == 0 and new["frontier_remaining"] == 0:
         new["empty_streak"] += 1
     return {"action": "skip", "reason": gate["reason"], "state": new,

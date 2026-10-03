@@ -273,6 +273,20 @@ def test_protection_verdict():
     assert d.protection_verdict("required", None, unavailable="boom")["verdict"] == "ok"
 
 
+def test_the_verdict_marker_round_trips_through_its_parser():
+    # one writer, one reader: whatever `verdict_marker` spells, the parser reads back
+    for phase in d.VERDICT_PHASES:
+        got = d.parse_verdict_marker(d.verdict_marker(12, phase, [3, 4], "needs pages from #3"))
+        assert got == {"found": True, "n": 12, "phase": phase, "blocked_by": [3, 4],
+                       "reason": "needs pages from #3"}, phase
+        bare = d.parse_verdict_marker(d.verdict_marker(7, phase))
+        assert (bare["n"], bare["phase"], bare["blocked_by"], bare["reason"]) == (7, phase, [], None)
+    # what the worker is shown is that same spelling, with placeholders
+    shown = d.verdict_marker_format(31)
+    assert shown == ("<!--afk:verdict n=31 phase=<already-satisfied|blocked|giving-up> "
+                     "[blocked_by=<csv of issue numbers>] [reason=<short>]-->")
+
+
 def test_parse_verdict_marker():
     # valid, every field; reason (last) keeps its spaces
     body = ("<!--afk:verdict n=12 phase=blocked blocked_by=3,4 reason=needs pages from #3-->\n"
@@ -859,6 +873,15 @@ def test_cycle_wake_gates_beats_and_paces_a_skipped_cycle():
     assert first["state"]["fingerprint"] == "aaa"
     # a tick owes its sleep to cycle_ticked, not to the gate
     assert "sleep_seconds" not in first and "heartbeat" not in first
+    # …and comes with the shape its summary must return in: every key cycle_ticked
+    # reads, the two counts as integers, all of them required
+    schema = first["summary_schema"]
+    assert set(schema["properties"]) == {*d.SUMMARY_WORK, *d.SUMMARY_COUNTS, "note"}
+    assert set(schema["required"]) == {*d.SUMMARY_WORK, *d.SUMMARY_COUNTS}
+    assert all(schema["properties"][k]["type"] == "integer" for k in d.SUMMARY_COUNTS)
+    assert "summary_schema" not in d.cycle_wake(
+        d.cycle_ticked(first["state"], {"in_flight": 0, "frontier_remaining": 0}, cfg)["state"],
+        "aaa", cfg)                                           # a skip spawns no tick
 
     # unchanged + idle fleet → skip; each such skip is itself an empty cycle
     idle = d.cycle_ticked(first["state"], {"in_flight": 0, "frontier_remaining": 0}, cfg)["state"]
