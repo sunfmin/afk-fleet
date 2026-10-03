@@ -177,8 +177,8 @@ _Avoid_: assignee (dropped as a claim signal), assignment, lock (too generic)
 **Heartbeat** (and its lease):
 The liveness signal a **fleet instance** publishes for itself — one ref `afk-heartbeat/<id>` carrying
 a timestamp, refreshed while it holds any claim (per instance, not per claim; roughly once per
-`claim_lease_ttl`/3, not once per tick). A claim is leased-live while its owner's heartbeat is within
-`claim_lease_ttl`; its freshness is the only thing that lets a peer tell a live owner from a dead one.
+`claim_lease_ttl_seconds`/3, not once per tick). A claim is leased-live while its owner's heartbeat is within
+`claim_lease_ttl_seconds`; its freshness is the only thing that lets a peer tell a live owner from a dead one.
 _Avoid_: ping, keepalive, liveness probe (that name is the local orca-cli worker check — a different
 thing, at a different granularity)
 
@@ -204,7 +204,7 @@ Contrast **Stale claim**, which is a peer's.
 _Avoid_: stuck issue, dead worker, zombie
 
 **Stale claim**:
-A **peer's** claim whose owner's **heartbeat** has expired past `claim_lease_ttl` — evidence the owning
+A **peer's** claim whose owner's **heartbeat** has expired past `claim_lease_ttl_seconds` — evidence the owning
 instance died mid-flight. It is the only claim a fleet may take from another *unattended*: reclaimed
 by an atomic `git push --force-with-lease` takeover of the ref, and only then, then recovered by
 **continuation**. A live peer's claim is never touched — that is what keeps cooperating fleets from
@@ -215,7 +215,7 @@ _Avoid_: dead claim, abandoned claim, orphaned claim (that is one's *own* worker
 **Takeover**:
 The **human-authorized**, **immediate** reclaim of a dead **fleet instance**'s claims — the
 lease-bypassing sibling of **stale-claim** reclaim. Where a stale reclaim is unattended and waits for
-the owner's **heartbeat** to expire past `claim_lease_ttl` (the only machine-visible proof of death),
+the owner's **heartbeat** to expire past `claim_lease_ttl_seconds` (the only machine-visible proof of death),
 a takeover is initiated by a present human who *is* the proof of death — the oracle that knows, before
 the lease lapses, that the fleet hard-stopped (quota exhausted, process killed). It is a **launcher**
 bootstrap variant (`afk-fleet --takeover`): the new instance runs the full bootstrap (config, instance

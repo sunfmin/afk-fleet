@@ -135,7 +135,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    older than a third of the lease.
    `skills/afk-fleet/scripts/afk_decide.py:heartbeat_due`
 2. The fleet hard-stops and runs no code; a peer's next rebuild finds a claim whose owner's heartbeat
-   is older than `claim_lease_ttl`, and classifies it a **stale claim**.
+   is older than `claim_lease_ttl_seconds`, and classifies it a **stale claim**.
    `skills/afk-fleet/scripts/afk_decide.py:classify_claims`
 3. The peer takes the claim by re-stamping the ref with its own instance, a push the server rejects
    unless the ref still points at the sha the peer read.

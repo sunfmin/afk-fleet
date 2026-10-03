@@ -25,9 +25,10 @@ and never needs to read this file. It is a template of named blocks:
 
 The fields are `{n}`, `{title}`, `{repo}`, `{base_branch}`, `{local_command}` (from the issue and the
 config), `{branch}`, `{worktree_path}` (the **actual** values orca returned — orca names the branch
-`<user>/…`, never assumed from `branch_pattern`) and `{wake_command}` — the line that **wakes** the
+`<user>/…`, never assumed from `branch_pattern`), `{wake_command}` — the line that **wakes** the
 launcher, built from the handle of the terminal the launcher runs in, or a no-op when it runs in
-none (ADR-0020). A field or slot the code cannot fill is an error: no
+none (ADR-0020) — and `{verdict_marker}`, the `<!--afk:verdict …-->` line a worker that opens no PR
+must post, written by the same code that parses it back. A field or slot the code cannot fill is an error: no
 worker is ever started on a prompt with a literal placeholder in it. A test renders both variants.
 
 <!--afk:block prompt-->
@@ -47,7 +48,7 @@ leaving exactly one of these two durable, machine-readable facts:
 2. **An `afk:verdict` marker comment** on the issue — when you are *not* going to open a PR. Its
    **first line** must be exactly this HTML comment (one line), followed by a human-readable body:
    ```
-   <!--afk:verdict n={n} phase=<already-satisfied|blocked|giving-up> [blocked_by=<csv of issue numbers>] [reason=<short>]-->
+   {verdict_marker}
    ```
    Post it with `gh issue comment {n} --repo {repo} --body "..."`. Pick the phase:
    - **`already-satisfied`** — the issue is already implemented in `{base_branch}` (your diff vs base is
