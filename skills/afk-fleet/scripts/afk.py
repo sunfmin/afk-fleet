@@ -215,10 +215,10 @@ def _issue_state(repo, number):
 
 def _blocker(repo, number):
     """One issue a `blocked` verdict names, as `afk_decide.blocker_standings` reads
-    it: {"id", "state", "state_reason", "labels": [name...], "pull_request"}. None
+    it: {"state", "state_reason", "labels": [name...], "pull_request"}. None
     when it cannot be read — which is never "closed"."""
     p = _gh(["api", f"repos/{repo}/issues/{number}", "--jq",
-             "{id, state, state_reason, labels: [.labels[].name], "
+             "{state, state_reason, labels: [.labels[].name], "
              "pull_request: (.pull_request != null)}"], check=False)
     return json.loads(p.stdout) if p.returncode == 0 and p.stdout.strip() else None
 
@@ -711,10 +711,19 @@ def cmd_rebuild(a):
 def _issue_worktree(repo, number):
     """This machine's orca worktree for an issue → (path, branch), each None when
     there is none. Soft, like the read behind it: no orca means no worktree. A
-    path orca remembers but the disk no longer has is returned as-is — callers
-    check `os.path.isdir`."""
+    path orca remembers but the disk no longer has is returned as-is — a caller
+    that will read the worktree asks `_live_worktree` instead."""
     hit = afk_decide.find_orca_worktree(_orca_worktree_rows(), number, repo)
     return hit["path"], hit["branch"]
+
+
+def _live_worktree(repo, number):
+    """The path of an issue's worktree that is really on this machine's disk, None
+    when orca knows none or the directory is gone — what every caller that reads
+    or works IN the worktree wants. (`_issue_worktree` is for the ones that must
+    also see a path orca still remembers: removing it, reporting it.)"""
+    path, _ = _issue_worktree(repo, number)
+    return path if path and os.path.isdir(path) else None
 
 
 def cmd_no_pr(a):
@@ -821,9 +830,8 @@ def _blocker_standings(a, cfg, number, named, prs):
         edges[n] = [e["number"] for e in _blocked_by(a.repo, n) if e["state"] == "open"]
         todo.extend(edges[n])
     return afk_decide.blocker_standings(
-        number, named, blockers, {c["number"] for c in claims},
-        {n for n in named if afk_decide.closing_pr(prs, n)}, edges,
-        cfg["ready_label"], cfg["epic_labels"])
+        number, named, cfg, blockers=blockers, claimed={c["number"] for c in claims},
+        open_pr={n for n in named if afk_decide.closing_pr(prs, n)}, edges=edges)
 
 
 def cmd_nudge(a):
@@ -836,8 +844,8 @@ def cmd_nudge(a):
       {"issue", "action": "nudged", "terminal", "terminal_tail": [...]}"""
     cfg, rem = _cfg(a), _remote(a)
     _require_mine(rem, cfg, a.number, a.instance)
-    path = a.worktree or _issue_worktree(a.repo, a.number)[0]
-    if not path or not os.path.isdir(path):
+    path = a.worktree or _live_worktree(a.repo, a.number)
+    if not path or not os.path.isdir(path):      # the isdir is for a --worktree given by hand
         raise RuntimeError(f"issue #{a.number} has no worktree on this machine — there is no "
                            f"worker here to nudge")
     if _nudge(path) is not None:
@@ -862,8 +870,7 @@ def _stalled_reason(repo, number, reason):
     """`reason`, plus where the worker stopped when this failure follows a nudge
     it never answered: its screen as it is now, else as it was when nudged. Soft —
     a failure is never blocked on reading a terminal."""
-    path, _ = _issue_worktree(repo, number)
-    path = path if path and os.path.isdir(path) else None
+    path = _live_worktree(repo, number)
     nudge = _nudge(path)
     if nudge is None:
         return reason
@@ -1327,8 +1334,8 @@ def cmd_merge(a):
                            "resolved yet; nothing was touched")
 
     # --- the branch's worktree: the worker's, else one recreated at the PR head ---
-    path, _ = _issue_worktree(a.repo, a.number)
-    recreated = not (path and os.path.isdir(path))
+    path = _live_worktree(a.repo, a.number)
+    recreated = path is None
     if recreated:
         path, _, pr_tip = _create_worktree(a, cfg, rem, _issue(a.repo, a.number), branch)
     else:
@@ -1431,9 +1438,9 @@ def cmd_hand_back(a):
     pr = afk_decide.closing_pr(_open_prs(a.repo), a.number)
     if pr is None:
         raise RuntimeError(f"no open PR closes issue #{a.number} — nothing to hand back")
-    path, _ = _issue_worktree(a.repo, a.number)
+    path = _live_worktree(a.repo, a.number)
     tip = (_git(["-C", path, "rev-parse", "-q", "--verify", "MERGE_HEAD"], check=False)
-           .stdout.strip() if path and os.path.isdir(path) else "")
+           .stdout.strip() if path else "")
     if not tip:
         raise RuntimeError(f"issue #{a.number} has no sync conflict in progress on this machine "
                            f"— a hand-back acts on the `conflict` outcome of `afk merge`; run "
@@ -1563,16 +1570,11 @@ def cmd_park(a):
     _require_mine(rem, cfg, a.number, a.instance)
     declared = afk_decide.latest_verdict(_issue_comments(a.repo, a.number))
     standings = _blocker_standings(a, cfg, a.number, declared["blocked_by"], _open_prs(a.repo))
-    route = afk_decide.blocked_route(declared["blocked_by"],
-                                     {b["number"]: b["standing"] for b in standings})
-    if declared["phase"] != "blocked" or route["action"] != "park":
-        why = "; ".join(f"#{b['number']} {b['reason']}" for b in standings if b["reason"])
-        raise ValueError(f"issue #{a.number} is not parkable (`afk no-pr` decides): "
-                         f"{why or 'its worker left no `blocked` verdict naming an open blocker'}; "
-                         f"nothing was changed")
-    waiting = route["open_blockers"]
-    path, _ = _issue_worktree(a.repo, a.number)
-    path = path if path and os.path.isdir(path) else None
+    refusal = afk_decide.park_refusal(declared, standings)
+    if refusal:
+        raise ValueError(f"issue #{a.number} is not parkable: {refusal}; nothing was changed")
+    waiting = [b["number"] for b in standings if b["standing"] == "waiting"]
+    path = _live_worktree(a.repo, a.number)
     progress = _worktree_progress(path, rem, cfg["base_branch"]) if path else {}
 
     recorded = {e["number"] for e in _blocked_by(a.repo, a.number)}

@@ -299,6 +299,28 @@ def _eligibility_rows(issues, prs, claims, blocked_by):
             for i in issues]
 
 
+def label_bars(labels, ready_label, epic_labels):
+    """
+    Every reason an issue's LABELS keep a fleet from dispatching it, as
+    {kind: reason} in the order the frontier reports them; {} when its labels
+    allow dispatch. The one home of the label rules: the frontier reads it, and
+    so does the standing of a blocker (`blocker_standings`), so the two cannot
+    disagree about what a fleet will work.
+
+      not_ready  it lacks `ready_label` — the one bar a claim or an open PR
+                 overrides (the issue is being worked anyway);
+      epic       it carries an epic label — never dispatched, whatever else holds.
+    """
+    labels = set(labels or [])
+    bars = {}
+    if ready_label not in labels:
+        bars["not_ready"] = f"no {ready_label} label"
+    hit_epic = labels & {e.strip() for e in epic_labels if e.strip()}
+    if hit_epic:
+        bars["epic"] = f"epic label ({', '.join(sorted(hit_epic))})"
+    return bars
+
+
 def select_frontier(issues, ready_label, epic_labels):
     """
     Decide which issues are dispatchable RIGHT NOW. Shared by `--plan` and the live
@@ -310,16 +332,12 @@ def select_frontier(issues, ready_label, epic_labels):
 
     Returns {"dispatch": [num...], "excluded": [{"number","reason"}...]}.
     """
-    epic_set = {e.strip() for e in epic_labels if e.strip()}
     dispatch, excluded = [], []
     for issue in issues:
         num = issue.get("number")
-        labels = set(issue.get("labels") or [])
-        hit_epic = labels & epic_set
-        if ready_label not in labels:
-            reason = f"no {ready_label} label"
-        elif hit_epic:
-            reason = f"epic label ({', '.join(sorted(hit_epic))})"
+        bars = label_bars(issue.get("labels"), ready_label, epic_labels)
+        if bars:
+            reason = next(iter(bars.values()))
         elif issue.get("claimed"):
             reason = "already claimed (afk-claim ref exists)"
         elif issue.get("has_open_pr"):
@@ -705,7 +723,7 @@ _CLOSED_UNDONE = {"not_planned": "was closed as not planned",
                   "duplicate": "was closed as a duplicate"}
 
 
-def _blocker_standing(blocker, claimed, has_open_pr, ready_label, epic_labels):
+def _blocker_standing(blocker, claimed, has_open_pr, config):
     """One named blocker's `(standing, reason)`, before the cycle check."""
     if blocker is None:
         return _UNMET, "could not be read (it may not exist)"
@@ -714,13 +732,12 @@ def _blocker_standing(blocker, claimed, has_open_pr, ready_label, epic_labels):
     if blocker.get("state") == "closed":
         undone = _CLOSED_UNDONE.get(blocker.get("state_reason"))
         return (_UNMET, undone) if undone else (_CLOSED, None)
-    labels = set(blocker.get("labels") or [])
-    hit_epic = labels & {e.strip() for e in epic_labels if e.strip()}
-    if hit_epic:
-        return _UNMET, f"is an epic ({', '.join(sorted(hit_epic))})"
-    if claimed or has_open_pr or ready_label in labels:
-        return _WAITING, None
-    return _UNMET, f"is open but no fleet will work it (unclaimed, no {ready_label} label)"
+    bars = label_bars(blocker.get("labels"), config["ready_label"], config["epic_labels"])
+    if set(bars) - {"not_ready"}:          # a bar no claim overrides: nothing will dispatch it
+        return _UNMET, f"will never be dispatched: {'; '.join(bars.values())}"
+    if bars and not (claimed or has_open_pr):
+        return _UNMET, f"is open but no fleet will work it (unclaimed, {bars['not_ready']})"
+    return _WAITING, None
 
 
 def depends_on(start, target, edges):
@@ -737,12 +754,13 @@ def depends_on(start, target, edges):
     return False
 
 
-def blocker_standings(number, named, blockers, claimed, open_pr, edges, ready_label, epic_labels):
+def blocker_standings(number, named, config, *, blockers, claimed, open_pr, edges):
     """
     Where each issue a `blocked` verdict names stands — will the dependency
     issue <number>'s worker discovered resolve on its own, or must a human look?
 
       named:    the verdict's blocked_by, in order
+      config:   the canonical config — read for ready_label and epic_labels
       blockers: {n: {"state", "state_reason", "labels": [name...], "pull_request": bool}};
                 a missing or None entry is an issue that could not be read
       claimed:  the issue numbers a claim ref exists for — ANY owner: mine and a
@@ -750,7 +768,6 @@ def blocker_standings(number, named, blockers, claimed, open_pr, edges, ready_la
       open_pr:  the issue numbers an open PR closes
       edges:    {n: [its open blockers]}, covering everything reachable from a
                 `waiting` blocker (`afk.py` walks it) — the cycle check
-      ready_label, epic_labels: config
 
     Returns [{"number", "standing": one of BLOCKER_STANDINGS, "reason": str|None}...].
     A `waiting` blocker that itself depends on <number> is `unmet`: recording
@@ -759,7 +776,7 @@ def blocker_standings(number, named, blockers, claimed, open_pr, edges, ready_la
     rows = []
     for n in named:
         standing, reason = _blocker_standing((blockers or {}).get(n), n in claimed, n in open_pr,
-                                             ready_label, epic_labels)
+                                             config)
         if n == number:
             standing, reason = _UNMET, "is the issue itself"
         elif standing == _WAITING and depends_on(n, number, edges or {}):
@@ -777,18 +794,42 @@ def blocked_route(named, standings):
       standings: {issue number: one of BLOCKER_STANDINGS}; anything else — a
                  missing entry, an unknown word — is `unmet`
 
-    Returns {"action", "open_blockers"}:
+    Returns {"action", "pending_blockers"}:
       redispatch  every named blocker is closed: the dependency cleared.
       park        every named blocker is closed or `waiting`: record the
                   dependency and wait for it (`afk park`).
       escalate    one is `unmet`, or none was named — nothing will ever clear it.
-    `open_blockers` is the named blockers not `closed`.
+    `pending_blockers` is the named blockers not `closed` — still open, or
+    closed without the work being done.
     """
     standings = standings or {}
     pending = [n for n in named if standings.get(n) != _CLOSED]
     if not named or any(standings.get(n) != _WAITING for n in pending):
-        return {"action": "escalate", "open_blockers": pending}
-    return {"action": "park" if pending else "redispatch", "open_blockers": pending}
+        return {"action": "escalate", "pending_blockers": pending}
+    return {"action": "park" if pending else "redispatch", "pending_blockers": pending}
+
+
+def park_refusal(verdict, standings):
+    """
+    Why a claim cannot be parked, or None when it can — `afk park`'s own
+    check of what `afk no-pr` told the tick, worded so the tick knows what to do
+    instead.
+
+      verdict:   the `latest_verdict` dict
+      standings: `blocker_standings`' rows for its blocked_by
+    """
+    if not verdict.get("found") or verdict.get("phase") != _BLOCKED:
+        return "its worker's latest verdict is not `blocked`"
+    named = verdict.get("blocked_by") or []
+    action = blocked_route(named, {b["number"]: b["standing"] for b in standings})["action"]
+    if action == "park":
+        return None
+    if action == "redispatch":
+        return "every blocker it named is closed — dispatch it again instead"
+    if not named:
+        return "its `blocked` verdict names no blocker — escalate it instead"
+    unmet = "; ".join(f"#{b['number']} {b['reason']}" for b in standings if b["standing"] == _UNMET)
+    return f"nothing will resolve {unmet} — escalate it instead"
 
 
 def read_worker_state(row, now, grace_seconds, tui_idle=None):
@@ -871,7 +912,7 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
                        period to start on it, and after that its silence takes the
                        same nudge → failure path as any other.
 
-    Returns {"outcome", "action", "idle_seconds", "open_blockers"} — `action` is
+    Returns {"outcome", "action", "idle_seconds", "pending_blockers"} — `action` is
     what the tick does, `outcome` the reason it is grouped under:
       coding       leave         — busy, OR last activity within grace.
       idle_done    close_release — idle past grace + `already-satisfied` + NO changes
@@ -898,7 +939,8 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
     newest file mtime, terminal activity, the nudge, the hand-back — a nudged or
     handed-back worker gets a whole grace period to answer); None when none is
     known, which is never
-    "within grace". `open_blockers` is the blocked_by not yet closed (`blocked_route`).
+    "within grace". `pending_blockers` is `blocked_route`'s: the blocked_by not yet
+    done, [] for any other verdict.
     """
     progress = progress or {}
     seen = [t for t in (progress.get("last_commit_ts"), progress.get("worktree_mtime_ts"))
@@ -910,10 +952,10 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
             seen.append(int(told_at))
     idle_seconds = max(0, int(now) - int(max(seen))) if seen else None
 
-    def out(outcome, action, open_blockers=()):
+    def out(outcome, action, pending_blockers=()):
         assert (outcome, action) in NO_PR_ROUTES, (outcome, action)
         return {"outcome": outcome, "action": action, "idle_seconds": idle_seconds,
-                "open_blockers": list(open_blockers)}
+                "pending_blockers": list(pending_blockers)}
 
     # dead first: no worker means it cannot be "coding", whatever it left behind.
     if terminal == "none":
@@ -935,7 +977,7 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
         return out("idle_done", "close_release")
     if phase == _BLOCKED:
         route = blocked_route(verdict.get("blocked_by") or [], blocker_states)
-        return out("idle_blocked", route["action"], route["open_blockers"])
+        return out("idle_blocked", route["action"], route["pending_blockers"])
     if not verdict.get("found") and nudged_at is None and can_nudge:
         return out("idle_stalled", "nudge")
     return out("idle_failed", "next_attempt")
@@ -1488,6 +1530,7 @@ _STATUS_STEPS = (
 # (a terminal give-up, ticked specially in `render_status_board`), closed (the
 # worker found the issue already satisfied — `afk close`), and parked (the worker
 # found an open dependency; the claim is released until it closes — `afk park`).
+_NOTHING_REACHED = -1      # no step ticked: the phase is before, or outside, the happy path
 _PHASES = {
     "claimed":        (0, "▸ 当前:worker 实现中,尚无 PR"),
     "pr_open":        (1, "▸ 当前:等 {gate}"),
@@ -1497,7 +1540,7 @@ _PHASES = {
     "merged":         (3, "✅ 已合并,完成"),
     "escalated":      (1, "⚠️ 已升级给人处理 —— 见下方评论"),
     "closed":         (0, "✅ 主干已满足此需求,无需改动 —— 已关闭"),
-    "parked":         (-1, "⏸ 等待依赖 {blockers} 关闭 —— 关闭后自动重新派发,无需人工处理"),
+    "parked":         (_NOTHING_REACHED, "⏸ 等待依赖 {blockers} 关闭 —— 关闭后自动重新派发,无需人工处理"),
 }
 STATUS_PHASES = tuple(_PHASES)
 

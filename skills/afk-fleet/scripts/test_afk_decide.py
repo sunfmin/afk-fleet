@@ -532,33 +532,33 @@ def test_classify_no_pr_blocked_routes_on_the_blockers_real_state():
 
     # every named blocker closed → the DAG cleared: re-dispatch (keep the claim)
     r = blocked([42, 43], {42: "closed", 43: "closed"})
-    assert (r["outcome"], r["action"], r["open_blockers"]) == ("idle_blocked", "redispatch", [])
+    assert (r["outcome"], r["action"], r["pending_blockers"]) == ("idle_blocked", "redispatch", [])
     # one still open that the backlog will resolve → park on it, and say which (ADR-0022)
     r = blocked([42, 43], {42: "closed", 43: "waiting"})
-    assert (r["outcome"], r["action"], r["open_blockers"]) == ("idle_blocked", "park", [43])
-    assert blocked([42, 43], {42: "waiting", 43: "waiting"})["open_blockers"] == [42, 43]
+    assert (r["outcome"], r["action"], r["pending_blockers"]) == ("idle_blocked", "park", [43])
+    assert blocked([42, 43], {42: "waiting", 43: "waiting"})["pending_blockers"] == [42, 43]
     # one that nothing will resolve → a real DAG gap: escalate, whatever the others are
     r = blocked([42, 43], {42: "waiting", 43: "unmet"})
-    assert (r["outcome"], r["action"], r["open_blockers"]) == ("idle_blocked", "escalate", [42, 43])
+    assert (r["outcome"], r["action"], r["pending_blockers"]) == ("idle_blocked", "escalate", [42, 43])
     r = blocked([42, 43], {42: "closed", 43: "open"})                 # not a standing: unmet
-    assert (r["outcome"], r["action"], r["open_blockers"]) == ("idle_blocked", "escalate", [43])
+    assert (r["outcome"], r["action"], r["pending_blockers"]) == ("idle_blocked", "escalate", [43])
     # a blocker whose state could not be read is NOT provably closed → still open
     r = blocked([42, 43], {42: "closed", 43: None})
-    assert (r["action"], r["open_blockers"]) == ("escalate", [43])
-    assert blocked([42], {})["open_blockers"] == [42]
+    assert (r["action"], r["pending_blockers"]) == ("escalate", [43])
+    assert blocked([42], {})["pending_blockers"] == [42]
     # a `blocked` verdict naming NO blocker can never clear — re-dispatching it
     # would loop forever outside the retry ladder, so it escalates
     r = blocked([], {})
-    assert (r["outcome"], r["action"], r["open_blockers"]) == ("idle_blocked", "escalate", [])
+    assert (r["outcome"], r["action"], r["pending_blockers"]) == ("idle_blocked", "escalate", [])
     # blocked routes on the DAG even with work on the branch
     assert blocked([42], {42: "open"}, {**ZERO, "commits_ahead": 4})["action"] == "escalate"
     assert blocked([42], {42: "waiting"}, {**ZERO, "commits_ahead": 4})["action"] == "park"
     # every route it can return is one the docs are held to
     assert {("idle_blocked", a) for a in ("redispatch", "park", "escalate")} <= set(d.NO_PR_ROUTES)
 
-    # open_blockers is reported only for a blocked verdict
+    # pending_blockers is reported only for a blocked verdict
     assert d.classify_no_pr(ZERO, "idle", 600, _verdict("giving-up", [42]), {42: "open"},
-                            NOW, GRACE)["open_blockers"] == []
+                            NOW, GRACE)["pending_blockers"] == []
 
 
 def test_blocker_standings_tell_a_dependency_the_backlog_resolves_from_one_nothing_will():
@@ -568,10 +568,11 @@ def test_blocker_standings_tell_a_dependency_the_backlog_resolves_from_one_nothi
     ready = {"state": "open", "state_reason": None, "labels": ["ready-for-agent"],
              "pull_request": False}
     bare = {**ready, "labels": ["bug"]}
+    cfg = {"ready_label": "ready-for-agent", "epic_labels": ["epic", "prd"]}
 
     def stand(named, blockers, claimed=(), open_pr=(), edges=None, number=7):
-        rows = d.blocker_standings(number, named, blockers, set(claimed), set(open_pr),
-                                   edges or {}, "ready-for-agent", ["epic", "prd"])
+        rows = d.blocker_standings(number, named, cfg, blockers=blockers, claimed=set(claimed),
+                                   open_pr=set(open_pr), edges=edges or {})
         assert [r["number"] for r in rows] == list(named)            # one row each, in order
         assert all(r["standing"] in d.BLOCKER_STANDINGS for r in rows)
         assert all((r["reason"] is None) == (r["standing"] != "unmet") for r in rows)
@@ -593,7 +594,7 @@ def test_blocker_standings_tell_a_dependency_the_backlog_resolves_from_one_nothi
     for blocker, kw, why in (
             (None, {}, "could not be read"),
             (bare, {}, "no ready-for-agent label"),
-            ({**ready, "labels": ["ready-for-agent", "prd"]}, {"claimed": [1]}, "an epic (prd)"),
+            ({**ready, "labels": ["ready-for-agent", "prd"]}, {"claimed": [1]}, "epic label (prd)"),
             ({**done, "state_reason": "not_planned"}, {}, "not planned"),
             ({**done, "state_reason": "duplicate"}, {}, "duplicate"),
             ({**ready, "pull_request": True}, {}, "pull request")):
@@ -616,13 +617,51 @@ def test_blocker_standings_tell_a_dependency_the_backlog_resolves_from_one_nothi
 
     # and the route those standings come to
     assert d.blocked_route([1, 2], {1: "closed", 2: "closed"}) == \
-        {"action": "redispatch", "open_blockers": []}
+        {"action": "redispatch", "pending_blockers": []}
     assert d.blocked_route([1, 2], {1: "closed", 2: "waiting"}) == \
-        {"action": "park", "open_blockers": [2]}
+        {"action": "park", "pending_blockers": [2]}
     assert d.blocked_route([1, 2], {1: "unmet", 2: "waiting"}) == \
-        {"action": "escalate", "open_blockers": [1, 2]}
-    assert d.blocked_route([], {}) == {"action": "escalate", "open_blockers": []}
-    assert d.blocked_route([1], None) == {"action": "escalate", "open_blockers": [1]}
+        {"action": "escalate", "pending_blockers": [1, 2]}
+    assert d.blocked_route([], {}) == {"action": "escalate", "pending_blockers": []}
+    assert d.blocked_route([1], None) == {"action": "escalate", "pending_blockers": [1]}
+
+    # `afk park`'s own check: None when parkable, else what to do instead
+    def refusal(named, blockers, phase="blocked", **kw):
+        rows = d.blocker_standings(7, named, cfg, blockers=blockers, claimed=set(),
+                                   open_pr=set(), edges={}, **kw)
+        return d.park_refusal(_verdict(phase, named), rows)
+
+    assert refusal([1, 2], {1: done, 2: ready}) is None
+    assert "not `blocked`" in refusal([1], {1: ready}, phase="giving-up")
+    assert "not `blocked`" in d.park_refusal({"found": False, "phase": None, "blocked_by": []}, [])
+    assert "dispatch it again" in refusal([1], {1: done})
+    assert "names no blocker" in refusal([], {})
+    why = refusal([1, 2, 3], {1: ready, 2: bare, 3: None})
+    assert "#2 is open but no fleet" in why and "#3 could not be read" in why
+    assert "#1" not in why and "escalate it" in why                  # only the unmet ones
+
+
+def test_the_frontier_and_a_blockers_standing_read_one_set_of_label_rules():
+    """What keeps an issue off the frontier and what makes a blocker `unmet` are
+    the same facts about its labels. Two copies would drift: a rule added to the
+    frontier alone leaves parked issues waiting on a blocker no fleet will ever
+    dispatch."""
+    assert d.label_bars(["ready-for-agent", "bug"], "ready-for-agent", ["epic"]) == {}
+    assert d.label_bars(None, "go", []) == {"not_ready": "no go label"}
+    bars = d.label_bars(["epic", "prd"], "ready-for-agent", ["epic", " prd ", ""])
+    assert list(bars) == ["not_ready", "epic"] and bars["epic"] == "epic label (epic, prd)"
+
+    cfg = {"ready_label": "ready-for-agent", "epic_labels": ["epic"]}
+    for labels in (["ready-for-agent"], ["bug"], ["ready-for-agent", "epic"], ["epic"], []):
+        row = {"number": 1, "labels": labels}
+        front = d.select_frontier([row], cfg["ready_label"], cfg["epic_labels"])
+        blocker = {"state": "open", "state_reason": None, "labels": labels, "pull_request": False}
+        (standing,) = d.blocker_standings(7, [1], cfg, blockers={1: blocker}, claimed=set(),
+                                          open_pr=set(), edges={})
+        # an unclaimed, PR-less open issue is `waiting` exactly when it is dispatchable
+        assert (standing["standing"] == "waiting") == (front["dispatch"] == [1]), labels
+        if front["excluded"]:                    # …and is told off for the frontier's own reason
+            assert front["excluded"][0]["reason"] in standing["reason"], labels
 
 
 def _takeover_state(now):

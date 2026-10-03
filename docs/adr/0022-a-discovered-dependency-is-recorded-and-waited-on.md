@@ -35,6 +35,10 @@ down.
      planned or as a duplicate, is an epic, is open with no claim, no PR and no `ready_label` (which
      includes an escalated one), or already depends on the blocked issue — recording the edge would
      close a cycle neither side ever leaves. Each carries the reason a human is told.
+
+   The label half of this — `ready_label`, epic labels — is not restated: the frontier and the
+   standing both read `label_bars`, so a rule added to one is a rule of the other, and a test holds
+   "an unclaimed, PR-less open issue is `waiting` exactly when it is dispatchable".
 2. **`idle_blocked` has three routes** (`blocked_route`): every named blocker `closed` → `redispatch`,
    as before; every open one `waiting` → **`park`**; any `unmet`, or none named → `escalate`, as
    before. One `unmet` blocker escalates the issue whatever the others are.
@@ -53,7 +57,11 @@ down.
    id to decide.
 6. **`afk park` decides for itself.** It re-reads the verdict and the standings through the same
    gatherer `afk no-pr` uses and refuses, touching nothing, a claim that is not parkable now
-   ([ADR-0016](0016-the-seam-enforces-its-own-rules.md)).
+   ([ADR-0016](0016-the-seam-enforces-its-own-rules.md)) — naming the transition it needs instead
+   (`park_refusal`).
+7. **The row says `pending_blockers`, not `open_blockers`.** A blocker closed as not planned is
+   not open, and is not done either; `open_blockers` stays the name of the frontier's count of
+   open dependency edges, which is a different thing.
 
 ## Consequences
 
