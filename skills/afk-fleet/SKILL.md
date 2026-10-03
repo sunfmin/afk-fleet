@@ -297,9 +297,10 @@ spawns).
      Only for a worker that stopped does it gather the rest — the issue's worktree on this machine (asked of orca) and its
      git progress, the worker's `afk:verdict` marker, where every issue that marker says it is
      blocked by stands — computes how long the worker has been quiet, and returns `{outcome, action,
-     idle_seconds, open_blockers, worktree, progress, worker_verdict, blockers, nudged_at,
+     idle_seconds, pending_blockers, worktree, progress, worker_verdict, blockers, nudged_at,
      handed_back_at, worker_state}` (`worker_state` is the runtime's own report; null when it
-     reports none; `blockers` is `[{number, standing, reason}]` for a `blocked` verdict — each named
+     reports none; `pending_blockers` is the named blockers not yet done — still open, or closed
+     without the work; `blockers` is `[{number, standing, reason}]` for a `blocked` verdict — each named
      blocker is `closed`, `waiting` (open, and the backlog will resolve it: a fleet holds its claim,
      a PR is open for it, or it carries `ready_label`) or `unmet` (nothing will, and `reason` says
      why)).
@@ -314,7 +315,7 @@ spawns).
          `afk close --issue <n> --instance <id>`;
        - **idle_blocked** / `redispatch` (verdict `blocked`, every named blocker now closed) →
          `afk dispatch --issue <n>` again (the claim is kept; not a retry);
-       - **idle_blocked** / `park` (every blocker in `open_blockers` is `waiting`: the worker found
+       - **idle_blocked** / `park` (every blocker in `pending_blockers` is `waiting`: the worker found
          a dependency the backlog never declared, and the backlog will resolve it — often this very
          fleet is working the blocker) → **record it and wait**: `afk park --issue <n> --instance
          <id>` writes a native `blocked_by` edge to each open blocker, sets the status board,
@@ -547,7 +548,8 @@ Never silently drop or silently merge bad work.
 A dependency a worker *discovered* is not such a gap while the backlog will resolve it: `afk park
 --issue <n> --instance <id>` records it as a native `blocked_by` edge and releases the claim, and the
 frontier contract does the waiting — no label changes, no human (ADR-0022). `afk park` re-reads the
-blockers and refuses (exit 3, nothing changed) a claim `afk no-pr` would not call parkable now.
+blockers and refuses (exit 3, nothing changed) a claim `afk no-pr` would not call parkable now —
+the error says which transition it needs instead.
 
 **`no_pr` idle routing (not all of it is a failure).** Of the six `afk no-pr` outcomes (defined in
 the tick's In-flight list), only **idle_failed** enters the retry ladder above. **idle_stalled** is

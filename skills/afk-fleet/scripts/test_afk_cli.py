@@ -228,9 +228,9 @@ if parts[0] == "issues" and len(parts) == 2:
         finish(row.get("state", "open"))
     if jq == ".id":
         finish(str(issue_id(row)))
-    if jq == ("{id, state, state_reason, labels: [.labels[].name], "
+    if jq == ("{state, state_reason, labels: [.labels[].name], "
               "pull_request: (.pull_request != null)}"):
-        finish(json.dumps({"id": issue_id(row), "state": row.get("state", "open"),
+        finish(json.dumps({"state": row.get("state", "open"),
                            "state_reason": row.get("state_reason"),
                            "labels": [lb["name"] for lb in row["labels"]],
                            "pull_request": "pull_request" in row}))
@@ -901,10 +901,10 @@ def test_no_pr_gathers_every_signal_and_decides_in_one_call():
         assert 0 <= r["idle_seconds"] < 300 and r["worker_verdict"]["found"] is False
         # the tool's conclusion is `outcome`/`action`; what the WORKER declared is
         # `worker_verdict` — never one bare "verdict" that could be read as either
-        assert set(r) == {"issue", "outcome", "action", "idle_seconds", "open_blockers",
+        assert set(r) == {"issue", "outcome", "action", "idle_seconds", "pending_blockers",
                           "worktree", "progress", "worker_verdict", "blockers", "nudged_at",
                           "handed_back_at", "worker_state"}
-        assert r["issue"] == 4 and r["open_blockers"] == [] and r["worktree"] == w.cwd
+        assert r["issue"] == 4 and r["pending_blockers"] == [] and r["worktree"] == w.cwd
         assert r["blockers"] == []
         assert r["worker_state"] is None
 
@@ -964,7 +964,7 @@ def test_no_pr_gathers_every_signal_and_decides_in_one_call():
                               _comment(3, _marker("blocked", " blocked_by=41,42 reason=needs both"))]})
         w.calls()
         r = w.no_pr(*base, "--now", later)
-        assert (r["outcome"], r["action"], r["open_blockers"]) == ("idle_blocked", "escalate", [41, 42])
+        assert (r["outcome"], r["action"], r["pending_blockers"]) == ("idle_blocked", "escalate", [41, 42])
         assert r["worker_verdict"]["phase"] == "blocked"
         assert r["worker_verdict"]["reason"] == "needs both"
         assert r["worker_verdict"]["comment_url"] == "https://gh/c/3"   # the LATEST marker wins
@@ -975,13 +975,13 @@ def test_no_pr_gathers_every_signal_and_decides_in_one_call():
 
         w.set(issues=[issue(4), issue(41, state="closed"), issue(42)])
         r = w.no_pr(*base, "--now", later)
-        assert (r["action"], r["open_blockers"]) == ("escalate", [42])
+        assert (r["action"], r["pending_blockers"]) == ("escalate", [42])
         w.set(issues=[issue(4), issue(41, state="closed"), issue(42, state="closed")])
         r = w.no_pr(*base, "--now", later)
-        assert (r["outcome"], r["action"], r["open_blockers"]) == ("idle_blocked", "redispatch", [])
+        assert (r["outcome"], r["action"], r["pending_blockers"]) == ("idle_blocked", "redispatch", [])
         # a blocker that cannot be read at all is not provably closed
         w.set(issues=[issue(4), issue(41, state="closed")])       # #42 is now a 404
-        assert w.no_pr(*base, "--now", later)["open_blockers"] == [42]
+        assert w.no_pr(*base, "--now", later)["pending_blockers"] == [42]
 
         # already-satisfied over a pristine branch → close + release…
         w.set(comments={"4": [_comment(9, _marker("already-satisfied"))]})
@@ -2063,11 +2063,12 @@ def test_a_worker_blocked_on_workable_backlog_is_parked_until_the_blocker_closes
             w.set(comments=comments)
             r = w.no_pr("--issue", str(n), *R, *cfg, "--now", later)
             assert r["outcome"] == "idle_blocked", r
-            return r["action"], r["open_blockers"], [b["standing"] for b in r["blockers"]]
+            return r["action"], r["pending_blockers"], [b["standing"] for b in r["blockers"]]
 
         # --- what nothing will resolve is still a human's -------------------------
         # no blocker named; unclaimed with no ready label; an epic; a dependency cycle
         assert stops_blocked(136, "") == ("escalate", [], [])
+        assert "names no blocker — escalate it instead" in w.error(*_park(136))
         assert stops_blocked(136, "138") == ("escalate", [138], ["unmet"])
         assert stops_blocked(136, "140") == ("escalate", [140], ["unmet"])
         w.set(deps={"139": [136]})                                   # #139 waits on #136…
@@ -2079,7 +2080,8 @@ def test_a_worker_blocked_on_workable_backlog_is_parked_until_the_blocker_closes
         # …and `afk park` refuses what `afk no-pr` would not call parkable, touching nothing
         assert "not this fleet's claim" in w.error(*_park(136, instance="peer"))
         err = w.error(*_park(136))
-        assert "not parkable" in err and "#138" in err and "nothing was changed" in err
+        assert "not parkable" in err and "nothing was changed" in err
+        assert "#138 is open but no fleet will work it" in err and "#135" not in err
         assert w.claimed_by(136) == "me" and "136" not in w.state()["deps"]
 
         # --- a blocker a fleet is working is waited on ------------------------------
