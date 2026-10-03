@@ -11,7 +11,7 @@ verbs: what happens, in what order, and what it leaves behind.
 `skills/afk-fleet/references/worker-prompt.md`, and every deterministic step is a subcommand of
 `skills/afk-fleet/scripts/afk.py` deciding through a pure function in
 `skills/afk-fleet/scripts/afk_decide.py`. Each thing a tick *does* to a claim — start a worker, land
-a PR, fail, escalate, close — is one such subcommand performing its whole ordered sequence
+a PR, fail, escalate, park, close — is one such subcommand performing its whole ordered sequence
 (ADR-0017), so most steps below anchor into code. An anchor into a `.py` file names a function, and
 an anchor into a `.md` file names a word in the passage that step is executed from. Check them all with
 the `mainline` skill's `verify-anchors.sh docs/flows.md`.
@@ -194,8 +194,13 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   a sync conflict handed back to its worker and never answered, an adversarial refute (`skills/afk-fleet/references/completion-gate.md:adversarial_verify`),
   or a worker idle past grace with a `giving-up` verdict or none at all
   (`skills/afk-fleet/scripts/afk_decide.py:classify_no_pr`).
-- A worker that declares itself blocked is not a failure: re-dispatched when its blockers close,
-  escalated as a DAG gap when they do not (`skills/afk-fleet/scripts/afk.py:cmd_escalate`), never counted as an attempt.
+- A worker that declares itself blocked is not a failure and never counts as an attempt. Where each
+  blocker it names stands decides (`skills/afk-fleet/scripts/afk_decide.py:blocker_standings`):
+  all closed, it is re-dispatched; still open but workable backlog, it is **parked** — the
+  dependency recorded as a native `blocked_by` edge and the claim released, so the frontier holds it
+  back until the blocker closes (`skills/afk-fleet/scripts/afk.py:cmd_park`, ADR-0022); one nothing
+  will resolve, or none named, it is escalated as a DAG gap
+  (`skills/afk-fleet/scripts/afk.py:cmd_escalate`).
 - A worker that declares the issue already satisfied, with nothing on its branch: the issue is
   closed and the claim released (the first mainline's fork).
 
@@ -210,11 +215,16 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 - A fleet never takes a peer's claim unattended while that peer's heartbeat is within the lease, and
   its own claims stay its own even when its heartbeat has expired. (ADR-0003;
   `test_classify_claims`, `test_classify_claims_my_own_expired_stays_mine`)
-- A claim is deleted at every terminal transition (merge, escalate, close, release) and as its last
-  step — after the PR landed, after the relabel — and a release that left the ref on the remote is
-  an error, never "released". (ADR-0016, ADR-0017;
+- A claim is deleted at every terminal transition (merge, escalate, park, close, release) and as its
+  last step — after the PR landed, after the relabel, after the dependency edge — and a release that
+  left the ref on the remote is an error, never "released". (ADR-0016, ADR-0017;
   `test_a_release_that_did_not_delete_the_claim_is_an_error`,
   `test_escalate_relabels_before_it_releases`)
+- A dependency a worker discovers is recorded on GitHub and waited on, never handed to a human, while
+  the backlog will resolve it; a parked issue keeps its ready label, costs no attempt, and cannot be
+  dispatched again while a blocker it named is open. (ADR-0022;
+  `test_blocker_standings_tell_a_dependency_the_backlog_resolves_from_one_nothing_will`,
+  `test_a_worker_blocked_on_workable_backlog_is_parked_until_the_blocker_closes`)
 - A branch catches up with its base by merging, never rebasing, and what lands on the target was
   gated in the form it lands; only exit 0 is green, and a timeout is red. (ADR-0012, ADR-0017;
   `test_merge_gates_the_tree_that_lands_then_settles_the_claim`,
@@ -249,7 +259,8 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 ## An issue's life
 
 The states are the status board's phases (`skills/afk-fleet/scripts/afk_decide.py:STATUS_PHASES`),
-plus the two a board never shows: ready before any claim, and released back to ready.
+plus the two a board never shows: ready before any claim, and released back to ready. (A parked
+issue's board stays up while it waits, unclaimed.)
 
 ```mermaid
 stateDiagram-v2
@@ -270,7 +281,9 @@ stateDiagram-v2
   handed_back --> ci_failed: never answered, after one nudge
   ci_failed --> claimed: attempts left, fresh worker under the same claim
   ci_failed --> escalated: attempts exhausted
-  claimed --> escalated: no outcome after grace and attempts exhausted, or blocker still open
+  claimed --> escalated: no outcome after grace and attempts exhausted, or a blocker nothing will resolve
+  claimed --> parked: worker blocked on open, workable backlog; dependency recorded, claim released
+  parked --> ready: every blocker it named has closed
   claimed --> closed: already satisfied, empty diff verified
   closed --> [*]: claim released, worktree removed
   merged --> [*]: claim released, worktree removed

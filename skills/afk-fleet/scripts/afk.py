@@ -19,7 +19,7 @@ worktree's git, gh, orca, the login shell — and applies their effects.
 
 The tick's Act half is transitions, not recipes (ADR-0017): `dispatch` starts a
 worker, `merge` lands a PR, `hand-back` returns a sync conflict to its worker,
-`fail` / `escalate` / `close` settle a claim. Each
+`fail` / `escalate` / `park` / `close` settle a claim. Each
 performs its whole ordered sequence in one process, so an invariant like "relabel
 before release" or "start from the fetched base tip" is code, not a paragraph.
 
@@ -211,6 +211,24 @@ def _issue_state(repo, number):
     """"open" | "closed", or None if the issue could not be read."""
     p = _gh(["api", f"repos/{repo}/issues/{number}", "--jq", ".state"], check=False)
     return p.stdout.strip() or None if p.returncode == 0 else None
+
+
+def _blocker(repo, number):
+    """One issue a `blocked` verdict names, as `afk_decide.blocker_standings` reads
+    it: {"id", "state", "state_reason", "labels": [name...], "pull_request"}. None
+    when it cannot be read — which is never "closed"."""
+    p = _gh(["api", f"repos/{repo}/issues/{number}", "--jq",
+             "{id, state, state_reason, labels: [.labels[].name], "
+             "pull_request: (.pull_request != null)}"], check=False)
+    return json.loads(p.stdout) if p.returncode == 0 and p.stdout.strip() else None
+
+
+def _blocked_by(repo, number):
+    """The issues GitHub records issue <number> as blocked by — its native
+    dependency edges — as [{"number", "state"}...]. Raises when it cannot be read."""
+    p = _gh(["api", "--paginate", f"repos/{repo}/issues/{number}/dependencies/blocked_by",
+             "--jq", ".[] | {number, state}"])
+    return [json.loads(ln) for ln in p.stdout.splitlines() if ln.strip()]
 
 
 def _contains(repo, sha, head):
@@ -708,8 +726,9 @@ def cmd_no_pr(a):
     runtime reported (ADR-0021): a worker that is busy, or one that is gone, is
     decided from that alone — nothing on GitHub or in git is read for it. Only a
     worker that stopped gets the rest gathered: the worktree's git progress, its
-    `afk:verdict` marker, the state of each issue that marker says it is blocked
-    by, and when it was last told something (`nudged_at`, `handed_back_at`).
+    `afk:verdict` marker, the standing of each issue that marker says it is blocked
+    by (`blockers`), and when it was last told something (`nudged_at`,
+    `handed_back_at`).
     Returns {"workers": [`afk_decide.classify_no_pr`'s outcome plus those signals
     and the `worker_state` it was read from, one per --issue, in order]}."""
     cfg = _cfg(a)
@@ -756,19 +775,55 @@ def _worker_outcome(a, cfg, number, path, reading, now, grace):
                                         None, {}, now, grace, nudged_at=nudged_at)
     if settled["outcome"] in ("coding", "dead"):
         return {**settled, "worktree": path, "progress": {}, "worker_verdict": None,
-                "nudged_at": nudged_at, "handed_back_at": None}
+                "blockers": [], "nudged_at": nudged_at, "handed_back_at": None}
     progress = _worktree_progress(path, _remote(a), cfg["base_branch"]) if path else {}
     declared = afk_decide.latest_verdict(_issue_comments(a.repo, number))
-    blocker_states = {n: _issue_state(a.repo, n) for n in declared["blocked_by"]}
-    pr = afk_decide.closing_pr(_open_prs(a.repo), number)
+    prs = _open_prs(a.repo)
+    blockers = _blocker_standings(a, cfg, number, declared["blocked_by"], prs)
+    pr = afk_decide.closing_pr(prs, number)
     handed_back_at = ((_open_handback(a.repo, pr) if pr else None) or {}).get("at")
     return {**afk_decide.classify_no_pr(progress, reading["terminal"],
                                         reading["terminal_idle_seconds"], declared,
-                                        blocker_states, now, grace,
+                                        {b["number"]: b["standing"] for b in blockers},
+                                        now, grace,
                                         nudged_at=nudged_at, can_nudge=path is not None,
                                         handed_back_at=handed_back_at),
             "worktree": path, "progress": progress, "worker_verdict": declared,
-            "nudged_at": nudged_at, "handed_back_at": handed_back_at}
+            "blockers": blockers, "nudged_at": nudged_at, "handed_back_at": handed_back_at}
+
+
+# More issues than any real dependency chain holds: a walk that gets here is an
+# error, never "no cycle found".
+_DEPENDENCY_WALK_LIMIT = 200
+
+
+def _blocker_standings(a, cfg, number, named, prs):
+    """Where each issue a `blocked` verdict names stands
+    (`afk_decide.blocker_standings`), gathering what that takes: the blocker
+    itself, the claim refs, the open PRs, and — from every blocker still open —
+    the chain of open blockers behind it, for the cycle check. `afk no-pr` and
+    `afk park` both read through here, so the transition parks exactly what the
+    observation said was parkable."""
+    if not named:
+        return []
+    blockers = {n: _blocker(a.repo, n) for n in named}
+    claims, _ = _scan(_remote(a), cfg["claim_namespace"])
+    edges = {}
+    todo = [n for n, b in blockers.items()
+            if b and b["state"] == "open" and not b["pull_request"]]
+    while todo:
+        n = todo.pop()
+        if n == number or n in edges:
+            continue
+        if len(edges) >= _DEPENDENCY_WALK_LIMIT:
+            raise RuntimeError(f"issue #{number}: the dependency chain behind its blockers is "
+                               f"longer than {_DEPENDENCY_WALK_LIMIT} issues")
+        edges[n] = [e["number"] for e in _blocked_by(a.repo, n) if e["state"] == "open"]
+        todo.extend(edges[n])
+    return afk_decide.blocker_standings(
+        number, named, blockers, {c["number"] for c in claims},
+        {n for n in named if afk_decide.closing_pr(prs, n)}, edges,
+        cfg["ready_label"], cfg["epic_labels"])
 
 
 def cmd_nudge(a):
@@ -1141,16 +1196,17 @@ def cmd_dispatch(a):
 
 
 # --------------------------------------------------------------------------- #
-# act: settling a claim — merge / fail / escalate / close                      #
+# act: settling a claim — merge / fail / escalate / park / close               #
 # --------------------------------------------------------------------------- #
 
-def _upsert_board(repo, number, cfg, phase, instance=None, pr=None, attempt=0):
+def _upsert_board(repo, number, cfg, phase, instance=None, pr=None, attempt=0, blocked_by=()):
     """Upsert the human-facing progress status board comment (idempotent, ADR-0006).
     Renders the body from the given phase (pure), then find-or-create by marker
     and write ONLY when the body changed — so re-entrant/disposable ticks and
     retry re-dispatches never spam the issue."""
     body = afk_decide.render_status_board(phase, cfg["gate"]["ci"], cfg["retry"],
-                                          instance=instance, pr=pr, attempt=attempt)
+                                          instance=instance, pr=pr, attempt=attempt,
+                                          blocked_by=blocked_by)
     comments = f"repos/{repo}/issues/{number}/comments"
     board = next((c for c in _issue_comments(repo, number)
                   if afk_decide.STATUS_MARKER in (c["body"] or "")), None)
@@ -1167,7 +1223,8 @@ def _upsert_board(repo, number, cfg, phase, instance=None, pr=None, attempt=0):
 def cmd_status(a):
     """Upsert one claim's status board at a NON-terminal phase — a `mine` row's
     `board_phase`. The terminal phases are written by the transition that reaches
-    them (`afk merge`, `afk escalate`, `afk close`), before it releases the claim."""
+    them (`afk merge`, `afk escalate`, `afk park`, `afk close`), before it releases
+    the claim."""
     return _upsert_board(a.repo, a.number, _cfg(a), a.phase,
                          instance=a.instance, pr=a.pr, attempt=a.attempt)
 
@@ -1482,13 +1539,55 @@ def cmd_fail(a):
 
 def cmd_escalate(a):
     """Hand one of my claims straight to a human, outside the retry ladder — a DAG
-    gap (`afk no-pr` → `idle_blocked` / `escalate`: a blocker that is still open, or
-    none named). Same ordered transition `afk fail` ends in; the attempt count is
+    gap (`afk no-pr` → `idle_blocked` / `escalate`: a blocker nothing will resolve,
+    or none named). Same ordered transition `afk fail` ends in; the attempt count is
     reported, not consulted."""
     cfg, rem = _cfg(a), _remote(a)
     _require_mine(rem, cfg, a.number, a.instance)
     issue = _issue(a.repo, a.number)
     return _escalate(a, cfg, rem, issue, afk_decide.current_attempt(issue["labels"]))
+
+
+def cmd_park(a):
+    """Leave one of my claims waiting on the dependency its worker discovered
+    (`afk no-pr` → `idle_blocked` / `park`), in one order (ADR-0022): record a
+    native `blocked_by` edge to each blocker still open → status board → release
+    the claim → remove the worktree, when its branch holds no work.
+
+    The edge goes first: from then on the frontier excludes the issue for as long
+    as a blocker is open, so the release puts nothing back on it — and returns the
+    issue by itself the tick after the last one closes. `ready_label` and the
+    attempt labels are not touched. The standings are read again here, and a
+    claim `afk no-pr` would not call parkable now is refused untouched."""
+    cfg, rem = _cfg(a), _remote(a)
+    _require_mine(rem, cfg, a.number, a.instance)
+    declared = afk_decide.latest_verdict(_issue_comments(a.repo, a.number))
+    standings = _blocker_standings(a, cfg, a.number, declared["blocked_by"], _open_prs(a.repo))
+    route = afk_decide.blocked_route(declared["blocked_by"],
+                                     {b["number"]: b["standing"] for b in standings})
+    if declared["phase"] != "blocked" or route["action"] != "park":
+        why = "; ".join(f"#{b['number']} {b['reason']}" for b in standings if b["reason"])
+        raise ValueError(f"issue #{a.number} is not parkable (`afk no-pr` decides): "
+                         f"{why or 'its worker left no `blocked` verdict naming an open blocker'}; "
+                         f"nothing was changed")
+    waiting = route["open_blockers"]
+    path, _ = _issue_worktree(a.repo, a.number)
+    path = path if path and os.path.isdir(path) else None
+    progress = _worktree_progress(path, rem, cfg["base_branch"]) if path else {}
+
+    recorded = {e["number"] for e in _blocked_by(a.repo, a.number)}
+    added = [n for n in waiting if n not in recorded]
+    for n in added:
+        blocker_id = _gh(["api", f"repos/{a.repo}/issues/{n}", "--jq", ".id"]).stdout.strip()
+        _gh(["api", "--method", "POST", f"repos/{a.repo}/issues/{a.number}/dependencies/blocked_by",
+             "-F", f"issue_id={blocker_id}"])
+    if cfg["progress_comment"]:
+        _upsert_board(a.repo, a.number, cfg, "parked", blocked_by=waiting)
+    _release(rem, cfg, a.number)
+    empty = progress.get("commits_ahead") == 0 and not progress.get("dirty")
+    cleanup = _remove_worktree(path) if (path and empty and cfg["worktree_cleanup"]) else None
+    return {"issue": a.number, "action": "parked", "blocked_by": waiting, "edges_added": added,
+            "released": True, **({"cleanup": cleanup} if cleanup else {})}
 
 
 def cmd_close(a):
@@ -1715,6 +1814,12 @@ def build_parser():
     issue(p)
     mine(p)
     p.add_argument("--reason", required=True, metavar="text", help="the stuck point, worded for a human")
+
+    p = command("park", cmd_park, remote="gh",
+                help="leave one of my claims waiting on the open blockers its worker named: "
+                     "record the dependency → status board → release → cleanup")
+    issue(p)
+    mine(p)
 
     p = command("close", cmd_close, remote="gh",
                 help="close one of my claims whose issue needed no change: status board → "

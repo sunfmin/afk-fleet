@@ -55,7 +55,9 @@ leaving exactly one of these two durable, machine-readable facts:
      empty); nothing to do. The coordinator verifies the empty diff, then closes the issue.
    - **`blocked`** — a shared prerequisite (module/entity/pages from another issue) does not exist yet.
      List the blocking issue numbers in `blocked_by=` (e.g. `blocked_by=41,42`). The coordinator
-     re-checks them: all closed → re-dispatches you; any still open → escalates the DAG gap to a human.
+     re-checks them: all closed → re-dispatches you; still open but workable backlog → records the
+     dependency on the issue and waits for it; one that nothing will resolve (or none named) →
+     escalates the DAG gap to a human. Name every blocker — the numbers are what gets recorded.
    - **`giving-up`** — you made a genuine effort and cannot make the gate pass or complete the work.
      The coordinator routes this through retry → escalate.
 

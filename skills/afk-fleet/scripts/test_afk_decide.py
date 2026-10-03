@@ -533,8 +533,14 @@ def test_classify_no_pr_blocked_routes_on_the_blockers_real_state():
     # every named blocker closed → the DAG cleared: re-dispatch (keep the claim)
     r = blocked([42, 43], {42: "closed", 43: "closed"})
     assert (r["outcome"], r["action"], r["open_blockers"]) == ("idle_blocked", "redispatch", [])
-    # one still open → a real DAG gap: escalate, and say which
-    r = blocked([42, 43], {42: "closed", 43: "open"})
+    # one still open that the backlog will resolve → park on it, and say which (ADR-0022)
+    r = blocked([42, 43], {42: "closed", 43: "waiting"})
+    assert (r["outcome"], r["action"], r["open_blockers"]) == ("idle_blocked", "park", [43])
+    assert blocked([42, 43], {42: "waiting", 43: "waiting"})["open_blockers"] == [42, 43]
+    # one that nothing will resolve → a real DAG gap: escalate, whatever the others are
+    r = blocked([42, 43], {42: "waiting", 43: "unmet"})
+    assert (r["outcome"], r["action"], r["open_blockers"]) == ("idle_blocked", "escalate", [42, 43])
+    r = blocked([42, 43], {42: "closed", 43: "open"})                 # not a standing: unmet
     assert (r["outcome"], r["action"], r["open_blockers"]) == ("idle_blocked", "escalate", [43])
     # a blocker whose state could not be read is NOT provably closed → still open
     r = blocked([42, 43], {42: "closed", 43: None})
@@ -546,10 +552,77 @@ def test_classify_no_pr_blocked_routes_on_the_blockers_real_state():
     assert (r["outcome"], r["action"], r["open_blockers"]) == ("idle_blocked", "escalate", [])
     # blocked routes on the DAG even with work on the branch
     assert blocked([42], {42: "open"}, {**ZERO, "commits_ahead": 4})["action"] == "escalate"
+    assert blocked([42], {42: "waiting"}, {**ZERO, "commits_ahead": 4})["action"] == "park"
+    # every route it can return is one the docs are held to
+    assert {("idle_blocked", a) for a in ("redispatch", "park", "escalate")} <= set(d.NO_PR_ROUTES)
 
     # open_blockers is reported only for a blocked verdict
     assert d.classify_no_pr(ZERO, "idle", 600, _verdict("giving-up", [42]), {42: "open"},
                             NOW, GRACE)["open_blockers"] == []
+
+
+def test_blocker_standings_tell_a_dependency_the_backlog_resolves_from_one_nothing_will():
+    """A worker's `blocked` verdict is the one fact the backlog was missing: an
+    undeclared dependency. Whether to wait on it or hand it to a human turns on
+    whether anything will ever close the blocker (ADR-0022)."""
+    ready = {"state": "open", "state_reason": None, "labels": ["ready-for-agent"],
+             "pull_request": False}
+    bare = {**ready, "labels": ["bug"]}
+
+    def stand(named, blockers, claimed=(), open_pr=(), edges=None, number=7):
+        rows = d.blocker_standings(number, named, blockers, set(claimed), set(open_pr),
+                                   edges or {}, "ready-for-agent", ["epic", "prd"])
+        assert [r["number"] for r in rows] == list(named)            # one row each, in order
+        assert all(r["standing"] in d.BLOCKER_STANDINGS for r in rows)
+        assert all((r["reason"] is None) == (r["standing"] != "unmet") for r in rows)
+        return {r["number"]: r["standing"] for r in rows}, {r["number"]: r["reason"] for r in rows}
+
+    # waiting: a fleet holds it (any owner — a stale claim is reclaimed and
+    # continued), a PR is open for it, or it is merely ready
+    assert stand([1], {1: bare}, claimed=[1])[0] == {1: "waiting"}
+    assert stand([1], {1: bare}, open_pr=[1])[0] == {1: "waiting"}
+    assert stand([1], {1: ready})[0] == {1: "waiting"}
+    # …including one that is itself waiting on blockers of its own
+    assert stand([1], {1: ready}, edges={1: [2], 2: []})[0] == {1: "waiting"}
+    # closed and done: no longer a blocker
+    done = {**bare, "state": "closed", "state_reason": "completed"}
+    assert stand([1], {1: done})[0] == {1: "closed"}
+    assert stand([1], {1: {**done, "state_reason": None}})[0] == {1: "closed"}
+
+    # unmet — each with the reason a human is told
+    for blocker, kw, why in (
+            (None, {}, "could not be read"),
+            (bare, {}, "no ready-for-agent label"),
+            ({**ready, "labels": ["ready-for-agent", "prd"]}, {"claimed": [1]}, "an epic (prd)"),
+            ({**done, "state_reason": "not_planned"}, {}, "not planned"),
+            ({**done, "state_reason": "duplicate"}, {}, "duplicate"),
+            ({**ready, "pull_request": True}, {}, "pull request")):
+        standings, reasons = stand([1], {1: blocker}, **kw)
+        assert standings == {1: "unmet"} and why in reasons[1], (blocker, reasons)
+    assert stand([1], {})[0] == {1: "unmet"}                          # never read at all
+
+    # a cycle: the blocker already depends on the issue — directly, or down a chain
+    standings, reasons = stand([1], {1: ready}, edges={1: [7]})
+    assert standings == {1: "unmet"} and "cycle" in reasons[1]
+    assert stand([1], {1: ready}, edges={1: [2], 2: [3], 3: [7]})[0] == {1: "unmet"}
+    assert stand([7], {7: ready})[0] == {7: "unmet"}                  # names itself
+    assert stand([1], {1: ready}, edges={1: [2], 2: [1]})[0] == {1: "waiting"}   # a loop elsewhere
+    # each named blocker stands on its own
+    assert stand([1, 2, 3], {1: done, 2: ready, 3: bare})[0] == \
+        {1: "closed", 2: "waiting", 3: "unmet"}
+
+    assert d.depends_on(1, 3, {1: [2], 2: [3]}) and not d.depends_on(3, 1, {1: [2], 2: [3]})
+    assert d.depends_on(1, 1, {})
+
+    # and the route those standings come to
+    assert d.blocked_route([1, 2], {1: "closed", 2: "closed"}) == \
+        {"action": "redispatch", "open_blockers": []}
+    assert d.blocked_route([1, 2], {1: "closed", 2: "waiting"}) == \
+        {"action": "park", "open_blockers": [2]}
+    assert d.blocked_route([1, 2], {1: "unmet", 2: "waiting"}) == \
+        {"action": "escalate", "open_blockers": [1, 2]}
+    assert d.blocked_route([], {}) == {"action": "escalate", "open_blockers": []}
+    assert d.blocked_route([1], None) == {"action": "escalate", "open_blockers": [1]}
 
 
 def _takeover_state(now):
@@ -817,6 +890,12 @@ def test_render_status_board():
     closed = d.render_status_board("closed", "required", 2, instance="x")
     assert closed.count("- [x]") == 1 and "无需改动" in closed and "已关闭" in closed
 
+    # parked: the claim is released until the blockers close — nothing is in
+    # progress, so nothing is ticked, and the line names what it waits on
+    parked = d.render_status_board("parked", "required", 2, blocked_by=[135, 140])
+    assert "- [x]" not in parked and "等待依赖 #135、#140 关闭" in parked
+    assert "认领方" not in parked and "无需人工处理" in parked
+
     # handed_back: the PR is open and stays ticked; the line says where the work is
     handed = d.render_status_board("handed_back", "required", 2, instance="x", pr=9)
     assert handed.count("- [x]") == 2 and "- [x] PR 已开 (#9)" in handed
@@ -903,6 +982,7 @@ def test_cycle_ticked_folds_the_summary_and_counts_empty_ticks():
     # anything that is not empty resets the streak — work done, a claim held, or
     # frontier the tick could not take (e.g. no free slot)
     for summary in ({"merged": [3]}, {"escalated": [4]}, {"dispatched": [1]}, {"reclaimed": [6]},
+                    {"parked": [5]},
                     {"in_flight": 2}, {"frontier_remaining": 5}):
         back = ticked(r["state"], **summary)
         assert back["state"]["empty_streak"] == 0 and back["sleep_seconds"] == 90, summary

@@ -142,8 +142,8 @@ sequence in code: **dispatch** (claim → worktree at the right commit → worke
 delivered → status board), **merge** (sync → gate → merge pinned to the gated head → status board →
 release → cleanup), **hand-back** (abort the conflicted sync → instruct the worker → record on the PR
 → status board), **fail** (count the attempt, then a fresh retry or an escalation), **escalate**
-(status board → relabel → comment → release, the release last), **close** (status board → close →
-release → cleanup). A transition stops with an **outcome** exactly where the next move is judgment —
+(status board → relabel → comment → release, the release last), **park** (dependency edge → status
+board → release → cleanup), **close** (status board → close → release → cleanup). A transition stops with an **outcome** exactly where the next move is judgment —
 a sync conflict, a PR with no checks, a verification still owed — and takes the tick's judgment as an
 argument (a reason, a verified head, "start fresh"). The tick therefore types no raw `git`, `gh` or
 `orca` to act; orderings such as "relabel before release" are code under test, not prose (ADR-0017).
@@ -171,6 +171,7 @@ _Avoid_: coordinator memory, session state
 **Frontier**:
 The set of currently-dispatchable issues — `open` + `ready_label` + not an epic + **unclaimed** (no
 `afk-claim` ref) + **no open linked PR** + zero open `blocked_by`. Recomputed from GitHub every tick.
+It is also what does the waiting for a **parked** issue: nothing else remembers that one is parked.
 _Avoid_: queue, backlog (the backlog is the whole issue set; the frontier is only the ready edge)
 
 **Claim**:
@@ -251,6 +252,20 @@ travels in the failure reason. That screen is the only thing the fleet ever read
 terminal, and it is read for *where the worker stopped*, never for its result (ADR-0018).
 _Avoid_: ping, poke, retry (a retry discards the attempt; a nudge keeps it), reminder
 
+**Park**:
+What the fleet does with a dependency a **worker** discovered — a `blocked` verdict naming issues
+that are still open — when the backlog will resolve them on its own: each open blocker is one a fleet
+holds a **claim** on, has an open PR, or carries `ready_label`. The missing dependency is written onto
+the issue as a native `blocked_by` edge, the claim is released, and the **frontier** contract does the
+rest: the issue is excluded while a blocker is open and dispatchable again the tick after the last one
+closes. No label changes, no **retry** is spent, no human is involved — and it cannot loop, because
+the edge keeps the issue off the frontier for exactly as long as the worker would report `blocked`
+again. One **transition** (`afk park`). A blocker nothing will resolve — missing, closed as not
+planned, an epic, open with no fleet to work it, or one that would close a dependency cycle — is still
+escalated (ADR-0022).
+_Avoid_: defer, snooze, hold (nothing is held: the claim is released), blocked (that is the worker's
+verdict; park is what the fleet does about it), escalate (that hands the issue to a human)
+
 **Wake**:
 The one line a **worker** types into the **launcher**'s terminal once its outcome is on GitHub — a PR,
 a verdict marker, a **hand-back**'s resolution pushed: `afk-wake #<n>`. It ends the launcher's sleep
@@ -293,7 +308,7 @@ progress)
 **Status board** (a.k.a. progress comment):
 The human-facing projection of an issue's lifecycle onto the issue surface: a **single** comment the
 owning **fleet instance**'s **tick** upserts each **rebuild**, rendering a milestone checklist (claimed
-→ PR open → gate green → merged, with the *ci-failed*, *handed-back* and *escalated* off-ramps) **derived** from
+→ PR open → gate green → merged, with the *ci-failed*, *handed-back*, *escalated* and *parked* off-ramps) **derived** from
 **fleet state**. It exists because the **claim** lives in a hidden ref namespace and the assignee is
 unused, so the "claimed but no PR yet" phase is otherwise invisible to a reader. It is a *rendering* of
 existing state, **never a source of truth** and **never read back by a tick**; it is edited in place
