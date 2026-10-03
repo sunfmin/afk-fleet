@@ -464,17 +464,61 @@ def _release(rem, cfg, number):
     return {"released": True, "issue": number, "ref": ref}
 
 
+def _clear(rem, cfg, number, expect_sha):
+    """Delete one claim ref that is NOT mine — a `stale_closed` row — only while it
+    still points at the sha rebuild read: the same lease a reclaim takes it under,
+    so a claim somebody took meanwhile is never deleted from under them. Already
+    gone counts as released; a claim that moved raises."""
+    ref = _claim_ref(cfg, number)
+    p = _git(["push", rem, f"--force-with-lease={ref}:{expect_sha}", f":{ref}"], check=False)
+    now_at = "" if p.returncode == 0 else _remote_sha(rem, ref)
+    if now_at == expect_sha:
+        raise RuntimeError(f"release failed and {ref} is still on the remote: "
+                           f"{p.stderr.strip()}")
+    if now_at:
+        raise RuntimeError(f"{ref} moved since it was read (expected {expect_sha}, now "
+                           f"{now_at}): somebody took the claim; nothing was changed")
+    return {"released": True, "issue": number, "ref": ref}
+
+
 def cmd_release(a):
-    return _release(_remote(a), _cfg(a), a.number)
+    """Delete one claim ref on its own, for the cases no transition covers:
+
+      afk release <n> --instance <id>
+          a claim of MINE — an orphan-release, a `closed` row, the drain. Refuses
+          a claim another instance holds.
+      afk release <n> --instance <id> --expect-sha <sha>
+          a `stale_closed` row of rebuild — a dead peer's claim on an issue that
+          is already closed: a phantom lock, deleted instead of reclaimed."""
+    cfg, rem = _cfg(a), _remote(a)
+    if a.expect_sha:
+        return _clear(rem, cfg, a.number, a.expect_sha)
+    ref = _claim_ref(cfg, a.number)
+    owner = _claim_owner(rem, ref)
+    if owner not in (None, a.instance):
+        raise RuntimeError(f"issue #{a.number} is not this fleet's claim ({ref} is held by "
+                           f"{owner!r}); nothing was changed. A dead peer's "
+                           f"claim on a closed issue — a `stale_closed` row — is released "
+                           f"with --expect-sha <the sha rebuild reported>")
+    return _release(rem, cfg, a.number)
+
+
+def _claim_owner(rem, ref):
+    """The instance id a claim ref is stamped with: None when there is no such
+    claim, "" when there is one whose marker names nobody (or cannot be read) —
+    which is never mine."""
+    if not _remote_sha(rem, ref):
+        return None
+    return (_read_marker(rem, ref) or {}).get("instance") or ""
 
 
 def _require_mine(rem, cfg, number, instance):
     """Refuse to settle a claim this fleet does not hold: every transition that
     merges, relabels or releases an issue acts on MY claim only (ADR-0003)."""
     ref = _claim_ref(cfg, number)
-    owner = _read_marker(rem, ref) if _remote_sha(rem, ref) else None
-    if owner is None or owner.get("instance") != instance:
-        held = f"held by {owner.get('instance')!r}" if owner else "not claimed at all"
+    owner = _claim_owner(rem, ref)
+    if owner != instance:
+        held = "not claimed at all" if owner is None else f"held by {owner!r}"
         raise RuntimeError(f"issue #{number} is not this fleet's claim ({ref} is {held}); "
                            f"nothing was changed")
 
@@ -684,9 +728,9 @@ def cmd_cycle(a):
 def cmd_rebuild(a):
     """One read-only call → the tick's whole working set (ADR-0008). The
     per-issue blocked_by read is paid only by issues that pass every cheaper
-    eligibility check, the per-issue state read only by a claim of mine whose
-    issue is missing from the open list, and the hand-back read only by a claim of
-    mine that has a PR. Strictly observation: nothing here writes a ref, a
+    eligibility check, the per-issue state read only by a claim whose issue is
+    missing from the open list, and the hand-back read only by a claim of mine
+    that has a PR. Strictly observation: nothing here writes a ref, a
     comment, or a PR."""
     cfg = _cfg(a)
     issues, prs, claims, heartbeats = _gather(a, cfg)
@@ -698,8 +742,7 @@ def cmd_rebuild(a):
         blocked[n] = 0 if v in ("", "null") else int(v)
     listed = {i["number"] for i in issues}
     closed = [c["number"] for c in claims
-              if c["instance"] == a.instance and c["number"] not in listed
-              and _issue_state(a.repo, c["number"]) == "closed"]
+              if c["number"] not in listed and _issue_state(a.repo, c["number"]) == "closed"]
     my_prs = {c["number"]: afk_decide.closing_pr(prs, c["number"])
               for c in claims if c["instance"] == a.instance}
     handed_back = [n for n, pr in my_prs.items() if pr and _open_handback(a.repo, pr)]
@@ -1730,8 +1773,14 @@ def build_parser():
                    help="confirm a takeover of an instance whose heartbeat is still FRESH "
                         "(it looks alive; you are asserting you know it is dead)")
 
-    p = command("release", cmd_release, "delete a claim ref (idempotent)", remote="refs")
+    p = command("release", cmd_release, remote="refs",
+                help="delete a claim ref of mine (idempotent) — or, with --expect-sha, a "
+                     "dead peer's on a closed issue")
     p.add_argument("number", type=int, metavar="n")
+    mine(p)
+    p.add_argument("--expect-sha", default=None, metavar="sha",
+                   help="release a `stale_closed` row: the sha rebuild reported; the delete "
+                        "fails if the claim moved")
 
     p = command("heartbeat", cmd_heartbeat, "refresh my heartbeat if due", remote="refs")
     mine(p)

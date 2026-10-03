@@ -51,6 +51,8 @@ def git(cwd, *args):
     return p.stdout.strip()
 
 
+ME = ("--instance", "me")
+
 # The two subcommands that run before a config exists, and so take none.
 NO_CONFIG = ("config", "worker-command")
 
@@ -261,11 +263,11 @@ def test_release_is_idempotent_and_the_claim_is_really_gone():
         afk(w, "claim", "9", "--instance", "me", "--now", str(T0))
         afk(w, "claim", "10", "--instance", "me", "--now", str(T0))
 
-        first = afk(w, "release", "9")
+        first = afk(w, "release", "9", *ME)
         assert first == {"released": True, "issue": 9, "ref": "refs/afk/claim/9"}
         # already gone counts as released — the terminal transitions call this blind
-        assert afk(w, "release", "9")["released"] is True
-        assert afk(w, "release", "404")["released"] is True
+        assert afk(w, "release", "9", *ME)["released"] is True
+        assert afk(w, "release", "404", *ME)["released"] is True
 
         assert sb.remote_ref("refs/afk/claim/9") == ""
         # the scan's local mirror is pruned too, so a later tick cannot see a ghost
@@ -284,16 +286,50 @@ def test_a_release_that_did_not_delete_the_claim_is_an_error():
         w = sb.clones[0]
         claim = afk(w, "claim", "9", "--instance", "me", "--now", str(T0))
 
-        err = afk_error(w, "release", "9", "--remote", "no-such-remote")
+        err = afk_error(w, "release", "9", *ME, "--remote", "no-such-remote")
         assert "no-such-remote" in err
         sb.forbid("refs/afk/")                                  # the server refuses the delete
-        err = afk_error(w, "release", "9")
+        err = afk_error(w, "release", "9", *ME)
         assert "still on the remote" in err and "refs/afk/claim/9" in err
         assert sb.remote_ref("refs/afk/claim/9") == claim["sha"]      # and it really is
+        # …and the same holds for the lease-checked delete of a peer's phantom lock
+        err = afk_error(w, "release", "9", "--instance", "peer", "--expect-sha", claim["sha"])
+        assert "still on the remote" in err
+        assert sb.remote_ref("refs/afk/claim/9") == claim["sha"]
 
         # the refusal is about THIS ref still existing, not about the push failing:
         # with the same server rule in force, a claim that is already gone is released
-        assert afk(w, "release", "404")["released"] is True
+        assert afk(w, "release", "404", *ME)["released"] is True
+        assert afk(w, "release", "404", *ME, "--expect-sha", claim["sha"])["released"] is True
+
+
+def test_release_deletes_only_my_claim_or_the_exact_claim_it_was_shown():
+    """`afk release` takes `--instance` like every other transition, and uses it:
+    a claim another instance holds is refused. The one foreign claim it deletes is
+    a `stale_closed` row — a dead peer's claim on a closed issue — and only under
+    the lease of the sha rebuild read, so a claim taken meanwhile survives."""
+    with sandbox() as sb:
+        w = sb.clones[0]
+        peer = afk(w, "claim", "9", "--instance", "peer", "--now", str(T0))
+
+        err = afk_error(w, "release", "9", *ME)
+        assert "not this fleet's claim" in err and "'peer'" in err and "--expect-sha" in err
+        assert sb.remote_ref("refs/afk/claim/9") == peer["sha"]
+        # the calling convention is the transitions': no --instance, no release
+        assert "--instance" in afk_error(w, "release", "9")
+
+        # somebody took the claim after it was read: the stale sha deletes nothing
+        taken = afk(w, "reclaim", "9", "--instance", "third", "--expect-sha", peer["sha"],
+                    "--now", str(T0 + 1))
+        err = afk_error(w, "release", "9", *ME, "--expect-sha", peer["sha"])
+        assert "moved" in err and "nothing was changed" in err
+        assert sb.remote_ref("refs/afk/claim/9") == taken["sha"]
+
+        # shown the sha it has now, the phantom lock is gone — and stays gone, quietly
+        cleared = afk(w, "release", "9", *ME, "--expect-sha", taken["sha"])
+        assert cleared == {"released": True, "issue": 9, "ref": "refs/afk/claim/9"}
+        assert sb.remote_ref("refs/afk/claim/9") == ""
+        assert afk(w, "release", "9", *ME, "--expect-sha", taken["sha"])["released"] is True
 
 
 def test_an_unreadable_remote_is_an_error_not_an_empty_fleet():
@@ -350,7 +386,7 @@ def test_probe_falls_back_when_the_server_rejects_the_hidden_namespace():
         hb = afk(w, "heartbeat", "--instance", "me", "--now", str(T0), *cfg)
         assert hb["refreshed"] and hb["ref"] == "refs/heads/afk-heartbeat/me"
         assert afk(w, "classify-claims", "--instance", "me", "--now", str(T0), *cfg)["mine"] == [12]
-        assert afk(w, "release", "12", *cfg)["released"] is True
+        assert afk(w, "release", "12", *ME, *cfg)["released"] is True
         assert sb.remote_ref("refs/heads/afk-claim/12") == ""
 
         # on the config the probe was GIVEN, the blocked namespace is an error —
@@ -359,7 +395,7 @@ def test_probe_falls_back_when_the_server_rejects_the_hidden_namespace():
         assert "not a lost race" in err and "refs/afk/claim/13" in err
         # …and with no config at all there is nothing to run on: the call is refused
         # outright rather than quietly sent to the default namespace
-        err = afk_error(w, "release", "12", bare=True)
+        err = afk_error(w, "release", "12", *ME, bare=True)
         assert "--config" in err
 
 
@@ -461,7 +497,7 @@ def test_every_ref_op_round_trips_under_the_refs_heads_fallback():
         assert afk(w, "reclaim", "12", "--instance", "third", *NS,
                    "--expect-sha", scan["claims"][0]["sha"], "--now", str(T0 + 2))["won"] is False
 
-        assert afk(w, "release", "12", *NS)["released"] is True
+        assert afk(w, "release", "12", "--instance", "peer", *NS)["released"] is True
         assert afk(w, "scan", *NS)["claims"] == []
         assert sb.remote_ref("refs/heads/afk-claim/12") == ""
 
