@@ -837,12 +837,12 @@ def _create_worktree(a, cfg, rem, issue, at_branch):
     wt = _orca(["worktree", "create", "--repo", f"id:{orca_repo['id']}", "--name", name,
                 "--no-parent", "--base-branch", sha,
                 "--issue", str(issue["number"])]).get("worktree") or {}
-    path, branch = wt.get("path"), wt.get("branch") or ""
+    path, branch = wt.get("path"), wt.get("branch")
     if not path or not os.path.isdir(path):
         raise RuntimeError(f"orca worktree create returned no usable path: {path!r}")
     if _git(["-C", path, "merge-base", "--is-ancestor", sha, "HEAD"], check=False).returncode != 0:
         _git(["-C", path, "merge", "--ff-only", sha])
-    return path, branch[len("refs/heads/"):] if branch.startswith("refs/heads/") else branch, sha
+    return path, afk_decide.short_branch(branch), sha
 
 
 def _remove_worktree(path):
@@ -1191,10 +1191,14 @@ def cmd_merge(a):
         raise RuntimeError(f"no open PR closes issue #{a.number} — nothing to merge")
     branch, target = pr["headRefName"], cfg["merge"]["target"]
     out = {"issue": a.number, "pr": pr["number"]}
+
+    def stop(outcome, **more):
+        return {**out, "outcome": afk_decide.merge_outcome(outcome), **more}
+
     if _open_handback(a.repo, pr):         # before the worktree: the worker is in it
-        return {**out, "outcome": "handed_back",
-                "detail": "a sync conflict on this PR was handed back to its worker and is not "
-                          "resolved yet; nothing was touched"}
+        return stop("handed_back",
+                    detail="a sync conflict on this PR was handed back to its worker and is not "
+                           "resolved yet; nothing was touched")
 
     # --- the branch's worktree: the worker's, else one recreated at the PR head ---
     path, _ = _issue_worktree(a.repo, a.number)
@@ -1213,10 +1217,10 @@ def cmd_merge(a):
     if cfg["merge"]["sync_before_merge"]:
         files = _sync(rem, path, target)
         if files:
-            return {**out, "outcome": "conflict", "files": files,
-                    "detail": f"merging {target} into {branch} conflicted; the merge is in "
-                              f"progress in the worktree — `afk hand-back` returns it to the "
-                              f"worker"}
+            return stop("conflict", files=files,
+                        detail=f"merging {target} into {branch} conflicted; the merge is in "
+                               f"progress in the worktree — `afk hand-back` returns it to the "
+                               f"worker")
     head = _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip()
     pushed = head != pr_tip
     if pushed:
@@ -1229,16 +1233,16 @@ def cmd_merge(a):
         if gate["status"] != "green":
             _gh(["pr", "comment", str(pr["number"]), "--repo", a.repo, "--body",
                  afk_decide.gate_comment(gate, gate["command"])])
-            return {**out, "outcome": "gate_red", "gate": gate}
+            return stop("gate_red", gate=gate)
     else:
         checks = afk_decide.pr_checks_state(pr.get("statusCheckRollup"))
         verdict = afk_decide.checks_gate(checks, pushed, a.allow_no_checks)
         if verdict != "green":
-            return {**out, "outcome": verdict, "checks": checks}
+            return stop(verdict, checks=checks)
     if cfg["gate"]["adversarial_verify"] and a.verified != head:
-        return {**out, "outcome": "needs_verify",
-                "detail": "run the adversarial verifier against `head`, then re-run with "
-                          "--verified <head>"}
+        return stop("needs_verify",
+                    detail="run the adversarial verifier against `head`, then re-run with "
+                           "--verified <head>")
 
     # --- land it, then settle the claim: board → release → worktree ---
     _gh(["pr", "merge", str(pr["number"]), "--repo", a.repo, f"--{cfg['merge']['strategy']}",
@@ -1248,8 +1252,7 @@ def cmd_merge(a):
         _upsert_board(a.repo, a.number, cfg, "merged", instance=a.instance, pr=pr["number"])
     _release(rem, cfg, a.number)
     cleanup = _remove_worktree(path) if (cfg["worktree_cleanup"] or recreated) else None
-    return {**out, "outcome": "merged", "released": True,
-            **({"cleanup": cleanup} if cleanup else {})}
+    return stop("merged", released=True, **({"cleanup": cleanup} if cleanup else {}))
 
 
 _HANDBACK_POINTER = ("The merge of your PR hit a sync conflict, and it is handed back to you. Your "
@@ -1570,11 +1573,12 @@ def build_parser():
 
     p = command("no-pr", cmd_no_pr, remote="gh",
                 help="why one of my claims has no PR (or has not answered a hand-back) → "
-                     "coding / idle_done / idle_blocked / idle_stalled / idle_failed / dead, "
-                     "gathered and decided in one call")
+                     + " / ".join(dict.fromkeys(o for o, _ in afk_decide.NO_PR_ROUTES))
+                     + ", gathered and decided in one call")
     issue(p)
-    p.add_argument("--terminal", choices=["busy", "idle", "none"], required=True,
-                   help="the orca probe: busy | idle | none (no live worker)")
+    p.add_argument("--terminal", choices=list(afk_decide.TERMINAL_STATES), required=True,
+                   help="the orca probe: " + " | ".join(afk_decide.TERMINAL_STATES)
+                        + " (none = no live worker)")
     p.add_argument("--terminal-idle-seconds", type=int, default=None,
                    help="seconds since the terminal last showed activity, if the probe says")
     p.add_argument("--worktree", default=None,
@@ -1612,7 +1616,7 @@ def build_parser():
                    help="gate.ci required: merge a PR that has no checks at all (the tick's "
                         "progressive-gate judgment)")
     p.add_argument("--gate-timeout", type=int, default=1800,
-                   help="seconds before the local gate is called red (default 1800)")
+                   help="seconds before the local gate is called red (default %(default)s)")
     p.add_argument("--excerpt-lines", type=int, default=afk_decide.GATE_EXCERPT_LINES,
                    help="how many trailing log lines a red gate's excerpt keeps")
 

@@ -89,10 +89,11 @@ CLAIM_NAMESPACES = {
 }
 BRANCH_NAMESPACE = "refs/heads"
 
-# The completion gate's two modes (ADR-0012). `required` waits for the PR's GitHub
-# checks; `local` never reads them and makes `gate.local_command` the gate, re-run
-# at merge time against the exact tree that lands.
-GATE_CI_MODES = ("required", "local")
+# The completion gate's two modes (ADR-0012), each with what the status board calls
+# that gate. `required` waits for the PR's GitHub checks; `local` never reads them
+# and makes `gate.local_command` the gate, re-run at merge time against the exact
+# tree that lands.
+GATE_CI_MODES = {"required": "CI", "local": "本地门"}
 
 # How `afk merge` lands a PR — each is a `gh pr merge` flag of the same name.
 MERGE_STRATEGIES = ("squash", "merge", "rebase")
@@ -368,7 +369,7 @@ def classify_claims(claims, heartbeats, me, now, ttl):
       claims:     [{"number": int, "instance": str}, ...]  (from refs/afk/claim/*)
       heartbeats: {instance_id: last_ts_epoch}             (from refs/afk/heartbeat/*)
       me:         my instance id
-      now, ttl:   epoch seconds / claim_lease_ttl seconds
+      now, ttl:   epoch seconds / `claim_lease_ttl_seconds`
 
     Returns {"mine":[n...], "peer_live":[n...], "stale":[n...]}:
       mine       — stamped with my instance; I reconcile these locally (a no-PR/
@@ -391,6 +392,11 @@ def classify_claims(claims, heartbeats, me, now, ttl):
         else:
             peer_live.append(n)
     return {"mine": sorted(mine), "peer_live": sorted(peer_live), "stale": sorted(stale)}
+
+
+# Every `status` a `mine` row can carry — what `subclassify_pr` returns, and the
+# vocabulary the tick's instructions route on (a test holds the docs to it).
+CLAIM_STATUSES = ("awaiting_merge", "awaiting_ci", "failure", "handed_back", "no_pr", "closed")
 
 
 def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=False):
@@ -522,6 +528,20 @@ def protection_verdict(ci_mode, protection, unavailable=None):
             "detail": "target branch requires no status checks — a local gate can merge"}
 
 
+# Every `outcome` `afk merge` can stop with — the vocabulary the tick's
+# instructions route on (a test holds the docs to it).
+MERGE_OUTCOMES = ("merged", "conflict", "handed_back", "gate_red", "awaiting_ci", "no_checks",
+                  "needs_verify")
+
+
+def merge_outcome(outcome):
+    """`outcome`, refused unless it is one of MERGE_OUTCOMES: `afk merge` cannot
+    stop with a word the tick was never told how to act on."""
+    if outcome not in MERGE_OUTCOMES:
+        raise ValueError(f"not a merge outcome: {outcome!r}")
+    return outcome
+
+
 def checks_gate(checks_state, pushed, allow_no_checks=False):
     """
     The `gate.ci: required` half of `afk merge`'s gate: may this PR merge on what
@@ -575,13 +595,28 @@ def gate_comment(verdict, command):
 
 _VERDICT_MARKER_RE = re.compile(r"<!--\s*afk:verdict\b(.*?)-->", re.DOTALL)
 
+# The phases a worker may declare in its marker (worker-prompt.md asks for exactly
+# these; anything else `classify_no_pr` treats as a failure).
+VERDICT_PHASES = ("already-satisfied", "blocked", "giving-up")
+_SATISFIED, _BLOCKED, _ = VERDICT_PHASES
+
+# What the orca liveness probe can say about a worker's terminal.
+TERMINAL_STATES = ("busy", "idle", "none")
+
+# Every (outcome, action) `classify_no_pr` can return — the vocabulary the tick's
+# instructions route on (a test holds the docs to it).
+NO_PR_ROUTES = (("coding", "leave"), ("idle_done", "close_release"),
+                ("idle_blocked", "redispatch"), ("idle_blocked", "escalate"),
+                ("idle_stalled", "nudge"), ("idle_failed", "next_attempt"),
+                ("dead", "orphan"))
+
 
 def parse_verdict_marker(body):
     """
     Parse the FIRST afk:verdict marker in one comment body → a verdict dict, or
     None if the body carries no marker. The marker (worker-prompt.md, LAYER 1) is:
 
-      <!--afk:verdict n=<issue> phase=<already-satisfied|blocked|giving-up> \
+      <!--afk:verdict n=<issue> phase=<one of VERDICT_PHASES> \
           [blocked_by=<csv of issue numbers>] [reason=<short>]-->
 
     LENIENT — a marker with a missing/unknown field still parses
@@ -696,6 +731,7 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
     idle_seconds = max(0, int(now) - int(max(seen))) if seen else None
 
     def out(outcome, action, open_blockers=()):
+        assert (outcome, action) in NO_PR_ROUTES, (outcome, action)
         return {"outcome": outcome, "action": action, "idle_seconds": idle_seconds,
                 "open_blockers": list(open_blockers)}
 
@@ -711,13 +747,13 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
     # idle past grace: route on the declared reason.
     verdict = worker_verdict or {}
     phase = verdict.get("phase") if verdict.get("found") else None
-    if phase == "already-satisfied":
+    if phase == _SATISFIED:
         # "nothing needed doing" is refuted by work sitting on the branch.
         has_changes = int(progress.get("commits_ahead") or 0) > 0 or bool(progress.get("dirty"))
         if has_changes:
             return out("idle_failed", "next_attempt")
         return out("idle_done", "close_release")
-    if phase == "blocked":
+    if phase == _BLOCKED:
         named = verdict.get("blocked_by") or []
         still_open = [n for n in named if (blocker_states or {}).get(n) != "closed"]
         if still_open or not named:
@@ -966,6 +1002,13 @@ def branch_candidates(heads, branch_pattern, number):
     return sorted(h for h in (heads or []) if h and rx.match(h))
 
 
+def short_branch(ref):
+    """`refs/heads/x/y` → `x/y`; a name that is already short is returned as is.
+    orca reports a worktree's branch either way."""
+    ref = ref or ""
+    return ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+
+
 def find_orca_worktree(worktrees, number, repo=None):
     """
     The orca worktree belonging to issue <number> on THIS machine, from
@@ -998,10 +1041,8 @@ def find_orca_worktree(worktrees, number, repo=None):
     if not hits:
         return {"found": False, "path": None, "branch": None}
     best = max(hits, key=lambda w: int(w.get("lastActivityAt") or 0))
-    branch = best.get("branch") or None
-    if branch and branch.startswith("refs/heads/"):
-        branch = branch[len("refs/heads/"):]
-    return {"found": True, "path": best.get("path") or None, "branch": branch}
+    return {"found": True, "path": best.get("path") or None,
+            "branch": short_branch(best.get("branch")) or None}
 
 
 def find_orca_repo(repos, repo):
@@ -1250,13 +1291,6 @@ def render_handback(template, fields, handback):
 
 STATUS_MARKER = "<!--afk:status-->"
 
-# The closed set of lifecycle phases the board renders. Happy path plus four
-# off-ramps that reuse the same checkboxes + an annotation: ci_failed, handed_back
-# (a sync conflict returned to the worker — `afk hand-back`), escalated, and
-# closed (the worker found the issue already satisfied — `afk close`).
-STATUS_PHASES = ("claimed", "pr_open", "ci_failed", "handed_back", "awaiting_merge", "merged",
-                 "escalated", "closed")
-
 # Happy-path milestones, in order — these are the task-list checkboxes.
 _STATUS_STEPS = (
     ("claimed",        "已认领 · worker 实现中"),
@@ -1265,34 +1299,24 @@ _STATUS_STEPS = (
     ("merged",         "已合并"),
 )
 
-# What the board calls the machine gate, per gate.ci mode (ADR-0012).
-_GATE_NAME = {"required": "CI", "local": "本地门"}
-
-# How far along the happy path each phase has reached (index of the last DONE
-# step). escalated is a terminal give-up handled specially in `render_status_board`.
-_PHASE_REACHED = {
-    "claimed": 0, "pr_open": 1, "ci_failed": 1, "handed_back": 1, "awaiting_merge": 2,
-    "merged": 3, "escalated": 1, "closed": 0,
+# The closed set of lifecycle phases the board renders, each with everything the
+# board says about it: how far along the happy path it has reached (the index of
+# the last DONE step) and its single ▸/✅/⚠️ 'where are we now' line. Happy path
+# plus four off-ramps that reuse the same checkboxes + an annotation: ci_failed,
+# handed_back (a sync conflict returned to the worker — `afk hand-back`), escalated
+# (a terminal give-up, ticked specially in `render_status_board`), and closed (the
+# worker found the issue already satisfied — `afk close`).
+_PHASES = {
+    "claimed":        (0, "▸ 当前:worker 实现中,尚无 PR"),
+    "pr_open":        (1, "▸ 当前:等 {gate}"),
+    "ci_failed":      (1, "▸ 当前:{gate} 失败,修复重试中({attempt}/{retry_max}) —— 见下方 {gate} 与评论"),
+    "handed_back":    (1, "▸ 当前:与目标分支同步冲突,已交还 worker 解决 —— 见 PR 评论"),
+    "awaiting_merge": (2, "▸ 当前:门已绿,待合并"),
+    "merged":         (3, "✅ 已合并,完成"),
+    "escalated":      (1, "⚠️ 已升级给人处理 —— 见下方评论"),
+    "closed":         (0, "✅ 主干已满足此需求,无需改动 —— 已关闭"),
 }
-
-
-def _status_current_line(phase, gate, attempt, retry_max):
-    """The single ▸/✅/⚠️ 'where are we now' line under the checklist."""
-    if phase == "claimed":
-        return "▸ 当前:worker 实现中,尚无 PR"
-    if phase == "pr_open":
-        return f"▸ 当前:等 {gate}"
-    if phase == "ci_failed":
-        return f"▸ 当前:{gate} 失败,修复重试中({attempt}/{retry_max}) —— 见下方 {gate} 与评论"
-    if phase == "handed_back":
-        return "▸ 当前:与目标分支同步冲突,已交还 worker 解决 —— 见 PR 评论"
-    if phase == "awaiting_merge":
-        return "▸ 当前:门已绿,待合并"
-    if phase == "merged":
-        return "✅ 已合并,完成"
-    if phase == "closed":
-        return "✅ 主干已满足此需求,无需改动 —— 已关闭"
-    return "⚠️ 已升级给人处理 —— 见下方评论"   # escalated
+STATUS_PHASES = tuple(_PHASES)
 
 
 def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attempt=0):
@@ -1314,8 +1338,8 @@ def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attem
     """
     if phase not in STATUS_PHASES:
         raise ValueError(f"unknown status phase: {phase!r}")
-    gate = _GATE_NAME[gate_ci]
-    reached = _PHASE_REACHED[phase]
+    gate = GATE_CI_MODES[gate_ci]
+    reached, current = _PHASES[phase]
     escalated = phase == "escalated"
 
     def done(i, key):
@@ -1329,7 +1353,7 @@ def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attem
         label = label.format(pr=f" (#{pr})" if pr else "", gate=gate)
         lines.append(f"- [{'x' if done(i, key) else ' '}] {label}")
     lines.append("")
-    lines.append(_status_current_line(phase, gate, attempt, retry_max))
+    lines.append(current.format(gate=gate, attempt=attempt, retry_max=retry_max))
     return "\n".join(lines)
 
 
@@ -1441,7 +1465,11 @@ def pace(did_work, in_flight, empty_streak, config):
 CYCLE_START = {"fingerprint": "", "skips": 0, "empty_streak": 0,
                "in_flight": 0, "frontier_remaining": 0}
 
-_SUMMARY_WORK = ("merged", "dispatched", "reclaimed", "escalated")
+# The tick summary's keys this code reads (SKILL.md gives the tick its return
+# schema; a test holds that schema to these): the lists that mean a tick did work,
+# and the two integers pacing needs.
+SUMMARY_WORK = ("merged", "dispatched", "reclaimed", "escalated")
+SUMMARY_COUNTS = ("in_flight", "frontier_remaining")
 
 
 def cycle_state(raw):
@@ -1502,10 +1530,10 @@ def cycle_ticked(state, summary, config):
     """
     if not isinstance(summary, dict):
         raise ValueError(f"--summary must be the tick's summary object, got {summary!r}")
-    for key in ("in_flight", "frontier_remaining"):
+    for key in SUMMARY_COUNTS:
         if not isinstance(summary.get(key), int) or isinstance(summary.get(key), bool):
             raise ValueError(f"--summary needs an integer {key!r} (the tick's return schema)")
-    did_work = any(summary.get(k) for k in _SUMMARY_WORK)
+    did_work = any(summary.get(k) for k in SUMMARY_WORK)
     in_flight, remaining = summary["in_flight"], summary["frontier_remaining"]
     empty = not did_work and in_flight == 0 and remaining == 0
     new = {**state, "in_flight": in_flight, "frontier_remaining": remaining,

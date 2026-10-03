@@ -59,7 +59,7 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
   authorization its launcher injects; invoked cold without it, it dispatches but calls no
   `afk merge`.
 - `/afk-fleet --takeover` — a **launcher bootstrap variant** for when a fleet hard-stopped (quota) and
-  you will not wait ~75 min for its lease to lapse: the *full* bootstrap, then the opening working set
+  you will not wait for its lease to lapse: the *full* bootstrap, then the opening working set
   is seeded from a dead peer's claims instead of the frontier alone. Thereafter an ordinary standing
   fleet. See [Takeover mode](#takeover-mode---takeover).
 
@@ -129,8 +129,8 @@ written to a file, gone when the launcher stops.
 ### Takeover mode (`--takeover`)
 
 For when a fleet **hard-stopped** — its provider quota ran out, its process was killed — and you are
-standing right there. The lease will hand its claims to a peer, but only after `claim_lease_ttl`
-(~75 min), because a heartbeat is the only *machine-visible* line between "dead" and "alive but slow".
+standing right there. The lease will hand its claims to a peer, but only after
+`claim_lease_ttl_seconds` (default 4500), because a heartbeat is the only *machine-visible* line between "dead" and "alive but slow".
 The present human is the oracle that knows *now*; the dying fleet cannot help, since a hard stop runs no
 code at all (no drain, no release) — [ADR-0011](../../docs/adr/0011-takeover-and-progress-preservation.md).
 
@@ -199,10 +199,10 @@ streak, what is in flight — lives in there, maintained by code.
    → `{state, sleep_seconds}`. Keep `state`; surface a short progress line to the user from the summary,
    then discard the summary.
 4. **Sleep `sleep_seconds`** (`ScheduleWakeup`). The number already encodes the pacing rules — you
-   apply none yourself: `busy_interval` (~1–2 min) while the last tick did anything or anything is in
-   flight, so green PRs merge promptly; `idle_interval` (~25 min) once `idle_ticks_before_sleep`
+   apply none yourself: `busy_interval_seconds` (default 90) while the last tick did anything or anything is in
+   flight, so green PRs merge promptly; `idle_interval_seconds` (default 1500) once `idle_ticks_before_sleep`
    consecutive cycles were **empty** (a tick that did nothing, or a skip, with nothing in flight and
-   nothing left on the frontier); and never past `claim_lease_ttl`/2 while the fleet holds any claim.
+   nothing left on the frontier); and never past `claim_lease_ttl_seconds`/2 while the fleet holds any claim.
    **A wake ends the sleep early.** A line `afk-wake #<n>` arriving in this terminal is a worker
    saying its outcome is on GitHub (ADR-0020): go to step 1 **now** instead of waiting the sleep out,
    and let the sleep this new cycle ends with replace the one you were in. That is all it means — it
@@ -326,7 +326,7 @@ spawns).
      `rebuild` because it asks *this machine* about a worktree, and `rebuild` stays machine-independent
      (ADR-0008).
    - **Stale peer claims** — **`stale`** (a peer owns it and its `afk-heartbeat/<id>` is expired past
-     `claim_lease_ttl`) is the only foreign claim I may take *unattended*: `afk reclaim <n> --instance
+     `claim_lease_ttl_seconds`) is the only foreign claim I may take *unattended*: `afk reclaim <n> --instance
      <id> --expect-sha <the sha rebuild reported>` (atomic — fails if it moved), then `afk dispatch
      --issue <n>` — a reclaimed claim's worker is dead by definition, so it is recovered by
      **continuation** like any dead claim of mine (the worktree is reused when the dead peer ran on

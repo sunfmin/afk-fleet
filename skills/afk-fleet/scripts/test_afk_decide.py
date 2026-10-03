@@ -11,7 +11,7 @@ import re
 
 import afk_decide as d
 
-TTL = 4500  # ~75 min, the default lease
+TTL = d.CONFIG_DEFAULTS["claim_lease_ttl_seconds"]  # the default lease
 
 
 def test_select_frontier():
@@ -117,6 +117,14 @@ def test_subclassify_pr():
         for has_pr in (True, False):
             for checks in ("green", "red", "pending", None):
                 assert d.subclassify_pr(has_pr, checks, ci)[1] in d.STATUS_PHASES
+
+    # CLAIM_STATUSES is exactly what it can return: no status the docs were never
+    # held to, and none listed that cannot happen
+    seen = {d.subclassify_pr(has_pr, checks, ci, closed=closed, handed_back=handed_back)[0]
+            for ci in d.GATE_CI_MODES for has_pr in (True, False)
+            for checks in ("green", "red", "pending", None)
+            for closed in (True, False) for handed_back in (True, False)}
+    assert seen == set(d.CLAIM_STATUSES)
 
     # the issue is CLOSED but the claim is still mine — a merge or `afk close` that
     # crashed before releasing. Nothing else about it matters, and there is no board
@@ -1451,7 +1459,11 @@ def test_template_matches_defaults():
     tpl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "..", "references", "config-template.md")
     with open(tpl) as f:
-        parsed = d.parse_config_yaml(f.read())
+        text = f.read()
+    parsed = d.parse_config_yaml(text)
+    # a key with a closed set of values spells that set out, exactly
+    for choices in (d.CLAIM_NAMESPACES, d.GATE_CI_MODES, d.MERGE_STRATEGIES):
+        assert " | ".join(choices) in text, f"template does not list {' | '.join(choices)}"
     full = d.resolve_config({})
     for k, v in parsed.items():
         if isinstance(v, dict):

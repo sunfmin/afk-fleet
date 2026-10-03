@@ -2156,6 +2156,102 @@ def test_the_docs_name_only_subcommands_and_flags_that_exist():
     assert sorted(listed) == sorted(subs), set(listed) ^ set(subs)
 
 
+def _skill_docs():
+    """{basename: text} of every document a tick or a human reads this skill from:
+    SKILL.md, its references, and — in the source repo only, an installed skill
+    ships without them — the glossary and the flow doc."""
+    refs = os.path.join(SKILL, "references")
+    paths = [os.path.join(SKILL, "SKILL.md")]
+    paths += [os.path.join(refs, f) for f in sorted(os.listdir(refs)) if f.endswith(".md")]
+    paths += [p for p in (os.path.join(SKILL, "..", "..", "CONTEXT.md"),
+                          os.path.join(SKILL, "..", "..", "docs", "flows.md")) if os.path.exists(p)]
+    docs = {}
+    for path in paths:
+        with open(path) as f:
+            docs[os.path.basename(path)] = f.read()
+    return docs
+
+
+def test_the_docs_route_on_exactly_the_words_the_code_returns():
+    """A tick acts on a `status`, an `outcome`, an `action` — words it knows only
+    from the docs. One the code returns and the docs never mention is a claim the
+    tick has no instruction for; so each vocabulary has one home in afk_decide and
+    the docs are held to it."""
+    docs = _skill_docs()
+    skill, tools = docs["SKILL.md"], docs["tools.md"]
+
+    def row(sub):
+        return next(ln for ln in tools.splitlines() if ln.startswith(f"| `afk {sub} "))
+
+    # `mine` rows: every status is routed in SKILL.md and listed for `afk rebuild`
+    for status in afk_decide.CLAIM_STATUSES:
+        assert f"*{status}*" in skill, status
+        assert f"`{status}`" in row("rebuild"), status
+
+    # `afk no-pr`: every (outcome, action) has its bullet in the In-flight list
+    for outcome, action in afk_decide.NO_PR_ROUTES:
+        assert f"**{outcome}** / `{action}`" in skill, (outcome, action)
+        assert outcome in row("no-pr"), outcome
+
+    # `afk merge`: the outcome table IS the set, row for row
+    table = re.findall(r"^\| `(\w+)` \|", skill, re.M)
+    assert table == ["outcome", *afk_decide.MERGE_OUTCOMES], table      # header, then rows
+    for outcome in afk_decide.MERGE_OUTCOMES:
+        assert outcome in row("merge"), outcome
+
+    # the verdict a worker is asked for is spelled with the phases the code routes
+    assert f"phase=<{'|'.join(afk_decide.VERDICT_PHASES)}>" in docs["worker-prompt.md"]
+    for phase in afk_decide.VERDICT_PHASES:
+        assert f"`{phase}`" in skill, phase
+
+    # the summary schema the launcher gives a tick names every key `afk cycle` reads
+    for key in afk_decide.SUMMARY_WORK:
+        assert f"{key}:[…]" in skill, key
+    for key in afk_decide.SUMMARY_COUNTS:
+        assert f"{key}:N" in skill, key
+
+
+def test_the_docs_restate_config_only_as_the_schema_has_it():
+    """Prose that names a config key or quotes its default is a copy of
+    CONFIG_DEFAULTS: a key that does not exist is one a human sets to no effect,
+    and a stale default is a pace or a lease nobody runs on."""
+    docs = _skill_docs()
+    defaults = afk_decide.resolve_config({})
+
+    quoted = 0
+    for name, text in docs.items():
+        for key, value in re.findall(r"`([a-z_]+(?:\.[a-z_]+)?)`[^`\n]{0,30}?\bdefault ([\w/-]+)", text):
+            section, _, leaf = key.rpartition(".")
+            table = defaults.get(section, {}) if section else defaults
+            if leaf not in table or isinstance(table[leaf], dict):
+                continue
+            assert value == json.dumps(table[leaf]).strip('"'), f"{name}: `{key}` default {value}"
+            quoted += 1
+    assert quoted >= 4, quoted            # the scan really found the restated defaults
+
+    # a duration key is written with its unit, as the file has it: `claim_lease_ttl`
+    # is not a key, and a config that sets it is refused
+    stems = [k[:-len("_seconds")] for k in defaults if k.endswith("_seconds")]
+    short = re.compile(r"\b(%s)(?!_seconds)\b" % "|".join(stems))
+    for name, text in docs.items():
+        assert not short.findall(text), f"{name}: {sorted(set(short.findall(text)))}"
+
+
+def test_every_flow_anchor_still_names_something():
+    """docs/flows.md anchors each step to `path:Symbol`. A renamed function leaves
+    the doc pointing at nothing — and reading as if it still held."""
+    flows = _skill_docs().get("flows.md")
+    if flows is None:                     # an installed skill ships without it
+        return
+    root = os.path.join(SKILL, "..", "..")
+    anchors = sorted(set(re.findall(r"`([A-Za-z0-9_./\-]+\.[A-Za-z0-9]+):([A-Za-z_][A-Za-z0-9_]*)`",
+                                    flows)))
+    assert len(anchors) > 20, len(anchors)
+    for path, symbol in anchors:
+        with open(os.path.join(root, path)) as f:
+            assert re.search(r"(?<!\w)%s(?!\w)" % re.escape(symbol), f.read()), f"{path}:{symbol}"
+
+
 def run_all():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
