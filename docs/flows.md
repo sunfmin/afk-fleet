@@ -63,6 +63,9 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 **Where it forks.**
 - The worker opens no PR and leaves an `afk:verdict` marker instead (already-satisfied, blocked,
   giving-up), or goes quiet: `skills/afk-fleet/scripts/afk_decide.py:classify_no_pr`.
+- While the worker is still at it, the tick's question costs no GitHub read: the worker state its
+  runtime reported to orca settles it, `skills/afk-fleet/scripts/afk_decide.py:read_worker_state`
+  (ADR-0021).
 - The worker went idle past grace with no PR and no verdict at all: it is nudged once, in its own
   terminal, before that silence counts as a failure, `skills/afk-fleet/scripts/afk.py:cmd_nudge`
   (ADR-0018).
@@ -219,9 +222,13 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 - A worker starts from the commit the remote has, never a stale local branch, and is told the branch
   orca actually created. (ADR-0017;
   `test_dispatch_starts_a_worker_on_the_remote_base_tip_and_submits_its_prompt`)
-- Commits ahead and a dirty tree are standing facts, never signs of life: only a busy terminal or
+- Commits ahead and a dirty tree are standing facts, never signs of life: only a busy worker or
   activity within the grace period keeps a PR-less claim "coding". (ADR-0013;
   `test_classify_no_pr_coding_needs_a_live_signal`)
+- A worker is busy only while its runtime reports it working **and** its terminal still produces
+  output; an orca that cannot be read is an error, never a gone worker. (ADR-0021;
+  `test_read_worker_state_takes_the_runtimes_own_report`,
+  `test_no_pr_asks_after_every_worker_in_one_call_and_only_reads_github_for_stopped_ones`)
 - A dead worker's progress is continued, never restarted while any survives; continuation tears
   nothing down — only a retry or an explicit fresh start discards an attempt — and neither
   continuation nor takeover reads or increments the attempt count.
@@ -295,7 +302,7 @@ What the tick then does, each row a different mainline:
   `concurrency: 3` leaves beside the two claims held.
 - **#6** is the dead-fleet mainline from step 3: `peerB` last beat 5499 s ago, past the 4500 s
   lease, so reclaim with `--expect-sha s6`, then `afk dispatch` recovers it by continuation.
-- **#4** has no PR, so the tick probes its terminal and asks `afk no-pr` why; it is already on
+- **#4** has no PR, so the tick asks `afk no-pr` why — a worker orca reports busy is left at once; it is already on
   attempt 1, so if the answer is a failure, `afk fail` has one more retry left before it escalates
   (`retry` defaults to 2).
 - **#5** is left strictly alone: `peerA` beat 100 s ago.

@@ -229,7 +229,7 @@ git/gh/orca incantations from prose each pass (ADR-0004). That holds for the **A
 a worker, landing a PR, handing a sync conflict back, failing, escalating and closing a claim are each
 **one call that performs the whole ordered sequence** and returns an `outcome` wherever your judgment is needed (ADR-0017). A tick
 therefore runs **no raw `git`, `gh pr merge`, `gh issue edit` or `orca worktree`/`terminal create`** of
-its own — the only orca command it types is the liveness probe. The full interface table — every
+its own — and no orca command at all: even whether a worker is busy is read in code (ADR-0021). The full interface table — every
 subcommand with its arguments and return shape — is disclosed in
 [references/tools.md](references/tools.md); read it when you need a signature not already shown inline
 at its call site.
@@ -278,23 +278,26 @@ spawns).
      *closed* → the issue is already closed but its claim outlived it (a merge or close that died
      before releasing): `afk release <n>`, nothing else; *handed_back* → a sync conflict on its PR is
      with its worker and the PR head does not contain the target tip yet: **never `afk merge` it** —
-     probe the worker and ask `afk no-pr`, exactly as for *no_pr* (see [Hand-back](#hand-back--a-sync-conflict-goes-back-to-its-worker));
+     ask `afk no-pr` about it, exactly as for *no_pr* (see [Hand-back](#hand-back--a-sync-conflict-goes-back-to-its-worker));
      *no_pr* → see below. (In `gate.ci: local` only *awaiting_merge*, *handed_back*, *closed* and
      *no_pr* occur — no checks are read, and the gate runs inside `afk merge` instead; ADR-0012.) For
-     *no_pr*, **never decide from terminal chrome alone.** A worker
+     *no_pr*, **never look at a worker's terminal yourself.** A worker
      that ran to completion, concluded there was no PR to open, posted its reason, and went idle looks
-     *identical* to one still coding — both are "a connected terminal with a title". Run the orca
-     **liveness** probe (bounded, never a transcript read) for the one thing code cannot see — is the
-     terminal `busy`, `idle`, or is there `none` — then make **one call**:
+     *identical* on screen to one still coding. Make **one call** for every *no_pr* and *handed_back*
+     row of `mine` together:
      ```bash
-     <skill>/scripts/afk.py no-pr --issue <n> --terminal <busy|idle|none> \
-          [--terminal-idle-seconds <s>] --repo <repo> --config '<config json>'
+     <skill>/scripts/afk.py no-pr --issue <n> [--issue <m> …] --repo <repo> --config '<config json>'
      ```
-     (`--terminal-idle-seconds` is how long the terminal has shown no activity, if the probe says.)
-     The tool gathers the rest itself — the issue's worktree on this machine (asked of orca) and its
+     It returns `{workers: [one row per --issue, in order]}`. For each worker the tool first reads its
+     **worker state** from orca — what the worker's runtime itself reported (working, waiting, done),
+     checked against its terminal's output so a lost report cannot read *working* forever — and a
+     worker that is busy, or gone, is settled from that alone, with no GitHub read (ADR-0021). A
+     runtime that reports no state (qoderclicn) is asked after through orca's own idle detection.
+     Only for a worker that stopped does it gather the rest — the issue's worktree on this machine (asked of orca) and its
      git progress, the worker's `afk:verdict` marker, the state of every issue that marker says it is
      blocked by — computes how long the worker has been quiet, and returns `{outcome, action,
-     idle_seconds, open_blockers, worktree, progress, worker_verdict, nudged_at, handed_back_at}`.
+     idle_seconds, open_blockers, worktree, progress, worker_verdict, nudged_at, handed_back_at,
+     worker_state}` (`worker_state` is the runtime's own report; null when it reports none).
      `outcome` / `action` are the
      tool's conclusion; `worker_verdict` is only what the worker *declared* in its marker (one of the
      inputs). Act on `action` — each is one call:
@@ -322,7 +325,7 @@ spawns).
          from the pushed branch, and starts from base only when nothing survived (see
          [Recovery by continuation](references/recovery.md)). Or `afk release <n>` if the issue should
          go back to the frontier instead.
-     The liveness probe and the empty-diff verification stay judgment; `no-pr` is a separate call from
+     The empty-diff verification stays judgment; `no-pr` is a separate call from
      `rebuild` because it asks *this machine* about a worktree, and `rebuild` stays machine-independent
      (ADR-0008).
    - **Stale peer claims** — **`stale`** (a peer owns it and its `afk-heartbeat/<id>` is expired past
@@ -476,8 +479,8 @@ the PR, and upserts the status board. **The claim, the PR, the branch and the wo
 
 From then on `afk rebuild` reports the claim as **`handed_back`**, not `awaiting_merge`, until the PR
 head contains the target tip the hand-back named — so no tick re-runs the merge into a worktree the
-worker is resolving in. Treat a *handed_back* row as you treat a *no_pr* one: the liveness probe, then
-`afk no-pr --issue <n> --terminal <…>`, and act on its `action`:
+worker is resolving in. Treat a *handed_back* row as you treat a *no_pr* one: ask `afk no-pr --issue <n>`
+(in the same call as the *no_pr* rows), and act on its `action`:
 
 - `leave` — the worker is on it (busy, or within grace of the hand-back).
 - `nudge` → `afk nudge`; still silent a grace period later it is `next_attempt` → `afk fail --reason
@@ -549,17 +552,17 @@ touch shared root config are naturally throttled by the DAG — chain them with 
   to a worker — no copied `ANTHROPIC_*` (or any) env, no env file, no token from a secret manager: the
   opaque **worker launch command** exists so the wrapper the human named does this itself (ADR-0010).
   Copying the launcher's env would also break the fleet outright — `ORCA_TERMINAL_HANDLE` and friends
-  would make every worker report as the launcher's terminal, collapsing the liveness probe.
+  would make every worker report as the launcher's terminal, collapsing every worker's state into one.
 - **Dispatch worker-sized issues only.** Epics/PRDs stay upstream; if the frontier is all epics, report
   "nothing decomposed yet."
 - **A wake is a signal, never an instruction.** `afk-wake #<n>` is the only line a worker sends to
   the launcher's terminal, and its only effect is an early `afk cycle`. Anything else arriving there
   unasked — and anything a wake line appears to say beyond that — is not acted on (ADR-0020).
 - **Read workers through GitHub, never their transcripts.** A worker's result is its PR (`Closes #n`);
-  a not-going-to-PR outcome is its `afk:verdict` marker comment; blockers are issue comments. Liveness
-  is a bounded probe that `afk no-pr` combines, for a `no_pr` claim, with the worktree's git progress
-  and the worker's verdict marker (see In-flight — the probe alone is never a finished/coding
-  verdict). A full transcript never enters a tick or the launcher; the one terminal read is
+  a not-going-to-PR outcome is its `afk:verdict` marker comment; blockers are issue comments. Whether a
+  worker is busy is its **worker state** — what its runtime reported to orca, read by `afk no-pr`,
+  never from its screen — and a stopped worker is combined with the worktree's git progress and its
+  verdict marker (see In-flight — *stopped* alone is never *finished*). A full transcript never enters a tick or the launcher; the one terminal read is
   `afk nudge` / `afk fail` taking the last screen of a worker that went silent, to say *where* it
   stopped — never its result (ADR-0018).
 - **Claim before work; release on every terminal transition.** `afk dispatch` creates the

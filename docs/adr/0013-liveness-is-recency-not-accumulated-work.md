@@ -1,6 +1,6 @@
 # ADR-0013 — Liveness is recency, not accumulated work
 
-**Status:** accepted
+**Status:** accepted — the terminal reading it takes is made in code since [ADR-0021](0021-worker-state-is-mechanics.md)
 **Supersedes:** the `classify_no_pr` "real progress beats idle+verdict" rule (unrecorded; it lived
 only in `afk_decide.classify_no_pr`, its unit test, and the SKILL.md bullet).
 

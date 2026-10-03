@@ -320,6 +320,8 @@ if cmd == ["terminal", "wait"]:
     assert opt("--for") == "tui-idle" and int(opt("--timeout-ms")) > 0, argv
     if terminal() is None:
         finish(error="terminal_handle_stale")
+    if terminal().get("tui_busy"):                   # as real orca: a timeout is an error
+        finish(error="timeout")
     ready = not fake.get("never_ready")
     finish({"wait": {"satisfied": ready, "status": "idle" if ready else "timeout"}})
 
@@ -329,6 +331,17 @@ if cmd == ["terminal", "send"]:
         finish(error="terminal_handle_stale")
     term["sent"].append({"text": opt("--text"), "enter": "--enter" in argv})
     finish({"send": {"accepted": True}})
+
+if cmd == ["worktree", "ps"]:
+    assert int(opt("--limit")) > 0, argv
+    out = []
+    for r in rows:
+        terms = [t for t in fake["terminals"] if t["open"] and t["worktreePath"] == r["path"]]
+        out.append({"path": r["path"], "linkedIssue": r.get("linkedIssue"),
+                    "liveTerminalCount": len(terms),
+                    "lastOutputAt": max((t.get("lastOutputAt") or 0 for t in terms), default=0) or None,
+                    "agents": [t["agent"] for t in terms if t.get("agent")]})
+    finish({"worktrees": out, "totalCount": len(out), "truncated": fake.get("ps_truncated", False)})
 
 if cmd == ["terminal", "list"]:
     row = worktree()
@@ -498,6 +511,22 @@ class World:
         if reset:
             self.orca(calls=[])
         return calls
+
+    def worker(self, output=None, state=None, since=None, n=-1, tui_busy=False):
+        """What the worker in terminal `n` reported to orca: its terminal's last
+        output at `output`, its agent `state` since `since` (epoch seconds). For
+        one that reports no state, `tui_busy` is orca not seeing its terminal idle."""
+        terms = self.terminals()
+        terms[n]["tui_busy"] = tui_busy
+        terms[n]["lastOutputAt"] = output * 1000 if output is not None else None
+        terms[n]["agent"] = {"state": state, "stateStartedAt": (since or 0) * 1000,
+                             "parentPaneKey": None} if state else None
+        self.orca(terminals=terms)
+
+    def no_pr(self, *args):
+        """`afk no-pr` for ONE issue → that worker's row."""
+        (row,) = self.afk("no-pr", *args)["workers"]
+        return row
 
     # --- the CLI ----------------------------------------------------------
     def afk(self, *args, env=None):
@@ -821,12 +850,15 @@ def _comment(cid, body):
 def test_no_pr_gathers_every_signal_and_decides_in_one_call():
     with world(issues=[issue(4, "ready-for-agent"), issue(41), issue(42)]) as w:
         cfg = json.dumps({"base_branch": w.sb.base, "worker_idle_grace_seconds": 300})
-        base = ("no-pr", "--issue", "4", "--worktree", w.cwd, *R, "--config", cfg)
+        base = ("--issue", "4", *R, "--config", cfg)
+        w.orca([_orca_row(4, w.cwd)],
+               terminals=[{"handle": "term-1", "worktreePath": w.cwd, "sent": [], "open": True}])
         real_now = int(time.time())
         soon, later = str(real_now + 30), str(real_now + 5000)
 
-        # a clean worktree at base, no verdict, touched seconds ago → still coding
-        r = w.afk(*base, "--terminal", "idle", "--now", soon)
+        # a worker that reports nothing; a clean worktree at base touched seconds
+        # ago, no verdict → still coding
+        r = w.no_pr(*base, "--now", soon)
         assert (r["outcome"], r["action"]) == ("coding", "leave"), r
         assert r["progress"]["commits_ahead"] == 0 and r["progress"]["dirty"] is False
         assert 0 <= r["idle_seconds"] < 300 and r["worker_verdict"]["found"] is False
@@ -834,31 +866,65 @@ def test_no_pr_gathers_every_signal_and_decides_in_one_call():
         # `worker_verdict` — never one bare "verdict" that could be read as either
         assert set(r) == {"issue", "outcome", "action", "idle_seconds", "open_blockers",
                           "worktree", "progress", "worker_verdict", "nudged_at",
-                          "handed_back_at"}
+                          "handed_back_at", "worker_state"}
         assert r["issue"] == 4 and r["open_blockers"] == [] and r["worktree"] == w.cwd
+        assert r["worker_state"] is None
 
         # idle_seconds is derived HERE, from the freshest of commit / file / terminal
-        # clocks: the tick supplies a terminal reading, never arithmetic
-        r = w.afk(*base, "--terminal", "idle", "--now", later)
+        # clocks: the tick supplies nothing, not even a reading
+        r = w.no_pr(*base, "--now", later)
         assert 4900 < r["idle_seconds"] < 5100                    # the worktree's own clocks
         # silent with no verdict: stalled, to be nudged — not yet a failure
         assert (r["outcome"], r["action"], r["nudged_at"]) == ("idle_stalled", "nudge", None)
-        r = w.afk(*base, "--terminal", "idle", "--now", later, "--terminal-idle-seconds", "12")
-        assert r["idle_seconds"] == 12 and r["outcome"] == "coding"   # the terminal is fresher
-        # busy and none are the terminal's alone to say
-        assert w.afk(*base, "--terminal", "busy", "--now", later)["outcome"] == "coding"
-        assert w.afk(*base, "--terminal", "none", "--now", soon)["action"] == "orphan"
+        # a runtime that reports no state is asked after through orca's own idle
+        # detection — never its output, which an idle qoderclicn redraws on a timer
+        w.worker(output=int(later) - 12)
+        assert w.no_pr(*base, "--now", later)["outcome"] == "idle_stalled"
+        w.worker(tui_busy=True)
+        w.calls()
+        r = w.no_pr(*base, "--now", later)
+        assert (r["outcome"], r["worker_state"]) == ("coding", None) and w.calls() == []
+
+        # ADR-0021: a worker its runtime reports `working` is busy, and a busy worker
+        # costs nothing more — no GitHub, no git — however long since its last commit
+        w.worker(output=int(later) - 2, state="working", since=real_now)
+        w.calls()
+        r = w.no_pr(*base, "--now", later)
+        assert (r["outcome"], r["action"], r["worker_state"]) == ("coding", "leave", "working")
+        assert (r["progress"], r["worker_verdict"]) == ({}, None)
+        assert w.calls() == []
+        # …unless the terminal has said nothing for a grace period: a lost stop report
+        w.worker(output=int(later) - 400, state="working", since=real_now)
+        r = w.no_pr(*base, "--now", later)
+        assert (r["outcome"], r["worker_state"]) == ("idle_stalled", "working")
+        # a worker that STOPPED is timed from when it stopped, whatever it redraws
+        w.worker(output=int(later) - 1, state="done", since=int(later) - 400)
+        r = w.no_pr(*base, "--now", later)
+        assert (r["outcome"], r["idle_seconds"], r["worker_state"]) == ("idle_stalled", 400, "done")
+        w.worker(output=int(later) - 1, state="waiting", since=int(later) - 100)
+        assert w.no_pr(*base, "--now", later)["outcome"] == "coding"     # stopped within grace
         # grace: --set beats config
-        r = w.afk(*base, "--terminal", "idle", "--now", later,
-                  "--set", "worker_idle_grace_seconds=99999")
+        w.worker(output=int(later) - 400, state="done", since=int(later) - 400)
+        r = w.no_pr(*base, "--now", later, "--set", "worker_idle_grace_seconds=99999")
         assert r["outcome"] == "coding"
+        # no live terminal: gone — also decided from orca alone
+        terms = w.terminals()
+        terms[0]["open"] = False
+        w.orca(terminals=terms)
+        w.calls()
+        r = w.no_pr(*base, "--now", soon)
+        assert (r["outcome"], r["action"], r["worker_state"]) == ("dead", "orphan", None)
+        assert w.calls() == []
+        terms[0]["open"] = True
+        w.orca(terminals=terms)
+        w.worker()
 
         # the worker declared itself blocked on #41 and #42: their REAL state routes it
         w.set(comments={"4": [_comment(1, "a human note"),
                               _comment(2, _marker("giving-up")),
                               _comment(3, _marker("blocked", " blocked_by=41,42 reason=needs both"))]})
         w.calls()
-        r = w.afk(*base, "--terminal", "idle", "--now", later)
+        r = w.no_pr(*base, "--now", later)
         assert (r["outcome"], r["action"], r["open_blockers"]) == ("idle_blocked", "escalate", [41, 42])
         assert r["worker_verdict"]["phase"] == "blocked"
         assert r["worker_verdict"]["reason"] == "needs both"
@@ -867,41 +933,41 @@ def test_no_pr_gathers_every_signal_and_decides_in_one_call():
         assert states == [f"repos/{REPO}/issues/41", f"repos/{REPO}/issues/42"]
 
         w.set(issues=[issue(4), issue(41, state="closed"), issue(42)])
-        r = w.afk(*base, "--terminal", "idle", "--now", later)
+        r = w.no_pr(*base, "--now", later)
         assert (r["action"], r["open_blockers"]) == ("escalate", [42])
         w.set(issues=[issue(4), issue(41, state="closed"), issue(42, state="closed")])
-        r = w.afk(*base, "--terminal", "idle", "--now", later)
+        r = w.no_pr(*base, "--now", later)
         assert (r["outcome"], r["action"], r["open_blockers"]) == ("idle_blocked", "redispatch", [])
         # a blocker that cannot be read at all is not provably closed
         w.set(issues=[issue(4), issue(41, state="closed")])       # #42 is now a 404
-        assert w.afk(*base, "--terminal", "idle", "--now", later)["open_blockers"] == [42]
+        assert w.no_pr(*base, "--now", later)["open_blockers"] == [42]
 
         # already-satisfied over a pristine branch → close + release…
         w.set(comments={"4": [_comment(9, _marker("already-satisfied"))]})
-        r = w.afk(*base, "--terminal", "idle", "--now", later)
+        r = w.no_pr(*base, "--now", later)
         assert (r["outcome"], r["action"]) == ("idle_done", "close_release")
         # …but real work on the branch refutes it: commits, or just a dirty tree
         with open(os.path.join(w.cwd, "wip.txt"), "w") as f:
             f.write("uncommitted\n")
         later = str(int(time.time()) + 5000)
-        r = w.afk(*base, "--terminal", "idle", "--now", later)
+        r = w.no_pr(*base, "--now", later)
         assert r["progress"]["dirty"] is True and r["progress"]["commits_ahead"] == 0
         assert (r["outcome"], r["action"]) == ("idle_failed", "next_attempt")
         w.commit("done.txt", branch="sunfmin/issue-4-x")
         later = str(int(time.time()) + 5000)
-        r = w.afk(*base, "--terminal", "idle", "--now", later)
+        r = w.no_pr(*base, "--now", later)
         assert r["progress"]["commits_ahead"] == 2 - 1 and r["progress"]["dirty"] is False
         assert (r["outcome"], r["action"]) == ("idle_failed", "next_attempt")
         # the base it counts against is the config's — and it is the REMOTE's tip of
         # that branch, not the local one: a checkout that has not pulled must not make
         # a worktree cut from the fresh tip look like it carries work
         git(w.cwd, "push", "-q", "origin", "HEAD:refs/heads/release")
-        r = w.afk(*base, "--terminal", "idle", "--now", later, "--set", "base_branch=release")
+        r = w.no_pr(*base, "--now", later, "--set", "base_branch=release")
         assert r["progress"]["commits_ahead"] == 0 and r["outcome"] == "idle_done"
         git(w.cwd, "branch", "-q", "-f", "release", "HEAD~1")        # a stale LOCAL release
-        r = w.afk(*base, "--terminal", "idle", "--now", later, "--set", "base_branch=release")
+        r = w.no_pr(*base, "--now", later, "--set", "base_branch=release")
         assert r["progress"]["commits_ahead"] == 0
-        assert "no branch 'gone'" in w.error(*base, "--terminal", "idle", "--set", "base_branch=gone")
+        assert "no branch 'gone'" in w.error("no-pr", *base, "--set", "base_branch=gone")
 
 
 def test_a_silent_worker_is_nudged_once_and_its_screen_explains_the_failure():
@@ -916,8 +982,10 @@ def test_a_silent_worker_is_nudged_once_and_its_screen_explains_the_failure():
         cfg = ("--config", json.dumps({"base_branch": w.sb.base, "worker_idle_grace_seconds": 300}))
         nudge = ("nudge", "--issue", "7", *ME, *R, *cfg)
 
-        def no_pr(at, terminal="idle"):
-            r = w.afk("no-pr", "--issue", "7", "--terminal", terminal, *R, *cfg, "--now", str(at))
+        def no_pr(at, busy=False):
+            if busy:                     # its runtime reports it working, output just now
+                w.worker(output=at - 1, state="working", since=at - 60)
+            r = w.no_pr("--issue", "7", *R, *cfg, "--now", str(at))
             return r["outcome"], r["action"]
 
         def screen(lines):
@@ -942,13 +1010,13 @@ def test_a_silent_worker_is_nudged_once_and_its_screen_explains_the_failure():
         assert git(wt, "status", "--porcelain") == ""
 
         # the nudge buys one grace period…
-        r = w.afk("no-pr", "--issue", "7", "--terminal", "idle", *R, *cfg, "--now", str(t1 + 60))
+        r = w.no_pr("--issue", "7", *R, *cfg, "--now", str(t1 + 60))
         assert (r["outcome"], r["idle_seconds"], r["nudged_at"]) == ("coding", 60, t1)
         # …and it is spent once: the second silence is a failure, by outcome and by rule
         assert no_pr(t1 + 300) == ("idle_failed", "next_attempt")
         assert "already nudged" in w.error(*nudge)
         # a worker that answered the nudge is simply coding, or done
-        assert no_pr(t1 + 9000, "busy") == ("coding", "leave")
+        assert no_pr(t1 + 9000, busy=True) == ("coding", "leave")
 
         # the failure reason carries where it stopped — its screen as it is NOW
         screen(["● 我还是需要你确认。"])
@@ -984,121 +1052,69 @@ def test_a_silent_worker_is_nudged_once_and_its_screen_explains_the_failure():
         w.set(issues=[issue(8, "ready-for-agent")])
         r = w.afk(*dispatch(8)[:-2], "--now", str(T0 + 2))
         assert r["action"] == "reuse_worktree"
-        assert w.afk("no-pr", "--issue", "8", "--terminal", "idle", *R, *cfg,
-                     "--now", str(int(time.time()) + 5000))["action"] == "nudge"
+        assert w.no_pr("--issue", "8", *R, *cfg,
+                       "--now", str(int(time.time()) + 5000))["action"] == "nudge"
         assert "no worktree on this machine" in w.error(
             "nudge", "--issue", "8", *ME, *R, *cfg, "--worktree", "/no/such/dir")
 
 
 def test_no_pr_without_a_worktree_and_with_bad_input():
     with world(issues=[issue(4)], comments={"4": [_comment(1, _marker("giving-up"))]}) as w:
-        # no worktree at all (it lives on another machine): progress is unknown, the
-        # terminal reading is the only clock, and the verdict still routes
-        r = w.afk("no-pr", "--issue", "4", "--terminal", "idle", "--terminal-idle-seconds", "900", *R)
-        assert r["progress"] == {} and r["idle_seconds"] == 900 and r["worktree"] is None
-        assert (r["outcome"], r["action"]) == ("idle_failed", "next_attempt")
-        r = w.afk("no-pr", "--issue", "4", "--terminal", "idle", *R)
-        assert r["idle_seconds"] is None and r["outcome"] == "idle_failed"
+        # no worktree on this machine: no worker here either — gone, whatever it
+        # declared, and nothing more is read to say so
+        r = w.no_pr("--issue", "4", *R)
+        assert (r["outcome"], r["action"], r["worktree"], r["progress"]) == \
+            ("dead", "orphan", None, {})
+        assert w.calls() == []
 
         # the worktree is found through orca — the tick passes no path
-        w.orca([_orca_row(4, w.cwd), _orca_row(4, w.cwd + "-other", projectId="github:acme/other")])
-        r = w.afk("no-pr", "--issue", "4", "--terminal", "idle", *R)
+        term = {"handle": "term-1", "worktreePath": w.cwd, "sent": [], "open": True}
+        w.orca([_orca_row(4, w.cwd), _orca_row(4, w.cwd + "-other", projectId="github:acme/other")],
+               terminals=[term])
+        r = w.no_pr("--issue", "4", *R)
         assert r["worktree"] == w.cwd and r["progress"]["commits_ahead"] == 0
+        r = w.no_pr("--issue", "4", *R, "--now", str(int(time.time()) + 5000))
+        assert (r["outcome"], r["action"]) == ("idle_failed", "next_attempt")   # giving-up
         # one orca remembers but the disk no longer has is no worktree
         w.orca([_orca_row(4, os.path.join(w.sb.root, "gone"))])
-        r = w.afk("no-pr", "--issue", "4", "--terminal", "idle", *R)
-        assert r["worktree"] is None and r["progress"] == {}
+        r = w.no_pr("--issue", "4", *R)
+        assert r["worktree"] is None and r["outcome"] == "dead"
 
         # a worktree path GIVEN that does not exist is a mistake, never "no progress":
         # read as empty it could close an issue whose branch holds real work
-        err = w.error("no-pr", "--issue", "4", "--terminal", "idle", "--worktree", "/no/such/dir", *R)
+        err = w.error("no-pr", "--issue", "4", "--worktree", "/no/such/dir", *R)
         assert "worktree not found" in err
-        # gh failing is an error too, not an absent verdict
-        assert "gh api" in w.error("no-pr", "--issue", "4", "--terminal", "idle",
-                                   "--repo", "acme/other")
+        # and it names ONE worker's worktree
+        err = w.error("no-pr", "--issue", "4", "--issue", "5", "--worktree", w.cwd, *R)
+        assert "one --issue" in err
+        # a remote that cannot be read is an error too, not an absent verdict
+        w.orca([_orca_row(4, w.cwd)])
+        assert "acme/other" in w.error("no-pr", "--issue", "4", "--worktree", w.cwd,
+                                       "--repo", "acme/other")
+        # and so is an orca that cannot be asked — never "the worker is gone", which
+        # would start a second worker beside a live one
+        assert "orca worktree" in w.error("no-pr", "--issue", "4", *R,
+                                          env={"AFK_FAKE_ORCA_EXIT": "1"})
+        w.orca(ps_truncated=True)
+        assert "truncated" in w.error("no-pr", "--issue", "4", *R)
 
 
-# --------------------------------------------------------------------------- #
-# status board                                                                 #
-# --------------------------------------------------------------------------- #
-
-def test_status_upserts_exactly_one_comment_and_writes_only_on_change():
-    with world(issues=[issue(4)], comments={"4": [_comment(1, "a human comment")]}) as w:
-        def writes():
-            return [c for c in w.calls() if "--method" in c]
-
-        def board():
-            rows = [c for c in w.state()["comments"]["4"] if afk_decide.STATUS_MARKER in c["body"]]
-            assert len(rows) == 1, rows
-            return rows[0]
-
+def test_no_pr_asks_after_every_worker_in_one_call_and_only_reads_github_for_stopped_ones():
+    """ADR-0021: a tick asks once for all its PR-less claims. The busy ones — the
+    usual case — are settled from orca's worker state; only a worker that stopped
+    has its verdict, blockers and PR read from GitHub."""
+    with world(issues=[issue(1, "ready-for-agent"), issue(2, "ready-for-agent")]) as w:
+        w.afk(*dispatch(1))
+        w.afk(*dispatch(2, "--now", str(T0 + 1)))
+        now = int(time.time()) + 5000
+        w.worker(output=now - 3, state="working", since=now - 900, n=0)
+        w.worker(output=now - 3, state="done", since=now - 600, n=1)
         w.calls()
-        r = w.afk("status", "4", "--phase", "claimed", "--instance", "fl-1", *R)
-        assert r["action"] == "created" and r["issue"] == 4
-        assert len(writes()) == 1
-        assert "认领方 `fl-1`" in board()["body"] and "尚无 PR" in board()["body"]
-        cid = board()["id"]
-        assert r["comment_id"] == cid
-
-        # a re-entrant tick with the same state touches nothing
-        r = w.afk("status", "4", "--phase", "claimed", "--instance", "fl-1", *R)
-        assert (r["action"], r["comment_id"]) == ("unchanged", cid)
-        assert writes() == []
-
-        # the lifecycle moves → the SAME comment is edited in place, never appended
-        r = w.afk("status", "4", "--phase", "pr_open", "--instance", "fl-1", "--pr", "77", *R)
-        assert (r["action"], r["comment_id"]) == ("updated", cid)
-        assert [c[c.index("--method") + 1] for c in writes()] == ["PATCH"]
-        assert "- [x] PR 已开 (#77) · 等 CI" in board()["body"]
-        assert len(w.state()["comments"]["4"]) == 2               # the human's + the board
-
-        # retry_max comes from config `retry` — the tick passes only the attempt
-        cfg = json.dumps({"retry": 5})
-        w.afk("status", "4", "--phase", "ci_failed", "--pr", "77", "--attempt", "2", *R, "--config", cfg)
-        assert "CI 失败,修复重试中(2/5)" in board()["body"]
-        # …and so does the gate's name: a local gate is never called CI
-        cfg = json.dumps({"gate": {"ci": "local", "local_command": "make test"}})
-        w.afk("status", "4", "--phase", "pr_open", "--pr", "77", *R, "--config", cfg)
-        assert "等 本地门" in board()["body"] and "CI" not in board()["body"]
-
-        for phase in ("merged", "escalated"):                      # the terminal phases
-            assert w.afk("status", "4", "--phase", phase, "--pr", "77", *R)["action"] == "updated"
-        assert "已升级给人处理" in board()["body"]
-        # an issue with no comments yet, and an unknown phase
-        assert w.afk("status", "5", "--phase", "claimed", *R)["action"] == "created"
-
-
-# --------------------------------------------------------------------------- #
-# bootstrap: probe protection / worker-command / config                        #
-# --------------------------------------------------------------------------- #
-
-def test_probe_checks_branch_protection_only_for_a_local_gate():
-    local = json.dumps({"gate": {"ci": "local", "local_command": "make test"},
-                        "merge": {"target": "main"}})
-    with world() as w:
-        # required mode: checks ARE the gate, so protection is not even read
-        r = w.afk("probe", *R, "--now", str(T0))
-        assert "protection" not in r and w.calls() == []
-
-        # local mode, unprotected target → fine
-        r = w.afk("probe", *R, "--config", local, "--now", str(T0))
-        assert (r["protection"]["verdict"], r["protection"]["branch"]) == ("ok", "main")
-        assert r["config"]["gate"]["ci"] == "local"               # the config rides back whole
-
-        # local mode + REQUIRED status checks → every merge would be rejected: hard error
-        w.set(protection={"main": {"required_status_checks": {"contexts": ["ci/build"],
-                                                              "checks": [{"context": "ci/lint"}]}},
-                          "release": {"__error__": "gh: Resource not accessible (HTTP 403)"}})
-        r = w.afk("probe", *R, "--config", local, "--now", str(T0))
-        assert r["protection"]["verdict"] == "error"
-        assert r["protection"]["required_checks"] == ["ci/build", "ci/lint"]
-        # an unreadable protection is a warning, never a guess; --target picks the branch
-        r = w.afk("probe", *R, "--config", local, "--set", "merge.target=release", "--now", str(T0))
-        assert (r["protection"]["verdict"], r["protection"]["branch"]) == ("warn", "release")
-        assert "403" in r["protection"]["detail"]
-        # no --repo → the refs still probe (via origin), protection is flagged unchecked
-        r = w.afk("probe", "--config", local, "--now", str(T0))
-        assert r["protection"]["verdict"] == "warn" and "--repo" in r["protection"]["detail"]
+        r = w.afk("no-pr", "--issue", "2", "--issue", "1", *R, "--now", str(now))
+        assert [(x["issue"], x["outcome"], x["worker_state"]) for x in r["workers"]] == \
+            [(2, "idle_stalled", "done"), (1, "coding", "working")]
+        read = [c for c in w.calls() if c[:1] == ["api"] or c[:2] == ["pr", "list"]]
+        assert read and all("issues/1/" not in " ".join(c) for c in read), read
 
 
 def test_worker_command_settles_the_launch_command_from_env_and_shell():
@@ -1286,7 +1302,7 @@ def test_dispatch_starts_a_worker_on_the_remote_base_tip_and_submits_its_prompt(
         assert [(m["number"], m["status"]) for m in ws["mine"]] == [(1, "no_pr")]
         assert ws["free_slots"] == 2 and [f["number"] for f in ws["frontier"]["dispatch"]] == [2]
         # a worktree cut from the fresh tip is pristine, whatever the stale local base says
-        r_np = w.afk("no-pr", "--issue", "1", "--terminal", "busy", *R)
+        r_np = w.no_pr("--issue", "1", *R)
         assert (r_np["worktree"], r_np["progress"]["commits_ahead"]) == (wt, 0)
 
         # however orca resolved the base it was handed, the worktree ends up containing
@@ -1717,13 +1733,13 @@ def test_hand_back_returns_a_sync_conflict_to_the_worker_that_wrote_the_branch()
 
         # the hand-back is a sign of life: one grace period to start on it
         cfg = ("--config", json.dumps({"base_branch": w.sb.base, "worker_idle_grace_seconds": 300}))
-        np = w.afk("no-pr", "--issue", "2", "--terminal", "idle", *R, *cfg, "--now", str(t0 + 60))
+        np = w.no_pr("--issue", "2", *R, *cfg, "--now", str(t0 + 60))
         assert (np["outcome"], np["idle_seconds"], np["handed_back_at"]) == ("coding", 60, t0)
 
         # the worker answers: the PR head now contains the tip the hand-back named
         resolved = _resolve(w, wt, branch)
         assert _mine(w, gate, 2) == ("awaiting_merge", "pr_open", 20)
-        np = w.afk("no-pr", "--issue", "2", "--terminal", "idle", *R, *cfg, "--now", str(t0 + 60))
+        np = w.no_pr("--issue", "2", *R, *cfg, "--now", str(t0 + 60))
         assert np["handed_back_at"] is None
         assert w.issue(2)["labels"] == ["ready-for-agent"]          # still no attempt label
 
@@ -1755,8 +1771,8 @@ def test_an_unanswered_hand_back_falls_through_to_the_nudge_and_then_the_retry_l
         t0 = int(time.time()) + 5000
         cfg = ("--config", json.dumps({"base_branch": w.sb.base, "worker_idle_grace_seconds": 300}))
 
-        def no_pr(at, terminal="idle"):
-            r = w.afk("no-pr", "--issue", "5", "--terminal", terminal, *R, *cfg, "--now", str(at))
+        def no_pr(at):
+            r = w.no_pr("--issue", "5", *R, *cfg, "--now", str(at))
             return r["outcome"], r["action"]
 
         # a worker nudged BEFORE its PR is under a new instruction now: nudgeable again
@@ -1818,7 +1834,7 @@ def test_hand_back_with_no_terminal_continues_in_the_worktree_never_from_base():
         terms = w.terminals()
         terms[-1]["open"] = False
         w.orca(terminals=terms)
-        np = w.afk("no-pr", "--issue", "6", "--terminal", "none", *R, *gate)
+        np = w.no_pr("--issue", "6", *R, *gate)
         assert (np["outcome"], np["action"]) == ("dead", "orphan")
         r = w.afk(*dispatch(6, *gate, "--now", str(T0 + 90)))
         assert (r["claim"], r["action"], r["prompt"], r["handed_back"]) == \

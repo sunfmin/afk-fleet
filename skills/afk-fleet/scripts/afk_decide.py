@@ -634,6 +634,60 @@ def latest_verdict(comments):
     return result
 
 
+def read_worker_state(row, now, grace_seconds, tui_idle=None):
+    """
+    A worker's state, read from its worktree's row of `orca worktree ps --json` —
+    the `terminal` / `terminal_idle_seconds` reading `classify_no_pr` takes,
+    made in code instead of by a tick looking at a screen (ADR-0021).
+
+      row: {liveTerminalCount, lastOutputAt, agents: [{state, stateStartedAt,
+           parentPaneKey}]} (orca's clocks are epoch MILLISECONDS), or None when
+           orca lists no such worktree. `state` is what the agent's own hooks
+           reported: working | waiting | blocked | done.
+      now, grace_seconds: epoch seconds / `worker_idle_grace_seconds`.
+      tui_idle: for a runtime that reports NO state (qoderclicn), whether orca
+           sees its terminal idle — `orca terminal wait --for tui-idle` answered
+           (True) or timed out (False). None when not asked, read as idle.
+
+    Returns {"terminal", "terminal_idle_seconds", "state"}:
+      none  no live terminal in the worktree — the worker is gone.
+      busy  the agent reports `working` AND the terminal produced output within
+            grace. Both, because a stop report the runtime lost would otherwise
+            read `working` forever — a claim parked on a state that cannot change
+            (ADR-0013).
+            A runtime that reports no state is busy when orca does not see its
+            terminal idle (`tui_idle` False).
+      idle  anything else, timed from when the agent reported it stopped. A lost
+            stop report is timed from the terminal's last output; a runtime that
+            reports no state is not timed at all (None) — its idle screen redraws
+            on a timer, so its output says nothing — and the worktree's own
+            clocks decide.
+    `state` is the report it was read from: the top-level agent that changed
+    state last (an older pane's report, a subagent's, do not speak for it).
+    """
+    if not row or not row.get("liveTerminalCount"):
+        return {"terminal": "none", "terminal_idle_seconds": None, "state": None}
+
+    def ago(ms):
+        return max(0, int(now) - int(ms) // 1000) if ms else None
+
+    output_idle = ago(row.get("lastOutputAt"))
+    agents = [x for x in row.get("agents") or [] if x.get("state") and not x.get("parentPaneKey")]
+    lead = max(agents, key=lambda x: x.get("stateStartedAt") or 0, default=None)
+    state = lead["state"] if lead else None
+
+    def out(terminal, idle):
+        return {"terminal": terminal, "terminal_idle_seconds": idle, "state": state}
+
+    if state == "working":
+        live = output_idle is not None and output_idle < grace_seconds
+        return out("busy" if live else "idle", output_idle)
+    if state is not None:
+        stopped = ago(lead.get("stateStartedAt"))
+        return out("idle", output_idle if stopped is None else stopped)
+    return out("busy" if tui_idle is False else "idle", None)
+
+
 def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, blocker_states,
                    now, grace_seconds, nudged_at=None, can_nudge=True, handed_back_at=None):
     """
