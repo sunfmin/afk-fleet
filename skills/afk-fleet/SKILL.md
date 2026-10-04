@@ -18,7 +18,7 @@ context-bounded:
 
 | Role | What it is | Lifetime |
 |---|---|---|
-| **launcher** | The interactive session you invoke `/afk-fleet` in. It authorizes once, then loops: spawn a tick → ingest a one-line summary → pace → repeat. | Long-lived, but only accumulates ~one compact summary per tick (auto-compaction keeps it flat). |
+| **launcher** | The interactive session you invoke `/afk-fleet` in. It bootstraps once, then loops: spawn a tick → ingest a one-line summary → pace → repeat. | Long-lived, but only accumulates ~one compact summary per tick (auto-compaction keeps it flat). |
 | **tick** | A **fresh-context [Agent] subagent** that does exactly **one reconciliation pass** against GitHub, then returns a compact structured summary and dies. | Short. Its bulky context is discarded on return. |
 | **worker** | A fire-and-forget autonomous coding agent (Claude Code or qoderclicn — the run's **runtime**), one per issue: orca creates its worktree + branch, then starts it with the run's **worker launch command** so it runs on the same runtime as the launcher. Its outcome travels only through GitHub (its PR, and issue comments); the one thing it says to the launcher directly is a contentless **wake**. | Independent of the coordinator — never read by it. |
 
@@ -50,14 +50,15 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
 ## Modes
 
 - `/afk-fleet` — **launcher** (default): bootstrap, then loop spawning ticks. The main entry.
+  **Invoking it is the launch** — no preview, no confirmation (ADR-0023). `--worker-command "<cmd>"`
+  answers bootstrap's one possible question up front.
 - `/afk-fleet --plan` — **dry-run**: a **tick short-circuited before the Act phase**. It does the full
   rebuild (frontier + in-flight + stale classification), prints the dispatch plan, and exits —
-  merges/dispatches/reclaims **nothing**, needs no authorization. Same rebuild code path as `--tick`,
+  merges/dispatches/reclaims **nothing**: the way to look before launching. Same rebuild code path as `--tick`,
   so the plan can't drift from what a live tick would do (ADR-0002).
 - `/afk-fleet --tick` — **one reconciliation pass** and exit with a summary. This is what the
-  launcher spawns each cycle (and what you'd run headless). It auto-merges only under the run
-  authorization its launcher injects; invoked cold without it, it dispatches but calls no
-  `afk merge`.
+  launcher spawns each cycle (and what you'd run headless). Invoked cold it acts exactly as a
+  launcher's tick does, merges included.
 - `/afk-fleet --takeover` — a **launcher bootstrap variant** for when a fleet hard-stopped (quota) and
   you will not wait for its lease to lapse: the *full* bootstrap, then the opening working set
   is seeded from a dead peer's claims instead of the frontier alone. Thereafter an ordinary standing
@@ -65,19 +66,25 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
 
 ## Launcher (default mode)
 
-### Bootstrap (once, with the human present)
+### Bootstrap (once)
+
+**Invoking the skill is the launch** (ADR-0023): the invocation is itself the go-ahead to push worker
+branches and **auto-merge** green PRs to `merge.target`, unattended, for this run. Bootstrap shows no
+preview and asks for no confirmation — go straight from step 3 into the [Loop](#loop). It stops only
+on what makes the run impossible (a config error, a merge target that would reject every merge), and
+asks only the one thing code cannot derive (step 3, and only when it was not passed in).
 
 1. **Load config** — `afk config --file <target repo>/docs/agents/afk-fleet.md` parses + validates
-   the file against the one schema (unknown key or wrong shape → **error, with you present — fix the
-   file, don't guess**) and returns the **canonical config JSON**: every key present, defaults
+   the file against the one schema (unknown key or wrong shape → **error: stop and report it,
+   don't guess**) and returns the **canonical config JSON**: every key present, defaults
    filled (ADR-0009). That JSON is what the launcher holds and injects into every tick — nothing
    downstream re-parses YAML or re-applies defaults. Missing file → offer to create it from the
    template ([references/config-template.md](references/config-template.md)) and stop; never run on
    guessed settings.
 2. **Establish this fleet instance** — mint a short unique **instance id** (this launcher run's
-   identity, held only in the launcher and injected into every tick, exactly like the authorization
-   below). Then `afk probe --repo <repo> --config '<config>'`, which answers two compatibility questions
-   and returns the run's config — **hold its `config` from here on, in place of step 1's**:
+   identity, held only in the launcher and injected into every tick). Then
+   `afk probe --repo <repo> --config '<config>'`, which answers two compatibility questions and
+   returns the run's config — **hold its `config` from here on, in place of step 1's**:
    - **Claim namespace** — the returned `config` carries the `claim_namespace` that actually works, so
      every later call inherits it through `--config` with nothing extra to pass. If it reports
      `"blocked": true` (an org ruleset forbids `refs/afk/*`; `detail` is the server's rejection), that
@@ -87,7 +94,7 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
      remote could not be pushed to at all (auth, network) — fix that; it is not a namespace question.
    - **Branch protection** (only when `gate.ci: local`) — `protection.verdict == "error"` means
      `merge.target` **requires status checks**, so `gh pr merge` would be rejected however green the
-     local gate is: **stop here, with the human present** — drop the required checks on that branch or
+     local gate is: **stop here** — drop the required checks on that branch or
      switch to `gate.ci: required`. (`gh pr merge --admin` is not an option: it bypasses human review
      too.) A `"warn"` verdict (the read was inconclusive — no admin rights) is reported and continues.
 3. **Settle the worker launch command** — `afk worker-command`. The tool first detects the
@@ -98,10 +105,12 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
    (`ckimi`, `csk`, a direnv, a wrapper script) would otherwise dispatch workers that silently fall
    back to stock Anthropic and stay there for days (ADR-0010). For the Claude runtime, the tool reports:
    - `"status": "stock"` — no `ANTHROPIC_BASE_URL`; take its `command` and **ask nothing**.
-   - `"status": "ask"` — a custom provider. Show the `base_url` and the `candidates` it found (the
-     login shell's Claude-starting aliases, `wraps_env: true` marking the ones that carry a provider),
-     ask *"which command should workers start with?"*, then **verify the answer**:
-     `afk worker-command --check "<their answer>"`. `unresolved` → say what didn't resolve and re-ask
+   - `"status": "ask"` — a custom provider, which code cannot map back to a command. If the skill was
+     invoked with `--worker-command "<cmd>"`, that is the answer — ask nothing. Otherwise show the
+     `base_url` and the `candidates` it found (the login shell's Claude-starting aliases,
+     `wraps_env: true` marking the ones that carry a provider) and ask *"which command should workers
+     start with?"* — the only question a launch can ask. Either way **verify the answer**:
+     `afk worker-command --check "<the answer>"`. `unresolved` → say what didn't resolve and re-ask
      (an unresolvable command starts no worker at all: the claim goes PR-less into the retry ladder
      and escalates, on a typo). `confirmed` with `"yolo": false` → warn that it carries no unattended
      flag, so a worker will park on a permission prompt — indistinguishable to the fleet from one that
@@ -112,19 +121,10 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
    to a subshell isn't even valid syntax). This is what keeps every credential inside the wrapper the
    human already trusts: the fleet copies no environment, writes no file, and puts no key on any
    command line.
-4. **Preview** — spawn a **plan tick** (a `--tick` in plan mode) as an [Agent] subagent and show the
-   dispatch plan it returns (which issues, order, concurrency, gate steps, merge target). The frontier
-   is computed **inside the subagent, never in the launcher's own context**; the launcher only ingests
-   the returned plan (ADR-0002).
-5. **Authorize (the one gate)** — state plainly: *"I will push worker branches and **auto-merge**
-   green PRs to `<target>` in `<repo>` unattended — this overrides the standing 'never push without
-   asking' rule, for this repo, for this run. Confirm?"* Get an explicit yes. This authorization is
-   **for the whole run**, held only in the launcher (never a config key); every tick inherits it via
-   its spawn prompt, and it dies when you stop the launcher.
 
-The instance id, the run authorization, and the worker launch command are the run's **three
-launcher-held facts**: settled once with you present, carried in every tick's spawn prompt, never
-written to a file, gone when the launcher stops.
+The instance id and the worker launch command are the run's **two launcher-held facts**: settled once
+at bootstrap, carried in every tick's spawn prompt, never written to a file, gone when the launcher
+stops.
 
 ### Takeover mode (`--takeover`)
 
@@ -134,8 +134,8 @@ standing right there. The lease will hand its claims to a peer, but only after
 The present human is the oracle that knows *now*; the dying fleet cannot help, since a hard stop runs no
 code at all (no drain, no release) — [ADR-0011](../../docs/adr/0011-takeover-and-progress-preservation.md).
 
-Run the **full** [Bootstrap](#bootstrap-once-with-the-human-present) above — config, a *new* instance id,
-the worker launch command, the one push+auto-merge authorization — so this is a real fleet instance. Only
+Run the **full** [Bootstrap](#bootstrap-once) above — config, a *new* instance id,
+the worker launch command — so this is a real fleet instance. Only
 the opening working set differs:
 
 1. **List what GitHub still remembers.** The dead launcher forgot its own id; the claim markers
@@ -186,7 +186,7 @@ streak, what is in flight — lives in there, maintained by code.
      Keep `state` and go to step 4.
    - `"action": "tick"` (`first` / `changed` / `forced` / `gate_off`) → continue.
 2. **Spawn a tick** — call the [Agent] tool (fresh context) to run one reconciliation pass, passing
-   only `{repo, config, authorized: true, instance_id, worker_command}`. Constrain its return with the
+   only `{repo, config, instance_id, worker_command}`. Constrain its return with the
    **`summary_schema`** step 1 returned, verbatim — the JSON schema of a tick's summary, written by
    the code that reads the summary back, so never compose one yourself.
    `in_flight` (claims the fleet still holds) and `frontier_remaining` (dispatchable issues it did not
@@ -219,7 +219,7 @@ streak, what is in flight — lives in there, maintained by code.
 The launcher never dispatches, merges, or reads a worker itself, never computes the frontier in its own
 context, and never reads the tick's files (the `afk.py`/`afk_decide.py` source, `worker-prompt.md`) — it
 reads only the repo config, calls `afk` subcommands, and spawns ticks. All coordination happens inside a
-tick; even the bootstrap preview is a plan-tick subagent. This keeps the launcher thin *by construction*
+tick. This keeps the launcher thin *by construction*
 (ADR-0002), not by later compaction.
 
 ## Tools (`scripts/afk.py`) — the deterministic muscle
@@ -258,8 +258,7 @@ empty `mine` means you hold nothing, `"released": true` means the claim is gone.
 
 A tick is stateless: it rebuilds from GitHub, acts, summarizes, and exits. It never waits for the
 workers it dispatches. In `--plan` mode it stops after step 1 (**Rebuild**) and returns the plan
-instead of acting — same rebuild, zero side effects (this is what the launcher's bootstrap preview
-spawns).
+instead of acting — same rebuild, zero side effects.
 
 1. **Rebuild the working set from GitHub** (never from memory) — **one read-only call** (ADR-0008):
    ```bash
@@ -574,9 +573,10 @@ touch shared root config are naturally throttled by the DAG — chain them with 
 
 ## Guardrails
 
-- **Authorize before any push or merge.** The launcher runs only on the bootstrap authorization, and a
-  cold `--tick` auto-merges only with an injected run authorization — without one it dispatches but
-  never calls `afk merge`.
+- **The invocation is the authorization, and it covers only this.** Running the skill is the human's
+  go-ahead to push worker branches and auto-merge green PRs to `merge.target`, for this repo, for
+  this run — ask for no further confirmation, and read it as permission for nothing else
+  (ADR-0023). `--plan` is how to look without acting.
 - **Keep every credential inside the worker's own shell.** Push only to worker branches and the merge
   to `merge.target`; deploying, secrets, and every other remote stay out of scope. Carry no credential
   to a worker — no copied `ANTHROPIC_*` (or any) env, no env file, no token from a secret manager: the

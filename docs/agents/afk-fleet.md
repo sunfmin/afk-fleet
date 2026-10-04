@@ -4,8 +4,7 @@ Per-repo config consumed by `/afk-fleet` at bootstrap via `afk config --file <th
 validates every key against the one schema (unknown key or wrong shape → error) and emits the
 canonical JSON every tick and tool consumes (ADR-0009). Anything omitted uses the default. This repo's
 trunk is `master` (not `main`), so `base_branch` and `merge.target` are set accordingly. The worker
-launch command and the run authorization are intentionally NOT here (settled interactively at
-bootstrap; ADR-0010).
+launch command is intentionally NOT here (settled at bootstrap; ADR-0010).
 
 ```yaml
 # --- dispatch contract ---

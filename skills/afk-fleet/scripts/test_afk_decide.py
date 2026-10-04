@@ -1496,14 +1496,14 @@ retry: 3
     # a whole markdown file: the first ```yaml fence is the config
     assert d.parse_config_yaml("intro\n```yaml\nretry: 1\n```\nnotes") == {"retry": 1}
 
-    # parsing IS validation: typo'd keys, wrong shapes, and file-armed
-    # authorize are all refused, never silently ignored
+    # parsing IS validation: typo'd keys, wrong shapes, and a
+    # launcher-held fact in a file are all refused, never silently ignored
     for bad in ("readylabel: x",            # unknown top-level key
                 "gate:\n  cii: x",          # unknown nested key
                 "retry: soon",              # wrong type
                 "gate: on",                 # scalar for a section
                 "  ci: required",           # indented key outside a section
-                "authorize: true"):         # never a config key
+                "worker_command: ckimi"):  # never a config key
         try:
             d.parse_config_yaml(bad)
             assert False, f"expected ValueError for {bad!r}"

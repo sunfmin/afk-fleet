@@ -1257,7 +1257,7 @@ def test_config_file_loads_validates_and_round_trips():
                          ("gate:\n  ci: local", "local_command"),
                          ("claim_namespace: afk", "claim_namespace"),
                          ("claim_namespace: refs/heads/afk", "claim_namespace"),
-                         ("authorize: true", "per-run")):
+                         ("worker_command: ckimi", "per-run")):
             assert why in w.error("config", "--file", load(bad)), bad
         assert "--file" in w.error("config")
         assert "No such file" in w.error("config", "--file", "/no/such/file.md")

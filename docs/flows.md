@@ -82,41 +82,36 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 - A peer wins the claim race, or the claim push fails outright (an error, never a lost race):
   ADR-0015.
 - `--plan` stops after step 2 and returns the dispatch plan: ADR-0002.
-- A cold `--tick` with no injected authorization does steps 1–10 and calls no merge: SKILL.md
-  Guardrails.
 
-## How does a fleet get permission once and then run for days?
+## How does a fleet launch and then run for days?
 
-1. A human invokes `/afk-fleet`; the **launcher** loads the target repo's config file, validated
-   against the one schema with defaults filled, and refuses to run on an unknown key.
+1. A human invokes `/afk-fleet`, and that invocation is the whole go-ahead to push and auto-merge —
+   nothing is previewed or confirmed (ADR-0023); the **launcher** loads the target repo's config
+   file, validated against the one schema with defaults filled, and refuses to run on an unknown key.
    `skills/afk-fleet/scripts/afk.py:cmd_config`
 2. The launcher mints this run's instance id and probes the remote for which claim namespace it may
    push under, and, with a local gate, whether the merge target demands status checks.
    `skills/afk-fleet/scripts/afk.py:cmd_probe`
 3. The launcher settles the **worker launch command**: a stock launcher is never asked, a launcher on
-   a custom provider has the human pick the command and the answer is checked to resolve.
+   a custom provider uses the command passed with the invocation, or has the human pick one, and the
+   answer is checked to resolve.
    `skills/afk-fleet/scripts/afk.py:cmd_worker_command`
-4. The launcher spawns a **plan tick** and shows the human the dispatch plan it returns.
-   `skills/afk-fleet/SKILL.md:Preview`
-5. The human authorizes, once and for the whole run, pushing worker branches and auto-merging green
-   PRs to the target.
-   `skills/afk-fleet/SKILL.md:Authorize`
-6. Each cycle, the launcher opens with one call that digests what a rebuild would observe and gets
+4. Each cycle, the launcher opens with one call that digests what a rebuild would observe and gets
    back skip or tick, plus an opaque cycle state to hand back; the raw state never enters its context.
    `skills/afk-fleet/scripts/afk.py:cmd_cycle`
-7. When the digest moved, the launcher spawns a fresh tick, handing it only the repo, the config and
-   the three launcher-held facts (authorization, instance id, worker launch command).
+5. When the digest moved, the launcher spawns a fresh tick, handing it only the repo, the config and
+   the two launcher-held facts (instance id, worker launch command).
    `skills/afk-fleet/SKILL.md:instance_id`
-8. The tick does one reconciliation pass (the mainline above) and returns one compact summary, which
+6. The tick does one reconciliation pass (the mainline above) and returns one compact summary, which
    the launcher hands back to the same call; it folds the summary into the cycle state and counts
    whether the cycle was empty.
    `skills/afk-fleet/scripts/afk_decide.py:cycle_ticked`
-9. The launcher sleeps the interval that call returned — busy, or idle after enough consecutive
+7. The launcher sleeps the interval that call returned — busy, or idle after enough consecutive
    empty cycles, never longer than half the lease while the fleet holds a claim — then repeats from
-   step 6, keeping nothing but the cycle state.
+   step 4, keeping nothing but the cycle state.
    `skills/afk-fleet/scripts/afk_decide.py:pace`
-10. On the human's word, one final drain tick releases the claims that have no PR, keeps the ones
-    that do, and the launcher spawns no more ticks.
+8. On the human's word, one final drain tick releases the claims that have no PR, keeps the ones
+   that do, and the launcher spawns no more ticks.
     `skills/afk-fleet/scripts/afk.py:cmd_release`
 
 **Where it forks.**
