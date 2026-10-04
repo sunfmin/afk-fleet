@@ -2,18 +2,17 @@
 
 Copy this into the **target repo** at `docs/agents/afk-fleet.md`. The fleet reads it at bootstrap
 through `afk config --file …`, which validates every key against the schema (an unknown key or
-wrong shape is an **error**, caught with the human present) and emits the canonical JSON every tick
+wrong shape is an **error**, caught before anything runs) and emits the canonical JSON every tick
 and tool consumes (ADR-0009). Everything is repo-specific here; the skill core is repo-agnostic.
-Anything omitted uses the default shown. Two things are intentionally NOT config keys, and the
-validator refuses both by construction:
+Anything omitted uses the default shown. One thing is intentionally NOT a config key, and the
+validator refuses it by construction (there is no `authorize` key either — invoking the skill is the
+authorization, ADR-0023):
 
-- **`authorize`** — push+auto-merge is confirmed interactively at launcher startup for the whole run
-  (each tick inherits it), never pre-armed in a file.
 - **the worker launch command** — the string workers are started with (`ckimi`, `direnv exec . claude`,
   …) is *machine-local*, while this file is checked into the target repo and shared with the team: on a
   teammate's machine it is `command not found`, or worse, a same-named alias pointing at a different
-  provider. It is settled at bootstrap by `afk worker-command` + one confirmation, and held only by the
-  launcher (ADR-0010).
+  provider. It is settled at bootstrap by `afk worker-command` — passed with the invocation or asked for — and
+  held only by the launcher (ADR-0010).
 
 ```yaml
 # --- dispatch contract ---

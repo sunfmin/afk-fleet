@@ -8,10 +8,10 @@ PRs to the target branch.
 ## Language
 
 **Launcher**:
-The interactive session `/afk-fleet` is invoked in. It authorizes once, mints a **fleet-instance**
-id, then loops: spawn a **tick**, ingest its one-line summary, pace, repeat. It does no coordination
+The interactive session `/afk-fleet` is invoked in. Invoking it is the launch: it asks for no
+confirmation, mints a **fleet-instance** id, then loops: spawn a **tick**, ingest its one-line summary, pace, repeat. It does no coordination
 itself: it never computes the **frontier**, never reads tick-only files (the `afk.py`/`afk_decide.py`
-source, `worker-prompt.md`), and delegates even the bootstrap **preview** to a **plan tick**. It is
+source, `worker-prompt.md`). It is
 thin *by construction* from its first action — it only ever spawns subagents and ingests their compact
 summaries — so its context stays flat over a multi-day run. Several launchers — on several machines,
 even under one GitHub account — may run against the same repo at once; they cooperate only through
@@ -21,9 +21,9 @@ orchestrator, manager, main agent
 
 **Fleet instance**:
 One launcher run and everything it owns — the ticks it spawns, the workers they dispatch, and the
-**claims** it holds — identified by an id minted at bootstrap and injected into every tick. That id,
-the run authorization, and the **worker launch command** are the run's three launcher-held facts:
-settled once with the human present, carried in every tick's spawn prompt, never written to a file,
+**claims** it holds — identified by an id minted at bootstrap and injected into every tick. That id
+and the **worker launch command** are the run's two launcher-held facts:
+settled once at bootstrap, carried in every tick's spawn prompt, never written to a file,
 and gone when the launcher stops. Its liveness is published as a **heartbeat**; when it stops or dies
 its claims are released or reclaimed. Distinct instances (even on one GitHub account) are the unit of
 cooperative concurrency across machines.
@@ -41,9 +41,8 @@ _Avoid_: batch (implies draining a whole wave), poll (a tick acts, not just obse
 A **tick** run in dry-run mode (`--plan`): it does the full **rebuild** (recompute the **frontier**,
 classify claims into mine/peer-live/stale) and then **stops before the Act phase**, returning the
 dispatch plan instead of merging/dispatching/reclaiming. It is the *same* procedure as an acting tick,
-short-circuited — so the plan a human authorizes against at bootstrap cannot drift from what a live
-tick will actually do. Used both for standalone `/afk-fleet --plan` and for the launcher's bootstrap
-preview (spawned there as a subagent, so the launcher never computes a frontier in its own context).
+short-circuited — so the plan a human reads cannot drift from what a live tick will actually do. It
+is how to look before launching: `/afk-fleet --plan`. A launch itself spawns none (ADR-0023).
 _Avoid_: dry run (that is its mode, not its name), preview pass
 
 **Worker**:
@@ -92,8 +91,9 @@ a script, and no credential ever enters the fleet. It exists because a launcher'
 in its environment — the wrapper's name is gone by the time the process exists, and its argv is
 identical to a stock `claude` — while a worker starts in a fresh login shell that inherits none of it
 and would otherwise fall back to stock Anthropic, silently, for days. Undetectable by construction, it
-is therefore **confirmed by the human at the same bootstrap gate as the run authorization** — but only
-when it can matter: a launcher with no custom provider is never asked. Code still settles everything
+is therefore **supplied by the human** — passed with the invocation (`--worker-command`) or asked for at
+bootstrap, the one question a launch can ask — but only when it can matter: a launcher with no custom
+provider is never asked. Code still settles everything
 around the answer: which wrappers exist to offer, whether the answer resolves to something runnable,
 and whether an unattended flag is visible in it (ADR-0010).
 _Avoid_: worker command (ambiguous with what the worker itself runs), agent command, provider profile
@@ -130,8 +130,7 @@ not a difference of opinion — selecting the **frontier**, claiming/reclaiming/
 mine/live-peer/stale partition, lease arithmetic, retry accounting, pacing, reading a worker's
 **worker state**. They are extracted into tested **tools**. **Judgment** is everything that must read
 context and can be reasonably contested — whether an implementation is correct (the gate), whether a
-refutation holds, whether an empty diff really is empty, how to word an escalation, granting the run
-authorization. It stays with the **tick** (an LLM). "Extract mechanics to code, keep judgment in the
+refutation holds, whether an empty diff really is empty, how to word an escalation. It stays with the **tick** (an LLM). "Extract mechanics to code, keep judgment in the
 LLM" is the fleet's core build rule.
 _Avoid_: automation vs decision, deterministic vs heuristic (near, but this is specifically the
 code/LLM ownership split), script vs agent (the tick is not a script)
@@ -234,7 +233,7 @@ the owner's **heartbeat** to expire past `claim_lease_ttl_seconds` (the only mac
 a takeover is initiated by a present human who *is* the proof of death — the oracle that knows, before
 the lease lapses, that the fleet hard-stopped (quota exhausted, process killed). It is a **launcher**
 bootstrap variant (`afk-fleet --takeover`): the new instance runs the full bootstrap (config, instance
-id, **worker launch command**, the one push+auto-merge authorization), then lists the instances
+id, **worker launch command**), then lists the instances
 discoverable in the claim markers and heartbeat refs and, on the human's selection, force-takes the
 chosen instance's claims with the *same* atomic `--force-with-lease` push as a stale reclaim — only
 skipping the staleness gate. A target whose heartbeat is still fresh prompts an explicit confirm,

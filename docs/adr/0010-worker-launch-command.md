@@ -1,7 +1,9 @@
 # The worker launch command: one opaque string, confirmed by the human, never composed
 
 **Status:** accepted — amends the dispatch step of [ADR-0005](0005-orca-owns-the-worktree.md).
-Amended by [ADR-0014](0014-runtime-detection.md) (runtime-generalized stock detection).
+Amended by [ADR-0014](0014-runtime-detection.md) (runtime-generalized stock detection) and
+[ADR-0023](0023-invoking-the-skill-is-the-launch.md) (there is no authorization gate for the question
+to share; the command may be passed with the invocation).
 
 ## Decision
 

@@ -61,6 +61,6 @@ function in `afk_decide.py` (fixture-tested); `afk.py` only gathers their inputs
 Judgment stays with the tick and is **not** a tool: is the implementation correct (the gate),
 adversarial verify, whether a sync conflict is mechanical enough to resolve rather than hand back, whether a
 recovered worktree is sane to build on, merging a PR that has no checks, the reason a failure or an
-escalation is given, the human authorization. Each of those is exactly where a transition stops and
+escalation is given. Each of those is exactly where a transition stops and
 returns an `outcome`, or the one argument (`--reason`, `--verified`, `--start fresh`,
 `--allow-no-checks`) it takes from you.

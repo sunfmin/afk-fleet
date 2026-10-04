@@ -2,6 +2,8 @@
 
 **Status:** accepted — supersedes the *single long-lived coordinator* premise of
 [ADR-0001](0001-disposable-coordinator-context.md); keeps its *fleet-state-in-GitHub* foundation.
+Amended by [ADR-0023](0023-invoking-the-skill-is-the-launch.md) (no bootstrap preview, no run
+authorization: the invocation is the go-ahead).
 
 ## Decision
 

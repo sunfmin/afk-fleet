@@ -29,8 +29,8 @@ import re
 # with its default and (via the default's type) its shape. The template in
 # references/config-template.md is the human-facing rendering of this table —
 # a fixture test keeps the two equal, so a hand-edit that drifts turns the
-# suite red. `authorize` and the instance id are deliberately NOT keys here:
-# they are per-run, launcher-held facts, and the unknown-key error below is
+# suite red. The instance id and the worker launch command are deliberately NOT
+# keys here: they are per-run, launcher-held facts, and the unknown-key error below is
 # what keeps them out of files.
 
 CONFIG_DEFAULTS = {
@@ -201,7 +201,7 @@ def parse_config_yaml(text):
     inline `[a, b]` list, one-level `gate:`/`merge:` sections), and every key
     and type is checked against CONFIG_DEFAULTS — so parsing IS validation. An
     unknown key raises (a typo silently ignored would be a config that lies to
-    its author, and `authorize:` in a file is refused by construction); so does
+    its author, and a launcher-held fact in a file is refused by construction); so does
     a wrong shape. Returns the PARTIAL config — only the keys present.
     """
     partial = {}
@@ -228,8 +228,8 @@ def parse_config_yaml(text):
         else:
             if key not in CONFIG_DEFAULTS:
                 raise ValueError(_renamed(key)
-                                 or f"config: unknown key {key!r} (note: authorize/instance "
-                                    f"are per-run facts, never config keys)")
+                                 or f"config: unknown key {key!r} (note: the instance id and "
+                                    f"the worker launch command are per-run facts, never config keys)")
             default = CONFIG_DEFAULTS[key]
             if isinstance(default, dict):
                 if raw:
@@ -1813,8 +1813,8 @@ def cycle_ticked(state, summary, config):
 # unattended, for days.
 #
 # What travels is therefore an OPAQUE command string the fleet never parses and
-# never composes — supplied by the human at the bootstrap gate they are already
-# standing at. That choice is what keeps the credential out of the fleet
+# never composes — supplied by the human, with the invocation or at bootstrap.
+# That choice is what keeps the credential out of the fleet
 # entirely: no env is copied, nothing is written to disk, no argv carries a key,
 # and the fleet is coupled to no particular secret manager. What code *can*
 # settle, it does: whether to ask at all (a stock launcher is never asked), which
