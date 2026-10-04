@@ -222,7 +222,9 @@ instance died mid-flight. It is the only claim a fleet may take from another *un
 by an atomic `git push --force-with-lease` takeover of the ref, and only then, then recovered by
 **continuation**. A live peer's claim is never touched — that is what keeps cooperating fleets from
 cannibalising each other's in-flight work. The lease-bypassing, human-authorized sibling of this
-reclaim is the **Takeover**.
+reclaim is the **Takeover**. A stale claim whose issue is already **closed** is not work to continue
+but a **phantom lock** — the owner finished the issue and died before releasing — so the rebuild
+lists it apart (`stale_closed`) and it is deleted under the same lease, never reclaimed.
 _Avoid_: dead claim, abandoned claim, orphaned claim (that is one's *own* worker-less claim)
 
 **Takeover**:

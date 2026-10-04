@@ -698,7 +698,8 @@ def test_rebuild_assembles_the_working_set_from_gh_and_refs():
                      "--now", str(T0), *R)
         assert took["won"] is True
         ws = w.afk("rebuild", "--instance", "me", "--now", str(T0), *R)
-        assert [m["number"] for m in ws["mine"]] == [3, 4, 6] and ws["stale"] == []
+        assert [m["number"] for m in ws["mine"]] == [3, 4, 6]
+        assert ws["stale"] == [] and ws["stale_closed"] == []
 
 
 def test_rebuild_reads_the_dispatch_contract_from_config_and_set():
@@ -742,14 +743,44 @@ def test_rebuild_reports_free_slots_and_a_claim_whose_issue_is_closed():
         rows = {m["number"]: (m["status"], m["board_phase"], m["title"]) for m in ws["mine"]}
         assert rows == {2: ("closed", None, None), 3: ("no_pr", "claimed", "issue 3")}
         assert ws["free_slots"] == 1 and ws["frontier"]["dispatch"] == [{"number": 1, "title": "issue 1"}]
-        # the state read is paid only by a claim of mine missing from the open list
+        # the state read is paid only by a claim missing from the open list
         assert [c[1] for c in w.calls() if ".state" in c] == [f"repos/{REPO}/issues/2"]
         assert w.afk("rebuild", *ME, *R, *NOW, "--set", "concurrency=1")["free_slots"] == 0
 
         # the one thing left to do for it
-        w.afk("release", "2", *R)
+        w.afk("release", "2", *ME, *R)
         ws = w.afk("rebuild", *ME, *R, *NOW)
         assert [m["number"] for m in ws["mine"]] == [3] and ws["free_slots"] == 2
+
+
+def test_rebuild_sets_a_dead_peers_claim_on_a_closed_issue_apart_from_work_to_reclaim():
+    """A fleet that merged or closed an issue and died before releasing leaves a
+    phantom lock. Listed under `stale` it reads as work to take over and dispatch;
+    it is `stale_closed` instead — nothing to continue, one release to clear."""
+    issues = [issue(1, "ready-for-agent"),
+              issue(2, "ready-for-agent", state="closed"),         # the dead peer finished it
+              issue(3, "ready-for-agent"),                         # the dead peer was mid-flight
+              issue(4, "ready-for-agent", state="closed")]         # a live peer is mid-merge
+    with world(issues=issues) as w:
+        for n, inst in ((2, "peer-dead"), (3, "peer-dead"), (4, "peer-live")):
+            w.afk("claim", str(n), "--instance", inst, *NOW, *R)
+        w.afk("heartbeat", "--instance", "peer-dead", "--now", str(T0 - TTL - 60), *R)
+        w.afk("heartbeat", "--instance", "peer-live", "--now", str(T0 - 60), *R)
+
+        ws = w.afk("rebuild", *ME, *R, *NOW)
+        sha = {n: w.sb.remote_ref(f"refs/afk/claim/{n}") for n in (2, 3)}
+        assert ws["stale"] == [{"number": 3, "instance": "peer-dead", "sha": sha[3]}]
+        assert ws["stale_closed"] == [{"number": 2, "instance": "peer-dead", "sha": sha[2]}]
+        # a live peer's claim is its own to release, closed issue or not
+        assert ws["peer_live"] == [{"number": 4, "instance": "peer-live"}]
+        assert ws["mine"] == [] and ws["free_slots"] == 3
+
+        # one call clears it — no reclaim, no second rebuild, no worker
+        w.calls(), w.orca_calls()
+        assert w.afk("release", "2", *ME, "--expect-sha", sha[2], *R)["released"] is True
+        assert w.claimed_by(2) is None and w.orca_calls() == []
+        ws = w.afk("rebuild", *ME, *R, *NOW)
+        assert ws["stale_closed"] == [] and [s["number"] for s in ws["stale"]] == [3]
 
 
 def test_rebuild_and_cycle_fail_when_the_claim_refs_cannot_be_read():
@@ -830,7 +861,7 @@ def test_cycle_gates_paces_and_beats_through_a_whole_run():
         assert top(red["state"])["reason"] == "changed"
 
         # the fleet goes quiet: #1 merged and released, nothing left on the frontier
-        w.afk("release", "1", *R)
+        w.afk("release", "1", *ME, *R)
         st = top(red["state"])["state"]
         idle = ticked(st, merged=[1])                                 # work was done: not empty
         assert (idle["state"]["empty_streak"], idle["sleep_seconds"]) == (0, 90)
@@ -1983,7 +2014,7 @@ def test_fail_retries_from_a_clean_base_then_escalates_when_exhausted():
     with world(issues=[issue(6, "ready-for-agent")]) as w:
         w.afk("claim", "6", "--instance", "peer", *NOW, *R)
         assert "not this fleet's claim" in w.error(*_fail(6, "x"))
-        w.afk("release", "6", *R)
+        w.afk("release", "6", "--instance", "peer", *R)
         w.afk("claim", "6", *ME, *NOW, *R)
         r = w.afk(*_fail(6, "gave up", "--set", "retry=0"))
         assert (r["action"], r["attempt"], r["pr"]) == ("escalate", 0, None)

@@ -1021,7 +1021,7 @@ def test_cycle_ticked_folds_the_summary_and_counts_empty_ticks():
     # anything that is not empty resets the streak — work done, a claim held, or
     # frontier the tick could not take (e.g. no free slot)
     for summary in ({"merged": [3]}, {"escalated": [4]}, {"dispatched": [1]}, {"reclaimed": [6]},
-                    {"parked": [5]},
+                    {"parked": [5]}, {"cleared": [7]},
                     {"in_flight": 2}, {"frontier_remaining": 5}):
         back = ticked(r["state"], **summary)
         assert back["state"]["empty_streak"] == 0 and back["sleep_seconds"] == 90, summary
@@ -1400,6 +1400,7 @@ def test_assemble_working_set():
     # peers: live one identified and left alone; stale one carries the sha reclaim needs
     assert ws["peer_live"] == [{"number": 5, "instance": "peerA"}]
     assert ws["stale"] == [{"number": 6, "instance": "peerB", "sha": "s6"}]
+    assert ws["stale_closed"] == []
 
     # the digest is the SAME function over the SAME observables the gate hashes
     assert ws["fingerprint"] == d.fingerprint(issues, prs, claims)
@@ -1437,6 +1438,14 @@ def test_assemble_working_set():
     assert (row["status"], row["board_phase"], row["title"]) == ("closed", None, None)
     assert {m["number"]: m["status"] for m in ws3["mine"]} == {3: "awaiting_merge", 4: "no_pr", 9: "closed"}
     assert ws3["free_slots"] == 0                       # it still holds a slot until released
+
+    # a STALE claim whose issue is closed is a phantom lock, not work to take over:
+    # it leaves `stale` (reclaim + dispatch) for `stale_closed` (release), sha and all.
+    # A live peer's claim on a closed issue is that peer's to release — untouched.
+    ws4 = d.assemble_working_set(issues, prs, claims, heartbeats, {}, "me", now, cfg, closed=[5, 6])
+    assert ws4["stale"] == []
+    assert ws4["stale_closed"] == [{"number": 6, "instance": "peerB", "sha": "s6"}]
+    assert ws4["peer_live"] == ws["peer_live"] and ws4["mine"] == ws["mine"]
 
     # a claim of mine whose PR carries an open hand-back: the worker is resolving a
     # sync conflict, so the row is `handed_back` — not the awaiting_merge its green
