@@ -141,8 +141,8 @@ force_tick_after_skips: 6              # safety net: a full tick at least every 
   machine gate": you give up the second, independent run on an unchanged commit, which is what
   catches a flaky test that happened to pass once. A gate that leaves untracked, un-ignored files
   behind makes every later run "not on a committed tree" — ignore its artifacts.
-- **Fingerprint gate.** On a skipped cycle the launcher spawns no tick — its only cost is the tool
-  call — and, while holding claims, refreshes the lease itself (`afk heartbeat`), so skipping never
+- **Fingerprint gate.** On a skipped cycle no tick runs — its only cost is the one `afk cycle`
+  call — which, while the fleet holds claims, refreshes the lease itself, so skipping never
   lapses a lease. Correctness never depends on the gate: a missed change waits at most
   `force_tick_after_skips` cycles (ADR-0007).
 - **Deploy is out of scope.** The fleet's mandate ends at a green merge to `merge.target`. Deploying

@@ -60,7 +60,7 @@ function in `afk_decide.py` (fixture-tested); `afk.py` only gathers their inputs
 | `afk scan` | debug only: every claim + heartbeat ref as read from the remote (an unreadable remote is an error, not an empty list). A tick never calls it — `rebuild` does | effect |
 | `afk classify-claims --instance <id>` | debug only: the mine / peer_live / stale partition on its own. A tick never calls it — `rebuild` does | effect gather + pure verdict |
 
-Judgment stays with the tick and is **not** a tool: is the implementation correct (the gate),
+Judgment stays with the launcher and is **not** a tool: is the implementation correct (the gate),
 adversarial verify, whether a
 recovered worktree is sane to build on, landing a PR that has no checks, the reason a failure or an
 escalation is given. Each of those is exactly where a transition stops and

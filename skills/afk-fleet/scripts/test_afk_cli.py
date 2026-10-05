@@ -2972,11 +2972,40 @@ def test_the_docs_name_exactly_the_words_the_code_returns():
     for phase in afk_decide.VERDICT_PHASES:
         assert f"`{phase}`" in skill and f"**`{phase}`**" in docs["worker-prompt.md"], phase
 
-    # the tick's instructions are the short form: one call, then the judgments. The
+    # a cycle's instructions are the short form: one call, then the judgments. The
     # routing table a tick used to re-read every pass is code under test, not prose
-    tick = skill[skill.index("## A tick ("):skill.index("## Cooperative multi-fleet")]
+    tick = skill[skill.index("## A cycle ("):skill.index("## Cooperative multi-fleet")]
     assert " cycle --repo <repo> --config" in tick and len(tick.splitlines()) < 90
     assert "idle_stalled" not in skill and "merge_order" not in skill
+
+
+def test_the_docs_have_the_launcher_run_each_cycle_itself():
+    """A tick is a pass in code, not a context (ADR-0028): no document a launcher
+    or a human reads this skill from tells anyone to spawn one. The one subagent
+    left is the ephemeral reader of a `bulky` judgment, and the stop is a cycle."""
+    docs = _skill_docs()
+    skill = docs["SKILL.md"]
+    for name, text in docs.items():
+        spawned = re.findall(r".*(?<!re-)\bspawn.*", text)       # a worker may be re-spawned
+        assert not spawned, (name, spawned)
+        assert "fresh-context" not in text and "disposable tick" not in text, name
+    # two roles hold a context; the tick is described beside them, not among them
+    roles = re.findall(r"^\| \*\*(\w+)\*\* \|", skill[:skill.index("## Why it runs forever")], re.M)
+    assert roles == ["launcher", "worker"], roles
+    # every paragraph that names a subagent or the Agent tool is the bulky judgment's
+    named = [para for para in re.split(r"\n(?=- |\n)", skill)
+             if re.search(r"subagent|\bAgent\b", para)]
+    assert len(named) == 1 and "`bulky: true`" in named[0], named
+    # the stop is the drain, and the drain is `afk cycle`
+    loop = skill[skill.index("### Loop"):skill.index("## Tools (")]
+    assert " cycle --drain --repo <repo> --config" in loop and "afk release" not in loop
+    assert "`afk cycle --drain`" in docs["cooperative-multi-fleet.md"]
+    assert "--drain" in next(ln for ln in docs["tools.md"].splitlines()
+                             if ln.startswith("| `afk cycle"))
+    # the glossary agrees: the launcher runs the tick, and the facts ride in the state
+    context = docs.get("CONTEXT.md")
+    if context is not None:                       # an installed skill ships without it
+        assert "ADR-0028" in context and "does no coordination" not in context
 
 
 def test_the_tools_table_is_the_one_the_parser_generates():

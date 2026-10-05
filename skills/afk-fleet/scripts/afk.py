@@ -577,7 +577,7 @@ def cmd_config(a):
     ```yaml block in docs/agents/afk-fleet.md), validate every key against the
     schema (unknown key / wrong shape → error — with the human present at
     bootstrap), fill defaults, and print the canonical JSON the launcher
-    injects into every tick. `--defaults` prints the pure defaults table."""
+    hands every `afk` call. `--defaults` prints the pure defaults table."""
     if a.defaults:
         return afk_decide.resolve_config({})
     if not a.file:
@@ -1364,9 +1364,9 @@ def _landing_fields(cfg, pr):
 
 def _prompt_fields(a, cfg, issue, path, branch):
     """The PROMPT_FIELDS of a worker prompt for one issue in one worktree. The
-    launcher's terminal is read off the environment, never passed in: a tick is a
-    subagent of the launcher, so the handle orca gave that terminal is the one
-    this process inherited (ADR-0020). The config travels whole, as the JSON
+    launcher's terminal is read off the environment, never passed in: the launcher
+    runs `afk cycle` itself, so the handle orca gave its terminal is the one
+    this process inherited (ADR-0020, ADR-0028). The config travels whole, as the JSON
     `afk land` is run with: the worker lands on the settings the tick ran on."""
     return {"n": issue["number"], "title": issue["title"], "repo": a.repo,
             "base_branch": cfg["base_branch"], "local_command": cfg["gate"]["local_command"],

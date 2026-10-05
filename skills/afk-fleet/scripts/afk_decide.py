@@ -2337,9 +2337,9 @@ def resolve_worker_command(base_url, supplied=None, resolved=None, runtime="clau
 # Fingerprint gate — skip ticks code can prove are no-ops (ADR-0007)           #
 # --------------------------------------------------------------------------- #
 #
-# A tick is a fresh LLM context; spawning one just to conclude "still waiting"
-# is the fleet's main steady-state token spend. The gate collapses everything a
-# tick's Rebuild observes into a short digest; the launcher spawns a tick only
+# A tick is a rebuild and a pass of transitions: dozens of gh calls, just to
+# conclude "still waiting", most cycles of a run. The gate collapses everything a
+# tick's Rebuild observes into a short digest; `afk cycle` runs a tick only
 # when the digest moved (or a forced full pass is due). A false "changed" costs
 # one tick; a missed change waits at most `force_after`
 # cycles. Correctness never depends on the gate.

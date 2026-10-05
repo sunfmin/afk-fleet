@@ -3,6 +3,11 @@
 **Status:** accepted — adds a second, contentless channel beside "a worker communicates only through
 GitHub" ([ADR-0001](0001-disposable-coordinator-context.md)), and leaves the pacing of
 [ADR-0007](0007-fingerprint-gated-ticks.md) as the backstop it already was.
+**Note ([ADR-0028](0028-the-launcher-runs-each-cycle-itself.md)):** decision 4's reason is simpler
+now. The handle is read from the environment of `afk dispatch` / `afk fail` / `afk turn`, and those
+run inside `afk cycle`, which the launcher itself calls — it is the launcher's own environment, not
+one inherited through "a tick is a subagent of the launcher". Where this ADR says a tick is
+*spawned*, read: a cycle is opened.
 
 ## Context
 
