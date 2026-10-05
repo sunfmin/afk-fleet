@@ -31,12 +31,12 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    `skills/afk-fleet/scripts/afk.py:cmd_dispatch`
 4. The dispatch fetches the base's tip from the remote and has orca create the worktree and branch
    at that sha, then asserts the worktree contains it.
-   `skills/afk-fleet/scripts/afk.py:_create_worktree`
+   `skills/afk-fleet/scripts/afk.py:cut`
 5. It starts a **worker** there with the run's **worker launch command**, waits until the agent is
    ready, and delivers the worker prompt, filled with the branch and path orca returned, as a brief
    file plus one submitted line pointing at it. A tick filling several slots begins every start
    first and then waits for all the agents together.
-   `skills/afk-fleet/scripts/afk.py:_submit_prompt`
+   `skills/afk-fleet/scripts/afk.py:put`
 6. It upserts the issue's **status board** to "claimed"; the tick refreshes its **heartbeat**
    and ends, without waiting for the worker.
    `skills/afk-fleet/scripts/afk.py:_upsert_board`
