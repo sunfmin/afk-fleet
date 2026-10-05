@@ -1397,6 +1397,17 @@ def test_only_the_read_and_write_helpers_know_the_read_cache():
     assert writes == _WRITES, writes
 
 
+def test_the_steps_of_a_tick_share_one_tick_and_a_start_names_its_outcome():
+    """The landing-turn step is handed the tick's books as one argument, and no
+    code tells how a start began by whether a value can be called."""
+    import ast
+    with open(AFK) as f:
+        tree = ast.parse(f.read())
+    turn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_tick_turn")
+    assert [a.arg for a in turn.args.args] == ["run", "instance", "agent", "tick"]
+    assert not [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id == "callable"]
+
+
 def _overlap(spans):
     """Whether every one of these calls was still running when the last began."""
     return max(s["start"] for s in spans) < min(s["end"] for s in spans)
@@ -1521,7 +1532,7 @@ def test_workers_are_started_at_once_and_never_past_concurrency():
         # #2 could not get a worktree: #3 is not even claimed — every further
         # dispatch would take a claim it cannot staff — and #1, begun before, runs
         assert [(e["step"], e["issue"]) for e in r["errors"]] == [("dispatch", 2)]
-        assert r["progress"].startswith("dispatched #1; ")
+        assert r["progress"] == "dispatched #1; 1 error; 1 in flight, 2 left on the frontier"
         assert w.claimed_by(1) == "me" and w.claimed_by(3) is None
         assert len(w.terminals()) == 1 and _told(w.terminals()[0])
         # the claim it took for #2 is not left behind unstaffed, and the next tick
@@ -1530,6 +1541,26 @@ def test_workers_are_started_at_once_and_never_past_concurrency():
         nxt = cycle(w, r["state"])
         assert nxt["action"] == "tick" and "errors" not in nxt, nxt
         assert [w.claimed_by(n) for n in (1, 2, 3)] == ["me"] * 3
+
+
+def test_a_claim_a_peer_won_mid_tick_is_off_the_frontier_and_takes_no_slot(monkeypatch):
+    """Beginning a dispatch can lose the claim to a peer that took the issue
+    after the rebuild. That is neither a start nor a failure: the issue is off
+    the frontier, the slot it would have filled goes to the next one, and the
+    starting goes on."""
+    with world(issues=[issue(n, "ready-for-agent") for n in range(1, 6)]) as w:
+        for name, value in w.env.items():          # orca is run on the process's own environment
+            monkeypatch.setenv(name, value)
+        with inside(w) as rem:
+            run = afk._Run(repo=REPO, rem=rem, cfg=afk_decide.resolve_config({}), clock=T0)
+            ws = afk._rebuild(run, "me")
+            w.afk("claim", "1", "--instance", "peer", *NOW, *R)
+            did, judgments, errors = afk._tick(run, "me", "host", afk._Agent(WORKER, 30), ws)
+        assert (judgments, errors) == ([], [])
+        assert did == {**{k: [] for k in afk_decide.TICK_DID}, "dispatched": [2, 3, 4],
+                       "in_flight": 3, "frontier_remaining": 1}
+        assert [w.claimed_by(n) for n in range(1, 6)] == ["peer", "me", "me", "me", None]
+        assert len(w.terminals()) == 3 and all(_told(t) for t in w.terminals())
 
 
 def test_what_changed_while_a_tick_ran_still_gets_a_tick():
