@@ -100,7 +100,7 @@ class _Agent:
 # git/gh plumbing                                                             #
 # --------------------------------------------------------------------------- #
 
-# A stable identity for the tiny marker commits (claims/heartbeats carry no code).
+# A stable identity for the tiny record commits (claims/heartbeats carry no code).
 _GIT_ENV = {
     **os.environ,
     "GIT_AUTHOR_NAME": "afk-fleet", "GIT_AUTHOR_EMAIL": "afk@fleet.local",
@@ -181,33 +181,23 @@ def _forget(*keys):
         _READS.pop(key, None)
 
 
-def _marker_commit(kind, instance, ts, host=None):
-    """A parentless commit on the empty tree whose subject is the marker
-    `<kind> instance=<id> [host=<host>] ts=<epoch>` (`_parse_marker` reads it
-    back). Its sha is what we push to a ref; it drags no repo history along."""
-    parts = [kind, f"instance={instance}", *([f"host={host}"] if host else []), f"ts={int(ts)}"]
-    empty_tree = _git(["hash-object", "-t", "tree", "/dev/null"]).stdout.strip()
-    return _git(["commit-tree", empty_tree, "-m", " ".join(parts)]).stdout.strip()
+def _record_commit(kind, record, tree=None, path="."):
+    """A parentless commit that carries one record → its sha, which is what gets
+    pushed to a ref. Every record the fleet keeps on a ref is written here, and
+    read back by `_read_record`; the encoding is `afk_decide.record_message`'s.
+    The commit is of `tree` — the empty tree, unless the record is of a tree —
+    so it drags no repo history along."""
+    tree = tree or _git(["-C", path, "hash-object", "-t", "tree", "/dev/null"]).stdout.strip()
+    return _git(["-C", path, "commit-tree", tree,
+                 "-m", afk_decide.record_message(kind, record)]).stdout.strip()
 
 
-def _parse_marker(subject):
-    """`afk-claim instance=abc host=mac ts=123` → {'instance':'abc','host':'mac','ts':123}."""
-    out = {}
-    for tok in (subject or "").split():
-        if "=" in tok:
-            k, v = tok.split("=", 1)
-            out[k] = int(v) if (k == "ts" and v.isdigit()) else v
-    return out
-
-
-def _read_marker(remote, refname):
-    """Fetch one ref by name and return its parsed marker, or None if it could
-    not be fetched (absent, or the remote is unreachable)."""
-    p = _git(["fetch", remote, refname], check=False)
-    if p.returncode != 0:
-        return None
-    subject = _git(["log", "-1", "--format=%s", "FETCH_HEAD"], check=False).stdout.strip()
-    return _parse_marker(subject)
+def _read_record(kind, rev, path="."):
+    """The record of `kind` the commit `rev` carries, or None when it carries
+    none: not a record, not of this kind, or missing a field the kind requires
+    (`afk_decide.read_record`)."""
+    return afk_decide.read_record(
+        kind, _git(["-C", path, "log", "-1", "--format=%s", rev], check=False).stdout)
 
 
 def _remote_sha(remote, refname):
@@ -537,30 +527,40 @@ def _newest_mtime(root):
 # claim refs: scan / claim / reclaim / takeover / release / heartbeat          #
 # --------------------------------------------------------------------------- #
 
-def _mirrored_markers(local_ns):
-    """(ref's last path segment, sha, parsed marker) for each mirrored ref."""
+def _mirrored_records(kind, local_ns):
+    """(ref's last path segment, sha, its record of `kind` or None) for each
+    mirrored ref."""
     rows = _git(["for-each-ref", "--format=%(refname) %(objectname)", local_ns],
                 check=False).stdout.splitlines()
     for row in rows:
         refname, sha = row.split(" ", 1)
-        subject = _git(["log", "-1", "--format=%s", sha], check=False).stdout.strip()
-        yield refname.rsplit("/", 1)[-1], sha, _parse_marker(subject)
+        yield refname.rsplit("/", 1)[-1], sha, _read_record(kind, sha)
+
+
+def _claim_row(number, sha, record):
+    """The claim on issue <number> as the scan lists it. The ref is the lock, so
+    a claim ref that carries no claim record is still a claim — one that names
+    nobody, which is never mine and is stale to everyone."""
+    record = record or {}
+    return {"number": number, "instance": record.get("instance"), "host": record.get("host"),
+            "ts": record.get("ts"), "sha": sha}
 
 
 def _scan(remote, ns):
     """Mirror the remote claim+heartbeat refs into a disposable local namespace and
-    read every marker. Returns (claims, heartbeats). Raises when the remote cannot
+    read every record. Returns (claims, heartbeats). Raises when the remote cannot
     be read: a fleet whose claims are unreadable must not look like one holding none."""
     def read():
         claim_ns, hb_ns = afk_decide.CLAIM_NAMESPACES[ns]
         _git(["fetch", "--prune", remote,
               f"+{claim_ns}/*:{_LOCAL_SCAN}/claim/*",
               f"+{hb_ns}/*:{_LOCAL_SCAN}/heartbeat/*"])
-        claims = [{"number": int(name), "instance": m.get("instance"), "host": m.get("host"),
-                   "ts": m.get("ts"), "sha": sha}
-                  for name, sha, m in _mirrored_markers(f"{_LOCAL_SCAN}/claim") if name.isdigit()]
-        heartbeats = {name: m["ts"] for name, _, m
-                      in _mirrored_markers(f"{_LOCAL_SCAN}/heartbeat") if "ts" in m}
+        claims = [_claim_row(int(name), sha, record) for name, sha, record
+                  in _mirrored_records(afk_decide.CLAIM_RECORD, f"{_LOCAL_SCAN}/claim")
+                  if name.isdigit()]
+        heartbeats = {name: record["ts"] for name, _, record
+                      in _mirrored_records(afk_decide.HEARTBEAT_RECORD, f"{_LOCAL_SCAN}/heartbeat")
+                      if record}
         return claims, heartbeats
     return _once(("scan", remote, ns), read)
 
@@ -591,18 +591,18 @@ def cmd_classify_claims(a):
 def _claim(rem, cfg, number, instance, now, host):
     """Atomically create one claim ref → {"won", …}; `won: false` names the `owner`."""
     ref = _claim_ref(cfg, number)
-    sha = _marker_commit("afk-claim", instance, now, host=host)
+    record = {"instance": instance, "host": host, "ts": int(now)}
+    sha = _record_commit(afk_decide.CLAIM_RECORD, record)
     # Create-only: the server rejects a ref that already exists → that is the CAS.
     p = _git(["push", rem, f"{sha}:{ref}"], check=False)
     if p.returncode == 0:
-        _claim_written(rem, cfg, number, {"number": number, "instance": instance, "host": host,
-                                          "ts": int(now), "sha": sha})
+        _claim_written(rem, cfg, number, {"number": number, **record, "sha": sha})
         return {"won": True, "issue": number, "ref": ref, "sha": sha, "instance": instance}
     _forget(("scan", rem, cfg["claim_namespace"]))      # it did not show this claim
-    owner = _read_marker(rem, ref)  # who beat us
-    if owner is None:
+    if _git(["fetch", rem, ref], check=False).returncode != 0:
         raise RuntimeError(f"claim push to {ref} failed and no such claim exists on the "
                            f"remote, so this is not a lost race: {p.stderr.strip()}")
+    owner = _read_record(afk_decide.CLAIM_RECORD, "FETCH_HEAD") or {}  # who beat us
     return {"won": False, "issue": number, "ref": ref,
             "owner": owner, "detail": p.stderr.strip()}
 
@@ -619,11 +619,11 @@ def _force_take(rem, cfg, number, expect_sha, instance, now, host):
     what gates the *choice* of claim (an expired lease vs a present human), never
     in the push, so a takeover is exactly as safe against a live peer."""
     ref = _claim_ref(cfg, number)
-    sha = _marker_commit("afk-claim", instance, now, host=host)
+    record = {"instance": instance, "host": host, "ts": int(now)}
+    sha = _record_commit(afk_decide.CLAIM_RECORD, record)
     p = _git(["push", rem, f"--force-with-lease={ref}:{expect_sha}", f"{sha}:{ref}"], check=False)
     if p.returncode == 0:
-        _claim_written(rem, cfg, number, {"number": number, "instance": instance, "host": host,
-                                          "ts": int(now), "sha": sha})
+        _claim_written(rem, cfg, number, {"number": number, **record, "sha": sha})
         return {"won": True, "issue": number, "ref": ref, "sha": sha, "instance": instance}
     _forget(("scan", rem, cfg["claim_namespace"]))      # the claim is not where it showed it
     if _remote_sha(rem, ref) == expect_sha:
@@ -782,7 +782,7 @@ def _beat(rem, cfg, instance, now):
     last = heartbeats.get(instance)
     if not afk_decide.heartbeat_due(last, now, cfg["claim_lease_ttl_seconds"]):
         return {"refreshed": False, "reason": "not due", "ts": last, "ref": ref}
-    sha = _marker_commit("afk-heartbeat", instance, now)
+    sha = _record_commit(afk_decide.HEARTBEAT_RECORD, {"instance": instance, "ts": now})
     _git(["push", rem, "--force", f"{sha}:{ref}"])
     heartbeats[instance] = now
     return {"refreshed": True, "ts": now, "ref": ref}
@@ -841,7 +841,7 @@ def _usable_namespace(rem, wanted, now):
     rejection = None
     for ns in dict.fromkeys([wanted, afk_decide.BRANCH_NAMESPACE]):
         ref = _claim_ref({"claim_namespace": ns}, "probe")
-        sha = _marker_commit("afk-probe", "probe", now)
+        sha = _record_commit(afk_decide.PROBE_RECORD, {"ts": now})
         p = _git(["push", rem, f"{sha}:{ref}"], check=False)
         if p.returncode == 0:
             _git(["push", rem, "--delete", ref], check=False)
@@ -900,7 +900,7 @@ def _probe_gate_records(rem, now):
     remote that refuses the records only costs every landing its own run of the
     gate — worth a word with the human present, not worth stopping a launch."""
     ns = afk_decide.GATE_RECORD_NAMESPACE
-    sha = _marker_commit("afk-probe", "probe", now)
+    sha = _record_commit(afk_decide.PROBE_RECORD, {"ts": now})
     p = _git(["push", "--quiet", rem, f"{sha}:{ns}/probe"], check=False)
     if p.returncode != 0:
         return {"verdict": "warn", "pruned": 0,
@@ -911,9 +911,9 @@ def _probe_gate_records(rem, now):
             check=False).returncode == 0:
         for name in _git(["for-each-ref", "--format=%(refname)", _LOCAL_GATE]).stdout.split():
             leaf = name[len(_LOCAL_GATE) + 1:]
-            body = _git(["log", "-1", "--format=%b", name], check=False).stdout
+            record = _read_record(afk_decide.GATE_RUN_RECORD, name)
             _git(["update-ref", "-d", name], check=False)
-            if leaf != "probe" and afk_decide.gate_record_void(_parse_gate_record(body), now):
+            if leaf != "probe" and afk_decide.gate_record_void(record, now):
                 expired.append(f"{ns}/{leaf}")
     _git(["push", "--quiet", rem, "--delete", *expired], check=False)
     return {"verdict": "ok", "pruned": len(expired) - 1,
@@ -2193,39 +2193,25 @@ def _run_gate(cfg, worktree, timeout, excerpt_lines, live=False):
     return {**afk_decide.gate_verdict(rc, out, excerpt_lines, timed_out), "command": cmd}
 
 
-_GATE_RECORD_SUBJECT = "afk-gate green"
-
-
 def _gate_record(rem, path, tree, command):
     """The `afk_decide.gate_record` the remote holds for a tree and a command,
-    None when it holds none — or could not be asked, which is the same answer:
-    the gate runs. One round trip."""
+    None when it holds none — or could not be asked, or holds at that name a
+    commit that is not a recorded gate run, which are all the same answer: the
+    gate runs. One round trip."""
     ref = afk_decide.gate_record_ref(tree, command)
     if _git(["-C", path, "fetch", "--quiet", "--no-tags", rem, ref], check=False).returncode != 0:
         return None
-    return _parse_gate_record(
-        _git(["-C", path, "log", "-1", "--format=%b", "FETCH_HEAD"], check=False).stdout)
-
-
-def _parse_gate_record(body):
-    """The `afk_decide.gate_record` in a record commit's message, or None. `afk`
-    writes every record with the time of its run, so a commit that carries none
-    is a ref under the namespace that `afk` did not write: it reads as no record."""
-    try:
-        record = json.loads(body)
-    except ValueError:
-        return None
-    return record if isinstance(record, dict) and isinstance(record.get("at"), int) else None
+    return _read_record(afk_decide.GATE_RUN_RECORD, "FETCH_HEAD", path)
 
 
 def _record_gate(rem, path, tree, command, now):
     """Put a green run on record on the remote → None, or why it could not be
     written. The record is a parentless commit OF the tested tree, at the ref
-    named for the tree and the command (`afk_decide.gate_record_ref`); its message
-    carries the record. Soft: a record that cannot be written costs the next
-    landing a run of the gate, nothing else."""
-    body = json.dumps(afk_decide.gate_record(tree, command, now))
-    sha = _git(["-C", path, "commit-tree", tree, "-m", f"{_GATE_RECORD_SUBJECT}\n\n{body}"]).stdout.strip()
+    named for the tree and the command (`afk_decide.gate_record_ref`). Soft: a
+    record that cannot be written costs the next landing a run of the gate,
+    nothing else."""
+    sha = _record_commit(afk_decide.GATE_RUN_RECORD, afk_decide.gate_record(tree, command, now),
+                         tree=tree, path=path)
     p = _git(["-C", path, "push", "--quiet", "--force", rem,
               f"{sha}:{afk_decide.gate_record_ref(tree, command)}"], check=False)
     return None if p.returncode == 0 else (p.stderr.strip() or f"git push exited {p.returncode}")
