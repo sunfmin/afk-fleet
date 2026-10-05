@@ -1337,15 +1337,13 @@ def test_a_turn_marker_write_is_in_the_turn_read_after_it():
     with world(issues=[issue(1, "ready-for-agent")]) as w:
         with_pr(w, 1, 10)
         with inside(w):
-            pr_row = {"number": 10}
-            assert afk._turn(REPO, pr_row) is None
-            afk._record_turn(REPO, pr_row, afk_decide.turn_comment("me", T0), None)
-            turn = afk._turn(REPO, pr_row)
+            assert afk._turn(REPO, 10) is None
+            afk._record_turn(REPO, 10, afk_decide.single_turn(None, "me", T0))
+            turn = afk._turn(REPO, 10)
             assert (turn["instance"], turn["at"], turn["stopped"]) == ("me", T0, None)
-            afk._record_turn(REPO, pr_row,
-                             afk_decide.turn_comment("me", T0 + 9, stopped="gate_red", head="abc"),
-                             turn)
-            again = afk._turn(REPO, pr_row)
+            afk._record_turn(REPO, 10, afk_decide.next_turn(turn, at=T0 + 9, stopped="gate_red",
+                                                            head="abc"))
+            again = afk._turn(REPO, 10)
             assert (again["at"], again["stopped"], again["comment_id"]) == \
                 (T0 + 9, "gate_red", turn["comment_id"])
             assert len(_turns(w, 10)) == 1
