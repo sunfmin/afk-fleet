@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-afk.py — the afk-fleet tool: deterministic muscle the LLM tick calls.
+afk.py — the afk-fleet tool: the fleet's deterministic muscle.
 
-The tick (an LLM) orchestrates and judges; when it needs a *deterministic* action
-it shells out to one of these subcommands and reads back JSON (ADR-0004).
+Every *deterministic* action is one of these subcommands (ADR-0004), and `cycle`
+runs a whole reconciliation pass of them — the tick — in code; the LLM is handed
+only the judgments that pass could not make, each with the subcommand to run.
 Every subcommand prints one JSON object to stdout:
 
   exit 0  it ran. A lost claim race is an outcome, not an error: `{"won": false}`.
@@ -21,7 +22,8 @@ The tick's Act half is transitions, not recipes (ADR-0017): `dispatch` starts a
 worker, `turn` gives a finished PR the landing turn, `fail` / `escalate` /
 `park` / `close` settle a claim. Each performs its whole ordered sequence in one
 process, so an invariant like "relabel before release" or "start from the
-fetched base tip" is code, not a paragraph.
+fetched base tip" is code, not a paragraph. `cycle` performs the pass that
+routes a claim to one of them, and returns the rest as judgments.
 
 Two subcommands are a worker's, not the tick's, run in its own worktree: `gate`
 runs the local gate and puts a green run on record (ADR-0026), and `land` lands

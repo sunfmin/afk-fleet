@@ -93,8 +93,8 @@ idle_ticks_before_sleep: 3             # this many consecutive empty cycles (not
 claim_lease_ttl_seconds: 4500          # a claim is live while its owner's heartbeat is this fresh (~75 min,
                                       #   3× idle). A peer may reclaim only a staler claim; while holding a
                                       #   claim the launcher never sleeps past ttl/2 so the lease can't lapse.
-fingerprint_gate: true                 # each wake-up the launcher runs `afk cycle` (code, zero LLM
-                                      #   tokens) and spawns a tick only when the digest of observable
+fingerprint_gate: true                 # each cycle, `afk cycle` (code, zero LLM tokens) runs its
+                                      #   reconciliation pass only when the digest of observable
                                       #   state (issues+labels, PRs+checks, claim refs) moved (ADR-0007)
 force_tick_after_skips: 6              # safety net: a full tick at least every N skipped cycles — time-
                                       #   driven events (a peer's lease expiring) are invisible to any

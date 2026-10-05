@@ -2832,33 +2832,25 @@ def _skill_docs():
     return docs
 
 
-def test_the_docs_route_on_exactly_the_words_the_code_returns():
-    """A tick acts on a `status`, an `outcome`, an `action` — words it knows only
-    from the docs. One the code returns and the docs never mention is a claim the
-    tick has no instruction for; so each vocabulary has one home in afk_decide and
-    the docs are held to it."""
+def test_the_docs_name_exactly_the_words_the_code_returns():
+    """The pass routes on a `status`, an `outcome`, an `action` in code now; what a
+    tick still acts on is a judgment's `kind`, and what a worker acts on is a
+    landing's `outcome` — words each knows only from the docs. One the code
+    returns and the docs never mention is a judgment, or a landing, with no
+    instruction; so each vocabulary has one home in afk_decide and the docs are
+    held to it."""
     docs = _skill_docs()
     skill, tools = docs["SKILL.md"], docs["tools.md"]
 
     def row(sub):
-        return next(ln for ln in tools.splitlines() if ln.startswith(f"| `afk {sub} "))
+        return next(ln for ln in tools.splitlines() if ln.startswith(f"| `afk {sub}"))
 
-    # `mine` rows: every status is routed in SKILL.md and listed for `afk rebuild`
-    for status in afk_decide.CLAIM_STATUSES:
-        assert f"*{status}*" in skill, status
-        assert f"`{status}`" in row("rebuild"), status
-
-    # `afk no-pr`: every (outcome, action) has its bullet in the In-flight list
-    for outcome, action in afk_decide.NO_PR_ROUTES:
-        assert f"**{outcome}** / `{action}`" in skill, (outcome, action)
-        assert outcome in row("no-pr"), outcome
-
-    # `afk turn`: the tick's outcome table IS the set, row for row — and so is the
-    # worker's, for `afk land`, in the one block every prompt variant carries
+    # the tick's judgment table IS the set, row for row — and so is the worker's
+    # outcome table, for `afk land`, in the one block every prompt variant carries
     table = re.findall(r"^\| `(\w+)` \|", skill, re.M)
-    assert table == ["outcome", *afk_decide.TURN_OUTCOMES], table      # header, then rows
-    for outcome in afk_decide.TURN_OUTCOMES:
-        assert outcome in row("turn"), outcome
+    assert table == ["kind", *afk_decide.JUDGMENT_KINDS], table        # header, then rows
+    for kind in afk_decide.JUDGMENT_KINDS:
+        assert f"`{kind}`" in row("cycle"), kind
     prompt = docs["worker-prompt.md"]
     land = re.search(r"<!--afk:block land-->\n(.*?)<!--/afk:block-->", prompt, re.S).group(1)
     assert re.findall(r"^\| `(\w+)` \|", prompt, re.M) == \
@@ -2866,10 +2858,20 @@ def test_the_docs_route_on_exactly_the_words_the_code_returns():
     assert "{land_command}" in land
     for outcome in afk_decide.LAND_OUTCOMES:
         assert outcome in row("land"), outcome
-    # nothing a tick or a worker reads names a way to land that no longer exists
+
+    # the routing words are the reference's: every one a subcommand can answer with
+    # is listed on that subcommand's row, for the human reading a result
+    for status in afk_decide.CLAIM_STATUSES:
+        assert f"`{status}`" in row("rebuild"), status
+    for outcome, _ in afk_decide.NO_PR_ROUTES:
+        assert outcome in row("no-pr"), outcome
+    for outcome in afk_decide.TURN_OUTCOMES:
+        assert outcome in row("turn"), outcome
+    # nothing a tick or a worker reads names a way to land that no longer exists,
+    # or a summary handed between two calls
     for name, text in docs.items():
         for gone in ("afk merge", "afk hand-back", "handed_back", "awaiting_merge", "worker_busy",
-                     "`queued`", "`unblocked`"):
+                     "`queued`", "`unblocked`", "--summary", "summary_schema"):
             assert gone not in text, (name, gone)
 
     # the verdict marker is written into the worker prompt by the code that parses
@@ -2879,11 +2881,11 @@ def test_the_docs_route_on_exactly_the_words_the_code_returns():
     for phase in afk_decide.VERDICT_PHASES:
         assert f"`{phase}`" in skill and f"**`{phase}`**" in docs["worker-prompt.md"], phase
 
-    # the tick's summary schema comes from `afk cycle`; the launcher is never given
-    # one to copy, only told which two counts it must not lose
-    assert "`summary_schema`" in skill and "granted:[" not in skill
-    for key in afk_decide.SUMMARY_COUNTS:
-        assert f"`{key}`" in skill, key
+    # the tick's instructions are the short form: one call, then the judgments. The
+    # routing table a tick used to re-read every pass is code under test, not prose
+    tick = skill[skill.index("## A tick ("):skill.index("## Cooperative multi-fleet")]
+    assert " cycle --repo <repo> --config" in tick and len(tick.splitlines()) < 90
+    assert "idle_stalled" not in skill and "merge_order" not in skill
 
 
 def test_the_tools_table_is_the_one_the_parser_generates():
