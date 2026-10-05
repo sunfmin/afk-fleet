@@ -437,21 +437,15 @@ def test_a_recorded_gate_run_counts_only_for_the_tree_and_command_it_ran():
     now = 1700000000
     rec = d.gate_record("abc123", "make test", now + 0.9)
     assert rec == {"tree": "abc123", "command": "make test", "at": now}
-    assert d.gate_record_void(rec, "abc123", "make test", now) is None
-    assert d.gate_record_void(rec, "abc123", "make test", now + d.GATE_RECORD_TTL) is None
+    assert d.gate_record_void(rec, now) is None
+    assert d.gate_record_void(rec, now + d.GATE_RECORD_TTL) is None
     assert d.GATE_RECORD_TTL == 24 * 3600
 
-    for record, tree, command, at, why in (
-            (None, "abc123", "make test", now, "no green run"),
-            ({}, "abc123", "make test", now, "no green run"),
-            ("green", "abc123", "make test", now, "no green run"),   # not a record at all
-            ({**rec, "tree": ""}, "", "make test", now, "no green run"),
-            (rec, "def456", "make test", now, "not on the tree that would land"),
-            (rec, "abc123", "make test -short", now, "different command"),
-            (rec, "abc123", " make test", now, "different command"),  # verbatim, not "close enough"
-            (rec, "abc123", "make test", now + d.GATE_RECORD_TTL + 1, "old"),
-            ({"tree": "abc123", "command": "make test"}, "abc123", "make test", now, "old")):
-        assert why in d.gate_record_void(record, tree, command, at), (record, tree, command)
+    # which tree and which command a record is of is settled by the name it was
+    # asked for under (below): all that is left to decide is whether there is
+    # one, and how old it is
+    assert "no green run" in d.gate_record_void(None, now)
+    assert "old" in d.gate_record_void(rec, now + d.GATE_RECORD_TTL + 1)
 
     # the ref's name is the key: one per tree and command, and nothing else in it
     ref = d.gate_record_ref("abc123", "make test")
