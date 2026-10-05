@@ -1911,6 +1911,331 @@ def test_closing_pr_and_superseded_prs():
     assert d.superseded_prs(None, 3, "issue-{number}-{slug}") == []
 
 
+# --------------------------------------------------------------------------- #
+# The tick's plan — the order of a tick, its slots and its figures, no process #
+# --------------------------------------------------------------------------- #
+
+class _Raises(str):
+    """A scripted answer: the step raised, saying this."""
+
+
+def _row(n, status="no_pr", **more):
+    return {"number": n, "status": status, "pr": None, "stopped": None, "batch": None,
+            "unbatched": None, "board_phase": None, "attempt": 0, **more}
+
+
+def _working_set(mine=(), frontier=(), stale=(), stale_closed=(), batches=(), concurrency=3):
+    mine = list(mine)
+    return {"mine": mine, "merge_order": d.turn_order(mine), "batches": list(batches),
+            "frontier": {"dispatch": [{"number": n, "title": f"issue {n}"} for n in frontier]},
+            "stale": [{"number": n, "instance": "dead", "sha": f"sha{n}"} for n in stale],
+            "stale_closed": [{"number": n, "instance": "dead", "sha": f"sha{n}"}
+                             for n in stale_closed],
+            "free_slots": max(0, concurrency - len(mine))}
+
+
+def _batch(members, instance="fl-1", batch="b1"):
+    return {"id": batch, "instance": instance, "phase": "stacking", "at": NOW,
+            "members": [{"issue": n, "pr": n * 10} for n in members]}
+
+
+def _play(ws, answers=None, causes=None, config=None):
+    """Carry a tick's plan out against a scripted world — the way `afk._tick`
+    does, with no process → (the steps it handed out, what it returned).
+
+      answers: {(do, issue or batch) | do: what that step's transition returns,
+                or `_Raises`}; a step with no answer here succeeds
+      causes:  {issue or batch id: the cause `afk no-pr` classifies its worker with}
+    """
+    answers, causes, steps = answers or {}, causes or {}, []
+    stock = {"begin": d.BEGUN, "reclaim": {"won": True}, "fail": {"action": "retry"},
+             "escalate": {"action": "escalate"}}
+
+    def said(do, key):
+        answer = answers.get((do, key), answers.get(do, stock.get(do, {"ok": True})))
+        return (None, str(answer)) if isinstance(answer, _Raises) else (answer, None)
+
+    def carry_out(step):
+        steps.append(step)
+        do = step["do"]
+        assert do in d.TICK_STEPS, step
+        if do == "finish":
+            return [said(do, n) for n in step["issues"]]
+        key = step.get("issue", step.get("batch"))
+        if do == "no-pr" and ("no-pr", key) not in answers and "no-pr" not in answers:
+            asked = step.get("issues") or [step["batch"]]
+            return {"workers": [{"issue": n, "cause": causes.get(n, "working")}
+                                for n in asked]}, None
+        if do == "turn" and ("turn", key) not in answers and "turn" not in answers:
+            return {"issue": key, "pr": key * 10, "head": "abc", "outcome": "granted"}, None
+        return said(do, key)
+
+    plan = d.tick_plan(ws, CALL, config or d.resolve_config({}))
+    return steps, d.follow(plan, carry_out)
+
+
+def _brief(steps):
+    """The steps as (do, the issue / issues / batch it is about)."""
+    return [(s["do"], *(s[k] for k in ("issue", "issues", "batch") if k in s)) for s in steps]
+
+
+def _nothing_done(**did):
+    return {**{k: [] for k in d.TICK_DID}, "in_flight": 0, "frontier_remaining": 0, **did}
+
+
+def test_a_tick_fills_its_free_slots_at_once_and_reports_what_it_holds():
+    # three free slots, five ready issues: three starts begun in frontier order,
+    # then ALL of them finished in one step — and nothing begun past the slots
+    steps, done = _play(_working_set(frontier=[1, 2, 3, 4, 5]))
+    assert _brief(steps) == [("begin", 1), ("begin", 2), ("begin", 3), ("finish", [1, 2, 3]),
+                             ("heartbeat",)]
+    assert done == {"did": _nothing_done(dispatched=[1, 2, 3], in_flight=3, frontier_remaining=2),
+                    "judgments": [], "errors": [], "held": {1, 2, 3}}
+    # a claim already held takes its slot: two held, one free
+    steps, done = _play(_working_set(mine=[_row(8), _row(9)], frontier=[1, 2]))
+    assert _brief(steps) == [("no-pr", [8, 9]), ("begin", 1), ("finish", [1]), ("heartbeat",)]
+    assert (done["did"]["in_flight"], done["did"]["frontier_remaining"]) == (3, 1)
+    # nothing to do, nothing held: not one step, and no lease to refresh
+    assert _play(_working_set()) == ([], {"did": _nothing_done(), "judgments": [], "errors": [],
+                                          "held": set()})
+
+
+def test_a_start_that_fails_to_begin_ends_the_starting_for_the_tick():
+    # #2 cannot begin: #3 is not even tried — it would take a claim nobody can
+    # staff — and #1, begun before, is finished all the same
+    steps, done = _play(_working_set(frontier=[1, 2, 3]),
+                        {("begin", 2): _Raises("orca worktree create failed")})
+    assert _brief(steps) == [("begin", 1), ("begin", 2), ("finish", [1]), ("heartbeat",)]
+    assert done["errors"] == [{"step": "dispatch", "issue": 2,
+                               "error": "orca worktree create failed"}]
+    assert done["did"] == _nothing_done(dispatched=[1], in_flight=1, frontier_remaining=2)
+    # it ends EVERY kind of start: a continuation that cannot begin leaves the dead
+    # peer's claim untaken and the frontier untouched
+    ws = _working_set(mine=[_row(7)], stale=[6], frontier=[1])
+    steps, done = _play(ws, {("begin", 7): _Raises("no orca")}, causes={7: "gone"})
+    assert _brief(steps) == [("no-pr", [7]), ("begin", 7), ("heartbeat",)]
+    assert done["did"] == _nothing_done(in_flight=1, frontier_remaining=1)
+    # a start whose agent never comes up is an error of ITS start only: the others ran
+    steps, done = _play(_working_set(frontier=[1, 2]), {("finish", 1): _Raises("not ready")})
+    assert done["errors"] == [{"step": "dispatch", "issue": 1, "error": "not ready"}]
+    assert done["did"] == _nothing_done(dispatched=[2], in_flight=1)
+    assert done["held"] == {2}
+
+
+def test_a_claim_a_peer_won_is_off_the_frontier_and_takes_no_slot():
+    # a peer took #1 after the rebuild: neither a start nor a failure — the slot it
+    # would have filled goes to the next issue, and the starting goes on
+    steps, done = _play(_working_set(frontier=[1, 2, 3, 4, 5]), {("begin", 1): d.LOST})
+    assert _brief(steps) == [("begin", 1), ("begin", 2), ("begin", 3), ("begin", 4),
+                             ("finish", [2, 3, 4]), ("heartbeat",)]
+    assert done["errors"] == []
+    assert done["did"] == _nothing_done(dispatched=[2, 3, 4], in_flight=3, frontier_remaining=1)
+
+
+def test_a_claim_settled_this_tick_frees_its_slot_for_a_dispatch_in_the_same_tick():
+    # three claims fill the fleet. One is parked, one escalated, one outlived its
+    # issue: three slots, filled from the frontier before the tick ends — and a
+    # dead peer's phantom lock, which was never a slot of mine, frees none
+    mine = [_row(1), _row(2), _row(3, "closed")]
+    ws = _working_set(mine=mine, frontier=[11, 12, 13, 14], stale_closed=[9])
+    blocked = {1: "blockers_waiting", 2: "blocker_unmet"}
+    steps, done = _play(ws, causes=blocked)
+    assert _brief(steps) == [
+        ("no-pr", [1, 2]), ("park", 1), ("escalate", 2), ("release", 3), ("release", 9),
+        ("begin", 11), ("begin", 12), ("begin", 13), ("finish", [11, 12, 13]), ("heartbeat",)]
+    assert steps[4] == {"do": "release", "issue": 9, "expect_sha": "sha9"}
+    assert done["did"] == _nothing_done(parked=[1], escalated=[2], cleared=[3, 9],
+                                        dispatched=[11, 12, 13], in_flight=3,
+                                        frontier_remaining=1)
+    assert done["held"] == {11, 12, 13}
+    # a retry keeps its claim, and so its slot; so does a continuation; a stale
+    # claim taken from a dead peer USES one, whether or not it could be started
+    ws = _working_set(mine=[_row(1), _row(2)], stale=[6], frontier=[11])
+    steps, done = _play(ws, causes={1: "satisfied_refuted", 2: "gone"})
+    assert _brief(steps)[:5] == [("no-pr", [1, 2]), ("fail", 1), ("begin", 2), ("reclaim", 6),
+                                 ("begin", 6)]
+    assert steps[3] == {"do": "reclaim", "issue": 6, "sha": "sha6"}
+    assert _brief(steps)[5:] == [("finish", [2, 6]), ("heartbeat",)]
+    assert done["did"] == _nothing_done(retried=[1], dispatched=[2], reclaimed=[6], in_flight=3,
+                                        frontier_remaining=1)
+    # a reclaim a peer beat me to is no claim of mine: its slot goes to the frontier
+    steps, done = _play(_working_set(mine=[_row(1), _row(2)], stale=[6], frontier=[11]),
+                        {("reclaim", 6): {"won": False}})
+    assert ("begin", 6) not in _brief(steps) and ("begin", 11) in _brief(steps)
+    assert done["did"] == _nothing_done(dispatched=[11], in_flight=3)
+
+
+def test_a_transition_that_fails_settles_nothing_and_the_rest_of_the_tick_runs():
+    mine = [_row(1), _row(2), _row(3), _row(4, "closed"), _row(5, "awaiting_turn", pr=50)]
+    ws = _working_set(mine=mine, frontier=[11], concurrency=5)
+    causes = {1: "blocker_unmet", 2: "satisfied_refuted", 3: "blockers_waiting"}
+    broken = {"escalate": _Raises("gh issue edit failed"), "park": _Raises("TypeError: null"),
+              "release": _Raises("push refused"), "turn": _Raises("gh is down"),
+              "heartbeat": _Raises("push refused")}
+    steps, done = _play(ws, broken, causes=causes)
+    # every step is still handed out, in order, whatever the one before it did
+    assert _brief(steps) == [("no-pr", [1, 2, 3]), ("turn", 5), ("escalate", 1), ("fail", 2),
+                             ("park", 3), ("release", 4), ("heartbeat",)]
+    assert [(e["step"], e.get("issue")) for e in done["errors"]] == [
+        ("turn", 5), ("escalate", 1), ("park", 3), ("release", 4), ("heartbeat", None)]
+    assert done["errors"][1]["error"] == "gh issue edit failed"
+    # nothing settled: five claims still held, no slot freed, the frontier untouched
+    assert done["did"] == _nothing_done(retried=[2], in_flight=5, frontier_remaining=1)
+    assert done["held"] == {1, 2, 3, 4, 5}
+    # the workers could not even be asked after: no route, and the rest still runs
+    steps, done = _play(_working_set(mine=[_row(1)], frontier=[11]),
+                        {"no-pr": _Raises("orca is down")})
+    assert _brief(steps) == [("no-pr", [1]), ("begin", 11), ("finish", [11]), ("heartbeat",)]
+    assert done["errors"] == [{"step": "no-pr", "error": "orca is down"}]
+
+
+def test_a_tick_grants_at_most_one_landing_turn():
+    # three PRs wait: the head of the merge queue is granted, the others are not asked
+    waiting = [_row(n, "awaiting_turn", pr=n * 10) for n in (2, 1, 3)]
+    steps, done = _play(_working_set(mine=waiting))
+    assert [s for s in _brief(steps) if s[0] == "turn"] == [("turn", 1)]
+    assert done["did"]["granted"] == [1] and done["judgments"] == []
+    # a PR holds the turn and its worker is at it: nobody is granted anything
+    landing = [_row(1, "landing", pr=10), _row(2, "awaiting_turn", pr=20)]
+    steps, done = _play(_working_set(mine=landing))
+    assert _brief(steps) == [("no-pr", [1]), ("heartbeat",)] and done["did"]["granted"] == []
+    # …and one that stopped for the tick is told again — still the one turn
+    landing[0]["stopped"] = "awaiting_ci"
+    steps, done = _play(_working_set(mine=landing))
+    assert _brief(steps) == [("turn", 1), ("heartbeat",)] and done["did"]["granted"] == [1]
+    # a turn that could not be decided is a judgment, and the next PR still waits
+    steps, done = _play(_working_set(mine=waiting),
+                        {"turn": {"issue": 1, "pr": 10, "head": "abc", "outcome": "no_checks"}})
+    assert [s for s in _brief(steps) if s[0] == "turn"] == [("turn", 1)]
+    assert [(j["issue"], j["kind"]) for j in done["judgments"]] == [(1, "no_checks")]
+    assert done["did"]["granted"] == []
+    # a merge batch is that one turn: formed from the PRs free to land together,
+    # and no single turn beside it
+    batching = d.resolve_config({"merge": {"batch": True}, "gate": {"ci": "local"}})
+    formed = {"outcome": "granted", "batch": "b9", "issues": [1, 2, 3]}
+    steps, done = _play(_working_set(mine=waiting), {"batch-turn": formed}, config=batching)
+    assert _brief(steps) == [("batch-turn",), ("heartbeat",), ("sweep",)]
+    assert steps[-1]["live"] == ["b9"] and done["did"]["granted"] == [1, 2, 3]
+    # too few of them were free after all: the turn goes to one PR, as before
+    steps, done = _play(_working_set(mine=waiting), {"batch-turn": {"outcome": "too_few"}},
+                        config=batching)
+    assert _brief(steps)[:2] == [("batch-turn",), ("turn", 1)] and steps[-1]["live"] == []
+    assert done["did"]["granted"] == [1]
+    # forming it failed: an error, and no turn is granted behind its back
+    steps, done = _play(_working_set(mine=waiting), {"batch-turn": _Raises("orca is down")},
+                        config=batching)
+    assert not [s for s in steps if s["do"] == "turn"] and done["did"]["granted"] == []
+    assert done["errors"] == [{"step": "turn", "error": "orca is down"}]
+
+
+def test_a_dead_fleets_batch_is_abandoned_before_anything_is_granted():
+    # claims I took carry a dead fleet's batch: it is abandoned, and no turn — a
+    # batch's or a single PR's — is granted until the next cycle reads the result
+    mine = [_row(n, "awaiting_turn", pr=n * 10) for n in (1, 2)]
+    ws = _working_set(mine=mine, batches=[_batch([1, 2], instance="dead", batch="old")])
+    steps, done = _play(ws, {"abandon": {"issues": [1, 2]}})
+    assert _brief(steps) == [("abandon", "old"), ("heartbeat",), ("sweep",)]
+    assert steps[-1]["live"] == [] and done["did"]["abandoned"] == [1, 2]
+    assert done["did"]["granted"] == [] and done["did"]["in_flight"] == 2
+    # the abandon failed: the batch still holds its turn, and its worktree is not swept
+    steps, done = _play(ws, {"abandon": _Raises("gh is down")})
+    assert _brief(steps) == [("abandon", "old"), ("heartbeat",), ("sweep",)]
+    assert steps[-1]["live"] == ["old"] and done["did"]["abandoned"] == []
+    assert done["errors"] == [{"step": "turn", "error": "gh is down"}]
+    # it comes before my own batch's worker is asked after, too
+    both = _working_set(mine=mine, batches=[_batch([1], instance="dead", batch="old"),
+                                            _batch([2], batch="new")])
+    steps, done = _play(both, {"abandon": {"issues": [1]}})
+    assert _brief(steps) == [("abandon", "old"), ("heartbeat",), ("sweep",)]
+    assert steps[-1]["live"] == ["new"]
+
+
+def test_a_batch_of_mine_is_left_continued_nudged_or_abandoned():
+    held = {"id": "b1", "members": [1, 2], "phase": "stacking"}
+    mine = [_row(n, "landing", pr=n * 10, batch=held) for n in (1, 2)]
+    ws = _working_set(mine=mine + [_row(3, "awaiting_turn", pr=30)], batches=[_batch([1, 2])])
+
+    def played(cause, **answers):
+        steps, done = _play(ws, answers, causes={"b1": cause})
+        # the batch's worker is asked after once, for the batch — never its members' own
+        assert _brief(steps)[0] == ("no-pr", "b1") and steps[0] == {"do": "no-pr", "batch": "b1"}
+        # the turn is out: #3 waits, whatever becomes of the batch this tick
+        assert not [s for s in steps if s["do"] == "turn"]
+        return _brief(steps)[1:-2], steps[-1]["live"], done
+
+    # its worker is at it: nothing
+    for cause in ("working", "just_stopped", "within_grace", "awaiting_tick"):
+        acted, live, done = played(cause)
+        assert (acted, live) == ([], ["b1"]) and done["did"] == _nothing_done(in_flight=3)
+    # its terminal is gone: continued, which is the turn told again
+    again = {"outcome": "granted", "batch": "b1", "issues": [1, 2]}
+    acted, live, done = played("gone", **{"batch-turn": again})
+    assert (acted, live, done["did"]["granted"]) == ([("batch-turn",)], ["b1"], [1, 2])
+    acted, live, done = played("gone", **{"batch-turn": {"outcome": "landing"}})
+    assert (acted, live, done["did"]["granted"]) == ([("batch-turn",)], ["b1"], [])
+    # silent past grace: nudged once, for every PR it carries
+    acted, live, done = played("silent")
+    assert (acted, live, done["did"]["nudged"]) == ([("nudge", "b1")], ["b1"], [1, 2])
+    # silent again: abandoned — nothing is live, and its worktree is swept this tick
+    for cause in ("silent_after_nudge", "silent_unnudgeable"):
+        acted, live, done = played(cause, abandon={"issues": [1, 2]})
+        assert (acted, live, done["did"]["abandoned"]) == ([("abandon", "b1")], [], [1, 2])
+    # an abandon that failed leaves the batch holding its turn
+    acted, live, done = played("silent_after_nudge", abandon=_Raises("gh is down"))
+    assert live == ["b1"] and done["did"]["abandoned"] == []
+    # its worker could not be read: left, and reported
+    steps, done = _play(ws, {"no-pr": _Raises("orca is down")})
+    assert _brief(steps) == [("no-pr", "b1"), ("heartbeat",), ("sweep",)]
+    assert done["errors"] == [{"step": "no-pr", "error": "orca is down"}]
+
+
+def test_a_tick_runs_its_stages_in_one_order_and_writes_each_board_once():
+    # every stage at once: observe → the turn → nudge / fail / park / escalate →
+    # releases → continuations → reclaims → the frontier → finish → the lease →
+    # the boards no transition of this tick already wrote
+    mine = [_row(1, board_phase="claimed"), _row(2, board_phase="claimed"),
+            _row(3, board_phase="claimed"), _row(4, board_phase="claimed"),
+            _row(5, "awaiting_turn", pr=50, board_phase="awaiting_turn"),
+            _row(6, "failure", pr=60, board_phase="ci_failed", attempt=1),
+            _row(7, "closed"), _row(8, "awaiting_ci", pr=80, board_phase="pr_open"),
+            _row(9, board_phase="claimed")]
+    ws = _working_set(mine=mine, stale=[20], stale_closed=[21], frontier=[30, 31, 32],
+                      concurrency=11)
+    causes = {1: "silent", 2: "gone", 3: "blockers_waiting", 4: "satisfied", 9: "satisfied_refuted"}
+    steps, done = _play(ws, causes=causes)
+    assert _brief(steps) == [
+        ("no-pr", [1, 2, 3, 4, 9]), ("turn", 5), ("nudge", 1), ("park", 3), ("fail", 9),
+        ("release", 7), ("release", 21), ("begin", 2), ("reclaim", 20), ("begin", 20),
+        ("begin", 30), ("begin", 31), ("begin", 32), ("finish", [2, 20, 30, 31, 32]),
+        ("heartbeat",), ("status", 1), ("status", 4), ("status", 6), ("status", 8)]
+    # free slots: 11 − 9 held + the two settled (#3, #7) − the one reclaimed = 3
+    assert done["did"] == {
+        "granted": [5], "dispatched": [2, 30, 31, 32], "reclaimed": [20], "cleared": [7, 21],
+        "escalated": [], "parked": [3], "abandoned": [], "retried": [9], "nudged": [1],
+        "in_flight": 11, "frontier_remaining": 0}
+    # a board is written for a claim only where no transition of this tick wrote it
+    assert steps[-2] == {"do": "status", "issue": 6, "phase": "ci_failed", "pr": 60, "attempt": 1}
+    # the judgments, in the order the tick met them: red checks, then the workers'
+    assert [(j["issue"], j["kind"]) for j in done["judgments"]] == [(6, "reason"), (4, "empty_diff")]
+    # the boards still mine to remember: every claim held as the tick ends
+    assert done["held"] == {1, 2, 4, 5, 6, 8, 9, 20, 30, 31, 32}
+    # `progress_comment: false` writes none
+    quiet = d.resolve_config({"progress_comment": False})
+    assert not [s for s in _play(ws, causes=causes, config=quiet)[0] if s["do"] == "status"]
+
+
+def test_a_plan_names_only_steps_the_table_lists_and_refuses_an_unknown_cause():
+    assert set(d.TICK_STEPS.values()) == {"no-pr", "turn", "nudge", "park", "fail", "escalate",
+                                          "release", "reclaim", "dispatch", "heartbeat",
+                                          "status", "sweep"}
+    # a cause the routing does not know is an error of the tick, never a step
+    try:
+        _play(_working_set(mine=[_row(1)]), causes={1: "levitating"})
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "no route for a worker classified 'levitating'" in str(e)
+
+
 def _prompt_template():
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "..", "references", "worker-prompt.md")) as f:
