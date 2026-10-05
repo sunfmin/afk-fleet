@@ -140,8 +140,8 @@ never rebasing (ADR-0012). It happens twice in a PR's life: the **worker** syncs
 before its pre-PR **local gate**, so integration conflicts surface inside the worker's own session,
 where they are cheapest to fix; and the worker's **landing** syncs again, on its **landing turn**, picking up
 whatever the base gained since — a conflict there is left in progress for the same worker to resolve. Merge rather than rebase because a rebase drops
-merge commits and re-ignites the conflicts already resolved inside them, and because squash-merging
-makes the target-branch history identical either way. Retires `rebase_before_merge` (the config key
+merge commits and re-ignites the conflicts already resolved inside them — and those merge commits
+land on the target as they are: a PR lands as a merge commit, never squashed (ADR-0034). Retires `rebase_before_merge` (the config key
 becomes `sync_before_merge`).
 _Avoid_: rebase (retired from the merge path), rebase onto latest, update branch
 
@@ -332,7 +332,7 @@ is the PR or the verdict, not this), **nudge** (that is fleet → worker; a wake
 
 **Landing turn**:
 The fleet's permission for one finished PR to land, granted by the **tick** in one **transition**
-(`afk turn`) and held by one PR of a **fleet instance** at a time — or, with `merge.batch`, by
+(`afk turn`) and held by one PR of a **fleet instance** at a time — or by
 the several PRs of one **merge batch** at once (ADR-0029). It is recorded as a single marker
 comment on the PR naming the instance that granted it — so it dies with the PR, and does not survive
 a **takeover** — and it carries the tick's judgments made *before* the grant (the head an adversarial
@@ -361,14 +361,13 @@ merge-time gate run (the gate run is the landing's)
 
 **Merge batch**:
 One **landing turn** held by several finished PRs of a **fleet instance** at once, so that they land
-behind ONE run of the **local gate** instead of one each (ADR-0029; opt-in with `merge.batch`,
-`gate.ci: local` only). Its whole record is the turn marker on every member PR, naming the batch,
+behind ONE run of the **local gate** instead of one each (ADR-0029; `gate.ci: local` only, and
+never an option: where it can form it does, ADR-0034). Its whole record is the turn marker on every member PR, naming the batch,
 its members and its phase — `stacking`, `gating` or `fixing` — and it is the only place the members
 are kept: the batch's worktree holds no list of them. A **batch worker** stacks the members
-on the target's tip as one squash commit per PR, in **merge queue** order, gates the stack once, and
+on the target's tip with one merge commit per PR, in **merge queue** order, gates the stack once, and
 pushes it to the target as a fast-forward: that push is the only lock, and a target that moved
-refuses it. Each PR then reads *closed* on GitHub, with a comment naming the commit that landed it
-— its commit was pushed, not merged. A red stack is repaired with a fix commit on top, never
+refuses it. Each PR's own head is then on the target, so GitHub shows it *merged* by itself. A red stack is repaired with a fix commit on top, never
 bisected. Whether the turn goes to a batch or to one PR is decided in code
 (`afk_decide.batch_candidates`): never while a turn is out, never a PR that owes an adversarial
 verify, whose own worker is still working, or that is a peer's. A PR that leaves a batch without
@@ -397,7 +396,7 @@ landing. Every other ready PR waits as `awaiting_turn` — not synced, not told 
 slot, its **status board** saying so — so PRs that conflict with each other are each resolved once,
 against a target that already holds everything landed before them. Waiting is bounded by the
 silent-worker ladder on the PR that holds the turn, and spends no **retry**. Turns are per fleet
-instance: two fleets on one repo each grant their own. With `merge.batch`, when two or more of
+instance: two fleets on one repo each grant their own. When two or more of
 those PRs may land together the turn goes to all of them as one **merge batch**, in this same order.
 _Avoid_: merge train (nothing is speculatively gated; a **merge batch** is one turn, not a train),
 lock (nothing is held: the order

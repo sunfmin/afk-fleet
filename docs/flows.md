@@ -87,13 +87,13 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   not told anything, its slot held — so each PR of a conflicting group is resolved once, against a
   target that already holds the ones before it, `skills/afk-fleet/scripts/afk_decide.py:turn_order`
   (ADR-0027).
-- `merge.batch` is on and two or more PRs may land together: the turn goes to all of them as one
+- Two or more PRs may land together (`gate.ci: local`, no adversarial verify owed): the turn goes to all of them as one
   **merge batch**, `skills/afk-fleet/scripts/afk_decide.py:batch_candidates` — a batch worker in a
-  worktree of the batch's own stacks them on the target as one squash commit per PR, gates the stack
+  worktree of the batch's own stacks them on the target with one merge commit per PR, gates the stack
   once and pushes it to the target as a fast-forward, `skills/afk-fleet/scripts/afk.py:_land_batch`;
-  each PR is then closed with a comment naming its commit. A PR that conflicts with the stack is
+  each PR's own head is then on the target, so GitHub shows it merged. A PR that conflicts with the stack is
   left out and takes a single turn; a batch whose worker stays silent is abandoned
-  (ADR-0029).
+  (ADR-0029, ADR-0034).
 - The landing's sync conflicts: the merge is left in progress in the worker's own worktree, and the
   worker resolves it, commits and lands again — claim, PR, branch, worktree and turn kept, no
   attempt spent, `skills/afk-fleet/scripts/afk_decide.py:land_outcome`.
@@ -313,7 +313,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 - A turn whose worker is gone is delivered by continuation in the PR's own worktree or at its head,
   never from base, and there is no launcher-side merge. (ADR-0027;
   `test_a_turn_with_no_terminal_is_delivered_by_continuation_never_from_base`)
-- With `merge.batch`, a batch of PRs lands behind exactly one gate run, as one squash commit per PR
+- A batch of PRs lands behind exactly one gate run, as one merge commit per PR
   in merge order; the target is only ever moved — by a fast-forward push — to a commit the gate
   passed on, so a red stack, a moved target and an abandoned batch each land nothing; and a PR that
   left a batch is never batched again. (ADR-0029;
@@ -346,8 +346,8 @@ stateDiagram-v2
   pr_open --> awaiting_turn: checks green, or local gate mode
   pr_open --> ci_failed: checks red
   awaiting_turn --> landing: the fleet grants it the landing turn, one PR at a time
-  awaiting_turn --> landing: with merge.batch, the turn goes to a merge batch it is in
-  landing --> merged: its batch stacked, gated once and pushed (the PR reads closed)
+  awaiting_turn --> landing: the turn goes to a merge batch it is in
+  landing --> merged: its batch stacked, gated once and pushed (GitHub shows the PR merged)
   landing --> awaiting_turn: left out of its batch, or the batch abandoned (single turns from here)
   landing --> merged: its worker synced, gated and merged it
   landing --> landing: conflict or red gate fixed in place; or the tick settles checks or a verify on a moved head
@@ -383,7 +383,7 @@ four claim refs.
 What the tick then does, each row a different mainline:
 
 - **#3** is the first mainline from step 11: it is alone in `merge_order`, so `afk turn` gives PR #30
-  the landing turn, and its worker's `afk land` syncs, re-confirms the gate, squash-merges it and
+  the landing turn, and its worker's `afk land` syncs, re-confirms the gate, merges it and
   sets the board to "merged"; the next tick releases the claim.
 - **#1** is the first mainline from step 3: `afk dispatch` claims it, has orca create the worktree,
   and delivers the worker its prompt. The row also says `free_slots: 1` — one slot is all

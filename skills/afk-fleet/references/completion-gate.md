@@ -52,12 +52,12 @@ A PR may land only when **all** configured gates are green. Which **machine gate
   green" proves nothing and leaves none. There is no switch. What is given up is a second,
   independent sample on unchanged content — a flaky test that passed once, or a gate that depends
   on the machine, is not asked again for a day.
-- **`merge.batch` — one landing run for several PRs**
+- **A merge batch — one landing run for several PRs**
   ([ADR-0029](../../../docs/adr/0029-a-merge-batch-lands-n-prs-behind-one-gate-run.md); `local`
-  only, opt-in). The landing's run is the fleet's landing throughput: N finished PRs are N runs.
-  With the option on, when two or more finished PRs may land together the landing turn goes to all
+  only, with `gate.adversarial_verify` off; not an option). The landing's run is the fleet's landing throughput: N finished PRs are N runs.
+  So when two or more finished PRs may land together the landing turn goes to all
   of them as a **merge batch**: a batch worker, in a worktree of the batch's own, stacks them on the
-  target's tip — one squash commit per PR, in merge order — and `afk land --batch` runs
+  target's tip — one merge commit per PR, in merge order — and `afk land --batch` runs
   `gate.local_command` **once, on the stack**, then pushes the stack to the target as a
   fast-forward. The invariant is kept literally — the commit the target is moved to is the commit
   the gate passed on — but what the gate proves is the **stack**, not each PR alone: the

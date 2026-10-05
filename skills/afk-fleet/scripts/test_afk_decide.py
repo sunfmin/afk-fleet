@@ -202,7 +202,7 @@ def test_a_batchs_turn_is_one_marker_on_every_member_and_leaving_it_is_remembere
     body = d.turn_comment(d.batch_turn(None, "fl-1", 500, "fl-1-500", members, "gating"))
     assert body.startswith("<!--afk:turn instance=fl-1 at=500 batch=fl-1-500 "
                            "members=1:10,2:20,3:30 phase=gating-->\n")
-    assert "#10, #20, #30" in body and "closed, not merged" in body
+    assert "#10, #20, #30" in body and "one merge commit each" in body
     rec = d.latest_turn([{"id": 4, "body": body}])
     assert (rec["batch"], rec["members"], rec["phase"]) == ("fl-1-500", members, "gating")
     assert (rec["unbatched"], rec["released"], rec["stopped"]) == (None, False, None)
@@ -306,9 +306,9 @@ def test_a_batch_is_known_by_its_id_wherever_orca_puts_its_branch():
     # a batch's id says which instance formed it — and only that one
     assert d.batch_formed_by(batch, "fl-1/x") and not d.batch_formed_by(batch, "fl-1")
     assert not d.batch_formed_by(batch, "") and not d.batch_formed_by(None, "fl-1/x")
-    # the PR a squash commit's subject names
-    assert d.squashed_pr(d.squash_message("a title", 12, 3).splitlines()[0]) == 12
-    assert d.squashed_pr("work: fix.txt") is None and d.squashed_pr(None) is None
+    # the PR a stacked merge commit's subject names
+    assert d.stacked_pr(d.stack_message("a title", 12, 3).splitlines()[0]) == 12
+    assert d.stacked_pr("work: fix.txt") is None and d.stacked_pr(None) is None
     assert d.batch_branches(heads, "fl-9-1") == [] and d.batch_branches(None, "fl-1-170") == []
 
     def wt(branch, at=1, **more):
@@ -331,9 +331,8 @@ def test_a_batch_is_known_by_its_id_wherever_orca_puts_its_branch():
 def test_the_cycle_forms_a_batch_only_from_two_or_more_eligible_prs():
     """The batch-or-single decision, whole (ADR-0029) — a table lookup, so it is
     this function and not a paragraph."""
-    on = d.resolve_config({"gate": {"ci": "local", "local_command": "make test"},
-                           "merge": {"batch": True}})
-    off = d.resolve_config({"gate": {"ci": "local", "local_command": "make test"}})
+    on = d.resolve_config({"gate": {"ci": "local", "local_command": "make test"}})
+    off = d.resolve_config({})                    # `required`: the gate is each PR's own checks
 
     def rows(*specs):
         mine = [_mine(n, status, pr=n * 10, **more) for n, status, more in specs]
@@ -344,7 +343,7 @@ def test_the_cycle_forms_a_batch_only_from_two_or_more_eligible_prs():
 
     waiting = [(n, "awaiting_turn", {}) for n in (3, 1, 2)]
     assert picked(waiting) == [1, 2, 3]                            # in merge order
-    assert picked(waiting, cfg=off) == []                          # opt-in: default off
+    assert picked(waiting, cfg=off) == []                          # only the local gate
     assert picked(waiting[:1]) == []                               # one PR is a single turn
     assert picked(waiting[:2]) == [1, 3]
     # a claim with no PR, a failed one, one still waiting on CI are not in the queue at all
@@ -359,9 +358,9 @@ def test_the_cycle_forms_a_batch_only_from_two_or_more_eligible_prs():
     assert picked(left) == [] and d.turn_order(rows(*left)[0])[0] == 4
     assert d.turn_due(*rows(*left)) == 4
     # every PR owes its own adversarial verify before its turn: none is eligible
-    verify = d.resolve_config({"gate": {"ci": "local", "local_command": "x", "adversarial_verify": True},
-                               "merge": {"batch": True}})
+    verify = d.resolve_config({"gate": {"ci": "local", "local_command": "x", "adversarial_verify": True}})
     assert picked(waiting, cfg=verify) == []
+    assert [d.batches_form(c) for c in (on, off, verify)] == [True, False, False]
 
     # a row in a batch is not asked after as its own worker's: the batch's worker is
     mine = [_mine(1, "landing", pr=10, batch={"id": "b", "members": [1, 2], "phase": "gating"}),
@@ -375,15 +374,15 @@ def test_the_cycle_forms_a_batch_only_from_two_or_more_eligible_prs():
 
 
 def test_a_stack_is_read_back_from_its_commits():
-    assert d.squash_message("Add the thing", 12, 7) == "Add the thing (#12)\n\nCloses #7\n"
-    assert d.squash_message("  ", 12, 7).startswith("PR 12 (#12)\n")
+    assert d.stack_message("Add the thing", 12, 7) == "Add the thing (#12)\n\nCloses #7\n"
+    assert d.stack_message("  ", 12, 7).startswith("PR 12 (#12)\n")
     log = [("a1", "Add the thing (#12)"), ("b2", "Fix a typo (#13)"), ("c3", "make the stack green"),
            ("d4", "refs issue (#99)"), ("e5", "Add the thing (#12)")]
     stacked, fixes = d.read_stack(log, {12, 13})
     assert stacked == {12: "a1", 13: "b2"} and fixes == ["c3", "d4", "e5"]
     assert d.read_stack([], {12}) == ({}, [])
     said = d.batch_landed_comment("abc123", "main", "fl-1-5", [12, 13])
-    assert "landed on `main` as abc123" in said and "#12, #13" in said and "closed rather than merged" in said
+    assert "landed on `main` as abc123" in said and "#12, #13" in said and "did not mark this PR merged" in said
 
 
 def test_the_ticks_judgments_are_settled_before_a_turn_is_granted():
@@ -464,17 +463,18 @@ def test_validate_config():
     except ValueError as e:
         assert "gate.ci" in str(e) and "required" in str(e)
 
-    # merge.strategy is a `gh pr merge --<strategy>` flag: a closed set, checked
-    # here rather than discovered at the first merge
-    for strategy in d.MERGE_STRATEGIES:
-        d.validate_config(d.resolve_config({"merge": {"strategy": strategy}}))
-    assert d.CONFIG_DEFAULTS["merge"]["strategy"] in d.MERGE_STRATEGIES
-    for bad in ("fast-forward", "", "Squash", None):
-        try:
-            d.validate_config(d.resolve_config({"merge": {"strategy": bad}}))
-            assert False, f"expected ValueError for merge.strategy {bad!r}"
-        except ValueError as e:
-            assert "merge.strategy" in str(e)
+    # how a PR lands is not a choice (ADR-0034): a config that still names a
+    # strategy, or switches batches on or off, is refused with the reason
+    for key, value in (("strategy", "squash"), ("strategy", "merge"), ("batch", "true"),
+                       ("batch", "false")):
+        for load in (lambda: d.parse_config_yaml(f"merge:\n  {key}: {value}"),
+                     lambda: d.override_config(d.resolve_config({}), [f"merge.{key}={value}"])):
+            try:
+                load()
+                assert False, f"expected ValueError for merge.{key}"
+            except ValueError as e:
+                assert f"merge.{key}" in str(e) and "removed" in str(e) and "Delete the key" in str(e)
+    assert set(d.CONFIG_DEFAULTS["merge"]) == {"target", "sync_before_merge", "delete_branch"}
 
 
 def test_gate_verdict():
@@ -727,25 +727,13 @@ def test_a_recorded_gate_run_counts_only_for_the_tree_and_command_it_ran():
 def test_a_merge_batch_needs_the_local_gate_and_a_target_that_takes_a_push():
     """What bootstrap refuses (ADR-0029). A batch is gated by ONE run of
     `gate.local_command` on the stack, and lands by pushing to the target."""
-    local = {"gate": {"ci": "local", "local_command": "make test"}, "merge": {"batch": True}}
-    assert d.validate_config(d.resolve_config(local))["merge"]["batch"] is True
-    assert d.resolve_config({})["merge"]["batch"] is False                 # opt-in
-    for bad in ({"merge": {"batch": True}},                                # `required` is the default
-                {"gate": {"ci": "required"}, "merge": {"batch": True}}):
-        try:
-            d.validate_config(d.resolve_config(bad))
-        except ValueError as e:
-            assert "merge.batch" in str(e) and "local" in str(e)
-        else:
-            raise AssertionError(f"accepted {bad}")
-
     refusing = ({"required_pull_request_reviews": {"required_approving_review_count": 1}},
                 {"restrictions": {"users": ["a"], "teams": []}},
                 {"lock_branch": {"enabled": True}})
     for prot in refusing:
         r = d.protection_verdict("local", prot, batch=True)
-        assert r["verdict"] == "error" and "merge.batch" in r["detail"], r
-        assert d.protection_verdict("local", prot)["verdict"] == "ok"      # only with the option
+        assert r["verdict"] == "error" and "merge batch" in r["detail"], r
+        assert d.protection_verdict("local", prot)["verdict"] == "ok"      # only where batches form
     for fine in (None, {}, {"lock_branch": {"enabled": False}}, {"restrictions": None},
                  {"enforce_admins": {"enabled": True}}):
         assert d.protection_verdict("local", fine, batch=True)["verdict"] == "ok", fine
@@ -2815,7 +2803,7 @@ gate:
   ci: required
   adversarial_verify: true
 merge:
-  strategy: rebase
+  target: trunk
 retry: 3
 """
     p = d.parse_config_yaml(text)
@@ -2824,7 +2812,7 @@ retry: 3
     assert p["concurrency"] == 5 and p["worktree_cleanup"] is False
     assert p["branch_pattern"] == "issue-{number}-{slug}"
     assert p["gate"] == {"ci": "required", "adversarial_verify": True}
-    assert p["merge"] == {"strategy": "rebase"}
+    assert p["merge"] == {"target": "trunk"}
     assert p["retry"] == 3          # top-level scalar after a section closes it
 
     # a whole markdown file: the first ```yaml fence is the config
@@ -2862,7 +2850,7 @@ def test_resolve_config():
     assert r["concurrency"] == 5
     # deep-merge keeps sibling defaults; untouched sections stay whole
     assert r["gate"]["adversarial_verify"] is True and r["gate"]["ci"] == "required"
-    assert r["merge"]["strategy"] == "squash"
+    assert r["merge"]["target"] == "main"
     # idempotent: resolving canonical config is a no-op
     assert d.resolve_config(r) == r
 
@@ -3003,7 +2991,7 @@ def test_template_matches_defaults():
         text = f.read()
     parsed = d.parse_config_yaml(text)
     # a key with a closed set of values spells that set out, exactly
-    for choices in (d.CLAIM_NAMESPACES, d.GATE_CI_MODES, d.MERGE_STRATEGIES):
+    for choices in (d.CLAIM_NAMESPACES, d.GATE_CI_MODES):
         assert " | ".join(choices) in text, f"template does not list {' | '.join(choices)}"
     full = d.resolve_config({})
     for k, v in parsed.items():

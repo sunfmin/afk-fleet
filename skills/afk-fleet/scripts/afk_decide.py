@@ -59,11 +59,9 @@ CONFIG_DEFAULTS = {
     },
     # merge
     "merge": {
-        "strategy": "squash",
         "target": "main",
         "sync_before_merge": True,
         "delete_branch": True,
-        "batch": False,
     },
     # failure handling
     "retry": 2,
@@ -285,9 +283,6 @@ def latest_record(kind, comments):
 # tree that lands.
 GATE_CI_MODES = {"required": "CI", "local": "本地门"}
 
-# How `afk land` lands a PR — each is a `gh pr merge` flag of the same name.
-MERGE_STRATEGIES = ("squash", "merge", "rebase")
-
 # Keys that were renamed, and why. A file still carrying the old name must fail
 # LOUDLY with the migration note rather than be silently defaulted — a config that
 # lies to its author is the failure mode ADR-0009 exists to prevent.
@@ -305,6 +300,14 @@ CONFIG_REMOVED = {
         "a recorded gate run is always trusted now (ADR-0030): the landing skips its own run "
         "whenever a green run of the configured command is on record for the tree that lands. "
         "Delete the key."),
+    "merge.strategy": (
+        "every PR lands as a merge commit now (ADR-0034): a PR's own head reaches the target, so "
+        "GitHub shows it merged whether it landed alone or in a merge batch. There is no squash "
+        "and no rebase. Delete the key."),
+    "merge.batch": (
+        "merge batches are no longer an option (ADR-0034): with gate.ci 'local' and "
+        "gate.adversarial_verify off, two or more PRs that are ready together always land as "
+        "one batch. Delete the key."),
 }
 
 
@@ -340,15 +343,6 @@ def validate_config(cfg):
         raise ValueError("config gate.ci: 'local' requires a non-empty gate.local_command — in "
                          "local mode that command IS the completion gate (ADR-0012), so an empty "
                          "one would merge every PR unverified")
-    strategy = (cfg.get("merge") or {}).get("strategy")
-    if strategy not in MERGE_STRATEGIES:
-        raise ValueError(f"config merge.strategy: expected one of "
-                         f"{' | '.join(MERGE_STRATEGIES)}, got {strategy!r}")
-    if (cfg.get("merge") or {}).get("batch") and ci != "local":
-        raise ValueError("config merge.batch: a merge batch is gated by one run of "
-                         "gate.local_command on the stack (ADR-0029), which only gate.ci: "
-                         "'local' has — with 'required', GitHub's own merge queue is the tool. "
-                         "Set gate.ci to 'local' or leave this false")
     return cfg
 
 
@@ -470,9 +464,12 @@ def override_config(cfg, assignments):
     place, and return it. Keys are the config file's own — dotted for a section
     (`gate.ci=local`) — and values are typed by the key's default exactly as the
     file's are, except that a string is taken verbatim (the shell already
-    unquoted it). An unknown key, or an item with no `=`, raises ValueError."""
+    unquoted it). An unknown key, or an item with no `=`, raises ValueError; a
+    renamed or removed one raises with its migration note, as the file does."""
     for item in assignments or []:
         dotted, eq, raw = item.partition("=")
+        if _renamed(dotted.strip()):
+            raise ValueError(_renamed(dotted.strip()))
         section, _, key = dotted.strip().rpartition(".")
         table = CONFIG_DEFAULTS.get(section) if section else CONFIG_DEFAULTS
         if not eq or not isinstance(table, dict) or isinstance(table.get(key), (dict, type(None))):
@@ -779,8 +776,9 @@ def protection_verdict(ci_mode, protection, unavailable=None, batch=False):
       protection:  the target branch's protection object, or None if it has none
       unavailable: why protection could not be read (no admin rights, an API
                    error); None when the read succeeded
-      batch:       merge.batch — a merge batch lands by PUSHING its stack to the
-                   target, so the target must also accept a direct push
+      batch:       merge batches form under this config (`batches_form`) — one
+                   lands by PUSHING its stack to the target, so the target must
+                   also accept a direct push
 
     Returns {"verdict": "ok"|"error"|"warn", "required_checks": [...], "detail"}.
 
@@ -789,7 +787,7 @@ def protection_verdict(ci_mode, protection, unavailable=None, batch=False):
              `--admin` — also overrides human review, far too much power for an
              unattended fleet. So this is a hard error at bootstrap, not a
              surprise on the first merge.
-             Likewise `merge.batch` + a target that refuses a direct push (it
+             Likewise `batch` + a target that refuses a direct push (it
              requires a pull request, restricts who may push, or is locked): every
              batch would gate its stack and then be refused (ADR-0029).
       warn   the probe itself was inconclusive: continue, but say so.
@@ -821,10 +819,10 @@ def protection_verdict(ci_mode, protection, unavailable=None, batch=False):
         refusals.append("is locked")
     if batch and refusals:
         return {"verdict": "error", "required_checks": [],
-                "detail": f"merge.batch is on but the target branch {' and '.join(refusals)} — a "
-                          f"merge batch lands by pushing its stack to the target as a "
-                          f"fast-forward, and that push would be refused. Either lift that "
-                          f"protection or leave merge.batch off."}
+                "detail": f"the target branch {' and '.join(refusals)} — with gate.ci 'local', "
+                          f"PRs that are ready together land as a merge batch, by pushing its "
+                          f"stack to the target as a fast-forward, and that push would be "
+                          f"refused. Either lift that protection or use gate.ci: required."}
     return {"verdict": "ok", "required_checks": [],
             "detail": "target branch requires no status checks — a local gate can merge"}
 
@@ -1553,10 +1551,10 @@ def turn_comment(turn):
     elif batch:
         prs = ", ".join(f"#{m['pr']}" for m in turn["members"])
         text = (f"**afk-fleet: this PR is in a merge batch** (`{batch}`) of fleet instance "
-                f"`{instance}`: {prs} are stacked on the target as one squash commit each, gated "
+                f"`{instance}`: {prs} are stacked on the target as one merge commit each, gated "
                 f"once as a stack, and landed together by the batch's own worker "
-                f"(`afk land --batch`). This PR's branch is not touched. It will be closed, not "
-                f"merged, with a comment naming the commit that landed it. Phase: "
+                f"(`afk land --batch`). This PR's branch is not touched; GitHub shows the PR "
+                f"merged once the stack is on the target. Phase: "
                 f"`{turn['phase']}`.")
     else:
         state = (f"Its last `afk land` stopped with `{stopped}` on `{(turn['head'] or '')[:12]}`."
@@ -1646,7 +1644,7 @@ def turn_order(rows):
 #
 # When two or more finished PRs wait for the landing turn, the turn goes to a
 # MERGE BATCH instead of to one PR: a batch worker, in a worktree of the
-# batch's own, stacks them on the target tip — one squash commit per PR — runs
+# batch's own, stacks them on the target tip — one merge commit per PR — runs
 # the local gate once on the stack, and pushes the stack to the target as a
 # fast-forward (`afk land --batch`). Still one turn out at a time; what the
 # gate proves is the stack, in the form it lands.
@@ -1707,6 +1705,15 @@ def batch_worktrees(worktrees, repo, batch=None, instance=None):
     return [row for _, row in sorted(hits, key=lambda h: -h[0])]
 
 
+def batches_form(config):
+    """Whether this config's PRs may land as merge batches at all: the stack is
+    gated by ONE run of `gate.local_command`, which only `gate.ci: local` has,
+    and with `gate.adversarial_verify` every PR owes a verify of its own head
+    before its turn (ADR-0029)."""
+    gate = config["gate"]
+    return gate["ci"] == "local" and not gate["adversarial_verify"]
+
+
 def batch_candidates(mine, merge_order, config, busy=()):
     """
     The claims a merge batch is formed from — their issue numbers, in merge
@@ -1714,18 +1721,16 @@ def batch_candidates(mine, merge_order, config, busy=()):
     batch-or-single decision, whole (ADR-0029):
 
       mine, merge_order: the working set's
-      config:  read for merge.batch, gate.ci and gate.adversarial_verify
+      config:  read for gate.ci and gate.adversarial_verify (`batches_form`)
       busy:    the issue numbers whose own worker is still working — its PR may
                yet move, so it is not stacked
 
-    No batch unless `merge.batch` is on in `gate.ci: local`; while any PR or
-    batch holds the turn; while a PR that left a batch still waits (those go
-    first, on single turns); or when fewer than two claims are eligible. With
-    `gate.adversarial_verify` every PR owes a verify of its own head before its
-    turn, so none is eligible. A peer fleet's PR is never in `mine`.
+    No batch unless batches form under this config; while any PR or batch
+    holds the turn; while a PR that left a batch still waits (those go first, on
+    single turns); or when fewer than two claims are eligible. A peer fleet's PR
+    is never in `mine`.
     """
-    merge, gate = config["merge"], config["gate"]
-    if not merge["batch"] or gate["ci"] != "local" or gate["adversarial_verify"]:
+    if not batches_form(config):
         return []
     rows = {r["number"]: r for r in mine}
     waiting = [rows[n] for n in merge_order]
@@ -1735,15 +1740,15 @@ def batch_candidates(mine, merge_order, config, busy=()):
     return picked if len(picked) >= 2 else []
 
 
-def squash_message(title, pr, issue):
-    """The message of the one commit a batched PR lands as — shaped like the one
-    `gh pr merge --squash` writes: the PR's title, `(#<pr>)`, and the closing
-    keyword. The `(#<pr>)` is also how the stack is read back (`read_stack`)."""
+def stack_message(title, pr, issue):
+    """The message of the merge commit a batched PR is stacked with: the PR's
+    title, `(#<pr>)`, and the closing keyword. The `(#<pr>)` is also how the
+    stack is read back (`read_stack`)."""
     return f"{(title or '').strip() or f'PR {pr}'} (#{pr})\n\nCloses #{issue}\n"
 
 
-def squashed_pr(subject):
-    """The PR a commit subject names the way `squash_message` writes it — its
+def stacked_pr(subject):
+    """The PR a commit subject names the way `stack_message` writes it — its
     trailing ` (#<pr>)` — or None."""
     m = re.search(r" \(#(\d+)\)$", subject or "")
     return int(m.group(1)) if m else None
@@ -1753,17 +1758,19 @@ def read_stack(commits, prs):
     """
     A batch worktree's commits above the target, read back → (stacked, fixes):
 
-      commits: [(sha, subject)...] oldest first — `git log <target tip>..HEAD`
+      commits: [(sha, subject)...] oldest first — `git log --first-parent
+               <target tip>..HEAD`: the stack's own line, without the commits
+               each PR brought
       prs:     the member PR numbers
 
-      stacked: {pr: sha} — the squash commit each member landed as
-               (`squash_message`'s subject ends ` (#<pr>)`)
+      stacked: {pr: sha} — the merge commit each member was stacked with
+               (`stack_message`'s subject ends ` (#<pr>)`)
       fixes:   [sha...] — every other commit, oldest first: what the batch
                worker committed to turn a red stack green
     """
     stacked, fixes = {}, []
     for sha, subject in commits:
-        pr = squashed_pr(subject)
+        pr = stacked_pr(subject)
         if pr in prs and pr not in stacked:
             stacked[pr] = sha
         else:
@@ -1772,14 +1779,14 @@ def read_stack(commits, prs):
 
 
 def batch_landed_comment(commit, target, batch, prs):
-    """The comment a batched PR is closed with: GitHub shows a PR whose commit
-    was pushed as closed, not merged, so the PR itself says which commit landed
-    it."""
+    """The comment a batched PR is closed with when GitHub did not show it merged
+    — its head moved after it was stacked, or GitHub never caught up: the PR
+    itself says which commit landed it."""
     others = ", ".join(f"#{p}" for p in prs)
     return (f"**afk-fleet: landed on `{target}` as {commit}** — in merge batch `{batch}` "
-            f"({others}), stacked as one squash commit per PR and gated once as a stack. "
-            f"This PR is closed rather than merged because its commit was pushed, not merged "
-            f"through GitHub; nothing was lost.")
+            f"({others}), stacked as one merge commit per PR and gated once as a stack. "
+            f"GitHub did not mark this PR merged, so it is closed here; what was stacked "
+            f"is on `{target}`.")
 
 
 # What a tick does about the batch that holds the turn, for each cause its
@@ -2164,7 +2171,7 @@ def _prompt_blocks(template):
 def land_command(afk_path, number, repo, config):
     """
     The one command a worker lands its PR with, on its landing turn: `afk land`,
-    carrying the run's config — the merge target and strategy, the gate, the
+    carrying the run's config — the merge target, the gate, the
     claim namespace the turn is checked against (ADR-0027).
 
       afk_path: the afk executable on this machine (the worker runs here)
@@ -3155,7 +3162,7 @@ def tick_plan(ws, call, config):
             if row["board_phase"] and row["number"] not in written:
                 yield from run("status", issue=row["number"], phase=row["board_phase"],
                                pr=row["pr"], attempt=row["attempt"])
-    if config["merge"]["batch"] or ws["batches"]:
+    if batches_form(config) or ws["batches"]:
         yield from run("sweep", live=sorted(live))
     return {"did": tick.account(), "judgments": tick.judgments, "errors": tick.errors,
             "held": tick.held}

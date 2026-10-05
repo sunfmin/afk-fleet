@@ -204,7 +204,7 @@ other finished PR waits behind it, so do not sit on it. Only **silence** fails i
 
 You are an afk-fleet **batch worker**. You own no issue and you write no feature. Several finished
 PRs are waiting to land on `{target}`, and the fleet has given the landing turn to all of them at
-once, as one **merge batch**: they are stacked on `{target}` — one squash commit per PR — the gate
+once, as one **merge batch**: they are stacked on `{target}` — one merge commit per PR — the gate
 runs **once** on the stack, and the whole stack lands together. Stacking, gating and landing are one
 command; your job is to run it and act on what it says. Every other finished PR waits until this
 batch has landed.
@@ -226,7 +226,7 @@ batch is no longer yours: nothing was changed — wake the coordinator and stop.
 
 | `outcome` | what happened | what you do |
 |---|---|---|
-| `landed` | The stack is on `{target}`; every PR in it is closed with a comment naming its commit, and its issue is closed. | Wake the coordinator and stop. You are done — the fleet removes this worktree. |
+| `landed` | The stack is on `{target}`; every PR in it shows merged on GitHub (`unmerged` lists any that does not yet — leave those alone), and its issue is closed. | Wake the coordinator and stop. You are done — the fleet removes this worktree. |
 | `gate_red` | The gate is red on the stack — `gate.excerpt` is the tail of its log. Nothing landed. | Fix the **stack**: read the failure, change what makes it green, and **commit** — one more commit on top. Do not hunt for the PR at fault and do not drop a PR. Then run the command again. |
 | `target_moved` | `{target}` moved while the gate ran, so the push was refused. Nothing landed. | Run the command again: the batch is re-stacked on the new tip, your commits carried over, and gated again. |
 | `too_small` | Fewer than two PRs could be stacked — the rest conflicted with the stack. The batch is dissolved; nothing landed. | Wake the coordinator and stop. Those PRs land one at a time instead. |
