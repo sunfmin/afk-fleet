@@ -1526,7 +1526,8 @@ def test_merge_gates_the_tree_that_lands_then_settles_the_claim():
         assert not w.sb.remote_ref(f"refs/heads/{d['branch']}")
         assert r["cleanup"] == {"removed": True, "path": d["worktree"]}
         assert w.worktrees() == [] and not os.path.isdir(d["worktree"])
-        assert w.orca_calls() == ["worktree rm"]
+        # the worker was asked after first (it had stopped), then its worktree removed
+        assert w.orca_calls() == ["worktree ps", "terminal list", "terminal wait", "worktree rm"]
         assert w.afk("rebuild", *ME, *R, *NOW)["mine"] == []
 
 
@@ -1868,6 +1869,76 @@ def test_an_unanswered_hand_back_falls_through_to_the_nudge_and_then_the_retry_l
         assert w.pr(50)["state"] == "closed"
         # the retry is a new attempt with no PR: the old hand-back went with the PR
         assert _mine(w, gate, 5) == ("no_pr", "claimed", None)
+
+
+def test_merge_stays_out_of_a_worktree_whose_worker_is_still_working():
+    """#32, as it was observed: ~25 s after a hand-back the worker had merged the
+    target in and PUSHED — then went on to run the gate. The hand-back was answered
+    (the PR head contains the tip it named), so the claim read `awaiting_merge`
+    while its worker was still at work in the worktree, and a tick following the
+    skill ran `afk merge` — a sync and a gate — into it. A pushed head is not the
+    worker's outcome until the worker stops: until then `afk merge` touches nothing."""
+    gate = local_gate("touch gate-ran")
+    with world(issues=[issue(2, "ready-for-agent")]) as w:
+        d, pr_head, tip = _conflicted(w, 2, 20, gate)
+        wt, branch = d["worktree"], d["branch"]
+        t0 = int(time.time()) + 5000
+        cfg = ("--config", json.dumps({"base_branch": w.sb.base, "worker_idle_grace_seconds": 300}))
+
+        def merge(at):
+            return w.afk(*_merge(2, *gate, "--now", str(at)))
+
+        assert w.afk(*_hand_back(2, *gate, now=t0))["delivery"] == "terminal"
+        # recorded: the head does not contain the named tip, so every later tick
+        # reads `handed_back`, and a stopped worker's row says since when
+        assert _mine(w, gate, 2)[0] == "handed_back"
+        assert w.no_pr("--issue", "2", *R, *cfg, "--now", str(t0 + 5))["handed_back_at"] == t0
+
+        # the worker picks it up. Busy is settled from orca alone (ADR-0021), so
+        # `handed_back_at` is null because it was not read — not because the record
+        # is missing: the claim is still `handed_back`
+        w.worker(output=t0 + 20, state="working", since=t0 + 6)
+        np = w.no_pr("--issue", "2", *R, *cfg, "--now", str(t0 + 25))
+        assert (np["outcome"], np["worker_state"], np["handed_back_at"]) == ("coding", "working", None)
+        assert _mine(w, gate, 2)[0] == "handed_back"
+        assert merge(t0 + 25)["outcome"] == "handed_back"
+
+        # it merges the target in and pushes BEFORE gating: the hand-back is answered
+        resolved = _resolve(w, wt, branch)
+        assert _mine(w, gate, 2) == ("awaiting_merge", "pr_open", 20)
+        moved = w.advance_base("landed-meanwhile.txt")          # a sync would have work to do
+        w.calls(), w.orca_calls()
+        r = merge(t0 + 30)
+        assert r == {"issue": 2, "pr": 20, "outcome": "worker_busy", "worktree": wt,
+                     "detail": r["detail"]}, r
+        # nothing was touched: no sync in the worker's worktree, no gate run beside
+        # the worker's own, nothing pushed, merged, released or removed
+        assert git(wt, "rev-parse", "HEAD") == resolved and git(wt, "status", "--porcelain") == ""
+        assert not os.path.exists(os.path.join(wt, "gate-ran"))
+        assert w.sb.remote_ref(f"refs/heads/{branch}") == resolved
+        assert w.sb.remote_ref(f"refs/heads/{w.sb.base}") == moved
+        assert w.pr(20).get("state", "open") == "open" and w.claimed_by(2) == "me"
+        assert w.orca_calls() == ["worktree ps"]
+        assert not [c for c in w.calls() if c[:2] == ["pr", "merge"]]
+
+        # the worker stops (its gate is green, its turn ended): the same call lands it
+        w.worker(output=t0 + 380, state="done", since=t0 + 380)
+        r = merge(t0 + 390)
+        assert (r["outcome"], r["synced"]) == ("merged", True), r
+        assert w.claimed_by(2) is None and "landed-meanwhile.txt" in w.remote_files(w.sb.base)
+
+
+def test_merge_does_not_wait_on_a_worker_whose_stop_report_was_lost():
+    """Busy takes both signals (ADR-0021): a runtime still reporting `working`
+    over a terminal silent past grace is a lost stop report, and a merge parked
+    on it would never land."""
+    gate = local_gate("true")
+    with world(issues=[issue(3, "ready-for-agent")]) as w:
+        with_pr(w, 3, 30)
+        t0 = int(time.time()) + 5000
+        w.worker(output=t0, state="working", since=t0 - 60)
+        assert w.afk(*_merge(3, *gate, "--now", str(t0 + 299)))["outcome"] == "worker_busy"
+        assert w.afk(*_merge(3, *gate, "--now", str(t0 + 300)))["outcome"] == "merged"
 
 
 def test_hand_back_with_no_terminal_continues_in_the_worktree_never_from_base():

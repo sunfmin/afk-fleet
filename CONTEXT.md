@@ -287,7 +287,10 @@ claim, the PR, the branch and the worktree are kept and no **retry** is spent. I
 marker comment on the PR naming the target tip; while the PR head does not contain that tip the claim
 is `handed_back` — never `awaiting_merge` — and its worker is watched like a PR-less one, so an
 unanswered hand-back is **nudged** and then failed. A worker whose terminal is gone is replaced by
-**continuation** in the same worktree, started on the hand-back (ADR-0019).
+**continuation** in the same worktree, started on the hand-back (ADR-0019). The push that answers a
+hand-back is not yet the worker's outcome: it usually pushes the merge and gates it afterwards, so a
+claim can be `awaiting_merge` with its worker still busy — and the **merge** transition stays out of
+a worktree whose worker is busy, stopping with `worker_busy` (ADR-0024).
 _Avoid_: retry (nothing is discarded), bounce, re-dispatch (the worker and its worktree are kept),
 conflict resolution (that is what the worker then does)
 

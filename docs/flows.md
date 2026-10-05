@@ -77,6 +77,9 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   `skills/afk-fleet/scripts/afk.py:cmd_hand_back` (ADR-0019). The claim is then `handed_back`, not
   awaiting merge, until the PR head contains the target tip it named
   (`skills/afk-fleet/scripts/afk_decide.py:handback_open`), and rejoins this mainline at step 10.
+- The PR is awaiting merge but its worker is still working in the worktree — it pushed its answer
+  to a hand-back and is gating it: the merge stops with `worker_busy`, nothing touched, and a later
+  tick lands it, `skills/afk-fleet/scripts/afk.py:cmd_merge` (ADR-0024).
 - The PR has no checks at all, or an adversarial verify is required: the merge stops and the tick
   decides (`--allow-no-checks`, `--verified`), `skills/afk-fleet/SKILL.md:needs_verify`.
 - A peer wins the claim race, or the claim push fails outright (an error, never a lost race):
@@ -248,7 +251,9 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 - A sync conflict is not a failure of the work: it is handed back to the worker that wrote the
   branch, spends no attempt and discards nothing, and the claim is not awaiting merge again until
   the PR head contains the target tip the hand-back named; only a hand-back the worker never answers
-  enters the retry ladder. (ADR-0019;
+  enters the retry ladder. And no merge runs into a worktree whose worker is busy, whatever the
+  claim's status. (ADR-0019, ADR-0024;
+  `test_merge_stays_out_of_a_worktree_whose_worker_is_still_working`;
   `test_hand_back_returns_a_sync_conflict_to_the_worker_that_wrote_the_branch`,
   `test_an_unanswered_hand_back_falls_through_to_the_nudge_and_then_the_retry_ladder`)
 - A wake carries no state and nothing waits on one: the cycle it opens reads GitHub like any other,
@@ -277,6 +282,7 @@ stateDiagram-v2
   awaiting_merge --> merged: synced, gate re-confirmed, squash-merged
   awaiting_merge --> ci_failed: merge-time gate red
   awaiting_merge --> handed_back: sync conflict, returned to its worker
+  awaiting_merge --> awaiting_merge: worker still busy in the worktree, merge waits
   pr_open --> handed_back: local gate mode, sync conflict at merge time
   handed_back --> awaiting_merge: worker merged the target in and pushed
   handed_back --> handed_back: worker died, continued on the hand-back

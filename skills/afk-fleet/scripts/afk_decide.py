@@ -550,8 +550,8 @@ def protection_verdict(ci_mode, protection, unavailable=None):
 
 # Every `outcome` `afk merge` can stop with — the vocabulary the tick's
 # instructions route on (a test holds the docs to it).
-MERGE_OUTCOMES = ("merged", "conflict", "handed_back", "gate_red", "awaiting_ci", "no_checks",
-                  "needs_verify")
+MERGE_OUTCOMES = ("merged", "conflict", "handed_back", "worker_busy", "gate_red", "awaiting_ci",
+                  "no_checks", "needs_verify")
 
 
 def merge_outcome(outcome):

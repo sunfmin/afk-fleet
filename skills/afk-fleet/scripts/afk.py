@@ -780,7 +780,9 @@ def cmd_no_pr(a):
     worker that stopped gets the rest gathered: the worktree's git progress, its
     `afk:verdict` marker, the standing of each issue that marker says it is blocked
     by (`blockers`), and when it was last told something (`nudged_at`,
-    `handed_back_at`).
+    `handed_back_at`). For a busy or gone worker `handed_back_at` is therefore
+    null because it was NOT READ — never evidence that no hand-back is open;
+    the claim's `status` in `afk rebuild` is what says that.
     Returns {"workers": [`afk_decide.classify_no_pr`'s outcome plus those signals
     and the `worker_state` it was read from, one per --issue, in order]}."""
     cfg = _cfg(a)
@@ -792,10 +794,7 @@ def cmd_no_pr(a):
     # HARD reads: an orca that cannot be asked is never "the worker is gone" —
     # read that way it would start a second worker beside a live one
     rows = _orca(["worktree", "list"]).get("worktrees") or []
-    ps = _orca(["worktree", "ps", "--limit", str(_PS_LIMIT)])
-    if ps.get("truncated"):
-        raise RuntimeError(f"orca worktree ps truncated at {_PS_LIMIT} rows")
-    states = {r.get("path"): r for r in ps.get("worktrees") or []}
+    states = _worker_states()
     now, grace = _now(a), cfg["worker_idle_grace_seconds"]
     workers = []
     for number in a.numbers:
@@ -803,11 +802,7 @@ def cmd_no_pr(a):
         if path is None:
             found = afk_decide.find_orca_worktree(rows, number, a.repo)["path"]
             path = found if found and os.path.isdir(found) else None
-        row = states.get(path) if path else None
-        reading = afk_decide.read_worker_state(row, now, grace)
-        if reading["terminal"] != "none" and reading["state"] is None:
-            # a runtime that reports nothing: ask orca whether its terminal is idle
-            reading = afk_decide.read_worker_state(row, now, grace, _tui_idle(path))
+        reading = _worker_reading(states, path, now, grace)
         workers.append({"issue": number,
                         **_worker_outcome(a, cfg, number, path, reading, now, grace),
                         "worker_state": reading["state"]})
@@ -816,6 +811,27 @@ def cmd_no_pr(a):
 
 # Far above any one machine's worktree count: a page that stops short is an error.
 _PS_LIMIT = 10000
+
+
+def _worker_states():
+    """Every worktree's row of `orca worktree ps`, by path — what each worker's
+    runtime reported (ADR-0021). HARD: an orca that cannot be asked is never "no
+    worker there"."""
+    ps = _orca(["worktree", "ps", "--limit", str(_PS_LIMIT)])
+    if ps.get("truncated"):
+        raise RuntimeError(f"orca worktree ps truncated at {_PS_LIMIT} rows")
+    return {r.get("path"): r for r in ps.get("worktrees") or []}
+
+
+def _worker_reading(states, path, now, grace):
+    """`afk_decide.read_worker_state` for the worker in the worktree at `path`
+    (None: this machine has no worktree, so no worker), from `_worker_states`."""
+    row = states.get(path) if path else None
+    reading = afk_decide.read_worker_state(row, now, grace)
+    if reading["terminal"] != "none" and reading["state"] is None:
+        # a runtime that reports nothing: ask orca whether its terminal is idle
+        reading = afk_decide.read_worker_state(row, now, grace, _tui_idle(path))
+    return reading
 
 
 def _worker_outcome(a, cfg, number, path, reading, now, grace):
@@ -1347,6 +1363,9 @@ def cmd_merge(a):
       handed_back   an earlier conflict on this PR is with its worker and the PR
                     head does not contain the target tip it named yet. Nothing was
                     touched; leave it (`afk no-pr` watches the worker).
+      worker_busy   the worker is still working in the PR's worktree — typically it
+                    pushed the answer to a hand-back and is now running the gate on
+                    it. Nothing was touched; leave it, a later tick merges.
       gate_red      local mode: the merge-time gate was red (its excerpt is now a
                     PR comment). required mode: the PR's checks are red. → `afk fail`.
       awaiting_ci   required mode: checks pending, or the sync just pushed and CI
@@ -1378,6 +1397,11 @@ def cmd_merge(a):
 
     # --- the branch's worktree: the worker's, else one recreated at the PR head ---
     path = _live_worktree(a.repo, a.number)
+    if path and _worker_reading(_worker_states(), path, _now(a),
+                                cfg["worker_idle_grace_seconds"])["terminal"] == "busy":
+        return stop("worker_busy", worktree=path,
+                    detail="the worker is still working in this PR's worktree — a head it "
+                           "pushed is not its outcome until it stops; nothing was touched")
     recreated = path is None
     if recreated:
         path, _, pr_tip = _create_worktree(a, cfg, rem, _issue(a.repo, a.number), branch)
