@@ -62,6 +62,8 @@ CONFIG_DEFAULTS = {
         "target": "main",
         "sync_before_merge": True,
         "delete_branch": True,
+        "batch": False,
+        "batch_fix_rounds": 2,
     },
     # failure handling
     "retry": 2,
@@ -80,14 +82,14 @@ CONFIG_DEFAULTS = {
 
 
 # The two places claim + heartbeat refs can live, as namespace → (claim ref prefix,
-# heartbeat ref prefix). `refs/afk` is hidden from branch listings and `on: push`
+# heartbeat ref prefix, merge-batch record prefix). `refs/afk` is hidden from branch listings and `on: push`
 # CI; `refs/heads` is the fallback for a remote whose rules forbid non-branch refs,
 # where the same markers are ordinary `afk-claim/*` / `afk-heartbeat/*` branches
 # (ADR-0003). A closed set: any other prefix would be a third layout no probe,
 # warning or doc describes.
 CLAIM_NAMESPACES = {
-    "refs/afk": ("refs/afk/claim", "refs/afk/heartbeat"),
-    "refs/heads": ("refs/heads/afk-claim", "refs/heads/afk-heartbeat"),
+    "refs/afk": ("refs/afk/claim", "refs/afk/heartbeat", "refs/afk/batch"),
+    "refs/heads": ("refs/heads/afk-claim", "refs/heads/afk-heartbeat", "refs/heads/afk-batch"),
 }
 BRANCH_NAMESPACE = "refs/heads"
 
@@ -150,6 +152,19 @@ def validate_config(cfg):
     if strategy not in MERGE_STRATEGIES:
         raise ValueError(f"config merge.strategy: expected one of "
                          f"{' | '.join(MERGE_STRATEGIES)}, got {strategy!r}")
+    merge = cfg.get("merge") or {}
+    if merge.get("batch"):
+        if ci != "local":
+            raise ValueError("config merge.batch: a merge batch lands behind ONE run of "
+                             "gate.local_command, so it needs gate.ci: 'local' (ADR-0027) — with "
+                             "gate.ci: 'required' GitHub's own merge queue is the tool. Set "
+                             "gate.ci to 'local' or leave this false")
+        if strategy != "squash":
+            raise ValueError("config merge.batch: a batch lands one squash commit per PR, so it "
+                             f"needs merge.strategy: 'squash', not {strategy!r} (ADR-0027)")
+        if int(merge.get("batch_fix_rounds", 0)) < 0:
+            raise ValueError("config merge.batch_fix_rounds: expected 0 or more — 0 abandons a "
+                             "red batch at once")
     return cfg
 
 
@@ -422,11 +437,12 @@ def classify_claims(claims, heartbeats, me, now, ttl):
 
 # Every `status` a `mine` row can carry — what `subclassify_pr` returns, and the
 # vocabulary the tick's instructions route on (a test holds the docs to it).
-CLAIM_STATUSES = ("awaiting_merge", "queued", "awaiting_ci", "failure", "handed_back", "no_pr",
-                  "closed")
+CLAIM_STATUSES = ("awaiting_merge", "queued", "batched", "awaiting_ci", "failure", "handed_back",
+                  "no_pr", "closed")
 
 
-def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=False, queued=False):
+def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=False, queued=False,
+                   batched=False):
     """
     Classify one of MY in-flight claims from its PR + checks → `(status,
     board_phase)`: what the tick does next, and what the status board shows a human
@@ -443,6 +459,9 @@ def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=Fals
       queued:       the PR waits behind a handed-back PR ahead of it in the merge
                     queue (`waits_behind`). Only a claim that would otherwise be
                     `awaiting_merge` is ever `queued`: it is the merge that waits
+      batched:      the PR is in this fleet's open merge batch (`batch_record`):
+                    it lands with the batch, never through `afk merge`. Like
+                    `queued`, only a claim that would otherwise be `awaiting_merge`
 
       status           the tick…                                board_phase
       closed           releases the leftover claim               None (not re-rendered)
@@ -457,6 +476,8 @@ def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=Fals
                        remote checks say)                        checks: pr_open)
       queued           leaves it: its turn comes when the PR     queued
                        it is behind has merged
+      batched          runs `afk batch`, which resumes the       None (`afk batch`
+                       batch it is in — never `afk merge`        writes the board)
 
     In `local` mode (ADR-0012) there are no checks to wait on: gating is an
     **action the tick takes at merge time** (sync → re-run the local gate → merge),
@@ -483,6 +504,8 @@ def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=Fals
         # hit the same conflict and hand it back again, every cycle
         return "handed_back", "handed_back"
     if ci_mode == "local" or checks_state in ("green", None):
+        if batched:
+            return "batched", None
         if queued:
             return "queued", "queued"
         gated = ci_mode != "local" and checks_state == "green"
@@ -571,7 +594,7 @@ def gate_record_void(record, head, command):
     return None
 
 
-def protection_verdict(ci_mode, protection, unavailable=None):
+def protection_verdict(ci_mode, protection, unavailable=None, batch=False):
     """
     Is the merge target's branch protection compatible with the configured gate?
     Read at bootstrap, with the human present (ADR-0012).
@@ -580,6 +603,7 @@ def protection_verdict(ci_mode, protection, unavailable=None):
       protection:  the target branch's protection object, or None if it has none
       unavailable: why protection could not be read (no admin rights, an API
                    error); None when the read succeeded
+      batch:       merge.batch — a merge batch lands by PUSHING to the target
 
     Returns {"verdict": "ok"|"error"|"warn", "required_checks": [...], "detail"}.
 
@@ -588,6 +612,9 @@ def protection_verdict(ci_mode, protection, unavailable=None):
              `--admin` — also overrides human review, far too much power for an
              unattended fleet. So this is a hard error at bootstrap, not a
              surprise on the first merge.
+             Also `merge.batch` + a target that refuses a direct push — it
+             requires pull requests, restricts who may push, or is locked: a
+             green batch could never land (ADR-0027).
       warn   the probe itself was inconclusive: continue, but say so.
       ok     nothing incompatible. In `required` mode required checks are exactly
              what the fleet waits for, so they are never a problem.
@@ -610,14 +637,35 @@ def protection_verdict(ci_mode, protection, unavailable=None):
                 "detail": "gate.ci is 'local' but the target branch requires status checks "
                           f"({', '.join(sorted(checks))}) — every merge would be rejected. Either "
                           f"drop the required checks on that branch or use gate.ci: required."}
+    refused = direct_push_refused(protection) if batch else []
+    if refused:
+        return {"verdict": "error", "required_checks": [],
+                "detail": "merge.batch is on but the target branch refuses a direct push "
+                          f"({'; '.join(refused)}) — a merge batch lands as a fast-forward push, "
+                          f"so no batch could ever land. Either lift that rule on the branch or "
+                          f"set merge.batch: false."}
     return {"verdict": "ok", "required_checks": [],
             "detail": "target branch requires no status checks — a local gate can merge"}
 
 
+def direct_push_refused(protection):
+    """Why a branch's protection would refuse a direct push — what a merge batch
+    lands by (ADR-0027) — as a list of reasons, empty when nothing in it does.
+    `protection` is the branch-protection object, None for an unprotected branch."""
+    prot, why = protection or {}, []
+    if prot.get("required_pull_request_reviews") is not None:
+        why.append("it requires pull requests")
+    if prot.get("restrictions") is not None:
+        why.append("it restricts who may push")
+    if (prot.get("lock_branch") or {}).get("enabled"):
+        why.append("it is locked")
+    return why
+
+
 # Every `outcome` `afk merge` can stop with — the vocabulary the tick's
 # instructions route on (a test holds the docs to it).
-MERGE_OUTCOMES = ("merged", "conflict", "handed_back", "queued", "worker_busy", "gate_red", "awaiting_ci",
-                  "no_checks", "needs_verify")
+MERGE_OUTCOMES = ("merged", "conflict", "handed_back", "queued", "batched", "worker_busy",
+                  "gate_red", "awaiting_ci", "no_checks", "needs_verify")
 
 
 def merge_outcome(outcome):
@@ -1056,14 +1104,14 @@ STALL_TAIL_LINES = 30
 _STALL_LINE_CHARS = 200
 
 
-def nudge_text(brief=None):
+def nudge_text(brief=None, finish="finish with a PR or an afk:verdict marker comment"):
     """The one line `afk nudge` types at a worker that stopped without an outcome.
     Short on purpose: a long text arrives as a paste the worker asks to have
-    confirmed, which is the stall this is sent to break."""
+    confirmed, which is the stall this is sent to break. `finish` names the
+    outcome it owes — a merge batch's fix worker owes a commit, not a PR."""
     task = f"your task brief ({brief})" if brief else "your task"
     return (f"You stopped without an outcome. Nobody is watching this terminal, so do not wait "
-            f"for a confirmation or an answer: continue {task} to the end, and finish with a PR "
-            f"or an afk:verdict marker comment.")
+            f"for a confirmation or an answer: continue {task} to the end, and {finish}.")
 
 
 def stall_tail(lines, limit=STALL_TAIL_LINES):
@@ -1232,6 +1280,8 @@ def freed_by(landed_pr, changed_files, ahead):
     """
     Does the landing of PR `landed_pr` free a PR that was queued behind it?
 
+      landed_pr:     the PR that lands — or the PRs, when a merge batch lands
+                     several at once
       changed_files: the paths the waiting PR changes
       ahead:         `queue_ahead` of its entry, read BEFORE the landing
 
@@ -1239,8 +1289,304 @@ def freed_by(landed_pr, changed_files, ahead):
     nothing: a PR that also overlaps another handed-back PR ahead of it is still
     queued, and merging it now would resolve against a tip about to move.
     """
-    rest = [e for e in ahead if e["pr"] != landed_pr]
-    return waits_behind(changed_files, ahead) == landed_pr and waits_behind(changed_files, rest) is None
+    landed = {landed_pr} if isinstance(landed_pr, int) else set(landed_pr)
+    rest = [e for e in ahead if e["pr"] not in landed]
+    return waits_behind(changed_files, ahead) in landed and waits_behind(changed_files, rest) is None
+
+
+# --------------------------------------------------------------------------- #
+# The merge batch — N ready PRs land behind one local gate run (ADR-0027)      #
+# --------------------------------------------------------------------------- #
+#
+# With `merge.batch` on, the PRs that are ready to merge and do not conflict
+# with each other are STACKED on the target tip — one squash commit per PR, in
+# merge order, in a worktree of the batch's own — and the local gate runs once
+# on the stack. Green: the stack is pushed to the target as a fast-forward, and
+# that push is the only lock. Red: nothing lands, and a worker is started in the
+# batch's worktree to make the stack green with one more commit on top.
+#
+# A batch outlives the tick that formed it, so it is on record: ONE ref per
+# fleet instance, beside its claims, whose marker commit says who is in it and
+# how far it got:
+#
+#   afk-batch instance=<id> ts=<epoch> phase=<gating|landing|fixing> round=<k>
+#             runs=<g> base=<sha> head=<sha> issues=<csv> prs=<csv> branch=<name>
+#
+# `base` is the target tip the stack was built on, `head` the stack head the
+# phase is about (being gated / gated green / gated red), `ts` when that phase
+# began, `round` the fix rounds started, `runs` the gate runs made, `branch` the
+# batch worktree's branch — how the worktree is found again. The record is
+# deleted when the batch ends, whichever way.
+
+# gating: the gate is running on `head` (or a tick died while it was);
+# landing: the gate passed on `head` — pushing it, then finishing each PR;
+# fixing: the gate was red on `head` and a fix worker is at it.
+BATCH_PHASES = ("gating", "landing", "fixing")
+
+# Every `outcome` `afk batch` can stop with — the vocabulary the tick's
+# instructions route on (a test holds the docs to it).
+BATCH_OUTCOMES = ("none", "landed", "fixing", "abandoned", "voided")
+
+# Why a PR of mine that is open is NOT in the batch being formed.
+BATCH_LEFT_OUT = {
+    "handed_back": "a sync conflict on it is with its worker",
+    "queued": "it waits behind a handed-back PR in the merge queue",
+    "worker_busy": "its worker is still working in its worktree",
+    "needs_verify": "it still owes an adversarial verify of its head",
+    "abandoned_batch": "a batch holding this head was abandoned — it merges on its own",
+    "conflict": "it conflicts with the stack so far",
+    "no_changes": "it changes nothing against the stack so far",
+    "moved": "its head moved while the batch was forming",
+}
+
+_BATCH_INTS = ("ts", "round", "runs")
+_BATCH_LISTS = ("issues", "prs")
+
+
+def batch_worktree_name(instance):
+    """The NAME hint a batch's worktree is created under (orca derives the real
+    branch from it, and the record keeps that branch — ADR-0005)."""
+    return f"afk-batch-{instance}"
+
+
+def _batch_branch_re(instance):
+    return re.compile(r"^(?:[^/]+/)?%s(?:-\d+)?$" % re.escape(batch_worktree_name(instance)))
+
+
+def _batch_rows(worktrees, repo):
+    """The orca worktree rows that could be a batch's: this repo's, not the main
+    checkout, not archived."""
+    return [w for w in worktrees or []
+            if not (w.get("isMainWorktree") or w.get("isArchived"))
+            and (not repo or w.get("projectId") == f"github:{repo}")]
+
+
+def find_batch_worktree(worktrees, branch, repo=None):
+    """The path of the worktree on THIS machine whose branch is the one a batch
+    record names, from `orca worktree list`'s rows; None when there is none."""
+    for w in _batch_rows(worktrees, repo):
+        if short_branch(w.get("branch")) == branch:
+            return w.get("path") or None
+    return None
+
+
+def batch_worktrees(worktrees, instance, repo=None):
+    """The paths of every worktree on this machine cut for a batch of `instance`
+    (orca suffixes a reused name, so there can be several) — what a new batch
+    sweeps away before it cuts its own: a batch that ended left none, so any
+    still here is a dead one's."""
+    rx = _batch_branch_re(instance)
+    return [w["path"] for w in _batch_rows(worktrees, repo)
+            if w.get("path") and rx.match(short_branch(w.get("branch")))]
+
+
+def batch_marker_fields(record):
+    """A batch record as the `key=value` tokens of its marker commit, after the
+    `instance` and `ts` every marker carries — what `batch_record` reads back."""
+    if record["phase"] not in BATCH_PHASES:
+        raise ValueError(f"not a batch phase: {record['phase']!r}")
+    return [f"phase={record['phase']}", f"round={int(record['round'])}",
+            f"runs={int(record['runs'])}", f"base={record['base']}", f"head={record['head']}",
+            f"issues={','.join(str(n) for n in record['issues'])}",
+            f"prs={','.join(str(n) for n in record['prs'])}", f"branch={record['branch']}"]
+
+
+def batch_record(marker):
+    """
+    A parsed marker commit ({key: value}, `ts` already an int) → the batch record
+    {"instance", "ts", "phase", "round", "runs", "base", "head", "issues": [n…],
+    "prs": [n…], "branch"}, or None when it is not a batch record this code
+    wrote: no ref, a marker of another kind, a phase it does not know, or
+    members that do not pair up. None is "no batch is open" — the safe side: its
+    PRs then merge one at a time.
+    """
+    if not isinstance(marker, dict) or marker.get("phase") not in BATCH_PHASES:
+        return None
+    out = {"instance": marker.get("instance"), "phase": marker["phase"],
+           "base": marker.get("base"), "head": marker.get("head"), "branch": marker.get("branch")}
+    try:
+        for key in _BATCH_INTS:
+            out[key] = int(marker.get(key, 0))
+        for key in _BATCH_LISTS:
+            out[key] = [int(x) for x in str(marker.get(key, "")).split(",") if x]
+    except (TypeError, ValueError):
+        return None
+    whole = out["instance"] and out["base"] and out["head"] and out["branch"]
+    if not whole or not out["issues"] or len(out["issues"]) != len(out["prs"]):
+        return None
+    return out
+
+
+def batch_candidates(rows, verify=False, verified=()):
+    """
+    Which of my open PRs may be stacked into a batch, before any of them is.
+
+      rows:     one per claim of MINE with an open PR, in merge order (`queue_order`)
+                — a peer's PR is never a row: {"issue", "pr", "head", "handed_back"
+                (its hand-back is unanswered), "behind" (the PR it is queued
+                behind, or None), "busy" (its worker is still working in its
+                worktree), "barred" (a batch holding this head was abandoned)}
+      verify:   gate.adversarial_verify
+      verified: the heads an adversarial verify passed (`afk batch --verified`)
+
+    Returns (eligible rows, left_out) — `left_out` is [{"issue", "pr", "reason":
+    a key of BATCH_LEFT_OUT, "detail"}...], in merge order. Fewer than two
+    eligible is no batch: the caller forms none.
+    """
+    eligible, left_out = [], []
+    for row in rows:
+        if row.get("handed_back"):
+            reason = "handed_back"
+        elif row.get("behind"):
+            reason = "queued"
+        elif row.get("busy"):
+            reason = "worker_busy"
+        elif row.get("barred"):
+            reason = "abandoned_batch"
+        elif verify and row.get("head") not in set(verified or ()):
+            reason = "needs_verify"
+        else:
+            eligible.append(row)
+            continue
+        left_out.append(batch_left_out(row, reason))
+    return eligible, left_out
+
+
+def batch_left_out(row, reason, files=()):
+    """One `left_out` row of a batch outcome: who, and why (BATCH_LEFT_OUT)."""
+    out = {"issue": row["issue"], "pr": row["pr"], "reason": reason,
+           "detail": BATCH_LEFT_OUT[reason]}
+    if files:
+        out["files"] = list(files)
+    return out
+
+
+def squash_message(title, pr, issue):
+    """The message of the one commit a batched PR lands as — shaped like the one
+    `gh pr merge --squash` writes, so the target's history reads the same
+    whichever way a PR landed: the PR's title, its number, a closing keyword."""
+    return f"{(title or '').strip() or f'PR #{pr}'} (#{pr})\n\nCloses #{issue}\n"
+
+
+def batch_after_red(round_, rounds):
+    """What a red gate on the stack leads to: "fix" — start a fix worker, as round
+    `round_ + 1` — while fix rounds remain, else "abandon" (`merge.batch_fix_rounds`)."""
+    return "fix" if int(round_) < int(rounds) else "abandon"
+
+
+# What `afk batch` does about a batch under repair, on each call.
+BATCH_FIX_ROUTES = ("leave", "gate", "nudge", "next_round", "abandon")
+
+
+def batch_fix_route(terminal, moved, clean, descends, watch):
+    """
+    What becomes of a batch under repair, from where its fix worker is.
+
+      terminal: the fix worker's terminal — "busy" | "idle" | "none"
+      moved:    the batch worktree's HEAD is no longer the head the gate was red on
+      clean:    the worktree has nothing uncommitted or untracked
+      descends: that HEAD contains the red head — the fix was added on top
+      watch:    `classify_no_pr`'s `action` for the worker, read with no verdict
+                (a fix worker posts none): leave | nudge | next_attempt | orphan
+
+    Returns (route, reason), route one of BATCH_FIX_ROUTES:
+      leave       the worker is at it, or within grace of its last sign of life.
+      gate        it stopped on a committed fix on top of the stack: gate again.
+      nudge       it stopped with no fix and was never nudged (ADR-0018).
+      next_round  its terminal is gone with no fix: another worker, another round.
+      abandon     it stayed silent after its nudge — or rewrote the stack instead
+                  of adding to it, so what was squashed per PR is no longer there.
+    A pushed or committed head is not the worker's outcome until it stops
+    (ADR-0024), so a busy worker is left whatever the worktree holds.
+    """
+    if terminal == "busy":
+        return "leave", "the fix worker is still working"
+    if moved and not descends:
+        return "abandon", "the fix worker rewrote the stack instead of adding a commit on top"
+    if moved and clean:
+        return "gate", "the fix worker stopped on a committed fix"
+    if watch == "leave":
+        return "leave", "the fix worker stopped moments ago — within grace"
+    if watch == "nudge":
+        return "nudge", "the fix worker stopped without a committed fix"
+    if watch == "orphan":
+        return "next_round", "the fix worker's terminal is gone and it left no committed fix"
+    return "abandon", "the fix worker stayed silent after its nudge"
+
+
+_BATCH_ABANDONED_RE = re.compile(r"<!--\s*afk:batch-abandoned\b(.*?)-->", re.DOTALL)
+
+
+def batch_abandoned_comment(head, prs, reason, at):
+    """The PR comment an abandoned batch leaves on each PR that was in it: the
+    marker `batch_barred` reads back, then why, worded for a human."""
+    others = "、".join(f"#{n}" for n in prs)
+    return (f"<!--afk:batch-abandoned head={head} at={int(at)}-->\n"
+            f"**afk-fleet: the merge batch holding this PR was abandoned — nothing landed.** "
+            f"It was stacked with PRs {others} and the local gate could not be made green on "
+            f"the stack: {reason}. This PR now merges on its own, behind its own gate run; it "
+            f"is not put in a batch again while its head is `{head[:12]}`.")
+
+
+def batch_barred(comments, head):
+    """Was a batch holding this PR at `head` abandoned? `comments` are the PR's
+    ([{"body"}...]). The bar is the head's: a PR whose head has moved since is a
+    different tree, and may be batched again."""
+    for c in comments or []:
+        m = _BATCH_ABANDONED_RE.search(c.get("body") or "")
+        if m and dict(t.split("=", 1) for t in m.group(1).split() if "=" in t).get("head") == head:
+            return True
+    return False
+
+
+def batch_landed_comment(commit, target, prs, fixes=0):
+    """The comment a batched PR is closed with: GitHub shows it as closed, not
+    merged, so this is what says it landed, and as which commit."""
+    others = "、".join(f"#{n}" for n in prs)
+    fixed = (f" The gate was red on the stack at first; {fixes} fix commit(s) on top of it made "
+             f"it green and landed with it.") if fixes else ""
+    return (f"**afk-fleet: landed in a merge batch.** This PR is on `{target}` as `{commit}` — "
+            f"one squash commit, pushed together with PRs {others} behind one run of the local "
+            f"gate on the whole stack.{fixed} GitHub shows the PR as closed rather than merged "
+            f"because the commit was pushed to `{target}`, not merged through the PR; nothing "
+            f"was discarded.")
+
+
+BATCH_FIX_FIELDS = ("repo", "target", "worktree_path", "branch", "local_command", "afk_path",
+                    "launcher_terminal", "round", "rounds", "prs", "excerpt")
+
+
+def render_batch_fix(template, fields):
+    """
+    The brief of a merge batch's fix worker: the template's `batch_fix` block.
+
+      fields: {name: value} for every one of BATCH_FIX_FIELDS — `prs` a list of
+              {"pr", "issue", "title", "commit"} in stack order, `excerpt` the red
+              gate's log tail
+
+    Raises ValueError on a missing field or a placeholder left unfilled, like
+    every other brief; the free text (titles, the excerpt) goes in last.
+    """
+    missing = [k for k in BATCH_FIX_FIELDS if k not in fields]
+    if missing:
+        raise ValueError(f"batch fix brief: missing field(s) {', '.join(missing)}")
+    text = _prompt_blocks(template)("batch_fix")
+    values = {k: str(fields[k]) for k in ("repo", "target", "worktree_path", "branch", "round",
+                                          "rounds")}
+    values["gate_command"] = gate_command(str(fields["afk_path"]), str(fields["local_command"]))
+    values["local_command"] = str(fields["local_command"]).strip() or _NO_LOCAL_COMMAND
+    values["wake_command"] = wake_command(fields["launcher_terminal"], "batch")
+    free_text = {"prs": "\n".join(f"- `{p['commit'][:12]}` PR #{p['pr']} (issue #{p['issue']}) — "
+                                  f"{p['title']}" for p in fields["prs"]),
+                 "excerpt": str(fields["excerpt"]).strip() or "(the gate printed nothing)"}
+    for name, value in values.items():
+        text = text.replace("{" + name + "}", value)
+    left = sorted(set(re.findall(r"\{[a-z_]+\}", text)) - {"{%s}" % k for k in free_text})
+    if left:
+        raise ValueError(f"batch fix brief: unfilled placeholder(s) {', '.join(left)}")
+    for name, value in free_text.items():
+        text = text.replace("{" + name + "}", value)
+    return text.strip() + "\n"
 
 
 # --------------------------------------------------------------------------- #
@@ -1702,9 +2048,10 @@ _STATUS_STEPS = (
 # The closed set of lifecycle phases the board renders, each with everything the
 # board says about it: how far along the happy path it has reached (the index of
 # the last DONE step) and its single ▸/✅/⚠️ 'where are we now' line. Happy path
-# plus six off-ramps that reuse the same checkboxes + an annotation: ci_failed,
+# plus eight off-ramps that reuse the same checkboxes + an annotation: ci_failed,
 # handed_back (a sync conflict returned to the worker — `afk hand-back`), queued
-# (waiting its turn in the merge queue behind a handed-back PR), escalated
+# (waiting its turn in the merge queue behind a handed-back PR), batch_gating and
+# batch_fixing (in a merge batch whose stack is being gated / repaired), escalated
 # (a terminal give-up, ticked specially in `render_status_board`), closed (the
 # worker found the issue already satisfied — `afk close`), and parked (the worker
 # found an open dependency; the claim is released until it closes — `afk park`).
@@ -1715,6 +2062,8 @@ _PHASES = {
     "ci_failed":      (1, "▸ 当前:{gate} 失败,修复重试中({attempt}/{retry_max}) —— 见下方 {gate} 与评论"),
     "handed_back":    (1, "▸ 当前:与目标分支同步冲突,已交还 worker 解决 —— 见 PR 评论"),
     "queued":         (1, "▸ 当前:排队等合并 —— 等 PR #{behind} 先合并(改动与它的同步冲突文件重叠),轮到后自动继续"),
+    "batch_gating":   (1, "▸ 当前:在合并批次中(PR {batch})—— 整批只跑一次 {gate},绿了一起合并"),
+    "batch_fixing":   (1, "▸ 当前:在合并批次中(PR {batch})—— 整批 {gate} 未过,worker 正在批次里修复,修好后一起合并"),
     "awaiting_merge": (2, "▸ 当前:门已绿,待合并"),
     "merged":         (3, "✅ 已合并,完成"),
     "escalated":      (1, "⚠️ 已升级给人处理 —— 见下方评论"),
@@ -1722,10 +2071,14 @@ _PHASES = {
     "parked":         (_NOTHING_REACHED, "⏸ 等待依赖 {blockers} 关闭 —— 关闭后自动重新派发,无需人工处理"),
 }
 STATUS_PHASES = tuple(_PHASES)
+# The phases of a PR in a merge batch, by the batch's own phase. `afk batch`
+# writes these boards itself — a tick's render pass never does (a `batched` row
+# has no `board_phase`).
+BATCH_BOARD_PHASES = {"gating": "batch_gating", "landing": "batch_gating", "fixing": "batch_fixing"}
 
 
 def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attempt=0,
-                        blocked_by=(), behind=None):
+                        blocked_by=(), behind=None, batch=()):
     """
     Render the human-facing progress *status board* comment body. Pure: a function
     of the discrete lifecycle state the tick already derived from fleet state; no
@@ -1741,6 +2094,8 @@ def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attem
       attempt:   the claim's current attempt (`current_attempt`)
       blocked_by: the open blockers the issue waits on, for parked only
       behind:    the PR number this one waits behind, for queued only
+      batch:     the PR numbers of the merge batch this one is in, for the two
+                 batch phases only
 
     Returns the full markdown body, led by STATUS_MARKER (the find-or-create anchor).
     """
@@ -1748,6 +2103,8 @@ def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attem
         raise ValueError(f"unknown status phase: {phase!r}")
     if phase == "queued" and not behind:
         raise ValueError("a queued status board names the PR it waits behind")
+    if phase in BATCH_BOARD_PHASES.values() and not batch:
+        raise ValueError("a batched status board names the batch's PRs")
     gate = GATE_CI_MODES[gate_ci]
     reached, current = _PHASES[phase]
     escalated = phase == "escalated"
@@ -1764,7 +2121,8 @@ def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attem
         lines.append(f"- [{'x' if done(i, key) else ' '}] {label}")
     lines.append("")
     lines.append(current.format(gate=gate, attempt=attempt, retry_max=retry_max, behind=behind,
-                                blockers="、".join(f"#{n}" for n in blocked_by)))
+                                blockers="、".join(f"#{n}" for n in blocked_by),
+                                batch="、".join(f"#{n}" for n in batch)))
     return "\n".join(lines)
 
 
@@ -2250,7 +2608,7 @@ def superseded_prs(prs, number, branch_pattern):
 
 
 def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, config,
-                         closed=(), handed_back=(), queued=None, merge_queue=()):
+                         closed=(), handed_back=(), queued=None, merge_queue=(), batch=None):
     """
     The tick's whole working set from the raw observables. Pure — afk.py's
     `rebuild` gathers, this assembles, and a fixture pins the join.
@@ -2277,12 +2635,15 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
                    waits its turn in the merge queue (`waits_behind`)
       merge_queue: the issue numbers of every claim's open PR in merge order
                    (`queue_order`); a claim missing from it keeps `mine`'s order
+      batch:       MY open merge batch (`batch_record`), None when there is none.
+                   Its issues' rows are `batched`
 
     Returns:
       {"frontier": {"dispatch": [{"number","title"}...], "excluded": [...]},
        "mine": [{"number","title","status","board_phase","pr","checks",
                  "attempt","behind"}...],
        "merge_order": [number...],   # the `awaiting_merge` rows, in the order to merge
+       "batch": {"phase","round","issues","prs"} | None,   # my open merge batch
        "peer_live": [{"number","instance"}...],
        "stale": [{"number","instance","sha"}...],   # sha feeds reclaim --expect-sha
        "stale_closed": [{"number","instance","sha"}...],  # sha feeds release --expect-sha
@@ -2317,6 +2678,7 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
                  "sha": by_claim.get(n, {}).get("sha")} for n in numbers]
 
     queued = queued or {}
+    batched = set((batch or {}).get("issues") or ())
     mine = []
     for n in part["mine"]:
         pr = pr_for.get(n)
@@ -2325,7 +2687,8 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
         status, board_phase = subclassify_pr(pr is not None, checks, ci_mode,
                                              closed=n in closed,
                                              handed_back=n in set(handed_back),
-                                             queued=n in queued)
+                                             queued=n in queued,
+                                             batched=n in batched)
         mine.append({"number": n, "title": issue.get("title"),
                      "status": status, "board_phase": board_phase,
                      "pr": pr.get("number") if pr else None, "checks": checks,
@@ -2337,6 +2700,8 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
     return {"frontier": frontier,
             "mine": mine,
             "merge_order": sorted(ready, key=lambda n: (place.get(n, len(place)), ready.index(n))),
+            "batch": ({k: batch[k] for k in ("phase", "round", "issues", "prs")}
+                      if batch else None),
             "peer_live": [{"number": n, "instance": by_claim.get(n, {}).get("instance")}
                           for n in part["peer_live"]],
             "stale": stale_rows(n for n in part["stale"] if n not in closed),

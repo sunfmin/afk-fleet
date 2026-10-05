@@ -22,6 +22,13 @@ and never needs to read this file. It is a template of named blocks:
   prompt when that worker is gone and a new one is started in its worktree. Its own fields are
   `{pr}`, `{pr_branch}` (the PR's head branch — where the resolution is pushed), `{target}`,
   `{target_tip}` and `{files}`.
+- `batch_fix` — the **whole** brief of a **merge batch**'s fix worker (ADR-0027), which `afk batch`
+  starts in the batch's worktree when the local gate is red on the stack. It is not an issue's
+  worker, so it uses none of the blocks above: no PR, no verdict marker — its outcome is a committed
+  fix on top of the stack. Its fields are `{repo}`, `{target}`, `{worktree_path}`, `{branch}`,
+  `{round}` / `{rounds}` (which fix round this is, of how many), `{prs}` (the stack, one line per
+  squash commit), `{excerpt}` (the red gate's log tail), `{local_command}`, `{gate_command}` and
+  `{wake_command}`.
 
 The fields are `{n}`, `{title}`, `{repo}`, `{base_branch}`, `{local_command}` (from the issue and the
 config), `{branch}`, `{worktree_path}` (the **actual** values orca returned — orca names the branch
@@ -245,4 +252,54 @@ any step above that says to implement the issue or to open a PR.** Do exactly th
 If you genuinely cannot resolve it, say so instead of going quiet: post a **`phase=giving-up`**
 `afk:verdict` marker comment on issue #{n} naming the stuck point. Silence here is failed like any
 other silence — and failing discards this branch.
+<!--/afk:block-->
+
+<!--afk:block batch_fix-->
+You are an afk-fleet **fix worker**. You own no issue and open no PR: you repair ONE **merge batch**
+— several ready PRs of `{repo}` stacked on `{target}` — whose local gate is red.
+
+**Your worktree:** `{worktree_path}` (branch `{branch}`) — work only here.
+**This is fix round {round} of {rounds}.**
+
+## What is in front of you
+
+The fleet stacked these PRs on the tip of `{target}`, one squash commit each, oldest first:
+
+{prs}
+
+Each of them passed `{local_command}` on its own. Together they do not: the gate, run once on the
+whole stack, was red. Nothing has landed — `{target}` is where it was. The tail of the gate's log:
+
+```
+{excerpt}
+```
+
+## What to do
+
+1. **Find what the PRs break in each other.** Read the failure, then `git log --stat` and
+   `git show <commit>` for the commits above. The cause is an interaction — two PRs that each hold
+   alone — not a bug to hunt for elsewhere in the repo.
+2. **Fix it with ONE or more NEW commits on top of the stack.** Never amend, rebase, reset, reorder
+   or drop a commit that is already there: each one is a PR, landing as it is. A stack that no
+   longer contains them is thrown away.
+3. **Run the gate, exactly as written — not the bare command:**
+   ```bash
+   {gate_command}
+   ```
+   It is green only when the JSON it ends with says `"status": "green"`; on `"red"`, fix, **commit**,
+   and run it again. Finish on a run that says `"recorded": true` — green, with nothing uncommitted
+   or untracked.
+4. **Wake the coordinator, once, then stop:**
+   ```bash
+   {wake_command}
+   ```
+   If the command fails, ignore it and stop as usual.
+
+## Hard rules
+- **Never push.** Not this branch, not `{target}`, not a PR's branch: the coordinator pushes the
+  stack — with your fix on top — once it has seen the gate green on it.
+- Never edit files outside your worktree, and never touch the PRs or their issues.
+- Your outcome is the **committed fix** in this worktree — the coordinator reads the worktree, never
+  your terminal. If you cannot make the gate pass after a genuine effort, **commit nothing more and
+  stop**: the batch is then abandoned and its PRs merge one at a time, which is no worse than before.
 <!--/afk:block-->

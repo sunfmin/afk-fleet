@@ -18,8 +18,9 @@ injected, fixture-tested). This file only gathers their inputs — git refs, a
 worktree's git, gh, orca, the login shell — and applies their effects.
 
 The tick's Act half is transitions, not recipes (ADR-0017): `dispatch` starts a
-worker, `merge` lands a PR, `hand-back` returns a sync conflict to its worker,
-`fail` / `escalate` / `park` / `close` settle a claim. Each
+worker, `merge` lands a PR, `batch` lands several behind one gate run,
+`hand-back` returns a sync conflict to its worker, `fail` / `escalate` / `park` /
+`close` settle a claim. Each
 performs its whole ordered sequence in one process, so an invariant like "relabel
 before release" or "start from the fetched base tip" is code, not a paragraph.
 
@@ -108,11 +109,13 @@ def _gh(args, check=True):
     return p
 
 
-def _marker_commit(kind, instance, ts, host=None):
+def _marker_commit(kind, instance, ts, host=None, extra=()):
     """A parentless commit on the empty tree whose subject is the marker
-    `<kind> instance=<id> [host=<host>] ts=<epoch>` (`_parse_marker` reads it
-    back). Its sha is what we push to a ref; it drags no repo history along."""
-    parts = [kind, f"instance={instance}", *([f"host={host}"] if host else []), f"ts={int(ts)}"]
+    `<kind> instance=<id> [host=<host>] ts=<epoch> [<key>=<value>…]`
+    (`_parse_marker` reads it back). Its sha is what we push to a ref; it drags
+    no repo history along."""
+    parts = [kind, f"instance={instance}", *([f"host={host}"] if host else []), f"ts={int(ts)}",
+             *extra]
     empty_tree = _git(["hash-object", "-t", "tree", "/dev/null"]).stdout.strip()
     return _git(["commit-tree", empty_tree, "-m", " ".join(parts)]).stdout.strip()
 
@@ -194,7 +197,8 @@ def _issue(repo, number):
     return {"number": number, **json.loads(p.stdout)}
 
 
-_PR_FIELDS = "number,headRefName,headRefOid,updatedAt,statusCheckRollup,closingIssuesReferences"
+_PR_FIELDS = ("number,title,headRefName,headRefOid,updatedAt,statusCheckRollup,"
+              "closingIssuesReferences")
 
 
 def _open_prs(repo):
@@ -246,13 +250,16 @@ def _contains(repo, sha, head):
 def _queue_entry(repo, issue, pr):
     """One claim's open PR as a merge-queue entry (`afk_decide.queue_rank`): how
     many times it was handed back, its latest record, and whether that record is
-    still open (`afk_decide.handback_open`). One comments read; one compare more
-    for a handed-back PR whose head has moved."""
-    records = afk_decide.handback_records(_issue_comments(repo, pr["number"]))
+    still open (`afk_decide.handback_open`) — and, from the same comments, whether
+    a merge batch holding this head was abandoned (`barred`). One comments read;
+    one compare more for a handed-back PR whose head has moved."""
+    comments = _issue_comments(repo, pr["number"])
+    records = afk_decide.handback_records(comments)
     handback, head = (records[-1] if records else None), pr["headRefOid"]
     contains = bool(handback) and head != handback["head"] and _contains(repo, handback["tip"], head)
     return {"issue": issue, "pr": pr["number"], "handbacks": len(records), "handback": handback,
-            "open": afk_decide.handback_open(handback, head, contains)}
+            "open": afk_decide.handback_open(handback, head, contains),
+            "barred": afk_decide.batch_barred(comments, head)}
 
 
 def _open_handback(repo, pr):
@@ -287,18 +294,19 @@ def _waits_behind(repo, entry, queue):
 
 
 def _unblocked(repo, landing, queue, mine):
-    """The issues in `mine` whose PRs are queued behind the PR of queue entry
-    `landing` and wait behind nothing else (`afk_decide.freed_by`) — what its
-    landing frees, in merge order. Read from the queue as it stands BEFORE the
-    landing; a PR's changed files are read only when `landing` is ahead of it,
-    so a PR that was never handed back frees nobody and costs nothing."""
-    free = []
+    """The issues in `mine` whose PRs are queued behind a PR of the queue entries
+    `landing` — one for a merge, several for a merge batch — and wait behind
+    nothing else (`afk_decide.freed_by`): what the landing frees, in merge order.
+    Read from the queue as it stands BEFORE the landing; a PR's changed files are
+    read only when a landing PR is ahead of it, so a PR that was never handed
+    back frees nobody and costs nothing."""
+    free, landed = [], {e["pr"] for e in landing}
     for number in afk_decide.queue_order(queue.values()):
         entry = queue[number]
         ahead = afk_decide.queue_ahead(entry, queue.values())
-        if number not in mine or entry["open"] or landing not in ahead:
+        if number not in mine or entry["open"] or not landed & {e["pr"] for e in ahead}:
             continue
-        if afk_decide.freed_by(landing["pr"], _changed_files(repo, entry["pr"]), ahead):
+        if afk_decide.freed_by(landed, _changed_files(repo, entry["pr"]), ahead):
             free.append(number)
     return free
 
@@ -395,7 +403,7 @@ def _scan(remote, ns):
     """Mirror the remote claim+heartbeat refs into a disposable local namespace and
     read every marker. Returns (claims, heartbeats). Raises when the remote cannot
     be read: a fleet whose claims are unreadable must not look like one holding none."""
-    claim_ns, hb_ns = afk_decide.CLAIM_NAMESPACES[ns]
+    claim_ns, hb_ns = afk_decide.CLAIM_NAMESPACES[ns][:2]
     _git(["fetch", "--prune", remote,
           f"+{claim_ns}/*:{_LOCAL_SCAN}/claim/*",
           f"+{hb_ns}/*:{_LOCAL_SCAN}/heartbeat/*"])
@@ -664,7 +672,8 @@ def cmd_probe(a):
     2. **Branch protection** (only when `gate.ci: local`, ADR-0012) — does the merge
        target REQUIRE status checks? Then `gh pr merge` is rejected however green the
        local gate is, so that combination is a hard `error` at bootstrap; an
-       inconclusive read is a `warn`."""
+       inconclusive read is a `warn`. With `merge.batch` a target that refuses
+       a direct push is an `error` too: a batch lands by pushing (ADR-0027)."""
     cfg = _cfg(a)
     ns, rejection = _usable_namespace(_remote(a), cfg["claim_namespace"], _now(a))
     cfg["claim_namespace"] = ns
@@ -681,7 +690,8 @@ def cmd_probe(a):
         else:
             prot, unavailable = _branch_protection(a.repo, target)
             result["protection"] = {"branch": target,
-                                    **afk_decide.protection_verdict(ci_mode, prot, unavailable)}
+                                    **afk_decide.protection_verdict(
+                                        ci_mode, prot, unavailable, cfg["merge"]["batch"])}
     return result
 
 
@@ -782,8 +792,8 @@ def cmd_rebuild(a):
     per-issue blocked_by read is paid only by issues that pass every cheaper
     eligibility check, the per-issue state read only by a claim whose issue is
     missing from the open list, the hand-back read only by a claim that has a PR,
-    and the changed-files read only by a PR of mine with a handed-back PR ahead
-    of it in the merge queue. Strictly observation: nothing here writes a ref, a
+    the changed-files read only by a PR of mine with a handed-back PR ahead
+    of it in the merge queue, and the batch record only with `merge.batch` on. Strictly observation: nothing here writes a ref, a
     comment, or a PR."""
     cfg = _cfg(a)
     issues, prs, claims, heartbeats = _gather(a, cfg)
@@ -804,7 +814,8 @@ def cmd_rebuild(a):
     return afk_decide.assemble_working_set(
         issues, prs, claims, heartbeats, blocked, a.instance, _now(a), cfg, closed=closed,
         handed_back=[e["issue"] for e in mine if e["open"]], queued=queued,
-        merge_queue=afk_decide.queue_order(queue.values()))
+        merge_queue=afk_decide.queue_order(queue.values()),
+        batch=_batch(_remote(a), cfg, a.instance))
 
 
 def _issue_worktree(repo, number):
@@ -966,19 +977,28 @@ def cmd_nudge(a):
     if _nudge(path) is not None:
         raise RuntimeError(f"the worker on issue #{a.number} was already nudged — a second "
                            f"silence is a failure (`afk fail`), not another nudge")
+    handle, tail = _nudge_worker(path, _now(a))
+    return {"issue": a.number, "action": "nudged", "terminal": handle, "terminal_tail": tail}
+
+
+def _nudge_worker(path, now, finish=None):
+    """Type the nudge at the worker in a worktree and record it there → (terminal
+    handle, the tail of its screen). `finish` names the outcome it owes, when
+    that is not a PR or a verdict (`afk_decide.nudge_text`)."""
     handle = _live_terminal(path)
     if handle is None:
         raise RuntimeError(f"no live terminal in {path} — the worker is dead, not stalled "
                            f"(`afk dispatch` continues it)")
     tail = _terminal_tail(handle)
     brief = _worker_file(path, _WORKER_BRIEF)
-    sent = _orca(["terminal", "send", "--terminal", handle, "--enter", "--text",
-                  afk_decide.nudge_text(brief if os.path.exists(brief) else None)]).get("send") or {}
+    brief = brief if os.path.exists(brief) else None
+    text = afk_decide.nudge_text(brief, finish) if finish else afk_decide.nudge_text(brief)
+    sent = _orca(["terminal", "send", "--terminal", handle, "--enter", "--text", text]).get("send") or {}
     if not sent.get("accepted"):
         raise RuntimeError(f"terminal {handle} did not accept the nudge")
     with open(_worker_file(path, _NUDGE_MARK), "w") as f:
-        json.dump({"at": _now(a), "tail": tail}, f)
-    return {"issue": a.number, "action": "nudged", "terminal": handle, "terminal_tail": tail}
+        json.dump({"at": now, "tail": tail}, f)
+    return handle, tail
 
 
 def _stalled_reason(repo, number, reason):
@@ -1047,8 +1067,16 @@ def cmd_recovery(a):
 
 def _create_worktree(a, cfg, rem, issue, at_branch):
     """Have orca create the worktree + branch for an issue at the REMOTE's current
-    tip of `at_branch` (ADR-0005: orca owns both, and names the branch) → (path,
-    branch, sha). The tip is fetched into the checkout orca cuts worktrees from and
+    tip of `at_branch` (`_cut_worktree`) → (path, branch, sha)."""
+    name = afk_decide.worktree_name(cfg["branch_pattern"], issue["number"], issue["title"])
+    return _cut_worktree(a, rem, name, at_branch, issue["number"])
+
+
+def _cut_worktree(a, rem, name, at_branch, issue=None):
+    """Have orca create a worktree + branch at the REMOTE's current tip of
+    `at_branch` (ADR-0005: orca owns both, and names the branch) → (path,
+    branch, sha) — linked to `issue`, or to none: a merge batch's. The tip is
+    fetched into the checkout orca cuts worktrees from and
     handed over as a sha rather than a branch name — and then ASSERTED: the
     worktree must contain it, however orca resolved the ref. A worker started on a
     base that is commits behind builds on files that have already moved."""
@@ -1057,10 +1085,9 @@ def _create_worktree(a, cfg, rem, issue, at_branch):
         raise RuntimeError(f"orca knows no repo for {a.repo} — add this checkout once with "
                            f"`orca repo add --path <path>`")
     sha = _fetch_tip(rem, at_branch, cwd=orca_repo["path"])
-    name = afk_decide.worktree_name(cfg["branch_pattern"], issue["number"], issue["title"])
     wt = _orca(["worktree", "create", "--repo", f"id:{orca_repo['id']}", "--name", name,
                 "--no-parent", "--base-branch", sha,
-                "--issue", str(issue["number"])]).get("worktree") or {}
+                *(["--issue", str(issue)] if issue is not None else [])]).get("worktree") or {}
     path, branch = wt.get("path"), wt.get("branch")
     if not path or not os.path.isdir(path):
         raise RuntimeError(f"orca worktree create returned no usable path: {path!r}")
@@ -1323,14 +1350,14 @@ def cmd_dispatch(a):
 # --------------------------------------------------------------------------- #
 
 def _upsert_board(repo, number, cfg, phase, instance=None, pr=None, attempt=0, blocked_by=(),
-                  behind=None):
+                  behind=None, batch=()):
     """Upsert the human-facing progress status board comment (idempotent, ADR-0006).
     Renders the body from the given phase (pure), then find-or-create by marker
     and write ONLY when the body changed — so re-entrant/disposable ticks and
     retry re-dispatches never spam the issue."""
     body = afk_decide.render_status_board(phase, cfg["gate"]["ci"], cfg["retry"],
                                           instance=instance, pr=pr, attempt=attempt,
-                                          blocked_by=blocked_by, behind=behind)
+                                          blocked_by=blocked_by, behind=behind, batch=batch)
     comments = f"repos/{repo}/issues/{number}/comments"
     board = next((c for c in _issue_comments(repo, number)
                   if afk_decide.STATUS_MARKER in (c["body"] or "")), None)
@@ -1484,6 +1511,10 @@ def cmd_merge(a):
                     in a file this PR also changes (`behind` names it). Nothing was
                     touched and nothing is handed back; its turn comes when that
                     PR has merged (ADR-0025). The status board says so.
+      batched       this fleet has a merge batch open (`afk batch`). `in_batch`
+                    says whether this PR is in it — then it lands with the batch
+                    — or outside it, where landing it now would move the target
+                    under the batch. Nothing was touched; leave it.
       worker_busy   the worker is still working in the PR's worktree — typically it
                     pushed the answer to a hand-back and is now running the gate on
                     it. Nothing was touched; leave it, a later tick merges.
@@ -1516,6 +1547,12 @@ def cmd_merge(a):
     def stop(outcome, **more):
         return {**out, "outcome": afk_decide.merge_outcome(outcome), **more}
 
+    batch = _batch(rem, cfg, a.instance)
+    if batch:                              # before anything: the batch owns the merge lane
+        return stop("batched", in_batch=a.number in batch["issues"],
+                    batch={k: batch[k] for k in ("phase", "issues", "prs")},
+                    detail="this fleet has a merge batch open; nothing was touched — `afk batch` "
+                           "lands or ends it, and this PR merges with it or after it")
     claims = _scan(rem, cfg["claim_namespace"])[0]
     queue = _merge_queue(a.repo, prs, claims)
     entry = queue[a.number]
@@ -1596,7 +1633,7 @@ def cmd_merge(a):
     # --- land it, then settle the claim: board → release → worktree ---
     # what it frees is read first: a read that fails after the PR landed would
     # report an error over a merge that happened
-    unblocked = _unblocked(a.repo, entry, queue,
+    unblocked = _unblocked(a.repo, [entry], queue,
                            {c["number"] for c in claims if c["instance"] == a.instance})
     _gh(["pr", "merge", str(pr["number"]), "--repo", a.repo, f"--{cfg['merge']['strategy']}",
          "--match-head-commit", head,
@@ -1607,6 +1644,456 @@ def cmd_merge(a):
     cleanup = _remove_worktree(path) if (cfg["worktree_cleanup"] or recreated) else None
     return stop("merged", released=True, unblocked=unblocked,
                 **({"cleanup": cleanup} if cleanup else {}))
+
+
+# --------------------------------------------------------------------------- #
+# act: a merge batch — N ready PRs behind one gate run (ADR-0027)              #
+# --------------------------------------------------------------------------- #
+
+_BATCH_STATE = "afk-batch.json"
+_BATCH_FIX_FINISH = "finish with the committed fix that brief asks for"
+
+
+def _batch_ref(cfg, instance):
+    return f"{afk_decide.CLAIM_NAMESPACES[cfg['claim_namespace']][2]}/{instance}"
+
+
+def _batch(rem, cfg, instance):
+    """My open merge batch (`afk_decide.batch_record`), None when I have none.
+    With `merge.batch` off no ref is read at all. Raises when the remote cannot
+    be read: "could not look" is never "no batch", which would merge its PRs one
+    at a time under it."""
+    if not cfg["merge"]["batch"]:
+        return None
+    ref = _batch_ref(cfg, instance)
+    if not _remote_sha(rem, ref):
+        return None
+    marker = _read_marker(rem, ref)
+    if marker is None:
+        raise RuntimeError(f"the batch record {ref} is on the remote but could not be fetched")
+    return afk_decide.batch_record(marker)
+
+
+def _write_batch(rem, cfg, record, now):
+    """Put a batch record on the remote, replacing mine → the record as written
+    (`ts` is now: when this phase began)."""
+    record = {**record, "ts": int(now)}
+    sha = _marker_commit("afk-batch", record["instance"], now,
+                         extra=afk_decide.batch_marker_fields(record))
+    _git(["push", rem, "--force", f"{sha}:{_batch_ref(cfg, record['instance'])}"])
+    return record
+
+
+def _drop_batch(rem, cfg, instance):
+    """Delete my batch record. Already gone counts; one that is still there after
+    a failed delete would hold its PRs off the single-PR path, so it raises."""
+    ref = _batch_ref(cfg, instance)
+    p = _git(["push", rem, "--delete", ref], check=False)
+    if p.returncode != 0 and _remote_sha(rem, ref):
+        raise RuntimeError(f"could not delete the batch record {ref}: {p.stderr.strip()}")
+
+
+def _batch_state(path):
+    """What only the batch's own worktree remembers — {"members": [{issue, pr,
+    title, branch, head, commit}…], "left_out": […], "excerpt"} — None when there
+    is no worktree or it holds none."""
+    if not path:
+        return None
+    try:
+        with open(_worker_file(path, _BATCH_STATE)) as f:
+            return json.load(f)
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def _save_batch_state(path, state):
+    with open(_worker_file(path, _BATCH_STATE), "w") as f:
+        json.dump(state, f)
+
+
+def _batch_boards(a, cfg, record, members, phase):
+    """Every batched PR's status board, at one phase: a batch phase names the
+    batch's PRs; `pr_open` is where a PR is again once its batch is gone."""
+    if not cfg["progress_comment"]:
+        return
+    for m in members:
+        _upsert_board(a.repo, m["issue"], cfg, phase, instance=a.instance, pr=m["pr"],
+                      batch=record["prs"] if phase != "pr_open" else ())
+
+
+def _squash(rem, path, row):
+    """Stack one PR on the batch's worktree as ONE squash commit → (commit, None,
+    []), or (None, reason, files) when it is left out: its head moved since it
+    was read, it conflicts with the stack so far, or it changes nothing against
+    it. A PR left out leaves the worktree exactly as it found it. The commit is
+    the PR author's, committed under the caller's own git identity."""
+    if _fetch_tip(rem, row["branch"], cwd=path) != row["head"]:
+        return None, "moved", []
+    p = subprocess.run(["git", "-C", path, "merge", "--squash", row["head"]],
+                       capture_output=True, text=True)
+    files = _unmerged(path)
+    if p.returncode != 0 or files:
+        _git(["-C", path, "reset", "-q", "--hard", "HEAD"])
+        if not files:
+            raise RuntimeError(f"git merge --squash of PR #{row['pr']} into {path} failed: "
+                               f"{(p.stderr or p.stdout).strip()}")
+        return None, "conflict", files
+    if not _git(["-C", path, "status", "--porcelain"]).stdout.strip():
+        return None, "no_changes", []
+    author = _git(["-C", path, "log", "-1", "--format=%an <%ae>", row["head"]]).stdout.strip()
+    p = subprocess.run(["git", "-C", path, "commit", "-q", "--no-verify", "--author", author, "-m",
+                        afk_decide.squash_message(row["title"], row["pr"], row["issue"])],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"could not commit PR #{row['pr']} onto the stack: "
+                           f"{(p.stderr or p.stdout).strip()}")
+    return _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip(), None, []
+
+
+def _batch_result(outcome, record, state, **more):
+    """One `afk batch` outcome: which PRs the batch holds, which were left out
+    and why, how many gate runs and fix rounds it has taken."""
+    if outcome not in afk_decide.BATCH_OUTCOMES:
+        raise ValueError(f"not a batch outcome: {outcome!r}")
+    return {"outcome": outcome,
+            "issues": list(record["issues"]) if record else [],
+            "prs": list(record["prs"]) if record else [],
+            "left_out": list((state or {}).get("left_out") or []),
+            "gate_runs": record["runs"] if record else 0,
+            "fix_rounds": record["round"] if record else 0, **more}
+
+
+def _batch_members(record, state):
+    """The batch's members, in stack order: the worktree's own record of them,
+    else — the worktree is gone — what the batch record names."""
+    if state and state.get("members"):
+        return state["members"]
+    return [{"issue": n, "pr": pr} for n, pr in zip(record["issues"], record["prs"])]
+
+
+def _batch_end(a, cfg, rem, record, path, state):
+    """A batch that lands nothing ends: its PRs' boards go back to `pr_open`, the
+    record is deleted, the worktree removed. The record goes before the worktree:
+    a record with no worktree is voided by the next call, a worktree with no
+    record is swept by the next batch."""
+    _batch_boards(a, cfg, record, _batch_members(record, state), "pr_open")
+    _drop_batch(rem, cfg, a.instance)
+    return _remove_worktree(path) if path else None
+
+
+def _batch_void(a, cfg, rem, record, path, state, reason):
+    """The batch no longer describes what would land. Nothing landed, nothing is
+    held against its PRs: the next `afk batch` forms one again."""
+    cleanup = _batch_end(a, cfg, rem, record, path, state)
+    return _batch_result("voided", record, state, reason=reason,
+                         detail="nothing landed; run `afk batch` again to form the batch on "
+                                "what is there now",
+                         **({"cleanup": cleanup} if cleanup else {}))
+
+
+def _batch_abandon(a, cfg, rem, now, record, path, state, reason):
+    """The stack could not be made green. Nothing landed; each PR is marked — at
+    the head it was stacked at — so it is not batched again, and merges on its
+    own. Marked before the record is dropped: the other order re-forms the same
+    red batch."""
+    prs = {p["number"]: p for p in _open_prs(a.repo)}
+    for m in _batch_members(record, state):
+        pr = prs.get(m["pr"])
+        if pr is None:
+            continue
+        head = m.get("head") or pr["headRefOid"]
+        if not afk_decide.batch_barred(_issue_comments(a.repo, m["pr"]), head):
+            _gh(["api", "--method", "POST", f"repos/{a.repo}/issues/{m['pr']}/comments", "-f",
+                 "body=" + afk_decide.batch_abandoned_comment(head, record["prs"], reason, now)])
+    cleanup = _batch_end(a, cfg, rem, record, path, state)
+    return _batch_result("abandoned", record, state, reason=reason,
+                         detail="nothing landed; `afk merge` each of `issues`, in this order",
+                         **({"cleanup": cleanup} if cleanup else {}))
+
+
+def _batch_red(a, cfg, rem, now, record, path, state, excerpt):
+    """A red stack lands nothing. While fix rounds remain a worker is started in
+    the batch's worktree on the failure excerpt, to make the stack green with one
+    more commit; past them the batch is abandoned. Recorded before delivered, as
+    a hand-back is: a worker that then fails to start is another round."""
+    if afk_decide.batch_after_red(record["round"], cfg["merge"]["batch_fix_rounds"]) == "abandon":
+        return _batch_abandon(a, cfg, rem, now, record, path, state,
+                              f"the gate was still red after {record['round']} fix round(s)")
+    head = _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip()
+    record = _write_batch(rem, cfg, {**record, "phase": "fixing", "round": record["round"] + 1,
+                                     "head": head}, now)
+    state = {**state, "excerpt": excerpt}
+    _save_batch_state(path, state)
+    _batch_boards(a, cfg, record, state["members"], "batch_fixing")
+    try:                                   # whatever agent was here is dead or idle
+        _orca(["terminal", "close", "--worktree", f"path:{path}", "--all"])
+    except RuntimeError:
+        pass
+    with open(_WORKER_PROMPT) as f:
+        brief = afk_decide.render_batch_fix(f.read(), {
+            "repo": a.repo, "target": cfg["merge"]["target"], "worktree_path": path,
+            "branch": record["branch"], "local_command": cfg["gate"]["local_command"],
+            "afk_path": os.path.abspath(__file__),
+            "launcher_terminal": os.environ.get("ORCA_TERMINAL_HANDLE", ""),
+            "round": record["round"], "rounds": cfg["merge"]["batch_fix_rounds"],
+            "prs": state["members"], "excerpt": excerpt})
+    handle = _start_terminal(path, a.worker_command, brief, a.ready_timeout)
+    return _batch_result("fixing", record, state, worktree=path, terminal=handle, head=head,
+                         detail=f"the gate was red on the stack; fix round {record['round']} of "
+                                f"{cfg['merge']['batch_fix_rounds']} started — nothing landed")
+
+
+def _batch_gate(a, cfg, rem, now, record, path, state):
+    """Gate the stack at `record["head"]` — the tree that would land, committed
+    and with nothing beside it — then land it, or turn to its repair. With
+    `gate.trust_recorded_run` a fix worker's own `afk gate` run of exactly that
+    head stands in for the run (ADR-0026)."""
+    head = _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip()
+    dirty = _git(["-C", path, "status", "--porcelain"]).stdout.strip()
+    if head != record["head"] or dirty:
+        return _batch_void(a, cfg, rem, record, path, state,
+                           "the batch's worktree is not at the stack on record, or holds "
+                           "uncommitted or untracked files — what would be gated is not what "
+                           "would land")
+    command = cfg["gate"]["local_command"]
+    trusted = (cfg["gate"]["trust_recorded_run"]
+               and afk_decide.gate_record_void(_gate_record(path), head, command) is None)
+    if trusted:
+        gate = {"status": "green", "source": "recorded", "head": head, "command": command}
+    else:
+        run = _run_gate(cfg, path, a.gate_timeout, a.excerpt_lines)
+        record = {**record, "runs": record["runs"] + 1}
+        gate = {**run, "source": "run", "head": head}
+    if gate["status"] != "green":
+        return {**_batch_red(a, cfg, rem, now, record, path, state, gate["excerpt"]),
+                "gate": gate}
+    record = _write_batch(rem, cfg, {**record, "phase": "landing", "head": head}, now)
+    return {**_batch_land(a, cfg, rem, record, path, state),
+            "gate": {k: gate[k] for k in ("status", "source", "head", "command")}}
+
+
+def _landed(rem, path, head, target):
+    """Does the remote's target already hold the stack head — a landing whose
+    tick died after the push? A head this checkout has never seen is one that
+    never landed."""
+    cwd = ["-C", path] if path else []
+    tip = _fetch_tip(rem, target, cwd=path)
+    return _git([*cwd, "merge-base", "--is-ancestor", head, tip], check=False).returncode == 0
+
+
+def _finish_batched(a, cfg, rem, member, record, fixes):
+    """Finish one landed PR exactly as a merge finishes it — plus what GitHub
+    does not do for a commit that was pushed rather than merged: close the PR,
+    saying which commit landed it, and close the issue. Every step is skipped
+    when it is already done, so a landing a dead tick left half-finished is
+    finished by the next one."""
+    target = cfg["merge"]["target"]
+    pr = next((p for p in _open_prs(a.repo) if p["number"] == member["pr"]), None)
+    if pr is not None:
+        _gh(["pr", "close", str(member["pr"]), "--repo", a.repo, "--comment",
+             afk_decide.batch_landed_comment(member.get("commit") or record["head"], target,
+                                             record["prs"], fixes)])
+        if cfg["merge"]["delete_branch"]:
+            _git(["push", rem, "--delete", f"refs/heads/{pr['headRefName']}"], check=False)
+    if _issue_state(a.repo, member["issue"]) == "open":
+        _gh(["issue", "close", str(member["issue"]), "--repo", a.repo, "--reason", "completed"])
+    if cfg["progress_comment"]:
+        _upsert_board(a.repo, member["issue"], cfg, "merged", instance=a.instance, pr=member["pr"])
+    _release(rem, cfg, member["issue"])
+    path, _ = _issue_worktree(a.repo, member["issue"])
+    return _remove_worktree(path) if (path and cfg["worktree_cleanup"]) else None
+
+
+def _batch_land(a, cfg, rem, record, path, state):
+    """Land a stack the gate passed on: push it to the target as a FAST-FORWARD —
+    the only lock there is: a target that moved refuses it, and nothing landed —
+    then finish every PR in it. What is pushed is `record["head"]`, the commit
+    the gate passed on, and nothing else ever is."""
+    target, head = cfg["merge"]["target"], record["head"]
+    members = _batch_members(record, state)
+    unblocked = []
+    if not _landed(rem, path, head, target):
+        if not path or not state:
+            return _batch_void(a, cfg, rem, record, path, state,
+                               "the batch's worktree is no longer on this machine")
+        prs = _open_prs(a.repo)
+        heads = {p["number"]: p["headRefOid"] for p in prs}
+        claims = _scan(rem, cfg["claim_namespace"])[0]
+        mine = {c["number"] for c in claims if c["instance"] == a.instance}
+        for m in members:
+            if heads.get(m["pr"]) != m["head"]:
+                return _batch_void(a, cfg, rem, record, path, state,
+                                   f"PR #{m['pr']} moved or was closed after it was stacked")
+            if m["issue"] not in mine:
+                return _batch_void(a, cfg, rem, record, path, state,
+                                   f"issue #{m['issue']} is no longer this fleet's claim")
+        # what it frees is read first, as in `afk merge`: a read that fails after
+        # the push would report an error over a landing that happened
+        queue = _merge_queue(a.repo, prs, claims)
+        unblocked = _unblocked(a.repo, [queue[m["issue"]] for m in members], queue,
+                               mine - set(record["issues"]))
+        p = _git(["-C", path, "push", rem, f"{head}:refs/heads/{target}"], check=False)
+        if p.returncode != 0:
+            if _remote_sha(rem, f"refs/heads/{target}") != record["base"]:
+                return _batch_void(a, cfg, rem, record, path, state,
+                                   f"{target} moved while the batch was gating — the push was "
+                                   f"refused")
+            raise RuntimeError(f"the push of the batch to {target} failed although {target} has "
+                               f"not moved: {p.stderr.strip()}")
+    fixes = 0
+    if path and members and members[-1].get("commit"):
+        count = _git(["-C", path, "rev-list", "--count", f"{members[-1]['commit']}..{head}"],
+                     check=False).stdout.strip()
+        fixes = int(count) if count.isdigit() else 0
+    landed = []
+    for m in members:
+        cleanup = _finish_batched(a, cfg, rem, m, record, fixes)
+        landed.append({"issue": m["issue"], "pr": m["pr"],
+                       "commit": m.get("commit") or head,
+                       **({"cleanup": cleanup} if cleanup else {})})
+    _drop_batch(rem, cfg, a.instance)
+    cleanup = _remove_worktree(path) if path else None
+    return _batch_result("landed", record, state, landed=landed, head=head, target=target,
+                         fix_commits=fixes, unblocked=unblocked,
+                         **({"cleanup": cleanup} if cleanup else {}))
+
+
+def _batch_form(a, cfg, rem, now):
+    """Form a batch from my PRs that are ready to merge: stack them on the
+    target's tip, in merge order, in a worktree of the batch's own; put the batch
+    on record; gate it. A PR's own branch and worktree are never touched."""
+    prs = _open_prs(a.repo)
+    claims = _scan(rem, cfg["claim_namespace"])[0]
+    mine = {c["number"] for c in claims if c["instance"] == a.instance}
+    queue = _merge_queue(a.repo, prs, claims)
+    order = [n for n in afk_decide.queue_order(queue.values()) if n in mine]
+    if len(order) < 2:
+        return _batch_result("none", None, None,
+                             detail="fewer than two of this fleet's PRs are open — nothing to batch")
+    states, grace, rows = _worker_states(), cfg["worker_idle_grace_seconds"], []
+    for n in order:
+        entry, pr = queue[n], afk_decide.closing_pr(prs, n)
+        wt = _live_worktree(a.repo, n)
+        rows.append({"issue": n, "pr": pr["number"], "head": pr["headRefOid"],
+                     "title": pr["title"], "branch": pr["headRefName"],
+                     "handed_back": entry["open"],
+                     "behind": None if entry["open"] else _waits_behind(a.repo, entry, queue),
+                     "busy": bool(wt) and _worker_reading(states, wt, now, grace)["terminal"] == "busy",
+                     "barred": entry["barred"]})
+    eligible, left_out = afk_decide.batch_candidates(
+        rows, cfg["gate"]["adversarial_verify"], a.verified)
+    if len(eligible) < 2:
+        return _batch_result("none", None, {"left_out": left_out},
+                             detail="fewer than two PRs are eligible for a batch — merge one at "
+                                    "a time, as without it")
+
+    orca_rows = _orca(["worktree", "list"]).get("worktrees") or []
+    for old in afk_decide.batch_worktrees(orca_rows, a.instance, a.repo):   # a dead batch's
+        _remove_worktree(old)
+    target = cfg["merge"]["target"]
+    path, branch, base = _cut_worktree(a, rem, afk_decide.batch_worktree_name(a.instance), target)
+    members = []
+    for row in eligible:
+        commit, reason, files = _squash(rem, path, row)
+        if commit is None:
+            left_out.append(afk_decide.batch_left_out(row, reason, files))
+        else:
+            members.append({k: row[k] for k in ("issue", "pr", "title", "branch", "head")}
+                           | {"commit": commit})
+    left_out.sort(key=lambda r: order.index(r["issue"]))
+    state = {"members": members, "left_out": left_out}
+    if len(members) < 2:
+        _remove_worktree(path)
+        return _batch_result("none", None, state,
+                             detail="fewer than two PRs stack without a conflict — merge one at "
+                                    "a time, as without it")
+    record = _write_batch(rem, cfg, {
+        "instance": a.instance, "phase": "gating", "round": 0, "runs": 0, "base": base,
+        "head": members[-1]["commit"], "issues": [m["issue"] for m in members],
+        "prs": [m["pr"] for m in members], "branch": branch}, now)
+    _save_batch_state(path, state)
+    _batch_boards(a, cfg, record, members, "batch_gating")
+    return _batch_gate(a, cfg, rem, now, record, path, state)
+
+
+def _batch_resume(a, cfg, rem, now, record):
+    """Carry on a batch an earlier call left open, from its record and its
+    worktree: land what was gated green, gate what was not gated yet, or look
+    after its repair — the fix worker is watched like any other worker."""
+    rows = _orca(["worktree", "list"]).get("worktrees") or []
+    path = afk_decide.find_batch_worktree(rows, record["branch"], a.repo)
+    path = path if path and os.path.isdir(path) else None
+    state = _batch_state(path)
+    if record["phase"] == "landing":
+        return _batch_land(a, cfg, rem, record, path, state)
+    if not path or not state:
+        return _batch_void(a, cfg, rem, record, path, state,
+                           "the batch's worktree is no longer on this machine")
+    if record["phase"] == "gating":
+        return _batch_gate(a, cfg, rem, now, record, path, state)
+
+    grace = cfg["worker_idle_grace_seconds"]
+    reading = _worker_reading(_worker_states(), path, now, grace)
+    head = _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip()
+    clean = not _git(["-C", path, "status", "--porcelain"]).stdout.strip()
+    descends = _git(["-C", path, "merge-base", "--is-ancestor", record["head"], head],
+                    check=False).returncode == 0
+    watch = afk_decide.classify_no_pr(
+        _worktree_progress(path, rem, cfg["merge"]["target"]), reading["terminal"],
+        reading["terminal_idle_seconds"], None, {}, now, grace,
+        nudged_at=(_nudge(path) or {}).get("at"), handed_back_at=record["ts"])["action"]
+    route, why = afk_decide.batch_fix_route(reading["terminal"], head != record["head"], clean,
+                                            descends, watch)
+    if route == "gate":
+        return _batch_gate(a, cfg, rem, now, {**record, "head": head}, path, state)
+    if route == "next_round":
+        return _batch_red(a, cfg, rem, now, record, path, state, state.get("excerpt") or "")
+    if route == "abandon":
+        return _batch_abandon(a, cfg, rem, now, record, path, state, why)
+    nudged = route == "nudge"
+    if nudged:
+        _nudge_worker(path, now, _BATCH_FIX_FINISH)
+    return _batch_result("fixing", record, state, worktree=path, head=record["head"],
+                         nudged=nudged, worker_state=reading["state"], detail=why)
+
+
+def cmd_batch(a):
+    """Land my ready PRs as ONE merge batch — or carry on the batch an earlier
+    call left open (ADR-0027). `merge.batch` only; one call per tick, before any
+    `afk merge`, stopping with an `outcome`:
+
+      none       fewer than two PRs could be batched. Nothing was touched: merge
+                 one at a time, as without it.
+      landed     the gate ran once on the stack — one squash commit per PR, in
+                 merge order — and passed; the stack was pushed to the target as
+                 a fast-forward, and every PR in it (`landed`) is closed with a
+                 comment naming its commit, its issue closed, its board upserted,
+                 its claim released, its worktree removed. `unblocked` lists my
+                 claims that were queued behind one of them and are free now.
+      fixing     the gate was red on the stack. Nothing landed; a fix worker is
+                 in the batch's worktree making it green with one more commit —
+                 just started, still at it, or just nudged (`nudged`). Leave it,
+                 and merge nothing meanwhile.
+      abandoned  the stack could not be made green — the fix rounds ran out, or
+                 the fix worker stayed silent (`reason`). Nothing landed and the
+                 batch is gone: `afk merge` each of `issues`, in order.
+      voided     the batch no longer describes what would land — the target moved
+                 under it and refused the push, a PR in it moved or closed, its
+                 worktree is gone (`reason`). Nothing landed and the batch is
+                 gone: run `afk batch` again.
+
+    Every outcome names the batch's `issues` and `prs`, who was `left_out` and
+    why, and the `gate_runs` and `fix_rounds` it has taken. The invariant of
+    ADR-0012 holds per batch: the target only ever moves to a commit the gate
+    passed on — the stack head, never anything else."""
+    cfg, rem, now = _cfg(a), _remote(a), _now(a)
+    if not cfg["merge"]["batch"]:
+        raise ValueError("merge.batch is off — there is no merge batch to form or resume; "
+                         "merge one at a time with `afk merge`")
+    record = _batch(rem, cfg, a.instance)
+    if record is None:
+        return _batch_form(a, cfg, rem, now)
+    return _batch_resume(a, cfg, rem, now, record)
 
 
 _HANDBACK_POINTER = ("The merge of your PR hit a sync conflict, and it is handed back to you. Your "
@@ -2021,6 +2508,19 @@ def build_parser():
     p.add_argument("--excerpt-lines", type=int, default=afk_decide.GATE_EXCERPT_LINES, metavar="k",
                    help="how many trailing log lines a red gate's excerpt keeps")
 
+    p = command("batch", cmd_batch, remote="gh",
+                help="merge.batch: land my ready PRs as one merge batch — stack them, run the "
+                     "local gate once, push the stack — or carry on the batch left open: "
+                     + " / ".join(afk_decide.BATCH_OUTCOMES))
+    starts_worker(p)
+    p.add_argument("--verified", action="append", default=[], metavar="head",
+                   help="a PR head an adversarial verify passed (gate.adversarial_verify); "
+                        "repeat for each — a PR whose head is not named is left out")
+    p.add_argument("--gate-timeout", type=int, default=1800, metavar="s",
+                   help="seconds before the local gate is called red (default %(default)s)")
+    p.add_argument("--excerpt-lines", type=int, default=afk_decide.GATE_EXCERPT_LINES, metavar="k",
+                   help="how many trailing log lines a red gate's excerpt keeps")
+
     p = command("hand-back", cmd_hand_back, remote="gh",
                 help="return the sync conflict `afk merge` reported to the worker that wrote "
                      "the branch: abort the merge → instruct the worker (or continue a dead "
@@ -2067,7 +2567,9 @@ def build_parser():
     p = command("status", cmd_status, remote="gh",
                 help="upsert one claim's status board at a non-terminal phase (idempotent)")
     p.add_argument("number", type=int, metavar="n")
-    p.add_argument("--phase", required=True, choices=list(afk_decide.STATUS_PHASES), metavar="phase",
+    p.add_argument("--phase", required=True, metavar="phase",
+                   choices=[ph for ph in afk_decide.STATUS_PHASES
+                            if ph not in afk_decide.BATCH_BOARD_PHASES.values()],
                    help="the lifecycle phase — a `mine` row's board_phase")
     p.add_argument("--instance", default=None, metavar="id", help="owning fleet instance id (shown in the header)")
     p.add_argument("--pr", type=int, default=None, metavar="pr", help="the PR number, once one is open")
