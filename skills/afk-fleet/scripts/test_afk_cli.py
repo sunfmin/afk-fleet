@@ -2612,13 +2612,13 @@ def test_the_docs_route_on_exactly_the_words_the_code_returns():
         assert outcome in row("no-pr"), outcome
 
     # `afk turn`: the tick's outcome table IS the set, row for row — and so is the
-    # worker's, for `afk land`, in the one block every prompt variant carries
+    # worker's, for `afk land`, in the landing brief — the one place it is spelled
     table = re.findall(r"^\| `(\w+)` \|", skill, re.M)
     assert table == ["outcome", *afk_decide.TURN_OUTCOMES], table      # header, then rows
     for outcome in afk_decide.TURN_OUTCOMES:
         assert outcome in row("turn"), outcome
     prompt = docs["worker-prompt.md"]
-    land = re.search(r"<!--afk:block land-->\n(.*?)<!--/afk:block-->", prompt, re.S).group(1)
+    land = re.search(r"<!--afk:block landing-->\n(.*?)<!--/afk:block-->", prompt, re.S).group(1)
     assert re.findall(r"^\| `(\w+)` \|", prompt, re.M) == \
         re.findall(r"^\| `(\w+)` \|", land, re.M) == ["outcome", *afk_decide.LAND_OUTCOMES]
     assert "{land_command}" in land

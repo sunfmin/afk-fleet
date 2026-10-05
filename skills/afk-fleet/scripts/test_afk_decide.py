@@ -1357,10 +1357,11 @@ def test_a_worker_is_told_how_to_wake_the_launcher_and_nothing_else():
 LANDING = {"pr": 77, "pr_branch": "sunfmin/issue-31-names", "target": "main"}
 
 
-def test_every_worker_is_told_the_one_way_its_pr_lands():
-    """ADR-0027. `afk land` is the only way a PR lands, so every way a worker is
-    instructed — a fresh start, a continuation, the landing brief — carries the
-    same block: the command, and what to do on each outcome it can stop with."""
+def test_a_worker_reads_the_one_way_its_pr_lands_when_it_holds_the_turn():
+    """ADR-0027. `afk land` is the only way a PR lands, and the landing brief is
+    the only place it is spelled: the command, and what to do on each outcome it
+    can stop with. A worker with a PR still to open is told only that it lands
+    later, on its turn, and never by hand."""
     t = _prompt_template()
     # the config travels whole, quoted for the worker's shell — and it is free text
     # to the template: a `{branch}` or an apostrophe inside it arrives verbatim
@@ -1373,16 +1374,18 @@ def test_every_worker_is_told_the_one_way_its_pr_lands():
     fresh = d.render_worker_prompt(t, "fresh", fields)
     cont = d.render_worker_prompt(t, "continue", fields)
     alone = d.render_landing(t, fields, LANDING)
+    assert alone.count(land) == 1, alone.count(land)
+    for outcome in d.LAND_OUTCOMES:
+        assert f"| `{outcome}` |" in alone, outcome
     for body in (fresh, cont, alone):
-        assert body.count(land) == 1, body.count(land)
-        for outcome in d.LAND_OUTCOMES:
-            assert f"| `{outcome}` |" in body, outcome
         assert "landing turn" in body and "gh pr merge" in body          # named only to forbid it
         assert "afk:block" not in body
-    # a worker with a PR to open is told it does NOT merge until its turn
+    # a worker with a PR to open is told it does NOT merge until its turn — and is
+    # not handed the command, or its outcomes, before it can run it
     for body in (fresh, cont):
-        assert "## Landing your PR — later, and only on its landing turn" in body
-        assert "do not merge" in body and "only on its landing turn" in body
+        assert "## Landing — later, on your PR's landing turn" in body
+        assert "never merge your PR yourself" in body and "only on its landing turn" in body
+        assert " land --issue " not in body and "| `outcome` |" not in body
 
     # the landing brief is the whole instruction, alone: which PR, where it lands,
     # the command, the wake — and nothing about implementing or opening a PR
@@ -1405,6 +1408,16 @@ def test_every_worker_is_told_the_one_way_its_pr_lands():
         assert False, "expected ValueError"
     except ValueError as e:
         assert "'landing' block" in str(e)
+
+
+def test_a_worker_is_not_sent_to_this_repos_adrs():
+    """The worker is in the TARGET repo, and step 1 sends it to that repo's
+    `docs/adr/`: an ADR number from this repo would name the wrong document."""
+    t = _prompt_template()
+    for body in (d.render_worker_prompt(t, "fresh", PROMPT_FIELDS, reason="gate red"),
+                 d.render_worker_prompt(t, "continue", PROMPT_FIELDS),
+                 d.render_landing(t, PROMPT_FIELDS, LANDING)):
+        assert not re.search(r"ADR-\d", body), re.findall(r"ADR-\d+", body)
 
 
 def test_render_worker_prompt_never_ships_a_placeholder():
@@ -1430,12 +1443,11 @@ def test_render_worker_prompt_never_ships_a_placeholder():
     refuses(partial, "fresh", PROMPT_FIELDS, why="step1.fresh")
     # a template naming a slot it never fills is caught, not sent
     looping = (block("prompt", "{opening} {step1}") + block("opening.fresh", "O")
-               + block("step1.fresh", "see {opening}") + block("land", "L"))
+               + block("step1.fresh", "see {opening}"))
     refuses(looping, "fresh", PROMPT_FIELDS, why="unfilled")
     # the minimal well-formed template renders
     ok = (block("prompt", "{opening}|{step1}|{n}{retry_reason}") + block("opening.fresh", "O")
-          + block("step1.fresh", "S") + block("retry_reason", " because {reason}")
-          + block("land", "run {land_command}"))
+          + block("step1.fresh", "S") + block("retry_reason", " because {reason}"))
     assert d.render_worker_prompt(ok, "fresh", PROMPT_FIELDS) == "O|S|31\n"
     assert d.render_worker_prompt(ok, "fresh", PROMPT_FIELDS, reason="R") == "O|S|31 because R\n"
 

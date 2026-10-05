@@ -1500,14 +1500,14 @@ def select_recovery(worktree, branch):
 #
 # references/worker-prompt.md is the template: named blocks between
 # `<!--afk:block NAME-->` and `<!--/afk:block-->`. The `prompt` block is the body;
-# it names four slots — {opening} and {step1}, each filled from the block of
-# that name for the chosen variant (`opening.fresh`, `step1.continue`, …),
+# it names three slots — {opening} and {step1}, each filled from the block of
+# that name for the chosen variant (`opening.fresh`, `step1.continue`, …), and
 # {retry_reason}, filled from the `retry_reason` block only when a failure reason
-# is handed over, and {land}, filled from the `land` block: the one command a
-# worker lands its PR with and what each of its outcomes asks for (ADR-0027).
-# The `landing` block is a brief of its own — `render_landing` — pointed at when
-# the worker is given its landing turn; it embeds the same `land` block, so the
-# command and the outcome table have one spelling. Everything else in braces is a
+# is handed over. The `landing` block is a brief of its own — `render_landing` —
+# pointed at when the worker is given its landing turn: the one command a worker
+# lands its PR with and what each of its outcomes asks for (ADR-0027). It is the
+# only place either is spelled; the body says no more than that the PR lands
+# later, on its turn. Everything else in braces is a
 # field — four of them derived: {wake_command}, the line a worker runs to wake
 # the launcher once its outcome is on GitHub, built from the `launcher_terminal`
 # field (ADR-0020), {gate_command}, the line a worker runs the local gate with —
@@ -1522,7 +1522,7 @@ PROMPT_VARIANTS = ("fresh", "continue")
 PROMPT_FIELDS = ("n", "title", "repo", "base_branch", "local_command", "afk_path", "config",
                  "branch", "worktree_path", "launcher_terminal")
 LANDING_FIELDS = ("pr", "pr_branch", "target")
-_PROMPT_SLOTS = ("opening", "step1", "retry_reason", "land")
+_PROMPT_SLOTS = ("opening", "step1", "retry_reason")
 _PROMPT_DERIVED = ("wake_command", "gate_command", "land_command", "verdict_marker")
 _NO_LOCAL_COMMAND = "true   # (no gate.local_command configured: run the repo's own build/test, if any)"
 _NO_WAKE = "true   # (no coordinator terminal to wake: it finds your outcome at its next poll)"
@@ -1651,8 +1651,7 @@ def render_worker_prompt(template, variant, fields, reason=None):
     block = _prompt_blocks(template)
     text = block("prompt")
     slots = {"opening": block(f"opening.{variant}"), "step1": block(f"step1.{variant}"),
-             "retry_reason": block("retry_reason") if reason else "",
-             "land": block("land")}
+             "retry_reason": block("retry_reason") if reason else ""}
     for name, body in slots.items():
         text = text.replace("{" + name + "}", body)
     text = re.sub(r"\n{3,}", "\n\n", text)      # an unfilled slot leaves no gap behind
@@ -1662,15 +1661,14 @@ def render_worker_prompt(template, variant, fields, reason=None):
 def render_landing(template, fields, landing):
     """
     The brief a worker is pointed at when its PR is given the landing turn: the
-    template's `landing` block, with the `land` block — the command and its
-    outcome table — set into it, filled from the same `fields` as
-    `render_worker_prompt` plus `landing`, {name: value} for every one of
-    LANDING_FIELDS. It is the whole brief either way: for the worker that wrote
+    template's `landing` block — the `afk land` command and its outcome table —
+    filled from the same `fields` as `render_worker_prompt` plus `landing`,
+    {name: value} for every one of LANDING_FIELDS. It is the whole brief either way: for the worker that wrote
     the branch and is still there, and for one started in its worktree because
     it is gone — that one is briefed only to land the PR (ADR-0027).
     """
     block = _prompt_blocks(template)
-    return _fill_prompt(block("landing").replace("{land}", block("land")), fields, landing)
+    return _fill_prompt(block("landing"), fields, landing)
 
 
 # --------------------------------------------------------------------------- #
