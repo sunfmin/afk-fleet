@@ -392,7 +392,7 @@ What the tick then does, each row a different mainline:
   lease, so reclaim with `--expect-sha s6`, then `afk dispatch` recovers it by continuation.
 - **#4** has no PR, so the tick asks `afk no-pr` why — a worker orca reports busy is left at once; it is already on
   attempt 1, so if the answer is a failure, `afk fail` has one more retry left before it escalates
-  (`retry` defaults to 2).
+  (`retry`, default 2).
 - **#5** is left strictly alone: `peerA` beat 100 s ago.
 - **#2** waits: it rejoins the frontier when its blocker closes.
 

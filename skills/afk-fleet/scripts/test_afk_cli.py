@@ -4592,6 +4592,104 @@ def test_the_docs_restate_config_only_as_the_schema_has_it():
     for name, text in docs.items():
         assert not short.findall(text), f"{name}: {sorted(set(short.findall(text)))}"
 
+    # the one phrasing the scan above reads: a default written any other way is unheld
+    for name, text in docs.items():
+        assert not re.findall(r"defaults to `?\d", text), name
+
+    # the template glosses a duration in minutes, and the lease as a multiple of the
+    # idle pace: both are arithmetic on the values beside them
+    template = docs["config-template.md"]
+    glossed = re.findall(r"^(\w+_seconds): (\d+) +#[^\n]*?~([\d.]+) min", template, re.M)
+    assert [key for key, _, _ in glossed] == \
+        ["busy_interval_seconds", "idle_interval_seconds", "claim_lease_ttl_seconds"], glossed
+    for key, seconds, minutes in glossed:
+        assert int(seconds) == defaults[key] == float(minutes) * 60, key
+    times, = re.findall(r"(\d+)× idle\b", template)
+    assert defaults["claim_lease_ttl_seconds"] == int(times) * defaults["idle_interval_seconds"]
+
+
+def test_the_docs_restate_a_flags_default_only_as_the_parser_has_it():
+    """A flag's default is defined once, in `build_parser()`. Prose that quotes it —
+    how long a landing waits for checks, how often it looks — is a copy, held here;
+    and a flag two subcommands take has one default, not one per subcommand."""
+    subs = afk.build_parser().subcommands
+    flags = {}
+    for name, parser in subs.items():
+        for action in parser._actions:
+            if action.option_strings and isinstance(action.default, (int, float)) \
+                    and not isinstance(action.default, bool):
+                flags.setdefault(action.option_strings[-1], {})[name] = action.default
+    for flag, by_sub in flags.items():
+        assert len(set(by_sub.values())) == 1, (flag, by_sub)
+    # the two that are taken twice really are
+    assert sorted(flags["--gate-timeout"]) == ["gate", "land"]
+    assert sorted(flags["--ready-timeout"]) == ["cycle", "dispatch", "fail", "turn"]
+
+    docs = _skill_docs()
+    quoted = {}
+    for name, text in docs.items():
+        for flag, value in re.findall(r"`(--[a-z-]+)`[^`\n]{0,30}?\bdefault (\w+)", text):
+            assert flag in flags, f"{name}: `{flag}` has no numeric default"
+            default, = set(flags[flag].values())
+            assert value == str(default), f"{name}: `{flag}` default {value}, the parser's is {default}"
+            quoted.setdefault(flag, set()).add(name)
+    # the scan really found the ones the references state
+    assert quoted == {"--checks-timeout": {"completion-gate.md", "tools.md"},
+                      "--checks-poll": {"tools.md"}}, quoted
+
+
+def _spoken(seconds):
+    """A duration as prose writes it: `a day`, `12 hours`, `90 minutes`."""
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60)):
+        if seconds % size == 0:
+            n = seconds // size
+            return f"{'an' if unit == 'hour' else 'a'} {unit}" if n == 1 else f"{n} {unit}s"
+    return f"{seconds} seconds"
+
+
+def test_the_docs_describe_a_recorded_gate_run_as_the_code_keeps_it():
+    """Where a recorded gate run lives and how long it is believed have one home
+    each — `gate_record_ref` and `GATE_RECORD_TTL` (ADR-0030). The documents that
+    spell the ref or say the duration are copies, held to them here."""
+    assert [_spoken(s) for s in (86400, 43200, 3600, 5400, 172800, 45)] == \
+        ["a day", "12 hours", "an hour", "90 minutes", "2 days", "45 seconds"]
+
+    # the ref is named for the tree and a HASH of the command — never the command
+    ns = afk_decide.GATE_RECORD_NAMESPACE
+    command = "make test"
+    ref = afk_decide.gate_record_ref("<tree>", command)
+    head, _, tail = ref.rpartition("-")
+    assert head == f"{ns}/<tree>" and command not in ref
+    assert re.fullmatch(r"[0-9a-f]{16}", tail)
+    assert afk_decide.gate_record_ref("<tree>", "make check") != ref
+    spelled = f"{head}-<hash of the command>"
+
+    docs = _skill_docs()
+    # the decision that made the record spells it too (source repo only)
+    adr_dir = os.path.join(SKILL, "..", "..", "docs", "adr")
+    for f in sorted(os.listdir(adr_dir)) if os.path.isdir(adr_dir) else []:
+        with open(os.path.join(adr_dir, f)) as fh:
+            docs[f] = fh.read()
+    where = set()
+    for name, text in docs.items():
+        for span in re.findall(r"`(%s[^`]*)`" % re.escape(ns), text):
+            # the namespace, a glob over it, or one record's ref — spelled the one way
+            assert span in (ns + "/", ns + "/*", spelled), f"{name}: `{span}`"
+            where |= {name} if span == spelled else set()
+    assert {"config-template.md", "completion-gate.md", "tools.md"} <= where, where
+
+    # how long a record is believed, wherever a document says it
+    day = _spoken(afk_decide.GATE_RECORD_TTL)
+    old = f"more than {day} old"
+    assert f"a record {old}" in docs["config-template.md"]
+    assert f"no {old}" in docs["completion-gate.md"]
+    assert f"is not asked again for {day}." in docs["completion-gate.md"]
+    probe = next(ln for ln in docs["tools.md"].splitlines() if ln.startswith("| `afk probe"))
+    assert f"records {old} swept" in probe
+    context = docs.get("CONTEXT.md")
+    if context is not None:               # an installed skill ships without it
+        assert f"run red, or after {day}." in context
+
 
 def test_every_flow_anchor_still_names_something():
     """docs/flows.md anchors each step to `path:Symbol`. A renamed function leaves
