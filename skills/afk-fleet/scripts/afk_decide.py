@@ -2701,6 +2701,329 @@ def worker_step(call, row, worker, config):
 
 
 # --------------------------------------------------------------------------- #
+# The tick's plan — which transitions a tick runs, and in what order           #
+# --------------------------------------------------------------------------- #
+#
+# The routing above says what ONE row gets. How those answers are put together —
+# the order they run in, the slot count, "at most one landing turn a tick", "a
+# start that fails to begin ends the starting", which claims count as settled —
+# is `tick_plan`. Later choices depend on earlier results (did the reclaim win,
+# what did the turn answer), so the plan is asked in stages: it hands out ONE
+# step, is told how that step ended, and only then says what comes next.
+# `afk.py` runs what it is handed and reports back (`follow`); it holds no
+# ordering rule and no count of its own (ADR-0017).
+
+# Every step a plan hands out, as {"do": <key>, **arguments} → the name its
+# failure is reported under in the cycle's `errors`.
+TICK_STEPS = {
+    "no-pr": "no-pr",           # {issues} | {batch}: `afk no-pr`'s rows for them
+    "turn": "turn",             # {issue}: `afk turn`
+    "batch-turn": "turn",       # `afk turn --batch`: form a merge batch, or continue mine
+    "abandon": "turn",          # {batch}: `afk turn --abandon`
+    "nudge": "nudge",           # {issue} | {batch}
+    "park": "park",             # {issue}
+    "fail": "fail",             # {issue, reason}
+    "escalate": "escalate",     # {issue, reason}
+    "release": "release",       # {issue}, + {expect_sha} for a dead peer's phantom lock
+    "reclaim": "reclaim",       # {issue, sha}
+    "begin": "dispatch",        # {issue}: `afk dispatch` up to the agent's terminal → BEGUN | LOST
+    "finish": "dispatch",       # {issues}: the rest of every start begun, at once
+    "heartbeat": "heartbeat",
+    "status": "status",         # {issue, phase, pr, attempt}
+    "sweep": "sweep",           # {live}: what a finished merge batch left behind
+}
+
+# How beginning a dispatch ended. A `begin` step answers with the first two;
+# the third is a start that raised, or was not tried.
+START_OUTCOMES = BEGUN, LOST, FAILED = ("begun", "lost", "failed")
+#   BEGUN   the claim is held and the agent's terminal is open
+#   LOST    a peer won the claim: nothing was started
+
+
+class TickBooks:
+    """One tick's books, shared by the stages of its plan: the working set it
+    acts on, what it has done so far, the judgments it hands back and the steps
+    that failed. A stage records what happened — `run`, `did`, `begin`, `take`
+    — and every count is read back from that record: nothing a tick reports
+    (`account`) is kept twice."""
+
+    SETTLES = ("parked", "escalated", "cleared")       # these release the claim
+    WRITES_BOARD = ("granted", "abandoned", "retried", "dispatched", "reclaimed")
+
+    def __init__(self, ws):
+        self.ws = ws
+        self.mine = {r["number"]: r for r in ws["mine"]}
+        self.judgments, self.errors = [], []
+        self.starting = True            # False once a start failed to begin
+        self.begun = []                 # (the list it joins, issue) of each start begun
+        self._done = []                 # (a TICK_DID key, issue), in the order it happened
+        self._took = set()              # stale claims taken from a dead peer
+        self._off_frontier = set()      # frontier issues begun, or lost to a peer
+        self._fresh = set()             # frontier issues whose start was begun
+
+    def run(self, do, **args):
+        """Hand out one step and wait for its answer → its result, None when it
+        failed. One that failed is recorded in `errors` and the tick goes on."""
+        result, error = yield {"do": do, **args}
+        if error is not None:
+            self.failed(do, args.get("issue"), error)
+        return result
+
+    def failed(self, do, number, error):
+        self.errors.append({"step": TICK_STEPS[do], **({"issue": number} if number else {}),
+                            "error": error})
+
+    def did(self, what, *numbers):
+        """Record that `what` — a key of TICK_DID — happened to these issues."""
+        self._done += [(what, n) for n in numbers]
+
+    def take(self, number):
+        """Record a stale claim taken from a dead peer: held from here, started or not."""
+        self._took.add(number)
+
+    def begin(self, number, counted, outcome, frontier=False):
+        """Record how beginning one start ended — a START_OUTCOMES. `counted` is
+        the list the issue joins once its worker runs; `frontier` says it came
+        off the frontier."""
+        if outcome == FAILED:
+            self.starting = False       # orca or the remote is unwell: no further start
+            return
+        if frontier:
+            self._off_frontier.add(number)
+        if outcome == BEGUN:
+            self.begun.append((counted, number))
+            if frontier:
+                self._fresh.add(number)
+
+    def _numbers(self, *whats):
+        return [n for what, n in self._done if what in whats]
+
+    @property
+    def settled(self):
+        """My claims this tick released."""
+        return set(self._numbers(*self.SETTLES)) & set(self.mine)
+
+    @property
+    def touched(self):
+        """The claims whose status board a transition of this tick wrote."""
+        return set(self._numbers(*self.WRITES_BOARD))
+
+    @property
+    def held(self):
+        """The claims whose status board is still mine to remember."""
+        return (set(self.mine) - self.settled) | set(self._numbers("dispatched", "reclaimed"))
+
+    @property
+    def slots(self):
+        """The dispatch slots still free for the frontier."""
+        return (self.ws["free_slots"] + len(self.settled) - len(self._took)
+                - len(self._fresh))
+
+    @property
+    def in_flight(self):
+        """The claims this fleet holds: a frontier issue counts once its worker runs."""
+        staffed = self._fresh & set(self._numbers("dispatched"))
+        return len(self.mine) - len(self.settled) + len(self._took) + len(staffed)
+
+    @property
+    def frontier_remaining(self):
+        return len(self.ws["frontier"]["dispatch"]) - len(self._off_frontier)
+
+    def account(self):
+        """What the tick did, as `cycle_ticked` reads it: the issues per TICK_DID
+        key, and the TICK_COUNTS."""
+        return {**{k: self._numbers(k) for k in TICK_DID},
+                "in_flight": self.in_flight, "frontier_remaining": self.frontier_remaining}
+
+
+def tick_plan(ws, call, config):
+    """
+    One reconciliation pass over the working set `ws`, as the steps to run — a
+    generator: each value it yields is ONE step ({"do": a TICK_STEPS key,
+    **arguments}), and it is sent that step's answer before it says the next.
+
+      ws:     the working set (`assemble_working_set`)
+      call:   what a judgment's commands are built from (`afk_command`); its
+              `instance` is the fleet instance the tick runs as
+      config: the canonical config
+
+      answer: (result, None) when the step was carried out — `result` is what
+              its transition returned, a START_OUTCOMES word for `begin` — or
+              (None, "<what it raised>") when it failed. `finish` is answered
+              with a list of such pairs, one per issue, in the order given
+
+    Returns (as the generator's value) {"did": the tick's account for
+    `cycle_ticked`, "judgments", "errors", "held": the claims whose status board
+    is still mine to remember}.
+
+    In order: `no-pr` for the claims waiting on a worker → the landing turn, to
+    one PR or to one merge batch (`_turn_plan`) → nudge / fail / park / escalate
+    where the reason is on record, or the judgment that stands in for one →
+    release `closed` rows and `stale_closed` phantom locks → begin the starts:
+    continuations of claims already held, each `stale` claim reclaimed, then the
+    frontier into the free slots → finish every start begun, at once → heartbeat
+    → status boards → what a finished batch left behind.
+
+    A step that fails is recorded in `errors` and settles nothing: its claim is
+    still held and the rest of the tick goes on. A start that fails to BEGIN
+    ends the starting for this tick — it is orca or the remote that is unwell,
+    and every further dispatch would take a claim it cannot staff. A claim
+    settled earlier in the tick frees its slot for the frontier; a stale claim
+    taken uses one; a frontier issue a peer won comes off the frontier and uses
+    none.
+    """
+    tick = TickBooks(ws)
+    run = tick.run
+
+    # --- observe: the claims waiting on their worker ---
+    asked = asks_after(ws["mine"])
+    seen = (yield from run("no-pr", issues=asked)) if asked else None
+    routes = [(w["issue"], *worker_step(call, tick.mine[w["issue"]], w, config))
+              for w in (seen or {}).get("workers", [])]
+
+    # --- the landing turn: at most one grant a tick, to one PR or to one merge batch ---
+    live = yield from _turn_plan(tick, call, config)
+
+    # --- nudge / fail / park / escalate, or the judgment that stands in for one ---
+    tick.judgments += [failure_judgment(call, r) for r in ws["mine"] if r["status"] == "failure"]
+    for number, do, detail in routes:
+        if do == "judge":
+            tick.judgments.append(detail)
+        elif do == "nudge":
+            if (yield from run("nudge", issue=number)):
+                tick.did("nudged", number)
+        elif do == "park":
+            if (yield from run("park", issue=number)):
+                tick.did("parked", number)
+        elif do in ("fail", "escalate"):
+            done = yield from run(do, issue=number, reason=detail)
+            if done:        # a failure past its last retry is an escalation
+                tick.did("escalated" if done["action"] == "escalate" else "retried", number)
+
+    # --- release what outlived its issue ---
+    for row in ws["mine"]:
+        if row["status"] == "closed" and (yield from run("release", issue=row["number"])):
+            tick.did("cleared", row["number"])
+    for row in ws["stale_closed"]:
+        if (yield from run("release", issue=row["number"], expect_sha=row["sha"])):
+            tick.did("cleared", row["number"])
+
+    # --- start workers: continuations of claims already held, then the frontier ---
+    def begin(number, counted, frontier=False):
+        """Begin one start; the claim is held from here unless it failed or a peer won it."""
+        outcome = (yield from run("begin", issue=number)) if tick.starting else None
+        tick.begin(number, counted, outcome or FAILED, frontier=frontier)
+
+    for number, do, _ in routes:
+        if do == "dispatch":
+            yield from begin(number, "dispatched")
+    for row in ws["stale"]:
+        took = (yield from run("reclaim", issue=row["number"], sha=row["sha"])) \
+            if tick.starting else None
+        if took and took["won"]:
+            tick.take(row["number"])
+            yield from begin(row["number"], "reclaimed")
+    for issue in ws["frontier"]["dispatch"]:
+        if tick.slots <= 0 or not tick.starting:
+            break
+        yield from begin(issue["number"], "dispatched", frontier=True)
+    if tick.begun:      # every agent is waited for and handed its prompt at once
+        workers = yield {"do": "finish", "issues": [n for _, n in tick.begun]}
+        for (counted, number), (worker, error) in zip(tick.begun, workers):
+            if error is not None:
+                tick.failed("finish", number, error)
+            elif worker:
+                tick.did(counted, number)
+
+    # --- the lease, and what a human reads on each issue ---
+    if tick.in_flight:
+        yield from run("heartbeat")
+    if config["progress_comment"]:
+        written = tick.settled | tick.touched
+        for row in ws["mine"]:
+            if row["board_phase"] and row["number"] not in written:
+                yield from run("status", issue=row["number"], phase=row["board_phase"],
+                               pr=row["pr"], attempt=row["attempt"])
+    if config["merge"]["batch"] or ws["batches"]:
+        yield from run("sweep", live=sorted(live))
+    return {"did": tick.account(), "judgments": tick.judgments, "errors": tick.errors,
+            "held": tick.held}
+
+
+def _turn_plan(tick, call, config):
+    """The landing-turn stage of `tick_plan` → the ids of the merge batches that
+    hold a turn when it is done; what it did and what it could not decide go
+    into `tick`. One turn is out at a time, held by one PR or by one batch
+    (ADR-0029), so exactly one of these happens:
+
+      a dead fleet's batch on claims I took   abandoned; nothing is granted until
+                                              the next cycle reads the result
+      my batch holds the turn                 its worker is asked after: left,
+                                              continued, nudged once, or the
+                                              batch abandoned
+      two or more PRs are eligible            a batch is formed (`afk turn --batch`)
+      otherwise                               the head of the merge queue gets
+                                              the turn, as before"""
+    ws, run, instance = tick.ws, tick.run, call["instance"]
+
+    def abandon(batch):
+        gone = yield from run("abandon", batch=batch["id"])
+        if gone:
+            tick.did("abandoned", *gone["issues"])
+        return gone
+
+    dead = [b for b in ws["batches"] if b["instance"] != instance]
+    mine = next((b for b in ws["batches"] if b["instance"] == instance), None)
+    live = {mine["id"]} if mine else set()
+    if dead:
+        for batch in dead:
+            if not (yield from abandon(batch)):
+                live.add(batch["id"])
+        return live
+    if mine:
+        seen = yield from run("no-pr", batch=mine["id"])
+        do = batch_step(seen["workers"][0]) if seen else "leave"
+        if do == "continue":
+            again = yield from run("batch-turn")
+            if again and again["outcome"] == "granted":
+                tick.did("granted", *again["issues"])
+        elif do == "nudge":
+            if (yield from run("nudge", batch=mine["id"])):
+                tick.did("nudged", *(m["issue"] for m in mine["members"]))
+        elif do == "abandon":
+            if (yield from abandon(mine)):
+                live = set()
+        return live
+    if batch_candidates(ws["mine"], ws["merge_order"], config):
+        formed = yield from run("batch-turn")
+        if formed is None:
+            return live
+        if formed["outcome"] == "granted":
+            tick.did("granted", *formed["issues"])
+            return {formed["batch"]}
+    due = turn_due(ws["mine"], ws["merge_order"])
+    single = (yield from run("turn", issue=due)) if due else None
+    if single:
+        do, asks = turn_step(call, single, config)
+        if do == "granted":
+            tick.did("granted", due)
+        elif do == "judge":
+            tick.judgments.append(asks)
+    return live
+
+
+def follow(plan, carry_out):
+    """Carry a `tick_plan` out → what it returns. `carry_out(step)` performs one
+    step and answers as the plan expects; it is all the effectful side supplies."""
+    answer = None
+    try:
+        while True:
+            answer = carry_out(plan.send(answer))
+    except StopIteration as end:
+        return end.value
+
+
+# --------------------------------------------------------------------------- #
 # Worker launch command — launcher/worker provider parity (ADR-0010)           #
 # --------------------------------------------------------------------------- #
 #
