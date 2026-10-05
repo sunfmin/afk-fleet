@@ -9,7 +9,8 @@ With the option off, or with one eligible PR, ADR-0027 is unchanged. Reuses the 
 of [ADR-0018](0018-nudge-a-silent-worker-before-failing-it.md), the continuation tiers of
 [ADR-0011](0011-takeover-and-progress-preservation.md) and the recorded-nothing rule of
 [ADR-0026](0026-a-recorded-gate-run-stands-in-for-the-merge-time-run.md) (a batch never trusts a
-recorded run: no record is of a stack).
+recorded run: no record is of a stack) — that last rule is removed by [ADR-0030](0030-a-gate-run-is-recorded-on-the-remote-under-the-tree-it-tested.md): a record is
+of a tree, so a stack whose tree was already gated green is not gated again.
 
 ## Context
 

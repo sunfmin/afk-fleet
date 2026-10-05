@@ -111,19 +111,28 @@ completion gate — promoted from the worker's optional pre-PR filter to the onl
 a PR must pass (ADR-0012). It runs twice in a PR's life: the **worker** runs it after its pre-PR
 **sync**, so it tests "my code + current base"; and the worker's **landing** runs it again, after the
 landing's **sync**, in the same worktree. The invariant both runs serve: *what lands on the target
-branch was tested in the form it lands.* The worker runs it through `afk gate`, which puts a green
-run on record with the head it ran on; unless a repo turns `gate.trust_recorded_run` off, the landing
-skips its own run when — and only when — that record is of the command configured now, on a
-committed tree, at the exact head that would land. A landing sync that moved the head, a later
-commit, a changed command, or no record at all voids it, and the landing runs the gate as before
-(ADR-0026). GitHub checks are never read in this mode — the repo is
+branch was tested in the form it lands.* A green run on a committed tree becomes a **recorded gate
+run**, and a landing skips its own run when one stands for the tree that would land. GitHub checks
+are never read in this mode — the repo is
 expected to scope remote CI away from worker branches, and a target branch whose protection requires
 checks is rejected at bootstrap. A red run at landing is the worker's to fix in place; its log
 excerpt is also posted as a PR comment, so a failure that does reach the retry ladder is re-read
 from where it lives, never from anyone's context. In a **merge batch** the landing's run is
 made once, on the batch's stack, and proves the stack rather than each PR alone — the invariant
-holds for the commit the target is moved to (ADR-0029); a recorded run is never trusted for a stack.
+holds for the commit the target is moved to (ADR-0029).
 _Avoid_: local CI (it substitutes for CI; it is not CI), pre-push check, local build
+
+**Recorded gate run**:
+The evidence that the **local gate** passed on a piece of content: one green run, of one command, on
+one committed tree. It is made by the tool that saw the exit code — never by a worker saying so —
+and kept on GitHub under the tree it tested, so it stands wherever that same content is about to
+land: the worker's worktree, one recreated from the pushed branch, another machine, another commit
+holding the same files, a **merge batch**'s stack. It is always trusted while it stands, and it
+stops standing when the same tree is later run red, or after a day. A **sync** that brought the
+target in or a later commit makes a different tree, which has its own record or none — and with
+none, the landing runs the gate (ADR-0030).
+_Avoid_: gate cache (it is evidence, not an optimisation that may be wrong), cached result, CI
+status (GitHub's checks are a different gate)
 
 **Sync**:
 The one way a worker branch catches up with its base: merging `origin/<base>` into the branch —

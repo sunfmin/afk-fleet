@@ -365,6 +365,41 @@ def test_probe_prefers_the_hidden_namespace_and_cleans_up():
         assert sb.all_refs() == before
 
 
+def test_probe_says_whether_gate_runs_can_be_recorded_and_sweeps_the_expired():
+    """ADR-0030. With a local gate the probe says, with the human present, whether
+    a gate run can be put on record on this remote — a warning when it cannot,
+    never an error — and sweeps the records past their day."""
+    with sandbox() as sb:
+        w = sb.clones[0]
+        local = ("--set", "gate.ci=local", "--set", "gate.local_command=make test", "--now", str(T0))
+        tree = git(w, "rev-parse", "HEAD^{tree}")
+
+        def record(command, at):
+            body = json.dumps(afk_decide.gate_record(tree, command, at))
+            sha = git(w, "commit-tree", tree, "-m", f"afk-gate green\n\n{body}")
+            ref = afk_decide.gate_record_ref(tree, command)
+            git(w, "push", "-q", "origin", f"{sha}:{ref}")
+            return ref
+
+        fresh = record("make test", T0 - afk_decide.GATE_RECORD_TTL)
+        stale = record("make old", T0 - afk_decide.GATE_RECORD_TTL - 1)
+        junk = "refs/afk/gate/not-a-record"
+        git(w, "push", "-q", "origin", f"HEAD:{junk}")
+        before = sb.all_refs()
+        r = afk(w, "probe", *local)["gate_records"]
+        assert (r["verdict"], r["pruned"]) == ("ok", 2) and "refs/afk/gate" in r["detail"], r
+        assert sb.all_refs() == before - {stale, junk} and fresh in sb.all_refs()
+        assert not git(w, "for-each-ref", "refs/afk-gate")           # no mirror left behind
+
+        # a remote that refuses the records: said, and the launch goes on
+        sb.forbid("refs/afk/gate/")
+        r = afk(w, "probe", *local)["gate_records"]
+        assert r["verdict"] == "warn" and "remote rejected" in r["detail"] \
+            and "every landing runs the gate itself" in r["detail"], r
+        # a gate that is GitHub's checks has no records to speak of
+        assert "gate_records" not in afk(w, "probe", "--now", str(T0))
+
+
 def test_probe_falls_back_when_the_server_rejects_the_hidden_namespace():
     """An org ruleset forbidding non-branch refs: the probe finds the namespace that
     DOES work and folds it into the config, so every later call inherits it through

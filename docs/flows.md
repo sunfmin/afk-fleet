@@ -45,7 +45,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    `skills/afk-fleet/references/worker-prompt.md:Publish`
 8. The worker **syncs** (merges the base into its branch, never rebases), pushes, and runs the
    **local gate** until it is green on the combined tree — through `afk gate`, which puts a green
-   run on record with the head it ran on.
+   run on record on the remote, under the tree it tested.
    `skills/afk-fleet/scripts/afk.py:cmd_gate`
 9. The worker opens a PR whose body says `Closes #n`, **wakes** the launcher with one line that
    carries nothing, and stops; it does not merge yet.
@@ -99,10 +99,10 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   attempt spent, `skills/afk-fleet/scripts/afk_decide.py:land_outcome`.
 - The landing's gate is red: the worker fixes the code, commits and lands again; the excerpt is
   also a PR comment, `skills/afk-fleet/scripts/afk_decide.py:gate_comment`.
-- `gate.trust_recorded_run` is on (the default), and a recorded run is of the command configured
-  now, on a committed tree, at the exact head that would land: step 13 does not run the local gate
-  again, `skills/afk-fleet/scripts/afk_decide.py:gate_record_void` (ADR-0026). Any sync that moved
-  the head, any later commit, or no record, and it runs as written.
+- A recorded gate run of the command configured now stands for the tree that would land: step 13
+  does not run the local gate again, `skills/afk-fleet/scripts/afk_decide.py:gate_record_void`
+  (ADR-0030). Any sync that moved the head, any later commit, a record past its day, or no record,
+  and it runs as written.
 - The landing's sync moved the head and the next move is the tick's — the checks on the new head
   were still running when the landing's wait ran out, or an adversarial verify is owed on it: the
   landing stops, the worker wakes the launcher,
@@ -275,9 +275,9 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   gated in the form it lands; only exit 0 is green, and a timeout is red. (ADR-0012, ADR-0017;
   `test_a_worker_lands_its_own_pr_on_the_turn_the_fleet_grants`,
   `test_in_required_mode_the_turn_waits_for_checks_on_the_head_that_lands`) The local gate is not run
-  twice on one commit only where the repo opted in, and only on a record `afk` itself made of that
-  commit. (ADR-0026; `test_a_recorded_worker_gate_run_is_not_repeated_by_the_landing`,
-  `test_a_recorded_gate_run_is_void_unless_it_is_of_the_head_that_lands`)
+  twice on one tree, and only on a record `afk` itself made of that tree, wherever it was made.
+  (ADR-0030; `test_a_recorded_worker_gate_run_is_not_repeated_by_the_landing`,
+  `test_a_recorded_gate_run_is_void_unless_it_is_of_the_tree_that_lands`)
 - A worker starts from the commit the remote has, never a stale local branch, and is told the branch
   orca actually created. (ADR-0017;
   `test_dispatch_starts_a_worker_on_the_remote_base_tip_and_submits_its_prompt`)

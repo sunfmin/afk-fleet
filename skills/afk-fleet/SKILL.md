@@ -94,7 +94,7 @@ asks only the one thing code cannot derive (step 3, and only when it was not pas
    guessed settings.
 2. **Establish this fleet instance** — mint a short unique **instance id** (this launcher run's
    identity, passed to the first cycle and carried in the cycle `state` from then on). Then
-   `afk probe --repo <repo> --config '<config>'`, which answers two compatibility questions and
+   `afk probe --repo <repo> --config '<config>'`, which answers three compatibility questions and
    returns the run's config — **hold its `config` from here on, in place of step 1's**:
    - **Claim namespace** — the returned `config` carries the `claim_namespace` that actually works, so
      every later call inherits it through `--config` with nothing extra to pass. If it reports
@@ -110,6 +110,9 @@ asks only the one thing code cannot derive (step 3, and only when it was not pas
      too.) With `merge.batch` it is also an `"error"` when the target would refuse a direct push
      (required pull request reviews, push restrictions, a locked branch) — a merge batch lands by
      pushing; **stop here** too. A `"warn"` verdict (the read was inconclusive — no admin rights) is reported and continues.
+   - **Gate records** (only when `gate.ci: local`) — `gate_records.verdict == "warn"` means the
+     remote refuses `refs/afk/gate/*`, so no gate run can be put on record and every landing runs
+     the gate itself (ADR-0030): **say so and continue** — it costs time, never correctness.
 3. **Settle the worker launch command** — `afk worker-command`. The tool first detects the
    **runtime** (ADR-0014): `QODERCN_CLI=1` in the environment → `qoderclicn` (always stock — no
    custom provider, no wrapping — returns its default and never asks); otherwise → `claude`, and
@@ -382,8 +385,8 @@ the PR's GitHub checks; `local` makes `gate.local_command` the gate, run by the 
 that lands, and never reads checks. `afk land` applies whichever is configured
 ([Landing](#landing--the-worker-lands-its-own-pr-on-its-turn)); the invariants
 behind them — the local gate's two-run rule, the one case the landing
-skips its own run unless `gate.trust_recorded_run` is turned off (an `afk gate` run is on record for the exact head that lands;
-[ADR-0026](../../docs/adr/0026-a-recorded-gate-run-stands-in-for-the-merge-time-run.md)), the
+skips its own run (a green run is on record, on the remote, for the tree that lands;
+[ADR-0030](../../docs/adr/0030-a-gate-run-is-recorded-on-the-remote-under-the-tree-it-tested.md)), the
 ephemeral CI sub-read, and the adversarial-verify procedure when `gate.adversarial_verify` is on — are
 disclosed in [references/completion-gate.md](references/completion-gate.md). Read it before running an
 adversarial verify or switching a repo to `gate.ci: local`. `afk gate` and `afk land` are the

@@ -430,36 +430,43 @@ def test_gate_verdict():
     assert r["status"] == "red" and r["timed_out"] is True
 
 
-def test_a_recorded_gate_run_counts_only_for_the_commit_and_command_it_ran():
-    """ADR-0026. The merge skips its own run of the local gate on ONE proof: a green
-    run of the command configured now, on a committed tree, at the head that would
-    land. Everything else is void — and void means the merge gates."""
-    rec = d.gate_record("abc123", "make test", True, 1700000000.9)
-    assert rec == {"head": "abc123", "command": "make test", "clean": True, "at": 1700000000}
-    assert d.gate_record_void(rec, "abc123", "make test") is None
+def test_a_recorded_gate_run_counts_only_for_the_tree_and_command_it_ran():
+    """ADR-0030. A landing skips its own run of the local gate on ONE proof: a green
+    run of the command configured now, on the tree that would land, no more than a
+    day old. Everything else is void — and void means the landing gates."""
+    now = 1700000000
+    rec = d.gate_record("abc123", "make test", now + 0.9)
+    assert rec == {"tree": "abc123", "command": "make test", "at": now}
+    assert d.gate_record_void(rec, "abc123", "make test", now) is None
+    assert d.gate_record_void(rec, "abc123", "make test", now + d.GATE_RECORD_TTL) is None
+    assert d.GATE_RECORD_TTL == 24 * 3600
 
-    for record, head, command, why in (
-            (None, "abc123", "make test", "no green run"),
-            ({}, "abc123", "make test", "no green run"),
-            ("green", "abc123", "make test", "no green run"),        # not a record at all
-            ({**rec, "head": ""}, "", "make test", "no green run"),
-            (rec, "def456", "make test", "not on the head that would land"),   # synced, or committed
-            (rec, "abc123", "make test -short", "different command"),
-            (rec, "abc123", " make test", "different command"),      # verbatim, not "close enough"
-            ({**rec, "clean": False}, "abc123", "make test", "uncommitted or untracked"),
-            ({k: v for k, v in rec.items() if k != "clean"}, "abc123", "make test", "uncommitted")):
-        assert why in d.gate_record_void(record, head, command), (record, head, command)
-    # the reason names both heads, so a human reading a tick's result can see what moved
-    void = d.gate_record_void(rec, "def456", "make test")
-    assert "abc123" in void and "def456" in void
+    for record, tree, command, at, why in (
+            (None, "abc123", "make test", now, "no green run"),
+            ({}, "abc123", "make test", now, "no green run"),
+            ("green", "abc123", "make test", now, "no green run"),   # not a record at all
+            ({**rec, "tree": ""}, "", "make test", now, "no green run"),
+            (rec, "def456", "make test", now, "not on the tree that would land"),
+            (rec, "abc123", "make test -short", now, "different command"),
+            (rec, "abc123", " make test", now, "different command"),  # verbatim, not "close enough"
+            (rec, "abc123", "make test", now + d.GATE_RECORD_TTL + 1, "old"),
+            ({"tree": "abc123", "command": "make test"}, "abc123", "make test", now, "old")):
+        assert why in d.gate_record_void(record, tree, command, at), (record, tree, command)
 
-    # on unless a repo turns it off — and so never an error in `required` mode,
-    # which has no landing run of the command to skip: the key is inert there
-    assert d.CONFIG_DEFAULTS["gate"]["trust_recorded_run"] is True
-    for ci in d.GATE_CI_MODES:
-        for trust in (True, False):
-            d.validate_config(d.resolve_config(
-                {"gate": {"ci": ci, "local_command": "make test", "trust_recorded_run": trust}}))
+    # the ref's name is the key: one per tree and command, and nothing else in it
+    ref = d.gate_record_ref("abc123", "make test")
+    assert ref.startswith("refs/afk/gate/abc123-") and ref == d.gate_record_ref("abc123", "make test")
+    assert len({ref, d.gate_record_ref("def456", "make test"),
+                d.gate_record_ref("abc123", "make test ")}) == 3
+
+    # a recorded run is always trusted: the key that turned that off is gone, and
+    # a file still carrying it is told so rather than silently ignored
+    assert "trust_recorded_run" not in d.CONFIG_DEFAULTS["gate"]
+    try:
+        d.parse_config_yaml("gate:\n  trust_recorded_run: false")
+        assert False, "expected ValueError for the removed trust_recorded_run key"
+    except ValueError as e:
+        assert "was removed" in str(e) and "ADR-0030" in str(e)
 
     # the line a worker gates with: the tool, carrying the command — quoted for a shell
     assert d.gate_command("/s/afk.py", " make test ") == \

@@ -5,7 +5,8 @@ checks). Composes with [ADR-0011](0011-takeover-and-progress-preservation.md)'s 
 progress preservation and reuses its continuation tier-2 move for merge-time worktree recreation.
 The merge-time re-run of decision 2 can be skipped, opt-in, when the worker's run is on record for
 the exact head that lands ([ADR-0026](0026-a-recorded-gate-run-stands-in-for-the-merge-time-run.md));
-the invariant is unchanged.
+the invariant is unchanged. That record is now kept on the remote under the tree it tested and always
+trusted ([ADR-0030](0030-a-gate-run-is-recorded-on-the-remote-under-the-tree-it-tested.md)).
 **Superseded in part by [ADR-0027](0027-a-worker-lands-its-own-pr-on-a-landing-turn.md):** the merge-time sync and gate run are no longer the tick's — the worker runs them, on its landing turn, with `afk land`. The invariant (what lands was gated in the form it lands) and merge-never-rebase stand.
 **Relaxed, opt-in, by [ADR-0029](0029-a-merge-batch-lands-n-prs-behind-one-gate-run.md):** with `merge.batch` the landing's run is made once on a stack of several PRs, so it proves the stack that lands, not each PR alone.
 
