@@ -46,21 +46,27 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    run on record with the head it ran on.
    `skills/afk-fleet/scripts/afk.py:cmd_gate`
 9. The worker opens a PR whose body says `Closes #n`, **wakes** the launcher with one line that
-   carries nothing, and stops; it never merges.
+   carries nothing, and stops; it does not merge yet.
    `skills/afk-fleet/scripts/afk_decide.py:wake_command`
-10. A later tick's rebuild matches that PR to the claim and classifies it: awaiting merge once its
-    checks are green (or, with `gate.ci: local`, as soon as the PR is open).
+10. A later tick's rebuild matches that PR to the claim and classifies it: awaiting its **landing
+    turn** once its checks are green (or, with `gate.ci: local`, as soon as the PR is open).
     `skills/afk-fleet/scripts/afk_decide.py:subclassify_pr`
-11. One PR at a time, the tick **merges**: the merge syncs the branch with the merge target again,
-    in the issue's worktree, and pushes what that produced.
+11. One PR at a time, in merge order, the tick grants the **landing turn**: it records the turn as
+    a marker comment on the PR and tells the worker — one submitted line pointing at a landing
+    brief — to land it. The tick merges nothing.
+    `skills/afk-fleet/scripts/afk.py:cmd_turn`
+12. The worker runs `afk land` in its own worktree, which refuses without the turn, then syncs the
+    branch with the merge target again and pushes what that produced.
     `skills/afk-fleet/scripts/afk.py:_sync`
-12. It re-confirms the gate against the exact head that will land: the local gate run there, or the
-    PR's checks, which count only if the sync did not move the head.
+13. The landing re-confirms the gate against the exact head that will land: the local gate run
+    there, or the PR's checks, which count only if the sync did not move the head.
     `skills/afk-fleet/scripts/afk_decide.py:checks_gate`
-13. It merges the PR, pinned to the gated head, which closes the issue; upserts the status board to
-    "merged"; releases the claim; and has orca remove the worktree, freeing the slot. Its outcome
-    names the claims that were queued behind that PR and are now free, and the tick merges those
-    next. `skills/afk-fleet/scripts/afk.py:cmd_merge`
+14. It merges the PR, pinned to the gated head, which closes the issue, and upserts the status
+    board to "merged"; the worker wakes the launcher and stops.
+    `skills/afk-fleet/scripts/afk.py:cmd_land`
+15. The next tick finds a claim of its own whose issue is closed and releases it, which also has
+    orca remove the worktree, freeing the slot — and the landing turn goes to the next PR.
+    `skills/afk-fleet/scripts/afk.py:cmd_release`
 
 **Where it forks.**
 - The worker opens no PR and leaves an `afk:verdict` marker instead (already-satisfied, blocked,
@@ -73,25 +79,31 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   (ADR-0018).
 - The worker declared the issue already satisfied and its branch is empty: the tick verifies the
   empty diff and closes it, `skills/afk-fleet/scripts/afk.py:cmd_close`.
-- The checks or the merge-time gate are red: the retry mainline below.
-- The sync conflicts: the merge stops, and the tick **hands the conflict back** to the worker that
-  wrote the branch — claim, PR, branch and worktree kept, no attempt spent,
-  `skills/afk-fleet/scripts/afk.py:cmd_hand_back` (ADR-0019). The claim is then `handed_back`, not
-  awaiting merge, until the PR head contains the target tip it named
-  (`skills/afk-fleet/scripts/afk_decide.py:handback_open`), and rejoins this mainline at step 10.
-- A handed-back PR ahead of it in the merge queue conflicted in a file this PR also changes: the
-  claim is `queued` — not merged, not synced, not handed back — until that PR has merged, so each
-  worker of a conflicting group resolves once, `skills/afk-fleet/scripts/afk_decide.py:waits_behind`
-  (ADR-0025).
-- The repo set `gate.trust_recorded_run`, and the worker's recorded run is of the command configured
-  now, on a committed tree, at the exact head that would land: step 12 does not run the local gate
+- The PR's checks are red before any turn is granted: the retry mainline below.
+- Another PR of this fleet holds the landing turn: this one waits, awaiting its turn — not synced,
+  not told anything, its slot held — so each PR of a conflicting group is resolved once, against a
+  target that already holds the ones before it, `skills/afk-fleet/scripts/afk_decide.py:turn_order`
+  (ADR-0027).
+- The landing's sync conflicts: the merge is left in progress in the worker's own worktree, and the
+  worker resolves it, commits and lands again — claim, PR, branch, worktree and turn kept, no
+  attempt spent, `skills/afk-fleet/scripts/afk_decide.py:land_outcome`.
+- The landing's gate is red: the worker fixes the code, commits and lands again; the excerpt is
+  also a PR comment, `skills/afk-fleet/scripts/afk_decide.py:gate_comment`.
+- The repo set `gate.trust_recorded_run`, and a recorded run is of the command configured
+  now, on a committed tree, at the exact head that would land: step 13 does not run the local gate
   again, `skills/afk-fleet/scripts/afk_decide.py:gate_record_void` (ADR-0026). Any sync that moved
   the head, any later commit, or no record, and it runs as written.
-- The PR is awaiting merge but its worker is still working in the worktree — it pushed its answer
-  to a hand-back and is gating it: the merge stops with `worker_busy`, nothing touched, and a later
-  tick lands it, `skills/afk-fleet/scripts/afk.py:cmd_merge` (ADR-0024).
-- The PR has no checks at all, or an adversarial verify is required: the merge stops and the tick
-  decides (`--allow-no-checks`, `--verified`), `skills/afk-fleet/SKILL.md:needs_verify`.
+- The landing's sync moved the head and the next move is the tick's — checks must run on the new
+  head, or an adversarial verify is owed on it: the landing stops, the worker wakes the launcher,
+  the turn stays with the PR, and the tick's next `afk turn` tells the worker to land again once
+  that is settled, `skills/afk-fleet/scripts/afk_decide.py:turn_gate`.
+- The PR has no checks at all, or an adversarial verify is required: the turn is not granted until
+  the tick decides (`--allow-no-checks`, `--verified`), `skills/afk-fleet/SKILL.md:needs_verify`.
+- The worker's terminal is gone when its turn comes: a new worker is started by continuation in
+  the same worktree — or one recreated at the PR's head — briefed only to land the PR,
+  `skills/afk-fleet/scripts/afk_decide.py:render_landing`.
+- The worker goes silent on its turn: it is nudged once and then failed like any other silence,
+  which closes its PR and frees the turn, `skills/afk-fleet/scripts/afk_decide.py:classify_no_pr`.
 - A peer wins the claim race, or the claim push fails outright (an error, never a lost race):
   ADR-0015.
 - `--plan` stops after step 2 and returns the dispatch plan: ADR-0002.
@@ -201,8 +213,9 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    `skills/afk-fleet/scripts/afk.py:_escalate`
 
 **Where it forks.**
-- Other ways into step 1: a red merge-time gate (`skills/afk-fleet/scripts/afk_decide.py:gate_verdict`),
-  a sync conflict handed back to its worker and never answered, an adversarial refute (`skills/afk-fleet/references/completion-gate.md:adversarial_verify`),
+- Other ways into step 1: a worker given its landing turn that never landed — a conflict it did
+  not resolve, a gate (`skills/afk-fleet/scripts/afk_decide.py:gate_verdict`) it did not make
+  green — an adversarial refute (`skills/afk-fleet/references/completion-gate.md:adversarial_verify`),
   or a worker idle past grace with a `giving-up` verdict or none at all
   (`skills/afk-fleet/scripts/afk_decide.py:classify_no_pr`).
 - A worker that declares itself blocked is not a failure and never counts as an attempt. Where each
@@ -226,8 +239,9 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 - A fleet never takes a peer's claim unattended while that peer's heartbeat is within the lease, and
   its own claims stay its own even when its heartbeat has expired. (ADR-0003;
   `test_classify_claims`, `test_classify_claims_my_own_expired_stays_mine`)
-- A claim is deleted at every terminal transition (merge, escalate, park, close, release) and as its
-  last step — after the PR landed, after the relabel, after the dependency edge — and a release that
+- A claim is deleted at every terminal transition (escalate, park, close, release) and as its
+  last step — after the relabel, after the dependency edge; a landed PR's claim by the next cycle's
+  release, which also removes its worktree — and a release that
   left the ref on the remote is an error, never "released". (ADR-0016, ADR-0017;
   `test_a_release_that_did_not_delete_the_claim_is_an_error`,
   `test_escalate_relabels_before_it_releases`)
@@ -242,10 +256,10 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   `test_a_worker_blocked_on_workable_backlog_is_parked_until_the_blocker_closes`)
 - A branch catches up with its base by merging, never rebasing, and what lands on the target was
   gated in the form it lands; only exit 0 is green, and a timeout is red. (ADR-0012, ADR-0017;
-  `test_merge_gates_the_tree_that_lands_then_settles_the_claim`,
-  `test_merge_in_required_mode_trusts_checks_only_on_the_head_that_lands`) The local gate is not run
+  `test_a_worker_lands_its_own_pr_on_the_turn_the_fleet_grants`,
+  `test_in_required_mode_the_turn_waits_for_checks_on_the_head_that_lands`) The local gate is not run
   twice on one commit only where the repo opted in, and only on a record `afk` itself made of that
-  commit. (ADR-0026; `test_a_recorded_worker_gate_run_is_not_repeated_by_the_merge`,
+  commit. (ADR-0026; `test_a_recorded_worker_gate_run_is_not_repeated_by_the_landing`,
   `test_a_recorded_gate_run_is_void_unless_it_is_of_the_head_that_lands`)
 - A worker starts from the commit the remote has, never a stale local branch, and is told the branch
   orca actually created. (ADR-0017;
@@ -261,19 +275,24 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   nothing down — only a retry or an explicit fresh start discards an attempt — and neither
   continuation nor takeover reads or increments the attempt count.
   (ADR-0011; `test_select_recovery`, `test_dispatch_continues_from_whatever_progress_survived`)
-- A sync conflict is not a failure of the work: it is handed back to the worker that wrote the
-  branch, spends no attempt and discards nothing, and the claim is not awaiting merge again until
-  the PR head contains the target tip the hand-back named; only a hand-back the worker never answers
-  enters the retry ladder. PRs land in one order — handed-back ones first — and a PR waits, unsynced,
-  behind a handed-back PR ahead of it whose conflicted files it changes, so mutually conflicting PRs
-  are each resolved once (ADR-0025;
-  `test_mutually_conflicting_prs_merge_one_at_a_time_each_resolving_once`). The merge that lands the
-  PR ahead names the claims it freed, so a queued PR is merged in that same tick (ADR-0026;
-  `test_a_landed_pr_names_the_claims_of_mine_it_freed_and_no_others`). And no merge runs into a worktree whose worker is busy, whatever the
-  claim's status. (ADR-0019, ADR-0024;
-  `test_merge_stays_out_of_a_worktree_whose_worker_is_still_working`;
-  `test_hand_back_returns_a_sync_conflict_to_the_worker_that_wrote_the_branch`,
-  `test_an_unanswered_hand_back_falls_through_to_the_nudge_and_then_the_retry_ladder`)
+- A PR lands only through its worker's `afk land`, and only while it holds the landing turn of the
+  fleet instance that holds its claim; turns are granted one at a time, in one order, so mutually
+  conflicting PRs are each resolved once. (ADR-0027;
+  `test_a_worker_lands_its_own_pr_on_the_turn_the_fleet_grants`,
+  `test_turns_are_granted_one_at_a_time_in_merge_order`)
+- A sync conflict or a red gate at landing is not a failure of the work: the worker fixes it in
+  place, spending no attempt and discarding nothing; only a worker that goes silent on its turn
+  enters the retry ladder, and failing it frees the turn. (ADR-0027;
+  `test_a_sync_conflict_on_the_turn_is_resolved_in_place_by_the_worker`,
+  `test_a_red_gate_on_the_turn_is_the_workers_to_fix_and_spends_nothing`,
+  `test_a_worker_silent_on_its_turn_is_nudged_once_then_failed_and_the_turn_moves_on`)
+- The tick's judgments — a PR's checks, a PR with none, an adversarial verify — are settled before
+  a turn is granted and pinned to the head; a landing that moved the head waits for them again, and
+  a worker never verifies itself. (ADR-0027;
+  `test_the_adversarial_verify_is_settled_before_the_turn_and_pinned_to_the_head`)
+- A turn whose worker is gone is delivered by continuation in the PR's own worktree or at its head,
+  never from base, and there is no launcher-side merge. (ADR-0027;
+  `test_a_turn_with_no_terminal_is_delivered_by_continuation_never_from_base`)
 - A wake carries no state and nothing waits on one: the cycle it opens reads GitHub like any other,
   and a worker with no launcher terminal to wake is given a no-op. (ADR-0020;
   `test_a_worker_is_told_how_to_wake_the_launcher_and_nothing_else`)
@@ -294,20 +313,13 @@ stateDiagram-v2
   claimed --> pr_open: worker opens a PR that closes the issue
   claimed --> claimed: worker died, continued from its progress
   claimed --> ready: drain, or orphan released
-  pr_open --> awaiting_merge: checks green
-  pr_open --> merged: local gate mode, gated at merge time instead
+  pr_open --> awaiting_turn: checks green, or local gate mode
   pr_open --> ci_failed: checks red
-  awaiting_merge --> merged: synced, gate re-confirmed, squash-merged
-  awaiting_merge --> ci_failed: merge-time gate red
-  awaiting_merge --> handed_back: sync conflict, returned to its worker
-  awaiting_merge --> awaiting_merge: worker still busy in the worktree, merge waits
-  awaiting_merge --> queued: a handed-back PR ahead of it conflicted in a file it changes
-  pr_open --> queued: local gate mode, the same
-  queued --> awaiting_merge: the PR ahead merged, or its unanswered hand-back was failed
-  pr_open --> handed_back: local gate mode, sync conflict at merge time
-  handed_back --> awaiting_merge: worker merged the target in and pushed
-  handed_back --> handed_back: worker died, continued on the hand-back
-  handed_back --> ci_failed: never answered, after one nudge
+  awaiting_turn --> landing: the fleet grants it the landing turn, one PR at a time
+  landing --> merged: its worker synced, gated and merged it
+  landing --> landing: conflict or red gate fixed in place; or the tick settles checks or a verify on a moved head
+  landing --> landing: worker died, continued onto the turn
+  landing --> ci_failed: worker silent on its turn, after one nudge
   ci_failed --> claimed: attempts left, fresh worker under the same claim
   ci_failed --> escalated: attempts exhausted
   claimed --> escalated: no outcome after grace and attempts exhausted, or a blocker nothing will resolve
@@ -315,7 +327,7 @@ stateDiagram-v2
   parked --> ready: every blocker it named has closed
   claimed --> closed: already satisfied, empty diff verified
   closed --> [*]: claim released, worktree removed
-  merged --> [*]: claim released, worktree removed
+  merged --> [*]: next cycle releases the claim and removes the worktree
   escalated --> [*]: claim released, handed to a human
 ```
 
@@ -330,15 +342,16 @@ four claim refs.
 |---|---|---|---|---|---|
 | #1 "ready" | `ready-for-agent` | none | | | `frontier.dispatch` |
 | #2 "blocked" | `ready-for-agent` | none | | | excluded: `1 open blocker(s)` |
-| #3 "mine green" | `ready-for-agent` | `me`, `s3` | 10 s ago | #30, one check `SUCCESS` | `mine`: `awaiting_merge`, `checks: green`, `attempt: 0` |
+| #3 "mine green" | `ready-for-agent` | `me`, `s3` | 10 s ago | #30, one check `SUCCESS` | `mine`: `awaiting_turn`, `checks: green`, `attempt: 0` |
 | #4 "mine coding" | `afk-attempt/1` | `me`, `s4` | 10 s ago | none | `mine`: `no_pr`, board phase `claimed`, `attempt: 1` |
 | #5 "peer live" | `ready-for-agent` | `peerA`, `s5` | 100 s ago | | `peer_live` |
 | #6 "peer dead" | none | `peerB`, `s6` | 5499 s ago | | `stale`, carrying `sha: s6` |
 
 What the tick then does, each row a different mainline:
 
-- **#3** is the first mainline from step 11: `afk merge` syncs, re-confirms the gate, squash-merges
-  PR #30, sets the board to "merged" and releases the claim.
+- **#3** is the first mainline from step 11: it is alone in `merge_order`, so `afk turn` gives PR #30
+  the landing turn, and its worker's `afk land` syncs, re-confirms the gate, squash-merges it and
+  sets the board to "merged"; the next tick releases the claim.
 - **#1** is the first mainline from step 3: `afk dispatch` claims it, has orca create the worktree,
   and delivers the worker its prompt. The row also says `free_slots: 1` — one slot is all
   `concurrency: 3` leaves beside the two claims held.
@@ -352,5 +365,5 @@ What the tick then does, each row a different mainline:
 
 The same test then flips two things worth knowing. With the PR's check `FAILURE`, #3 becomes
 `failure` (board `ci_failed`); with that same red check and `gate.ci: local`, #3 is still
-`awaiting_merge` (board `pr_open`), because the remote check is not the gate. And with the lease cut
+`awaiting_turn`, because the remote check is not the gate. And with the lease cut
 to 50 seconds, #5 goes stale too.

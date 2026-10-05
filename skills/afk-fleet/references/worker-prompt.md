@@ -7,31 +7,33 @@ to have confirmed instead of acting on) — **a tick never fills or sends it by 
 and never needs to read this file. It is a template of named blocks:
 
 - `prompt` — the body. It names four **slots**: `{opening}` and `{step1}`, each filled from the block
-  of that name for the chosen variant, `{retry_reason}`, filled only for a retry, and `{handback}`,
-  filled only for a worker started on a hand-back.
+  of that name for the chosen variant, `{retry_reason}`, filled only for a retry, and `{land}`,
+  filled from the `land` block.
 - `opening.fresh` / `step1.fresh` — a worker starting from a clean checkout of the latest base.
 - `opening.continue` / `step1.continue` — a worker **continuing** an issue whose previous worker died:
   its worktree or branch already carries that progress, so inspection comes first (ADR-0011). Every
-  other word of the prompt — the single-outcome rule, the checkpoint rule, steps 2–6, the hard rules —
-  is the same for both.
+  other word of the prompt — the single-outcome rule, the checkpoint rule, steps 2–6, the landing,
+  the hard rules — is the same for both.
 - `retry_reason` — appended when the retry ladder starts a fresh attempt, carrying the failure reason
   the tick re-read from where it lives (`{reason}`).
-- `handback` — the instruction for a **sync conflict handed back** to the worker that wrote the
-  branch (ADR-0019). It is used two ways: `afk hand-back` writes it **alone** as the brief of a worker
-  whose terminal is still there (it already has the rest), and it is appended to the continue-mode
-  prompt when that worker is gone and a new one is started in its worktree. Its own fields are
-  `{pr}`, `{pr_branch}` (the PR's head branch — where the resolution is pushed), `{target}`,
-  `{target_tip}` and `{files}`.
+- `land` — **the one way a PR lands** (ADR-0027): the `afk land` command and the table of what to do
+  on each `outcome` it stops with. Every worker carries it — it sits in `prompt`, and in `landing`.
+- `landing` — the **landing brief**: the whole instruction of a worker whose PR was given its
+  **landing turn** by `afk turn`. It is written **alone** as the brief, for the worker that wrote the
+  branch and is still there and equally for one started by continuation because that worker is gone —
+  that one is briefed only to land the PR. Its own fields are `{pr}`, `{pr_branch}` (the PR's head
+  branch) and `{target}` (the merge target).
 
 The fields are `{n}`, `{title}`, `{repo}`, `{base_branch}`, `{local_command}` (from the issue and the
 config), `{branch}`, `{worktree_path}` (the **actual** values orca returned — orca names the branch
 `<user>/…`, never assumed from `branch_pattern`), `{wake_command}` — the line that **wakes** the
 launcher, built from the handle of the terminal the launcher runs in, or a no-op when it runs in
 none (ADR-0020) — `{gate_command}` — the line the worker runs the **local gate** with: `afk gate`
-carrying `gate.local_command`, so a green run is on record for the merge (ADR-0026), or a no-op when
-no local gate is configured — and `{verdict_marker}`, the `<!--afk:verdict …-->` line a worker that opens no PR
+carrying `gate.local_command`, so a green run is on record for the landing (ADR-0026), or a no-op when
+no local gate is configured — `{land_command}` — the line the worker **lands** its PR with: `afk land`
+carrying the run's whole config — and `{verdict_marker}`, the `<!--afk:verdict …-->` line a worker that opens no PR
 must post, written by the same code that parses it back. A field or slot the code cannot fill is an error: no
-worker is ever started on a prompt with a literal placeholder in it. A test renders both variants.
+worker is ever started on a prompt with a literal placeholder in it. A test renders every variant.
 
 <!--afk:block prompt-->
 {opening}
@@ -46,7 +48,8 @@ The coordinator never reads your terminal for a result — a worker that finishe
 identical to one still coding. So your terminal going quiet is **not** an outcome. You MUST end by
 leaving exactly one of these two durable, machine-readable facts:
 
-1. **A PR** whose body contains `Closes #{n}` — the success path (steps 5–6 below), OR
+1. **A PR** whose body contains `Closes #{n}` — the success path (steps 5–6 below; you land it
+   later, on its landing turn), OR
 2. **An `afk:verdict` marker comment** on the issue — when you are *not* going to open a PR. Its
    **first line** must be exactly this HTML comment (one line), followed by a human-readable body:
    ```
@@ -123,31 +126,37 @@ anyway (ADR-0011).
    with one JSON object. Run it exactly as written — not the bare command. It is green only when that
    object says `"status": "green"`; on `"red"`, fix, **commit**, and run it again. Finish on a run that
    says `"recorded": true` — green, on a tree with nothing uncommitted or untracked — and then
-   `git push origin HEAD`. That run is on record for the commit it names, and the coordinator may
+   `git push origin HEAD`. That run is on record for the commit it names, and your landing may
    land that exact commit without running the gate a second time; the bare command leaves no record,
    and any commit after the recorded run needs another run.
    **Merge, never rebase:** a rebase replays your commits and drops the merge commits, re-igniting
-   conflicts whose resolutions lived only inside them; and because the coordinator squash-merges, the
+   conflicts whose resolutions lived only inside them; and because the PR is squash-merged, the
    target branch's history is identical either way (ADR-0012). **Resolve integration conflicts here**
-   — you are the author, your context is loaded, and the fix is cheap. A conflict that only shows up
-   later, at the coordinator's serialized merge point, comes back to you anyway (see step 6) — after
-   a round trip that blocks the queue. Note the coordinator gates the tree that actually lands with this
-   same `{local_command}` — running it again at merge time, or trusting your recorded run when
-   nothing moved since — and in `gate.ci: local` repos that is the *only* machine gate there is — so
-   leave it genuinely green, not green-if-you-squint.
+   — your context is loaded, and the fix is cheap. A conflict that only shows up later, on your
+   landing turn, is yours to resolve too — while every other finished PR waits behind you. Note the
+   tree that actually lands is gated with this same `{local_command}` — run again by your landing, or
+   your recorded run trusted when nothing moved since — and in `gate.ci: local` repos that is the
+   *only* machine gate there is — so leave it genuinely green, not green-if-you-squint.
 5. **Open the PR:** `gh pr create --base {base_branch} --head {branch} --title "..." --body "Closes #{n}
    ..."`. Body: what you changed, how you verified, any follow-ups.
 6. **Report done:** your PR is the result. Wake the coordinator (the one line under "outcome"
    above), emit the PR URL and "done", then stop — do not merge, do not touch other issues. (The coordinator detects completion from the PR on GitHub, not from your
    terminal, so the PR — its `Closes #{n}` body — and this line are what matter.)
-   **Your PR may come back to you.** If `{base_branch}` moves before the coordinator merges and your
-   branch then conflicts with it, the conflict is handed back to you in this same session: one line
-   pointing at this brief file, rewritten with what to do — merge the target in, resolve, re-run the
-   gate, push to the **same** PR. Carry it out exactly like a first instruction.
+
+## Landing your PR — later, and only on its landing turn
+
+Opening the PR does not land it, and nobody else lands it for you. Finished PRs land **one at a
+time**: the fleet gives one PR the **landing turn**, and the worker that wrote it lands it. When it
+is your PR's turn you are told, in this same session — one line pointing at this brief file,
+rewritten with the landing instruction. Until then: stop, and do nothing. Carry that instruction
+out exactly like a first one.
+
+{land}
 
 ## Hard rules
 - One issue, one worktree. Never edit files outside your worktree.
-- Never merge, never push to `{base_branch}` directly. PR only.
+- Never push to `{base_branch}` directly, and never merge by hand (`gh pr merge`, the web UI): your
+  PR lands only through the `afk land` line above, and only on its landing turn.
 - **Always end with a PR or an `afk:verdict` marker comment — never just stop.** The coordinator reads
   GitHub (your PR, or the marker comment), never your terminal transcript; a silent idle worker with
   neither leaves your claim parked forever.
@@ -156,13 +165,12 @@ anyway (ADR-0011).
   comment and will retry or escalate.
 
 {retry_reason}
-
-{handback}
 <!--/afk:block-->
 
 <!--afk:block opening.fresh-->
 You are an afk-fleet worker. You own exactly ONE GitHub issue and work in an isolated git worktree.
-Do the work end-to-end, open a PR, then report done. You do NOT merge — the coordinator does.
+Do the work end-to-end, open a PR, then report done. Your PR lands later, on the **landing turn** the
+fleet gives it: you land it yourself, with `afk land` — then, and only then.
 <!--/afk:block-->
 
 <!--afk:block step1.fresh-->
@@ -175,7 +183,8 @@ Do the work end-to-end, open a PR, then report done. You do NOT merge — the co
 You are an afk-fleet worker **continuing** an issue a previous worker started but did not finish
 (its session hard-stopped). You own exactly ONE GitHub issue and work in its worktree, on its
 branch, which already carries that earlier progress. Pick up where it left off, finish, open a
-PR, then report done. You do NOT merge — the coordinator does.
+PR, then report done. Your PR lands later, on the **landing turn** the fleet gives it: you land it
+yourself, with `afk land` — then, and only then.
 <!--/afk:block-->
 
 <!--afk:block step1.continue-->
@@ -198,51 +207,61 @@ This issue is being **retried**: an earlier attempt was discarded and you are st
 {reason}
 <!--/afk:block-->
 
-<!--afk:block handback-->
-## A sync conflict on your PR was handed back to you
+<!--afk:block land-->
+**This command is the only way your PR lands.** Run it in your worktree, exactly as written, once
+your PR holds the landing turn:
+```bash
+{land_command}
+```
+It syncs your branch with the merge target (a merge, never a rebase), pushes, runs the gate on that
+exact head, and merges the PR pinned to the head it gated. It ends with one JSON object. An
+`"error"` saying the PR does **not hold the landing turn** means it is not your turn: nothing was
+changed — stop and wait to be told; do not land it any other way. Otherwise act on its `outcome`:
 
-The work on `{repo}#{n}` is finished and PR #{pr} is open — the coordinator was about to merge it.
-But `{target}` moved first: merging its tip (`{target_tip}`) into the PR's branch `{pr_branch}`
-conflicts in:
+| `outcome` | what happened | what you do |
+|---|---|---|
+| `merged` | The PR landed. | Wake the coordinator and stop. You are done — the fleet removes this worktree. |
+| `conflict` | Merging the target into your branch conflicted. The merge is **left in progress** here, with `files` unmerged. | Resolve every file so both sides' intent survives (read what landed first: `git log HEAD..MERGE_HEAD`), `git add` it, **commit the merge**, and run the command again. Never rebase, never abort the merge, never drop the other change to make yours fit. |
+| `gate_red` | The gate is red on the synced head — `gate.excerpt` is the tail of its log (or, with required checks, the PR's checks are red). | Fix the code, **commit**, and run the command again. |
+| `awaiting_ci` | The PR's checks have not finished on the head that would land — the sync just pushed it. | Wake the coordinator and stop. The turn stays yours; you are told to run the command again. |
+| `needs_verify` | The head that would land is not the one that was verified — the sync moved it. | Wake the coordinator and stop. The turn stays yours; you are told to run the command again. |
+| `no_checks` | The PR has no checks at all, and that has not been waived. | Wake the coordinator and stop. The turn stays yours; you are told to run the command again. |
 
-{files}
+No outcome costs an attempt or closes the PR, and the turn is yours until the PR has landed — every
+other finished PR waits behind it, so do not sit on it. Only **silence** fails it.
+<!--/afk:block-->
 
-Nothing is wrong with the work and nothing was discarded: the PR, the branch and this worktree
-(`{worktree_path}`) are as they were, with no merge in progress. The branch is yours, so the
-resolution is yours — the coordinator has none of the context it takes. **This instruction replaces
-any step above that says to implement the issue or to open a PR.** Do exactly this:
+<!--afk:block landing-->
+## Your PR holds the landing turn — land it now
 
-1. **Fetch and merge the target — never rebase** (a rebase drops the merge commits and re-ignites
-   the conflicts resolved inside them; ADR-0012):
-   ```bash
-   git fetch origin {target}
-   git merge origin/{target}
-   ```
-2. **Resolve every conflict so both sides' intent survives.** Read what landed first — `git log
-   HEAD..origin/{target}` and the diffs of the conflicting commits — then fix each file, `git add`
-   it, and **commit the merge**. Do not drop the other change to make yours fit, and do not
-   re-implement the issue.
-3. **Run the gate until it is green**, committing each fix — with this line, exactly as written,
-   not the bare `{local_command}`:
-   ```bash
-   {gate_command}
-   ```
-   It streams the log and ends with one JSON object: green only on `"status": "green"`. Finish on a
-   run that says `"recorded": true` (green, nothing uncommitted or untracked) — that run is on record
-   for the merge commit you made, and the coordinator may land it without gating it again.
-4. **Push to the existing PR's branch** — the same PR, never a new one:
-   ```bash
-   git push origin HEAD:{pr_branch}
-   ```
-5. **Wake the coordinator, then stop.** That push is your outcome: run this once, exactly as
-   written (if it fails, ignore it — the coordinator polls anyway):
-   ```bash
-   {wake_command}
-   ```
-   The coordinator merges PR #{pr} once its head contains the `{target}` tip above. Do not open another PR, do not close this one, do not merge. If `{target}`
-   moves again before the merge, this comes back to you once more — each round merges a newer tip.
+You are an afk-fleet worker. The work on `{repo}#{n}` is finished and PR #{pr} is open. The fleet
+lands finished PRs one at a time, and **it is this PR's turn**: every other finished PR waits until
+this one has landed. If you wrote this branch, this instruction replaces everything you were told
+before. If you were just started in this worktree, landing this PR is your **whole** task — the
+worker that wrote the branch is gone; do not re-implement the issue and do not open another PR.
 
-If you genuinely cannot resolve it, say so instead of going quiet: post a **`phase=giving-up`**
-`afk:verdict` marker comment on issue #{n} naming the stuck point. Silence here is failed like any
-other silence — and failing discards this branch.
+**Your issue:** `{repo}#{n}` — {title}
+**Your PR:** #{pr}, on branch `{pr_branch}`, landing on `{target}`.
+**Your branch:** `{branch}` (checked out here; what you commit is pushed to `{pr_branch}` by the command below).
+**Your worktree:** `{worktree_path}` — work only here.
+
+{land}
+
+**Waking the coordinator** is this line, run once, exactly as written, whenever the table says so
+(if it fails, ignore it — the coordinator polls anyway; never send anything else to that terminal):
+```bash
+{wake_command}
+```
+
+- Never land the PR any other way — no `gh pr merge`, no push to `{target}` — and never close it or
+  open another.
+- Stay in this worktree, on this one PR.
+- If you genuinely cannot land it — a conflict you cannot resolve, a gate you cannot make green — say
+  so instead of going quiet: post an `afk:verdict` marker comment on issue #{n} with
+  `phase=giving-up` and the stuck point (`gh issue comment {n} --repo {repo} --body "..."`, first line
+  exactly this, one line), then wake the coordinator and stop:
+  ```
+  {verdict_marker}
+  ```
+  Silence here is failed like any other silence — and failing discards this branch.
 <!--/afk:block-->

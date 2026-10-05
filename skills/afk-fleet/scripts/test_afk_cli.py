@@ -8,8 +8,8 @@ Run: python3 test_afk_cli.py   (or under pytest, beside the other two suites)
 `test_afk_decide.py` pins the pure verdicts and `test_afk_refs.py` the ref races;
 what neither reaches is the seam between them: that `afk rebuild` asks gh for the
 fields its verdicts read, that `afk dispatch` puts a worker on the commit the
-REMOTE has and submits its prompt, that `afk merge` gates the tree that lands and
-releases only after it landed, that `afk escalate` relabels before it releases,
+REMOTE has and submits its prompt, that `afk land` gates the tree that lands and
+merges it only on a landing turn, that `afk escalate` relabels before it releases,
 that `--set` beats `--config` beats the defaults table — and that the docs name
 subcommands and flags that exist.
 
@@ -251,18 +251,6 @@ if parts[0] == "branches" and parts[2:] == ["protection"]:
     if "__error__" in prot:
         finish(code=1, err=prot["__error__"] + "\n")
     finish(json.dumps(prot))
-
-if parts[0] == "pulls" and parts[2:] == ["files"]:                  # what a PR changes
-    assert jq == ".[].filename", "fake gh: unsupported jq %%r" %% jq
-    row = next(r for r in st["prs"] if str(r["number"]) == parts[1])
-    finish(bare("diff", "--name-only", "refs/heads/%%s...%%s" %% (st["base"], head_of(row))))
-
-if parts[0] == "compare" and len(parts) == 2:                       # is base contained in head?
-    assert jq == ".behind_by", "fake gh: unsupported jq %%r" %% jq
-    base, _, head = parts[1].partition("...")
-    if not (bare("cat-file", "-t", base) and bare("cat-file", "-t", head)):
-        finish(code=1, err="gh: Not Found (HTTP 404)\n")
-    finish(bare("rev-list", "--count", "%%s..%%s" %% (head, base)))
 
 finish(code=1, err="fake gh: unsupported call %%r\n" %% argv)
 '''
@@ -574,8 +562,8 @@ class World:
     def afk(self, *args, env=None, cwd=None):
         return run(cwd or self.cwd, *args, env={**self.env, **(env or {})})
 
-    def error(self, *args, env=None, bare=False):
-        return afk_error(self.cwd, *args, env={**self.env, **(env or {})}, bare=bare)
+    def error(self, *args, env=None, bare=False, cwd=None):
+        return afk_error(cwd or self.cwd, *args, env={**self.env, **(env or {})}, bare=bare)
 
     # --- the code ---------------------------------------------------------
     def commit(self, name, branch=None):
@@ -641,7 +629,7 @@ def local_gate(command):
 
 
 def with_pr(w, n, pr_number, conclusion="SUCCESS", **work):
-    """Issue n as a tick finds it at merge time: dispatched, its worker committed and
+    """Issue n as a tick finds it when its PR is ready: dispatched, its worker committed and
     pushed, and a PR closing it is open → (the dispatch result, the PR head sha)."""
     d = w.afk(*dispatch(n, *work.pop("gate", ()), instance=work.pop("instance", "me")))
     head = w.work(d["worktree"], work.pop("name", f"feature{n}.txt"), **work)
@@ -682,7 +670,7 @@ def test_rebuild_assembles_the_working_set_from_gh_and_refs():
         mine = {m["number"]: m for m in ws["mine"]}
         assert set(mine) == {3, 4}
         assert (mine[3]["status"], mine[3]["board_phase"], mine[3]["pr"], mine[3]["checks"]) == \
-            ("awaiting_merge", "awaiting_merge", 30, "green")
+            ("awaiting_turn", "awaiting_turn", 30, "green")
         assert mine[3]["attempt"] == 1 and mine[4]["attempt"] == 0  # read off gh's label objects
         assert (mine[4]["status"], mine[4]["board_phase"], mine[4]["pr"]) == ("no_pr", "claimed", None)
         assert ws["peer_live"] == [{"number": 5, "instance": "peer-live"}]
@@ -692,7 +680,7 @@ def test_rebuild_assembles_the_working_set_from_gh_and_refs():
 
         # the per-issue blocked_by read is paid ONLY by issues that passed every
         # cheaper check — two of nine here, not one per open issue — and the
-        # hand-back read only by a claim of mine that has a PR
+        # landing-turn read only by a claim of mine that has a PR
         api = [c for c in w.calls() if c[0] == "api"]
         blocker_reads = sorted(c[1] for c in api if ".issue_dependencies_summary.blocked_by" in c)
         assert blocker_reads == [f"repos/{REPO}/issues/1", f"repos/{REPO}/issues/2"], blocker_reads
@@ -720,8 +708,8 @@ def test_rebuild_reads_the_dispatch_contract_from_config_and_set():
         reasons = {e["number"]: e["reason"] for e in ws["frontier"]["excluded"]}
         assert reasons[2] == "epic label (big)" and reasons[3] == "no go label"
         # gate.ci: local — red remote checks are not the gate, and the board must not
-        # claim a green gate the merge sequence has not run yet
-        assert (ws["mine"][0]["status"], ws["mine"][0]["board_phase"]) == ("awaiting_merge", "pr_open")
+        # claim a green gate the landing has not run yet
+        assert (ws["mine"][0]["status"], ws["mine"][0]["board_phase"]) == ("awaiting_turn", "awaiting_turn")
 
         # --set beats the config it was given alongside
         ws = w.afk("rebuild", "--instance", "me", "--now", str(T0), *R, "--config", cfg,
@@ -735,7 +723,7 @@ def test_rebuild_reads_the_dispatch_contract_from_config_and_set():
 
 
 def test_rebuild_reports_free_slots_and_a_claim_whose_issue_is_closed():
-    """A merge (or `afk close`) that died between landing and releasing leaves a
+    """A landed PR (or an `afk close` that died before releasing) leaves a
     claim on a CLOSED issue. gh's open list no longer has the issue, so the row used
     to read as a title-less `no_pr` — a worker to wait on, or re-dispatch, forever."""
     issues = [issue(1, "ready-for-agent"), issue(2, "ready-for-agent", state="closed"),
@@ -816,7 +804,7 @@ def test_cycle_gates_paces_and_beats_through_a_whole_run():
             return w.afk("cycle", *ME, *R, "--now", str(now), "--state", json.dumps(state), *extra)
 
         def ticked(state, *extra, **summary):
-            body = {"merged": [], "dispatched": [], "in_flight": 0, "frontier_remaining": 0, **summary}
+            body = {"granted": [], "dispatched": [], "in_flight": 0, "frontier_remaining": 0, **summary}
             return w.afk("cycle", *ME, *R, *NOW, "--state", json.dumps(state),
                          "--summary", json.dumps(body), *extra)
 
@@ -869,7 +857,7 @@ def test_cycle_gates_paces_and_beats_through_a_whole_run():
         # the fleet goes quiet: #1 merged and released, nothing left on the frontier
         w.afk("release", "1", *ME, *R)
         st = top(red["state"])["state"]
-        idle = ticked(st, merged=[1])                                 # work was done: not empty
+        idle = ticked(st, granted=[1])                                 # work was done: not empty
         assert (idle["state"]["empty_streak"], idle["sleep_seconds"]) == (0, 90)
         s1 = top(idle["state"])
         assert (s1["action"], s1["state"]["empty_streak"], s1["sleep_seconds"]) == ("skip", 1, 90)
@@ -940,7 +928,7 @@ def test_no_pr_gathers_every_signal_and_decides_in_one_call():
         # `worker_verdict` — never one bare "verdict" that could be read as either
         assert set(r) == {"issue", "outcome", "action", "idle_seconds", "pending_blockers",
                           "worktree", "progress", "worker_verdict", "blockers", "nudged_at",
-                          "handed_back_at", "worker_state"}
+                          "turn_at", "worker_state"}
         assert r["issue"] == 4 and r["pending_blockers"] == [] and r["worktree"] == w.cwd
         assert r["blockers"] == []
         assert r["worker_state"] is None
@@ -1330,14 +1318,21 @@ def _told(term):
         return f.read()
 
 
+def _prompt_fields(w, n, title, started, *cfg):
+    """The PROMPT_FIELDS of the prompt a worker was started (or told to land) with,
+    under the config a call's `cfg` arguments resolve to."""
+    config = afk._cfg(afk.build_parser().parse_args(["scan", "--config", "{}", *cfg]))
+    return {"n": n, "title": title, "repo": REPO, "base_branch": w.sb.base,
+            "local_command": config["gate"]["local_command"], "afk_path": AFK,
+            "config": json.dumps(config, ensure_ascii=False), "branch": started["branch"],
+            "worktree_path": started["worktree"], "launcher_terminal": LAUNCHER}
+
+
 def _prompt(w, variant, n, title, started, reason=None):
     """The prompt `afk dispatch` must have delivered, rendered independently."""
     with open(os.path.join(SKILL, "references", "worker-prompt.md")) as f:
         return afk_decide.render_worker_prompt(
-            f.read(), variant,
-            {"n": n, "title": title, "repo": REPO, "base_branch": w.sb.base, "local_command": "",
-             "afk_path": AFK, "branch": started["branch"], "worktree_path": started["worktree"],
-             "launcher_terminal": LAUNCHER}, reason=reason)
+            f.read(), variant, _prompt_fields(w, n, title, started), reason=reason)
 
 
 def test_dispatch_starts_a_worker_on_the_remote_base_tip_and_submits_its_prompt():
@@ -1484,206 +1479,25 @@ def test_dispatch_continues_from_whatever_progress_survived():
 
 
 # --------------------------------------------------------------------------- #
-# act: merge                                                                   #
-# --------------------------------------------------------------------------- #
-
-def _merge(n, *extra, instance="me"):
-    return ("merge", "--issue", str(n), "--instance", instance, *R, *NOW, *extra)
-
-
-def test_merge_gates_the_tree_that_lands_then_settles_the_claim():
-    """gate.ci: local, the whole sequence: sync → push → gate → merge → status
-    board → release → cleanup. What merges is the SYNCED tree, and it is that tree
-    the gate ran on."""
-    with world(issues=[issue(3, "ready-for-agent")]) as w:
-        d, pr_head = with_pr(w, 3, 30, conclusion="FAILURE")   # remote CI is not the gate here
-        base_tip = w.advance_base("landed-meanwhile.txt")
-        # green ONLY on the combined tree: the worker's file and what landed meanwhile
-        gate = local_gate("test -f feature3.txt && test -f landed-meanwhile.txt")
-
-        # only the claim's owner may land it — and a refusal changes nothing
-        assert "not this fleet's claim" in w.error(*_merge(3, *gate, instance="peer"))
-        assert w.sb.remote_ref(f"refs/heads/{d['branch']}") == pr_head
-
-        # gh refusing the merge is an error, and NOTHING is settled on it: released
-        # before it landed, the issue would be re-dispatched under an open green PR
-        w.set(fail=["pr merge"])
-        assert "pr merge" in w.error(*_merge(3, *gate))
-        assert w.claimed_by(3) == "me" and os.path.isdir(d["worktree"])
-        assert w.pr(30).get("state", "open") == "open" and "已合并,完成" not in w.board(3)
-        synced = w.sb.remote_ref(f"refs/heads/{d['branch']}")
-        assert synced != pr_head                               # …though the sync was pushed
-
-        w.set(fail=[])
-        w.orca_calls()
-        r = w.afk(*_merge(3, *gate))
-        assert (r["outcome"], r["pr"], r["released"], r["synced"]) == ("merged", 30, True, False), r
-        assert r["head"] == synced and r["worktree"] == d["worktree"]
-        # gh was pinned to the gated head, with the configured strategy
-        assert w.pr(30)["merged"] == {"strategy": "squash", "head": synced, "delete_branch": True}
-        # what landed contains both sides, by MERGE (the base tip is an ancestor)
-        assert w.sb.remote_ref(f"refs/heads/{w.sb.base}") == synced
-        assert {"feature3.txt", "landed-meanwhile.txt"} <= w.remote_files(w.sb.base)
-        git(w.cwd, "fetch", "-q", "origin", w.sb.base)
-        assert git(w.cwd, "merge-base", base_tip, synced) == base_tip
-        # settled: board, claim, branch, worktree
-        assert "已合并,完成" in w.board(3) and "#30" in w.board(3)
-        assert w.claimed_by(3) is None and w.issue(3)["state"] == "closed"
-        assert not w.sb.remote_ref(f"refs/heads/{d['branch']}")
-        assert r["cleanup"] == {"removed": True, "path": d["worktree"]}
-        assert w.worktrees() == [] and not os.path.isdir(d["worktree"])
-        # the worker was asked after first (it had stopped), then its worktree removed
-        assert w.orca_calls() == ["worktree ps", "terminal list", "terminal wait", "worktree rm"]
-        assert w.afk("rebuild", *ME, *R, *NOW)["mine"] == []
-
-
-def test_merge_red_local_gate_is_published_on_the_pr_and_lands_nothing():
-    with world(issues=[issue(4, "ready-for-agent")]) as w:
-        d, pr_head = with_pr(w, 4, 40)
-        base_tip = w.advance_base("landed-meanwhile.txt")
-
-        # it runs IN the worktree, on the synced tree; stderr is part of the log
-        r = w.afk(*_merge(4, *local_gate(
-            "test -f feature4.txt && test -f landed-meanwhile.txt && echo 'FAIL TestNames' >&2 && exit 7")))
-        assert (r["outcome"], r["synced"], r["pr"]) == ("gate_red", True, 40), r
-        assert (r["gate"]["status"], r["gate"]["exit_code"], r["gate"]["excerpt"]) == \
-            ("red", 7, "FAIL TestNames")
-        # the sync was pushed (the PR shows what was gated); the target was not touched
-        assert r["head"] == w.sb.remote_ref(f"refs/heads/{d['branch']}") != pr_head
-        assert w.sb.remote_ref(f"refs/heads/{w.sb.base}") == base_tip
-        # the failure is durable where a later tick — and a human — can re-read it
-        [note] = w.state()["pr_comments"]["40"]
-        assert "FAIL TestNames" in note and "exit 7" in note
-        assert w.pr(40).get("state", "open") == "open" and w.claimed_by(4) == "me"
-        assert os.path.isdir(d["worktree"])
-
-        # a hung gate is RED, never green-by-default; the excerpt is a bounded tail
-        r = w.afk(*_merge(4, *local_gate("sleep 30"), "--gate-timeout", "1"))
-        assert (r["outcome"], r["gate"]["timed_out"], r["synced"]) == ("gate_red", True, False)
-        assert "timed out after 1s" in r["gate"]["excerpt"]
-        r = w.afk(*_merge(4, *local_gate("seq 1 200; exit 1"), "--excerpt-lines", "3"))
-        assert (r["gate"]["excerpt"], r["gate"]["omitted_lines"]) == ("198\n199\n200", 197)
-        assert len(w.state()["pr_comments"]["40"]) == 3
-
-        # adversarial verify sits AFTER a green machine gate, and is pinned to the head
-        green = (*local_gate("true"), "--set", "gate.adversarial_verify=true")
-        r = w.afk(*_merge(4, *green))
-        assert r["outcome"] == "needs_verify" and len(r["head"]) == 40
-        assert w.afk(*_merge(4, *green, "--verified", pr_head))["outcome"] == "needs_verify"
-        assert w.pr(40).get("state", "open") == "open"
-        r = w.afk(*_merge(4, *green, "--verified", r["head"], "--set", "merge.strategy=rebase",
-                          "--set", "merge.delete_branch=false", "--set", "worktree_cleanup=false"))
-        assert r["outcome"] == "merged" and "cleanup" not in r
-        assert w.pr(40)["merged"]["strategy"] == "rebase"
-        # config decides what is left behind
-        assert w.sb.remote_ref(f"refs/heads/{d['branch']}") == r["head"]
-        assert os.path.isdir(d["worktree"]) and w.claimed_by(4) is None
-
-
-def test_merge_conflict_is_left_in_the_worktree_for_the_ticks_judgment():
-    with world(issues=[issue(2, "ready-for-agent")]) as w:
-        d, pr_head = with_pr(w, 2, 20, name="shared.txt", text="from the worker")
-        base_tip = w.advance_base("shared.txt", text="from someone else")
-        gate = local_gate("true")
-        wt = d["worktree"]
-
-        r = w.afk(*_merge(2, *gate))
-        assert (r["outcome"], r["files"], r["worktree"]) == ("conflict", ["shared.txt"], wt), r
-        assert "head" not in r and "gate" not in r               # nothing was gated or pushed
-        assert w.sb.remote_ref(f"refs/heads/{d['branch']}") == pr_head
-        assert w.sb.remote_ref(f"refs/heads/{w.sb.base}") == base_tip
-        assert os.path.exists(os.path.join(wt, ".git")) and git(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD")
-        # re-entrant: a re-run reports the same conflict rather than piling on a merge
-        assert w.afk(*_merge(2, *gate))["files"] == ["shared.txt"]
-
-        # resolved but not committed: what would be gated is not what would land
-        with open(os.path.join(wt, "shared.txt"), "w") as f:
-            f.write("resolved: both\n")
-        git(wt, "add", "shared.txt")
-        assert "uncommitted" in w.error(*_merge(2, *gate))
-        git(wt, "commit", "-qm", "merge main: keep both")
-
-        r = w.afk(*_merge(2, *gate))
-        assert (r["outcome"], r["synced"]) == ("merged", True)
-        p = subprocess.run(["git", "--git-dir", w.sb.bare, "show", f"{w.sb.base}:shared.txt"],
-                           capture_output=True, text=True, env=ENV)
-        assert p.stdout == "resolved: both\n"
-
-        # a claim with no PR has nothing to merge
-        w.set(issues=w.state()["issues"] + [issue(8, "ready-for-agent")])
-        w.afk("claim", "8", *ME, *NOW, *R)
-        assert "nothing to merge" in w.error(*_merge(8, *gate))
-
-
-def test_merge_in_required_mode_trusts_checks_only_on_the_head_that_lands():
-    with world(issues=[issue(n, "ready-for-agent") for n in range(1, 7)]) as w:
-        heads = {}
-        for n, conclusion in ((1, "SUCCESS"), (2, "FAILURE"), (3, "PENDING"), (4, None), (5, "SUCCESS")):
-            _, heads[n] = with_pr(w, n, n * 10, conclusion=conclusion)
-        base0 = w.sb.remote_ref(f"refs/heads/{w.sb.base}")
-
-        def branch_tip(n):
-            return w.sb.remote_ref("refs/heads/" + w.pr(n * 10)["headRefName"])
-
-        # the base has not moved, so the sync is a no-op and the checks describe the
-        # head that would land: red → fail it, pending → leave it, none → the tick's call
-        for n, outcome, checks in ((2, "gate_red", "red"), (3, "awaiting_ci", "pending"),
-                                   (4, "no_checks", None)):
-            r = w.afk(*_merge(n))
-            assert (r["outcome"], r["checks"], r["synced"], r["head"]) == \
-                (outcome, checks, False, heads[n]), (n, r)
-            assert w.claimed_by(n) == "me" and w.pr(n * 10).get("state", "open") == "open"
-        assert w.sb.remote_ref(f"refs/heads/{w.sb.base}") == base0
-        assert "pr_comments" not in w.state()                    # required mode publishes nothing
-
-        # no checks at all: merged only on the tick's explicit judgment
-        r = w.afk(*_merge(4, "--allow-no-checks"))
-        assert (r["outcome"], r["head"], r["synced"]) == ("merged", heads[4], False)
-        assert w.pr(40)["merged"]["head"] == heads[4]
-
-        # the base moved (PR 40 landed): PR 10's green checks ran on a tree that will
-        # NOT land. The sync is pushed and CI must speak about the new head first.
-        r = w.afk(*_merge(1))
-        assert (r["outcome"], r["checks"], r["synced"]) == ("awaiting_ci", "green", True), r
-        assert r["head"] == branch_tip(1) != heads[1]
-        assert w.claimed_by(1) == "me" and w.pr(10).get("state", "open") == "open"
-        # …even a RED run is stale once the head moved: it is not this head's verdict
-        assert w.afk(*_merge(2))["outcome"] == "awaiting_ci"
-        # --allow-no-checks waives ABSENT checks only, never present ones
-        assert w.afk(*_merge(2, "--allow-no-checks"))["outcome"] == "gate_red"
-
-        # CI is green on the synced head (the fake's rollup still says SUCCESS) → lands
-        r = w.afk(*_merge(1))
-        assert (r["outcome"], r["synced"], r["head"]) == ("merged", False, branch_tip(1) or r["head"])
-        assert {"feature1.txt", "feature4.txt"} <= w.remote_files(w.sb.base)
-
-        # sync_before_merge: false → the PR head lands as it is, on its own checks
-        r = w.afk(*_merge(5, "--set", "merge.sync_before_merge=false"))
-        assert (r["outcome"], r["synced"], r["head"]) == ("merged", False, heads[5])
-
-
-def test_merge_recreates_a_worktree_when_the_worker_ran_elsewhere():
-    with world(issues=[issue(9, "ready-for-agent")]) as w:
-        d, pr_head = with_pr(w, 9, 90)
-        w.advance_base("landed-meanwhile.txt")
-        git(w.cwd, "worktree", "remove", "--force", d["worktree"])
-        w.orca([])                                               # this machine has no worktree
-
-        r = w.afk(*_merge(9, *local_gate("test -f feature9.txt && test -f landed-meanwhile.txt"),
-                          "--set", "worktree_cleanup=false", "--set", "merge.delete_branch=false"))
-        assert (r["outcome"], r["synced"]) == ("merged", True), r
-        assert r["worktree"] != d["worktree"]
-        # the sync went to the PR's branch, whatever orca named the scratch one
-        assert w.sb.remote_ref(f"refs/heads/{d['branch']}") == r["head"] != pr_head
-        # its own scratch worktree is removed even when the config keeps workers' ones
-        assert r["cleanup"]["removed"] is True and w.worktrees() == []
-
-
-# --------------------------------------------------------------------------- #
-# the worker's own gate run, and the merge that trusts it (ADR-0026)           #
+# act: the landing turn (`afk turn`) and the landing (`afk land`) — ADR-0027   #
 # --------------------------------------------------------------------------- #
 
 TRUST = ("--set", "gate.trust_recorded_run=true")
+
+
+def _turn(n, *extra, now=T0, instance="me"):
+    """The argv of one `afk turn` — the tick's half of a landing."""
+    return ("turn", "--issue", str(n), "--instance", instance, "--worker-command", WORKER,
+            *R, "--now", str(now), *extra)
+
+
+def _land(w, n, wt, *extra, now=T0):
+    """`afk land` as a worker runs it: in its own worktree, with no instance id."""
+    return w.afk("land", "--issue", str(n), *R, "--now", str(now), *extra, cwd=wt)
+
+
+def _land_error(w, n, wt, *extra):
+    return w.error("land", "--issue", str(n), *R, *NOW, *extra, cwd=wt)
 
 
 def _brief(wt):
@@ -1697,10 +1511,409 @@ def _gate(w, wt, command, *extra):
     return w.afk("gate", "--set", f"gate.local_command={command}", *extra, cwd=wt)
 
 
-def test_a_recorded_worker_gate_run_is_not_repeated_by_the_merge():
+def _template():
+    with open(os.path.join(SKILL, "references", "worker-prompt.md")) as f:
+        return f.read()
+
+
+def _landing_brief(w, n, started, pr_number, pr_branch, *cfg):
+    """The landing brief `afk turn` must have written, rendered independently."""
+    return afk_decide.render_landing(
+        _template(), _prompt_fields(w, n, f"issue {n}", started, *cfg),
+        {"pr": pr_number, "pr_branch": pr_branch, "target": w.sb.base})
+
+
+def _mine(w, gate, n):
+    [row] = [m for m in w.afk("rebuild", *ME, *R, *NOW, *gate)["mine"] if m["number"] == n]
+    return row["status"], row["board_phase"], row["stopped"]
+
+
+def _turns(w, pr_number):
+    return [c for c in w.comments(pr_number) if "<!--afk:turn" in c]
+
+
+def _merging(wt):
+    return subprocess.run(["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"], cwd=wt,
+                          capture_output=True, env=ENV).returncode == 0
+
+
+def _close_terminals(w):
+    terms = w.terminals()
+    for t in terms:
+        t["open"] = False
+    w.orca(terminals=terms)
+
+
+def test_a_worker_lands_its_own_pr_on_the_turn_the_fleet_grants():
+    """gate.ci: local, the whole landing: the tick grants the turn, and the worker
+    — in its own worktree, with the one command its brief gives it — syncs, pushes,
+    gates and merges. What merges is the SYNCED tree, and it is that tree the gate
+    ran on. The claim and the worktree are the next cycle's to settle."""
+    with world(issues=[issue(3, "ready-for-agent")]) as w:
+        # green ONLY on the combined tree: the worker's file and what landed meanwhile
+        gate = local_gate("test -f feature3.txt && test -f landed-meanwhile.txt")
+        d, pr_head = with_pr(w, 3, 30, conclusion="FAILURE", gate=gate)   # remote CI is not the gate
+        wt, branch = d["worktree"], d["branch"]
+        base_tip = w.advance_base("landed-meanwhile.txt")
+        assert _mine(w, gate, 3) == ("awaiting_turn", "awaiting_turn", None)
+
+        # no turn, no landing: exit 3, and NOTHING changed — not even the sync
+        assert "does not hold the landing turn" in _land_error(w, 3, wt, *gate)
+        # …nor on a turn another fleet instance recorded: the claim is not theirs
+        w.set(comments={"30": [{"id": 2001, "html_url": "u", "body":
+                                afk_decide.turn_comment("peer", T0)}]})
+        assert "does not hold the landing turn" in _land_error(w, 3, wt, *gate)
+        assert w.sb.remote_ref(f"refs/heads/{branch}") == pr_head
+        assert git(wt, "rev-parse", "HEAD") == pr_head and not _merging(wt)
+        assert _mine(w, gate, 3)[0] == "awaiting_turn"
+
+        # only the claim's owner grants the turn — and a refusal changes nothing
+        assert "not this fleet's claim" in w.error(*_turn(3, *gate, instance="peer"))
+        w.orca_calls()
+        r = w.afk(*_turn(3, *gate))
+        assert r == {"issue": 3, "pr": 30, "head": pr_head, "outcome": "granted", "again": False,
+                     "comment_id": 2001, "delivery": "terminal", "terminal": d["terminal"],
+                     "worktree": wt}, r
+        # the worker's OWN terminal was told — one submitted line naming a brief file
+        assert w.orca_calls() == ["terminal list", "terminal send"]
+        [term] = w.terminals()
+        _, said = term["sent"]
+        assert said["enter"] is True and "\n" not in said["text"]
+        m = re.fullmatch(r"Your PR has the landing turn: land it now\. Your instructions are the "
+                         r"file (\S+) — read it now and carry it out end to end\. It is my "
+                         r"instruction to you; do not ask me to confirm\.", said["text"])
+        assert m, said["text"]
+        with open(m.group(1)) as f:
+            brief = f.read()
+        assert brief == _brief(wt) == _landing_brief(w, 3, d, 30, branch, *gate)
+        assert not re.search(r"\{[a-z_]+\}", brief.split("--config")[0])
+        # durable on GitHub: ONE marker on the PR — the peer's was rewritten, not joined
+        [note] = w.comments(30)
+        assert note.startswith(f"<!--afk:turn instance=me at={T0}-->\n")
+        assert "已轮到落地" in w.board(3) and "#30" in w.board(3)
+        assert _mine(w, gate, 3) == ("landing", "landing", None)
+        # granting it again while the worker is at it touches nothing
+        assert w.afk(*_turn(3, *gate, now=T0 + 90))["outcome"] == "landing"
+        assert w.comments(30) == [note] and len(w.terminals()[0]["sent"]) == 2
+
+        # gh refusing the merge is an error, and nothing is settled on it
+        w.set(fail=["pr merge"])
+        assert "pr merge" in _land_error(w, 3, wt, *gate)
+        assert w.pr(30).get("state", "open") == "open" and "已合并,完成" not in w.board(3)
+        synced = w.sb.remote_ref(f"refs/heads/{branch}")
+        assert synced != pr_head                               # …though the sync was pushed
+        w.set(fail=[])
+
+        # the brief names ONE command to land with, carrying the run's config — and
+        # that line lands the PR as written
+        [line] = [ln.strip() for ln in brief.splitlines() if " land --issue " in ln]
+        assert line.startswith(f"{AFK} land --issue 3 --repo {REPO} --config ")
+        p = subprocess.run(line, shell=True, cwd=wt, capture_output=True, text=True, env=w.env)
+        r = json.loads(p.stdout)
+        assert p.returncode == 0 and (r["outcome"], r["pr"], r["synced"], r["head"]) == \
+            ("merged", 30, False, synced), r
+        assert r["gate"] == {"status": "green", "source": "run", "head": synced,
+                             "command": "test -f feature3.txt && test -f landed-meanwhile.txt"}
+        # gh was pinned to the gated head, with the configured strategy
+        assert w.pr(30)["merged"] == {"strategy": "squash", "head": synced, "delete_branch": True}
+        # what landed contains both sides, by MERGE (the base tip is an ancestor)
+        assert w.sb.remote_ref(f"refs/heads/{w.sb.base}") == synced
+        assert {"feature3.txt", "landed-meanwhile.txt"} <= w.remote_files(w.sb.base)
+        git(w.cwd, "fetch", "-q", "origin", w.sb.base)
+        assert git(w.cwd, "merge-base", base_tip, synced) == base_tip
+        assert "已合并,完成" in w.board(3) and "#30" in w.board(3) and "`me`" in w.board(3)
+        assert w.issue(3)["state"] == "closed" and not w.sb.remote_ref(f"refs/heads/{branch}")
+
+        # the landing settles neither the claim nor the worktree it ran in: the next
+        # cycle reads a claim whose issue is closed, and releasing it removes both
+        assert w.claimed_by(3) == "me" and os.path.isdir(wt)
+        ws = w.afk("rebuild", *ME, *R, *NOW, *gate)
+        assert [(m["number"], m["status"]) for m in ws["mine"]] == [(3, "closed")]
+        assert ws["merge_order"] == []
+        w.orca_calls()
+        r = w.afk("release", "3", *ME, *R, *gate)
+        assert (r["released"], r["cleanup"]) == (True, {"removed": True, "path": wt}), r
+        assert w.orca_calls() == ["worktree rm"]
+        assert w.claimed_by(3) is None and w.worktrees() == [] and not os.path.isdir(wt)
+        assert w.afk("rebuild", *ME, *R, *NOW, *gate)["mine"] == []
+
+
+def test_release_removes_a_worktree_only_for_a_claim_whose_issue_is_closed():
+    with world(issues=[issue(1, "ready-for-agent"), issue(2, "ready-for-agent")]) as w:
+        d1, d2 = w.afk(*dispatch(1)), w.afk(*dispatch(2))
+        # an open issue's worktree may hold work: releasing its claim leaves it alone
+        r = w.afk("release", "1", *ME, *R)
+        assert r["released"] is True and "cleanup" not in r and os.path.isdir(d1["worktree"])
+        # closed, but the config keeps worktrees
+        w.set(issues=[issue(1, "ready-for-agent"), issue(2, "ready-for-agent", state="closed")])
+        r = w.afk("release", "2", *ME, *R, "--set", "worktree_cleanup=false")
+        assert r["released"] is True and "cleanup" not in r and os.path.isdir(d2["worktree"])
+
+
+def test_a_red_gate_on_the_turn_is_the_workers_to_fix_and_spends_nothing():
+    with world(issues=[issue(4, "ready-for-agent")]) as w:
+        d, pr_head = with_pr(w, 4, 40)
+        wt, branch = d["worktree"], d["branch"]
+        base_tip = w.advance_base("landed-meanwhile.txt")
+        red = local_gate("test -f feature4.txt && test -f landed-meanwhile.txt && "
+                         "echo 'FAIL TestNames' >&2 && test -f fixed.txt")
+        assert w.afk(*_turn(4, *red))["outcome"] == "granted"
+
+        # it runs IN the worktree, on the synced tree; stderr is part of the log
+        r = _land(w, 4, wt, *red, now=T0 + 10)
+        assert (r["outcome"], r["synced"], r["pr"]) == ("gate_red", True, 40), r
+        assert (r["gate"]["status"], r["gate"]["exit_code"], r["gate"]["excerpt"]) == \
+            ("red", 1, "FAIL TestNames")
+        # the sync was pushed (the PR shows what was gated); the target was not touched
+        assert r["head"] == w.sb.remote_ref(f"refs/heads/{branch}") != pr_head
+        assert w.sb.remote_ref(f"refs/heads/{w.sb.base}") == base_tip
+        # the failure is durable where a later tick — and a human — can re-read it
+        [note] = w.state()["pr_comments"]["40"]
+        assert "FAIL TestNames" in note and "exit 1" in note
+        # no attempt spent, the PR open, the turn kept — and the stop is on the marker
+        assert w.issue(4)["labels"] == ["ready-for-agent"] and w.claimed_by(4) == "me"
+        assert w.pr(40).get("state", "open") == "open"
+        [mark] = _turns(w, 40)
+        assert mark.startswith(f"<!--afk:turn instance=me at={T0 + 10} stopped=gate_red "
+                               f"head={r['head']}-->\n")
+        assert _mine(w, red, 4) == ("landing", "landing", "gate_red")
+        # the tick has nothing to add: the worker is fixing it
+        assert w.afk(*_turn(4, *red, now=T0 + 90))["outcome"] == "landing"
+
+        # a hung gate is RED, never green-by-default; the excerpt is a bounded tail
+        r = _land(w, 4, wt, *local_gate("sleep 30"), "--gate-timeout", "1")
+        assert (r["outcome"], r["gate"]["timed_out"], r["synced"]) == ("gate_red", True, False)
+        assert "timed out after 1s" in r["gate"]["excerpt"]
+        r = _land(w, 4, wt, *local_gate("seq 1 200; exit 1"), "--excerpt-lines", "3")
+        assert (r["gate"]["excerpt"], r["gate"]["omitted_lines"]) == ("198\n199\n200", 197)
+        assert len(w.state()["pr_comments"]["40"]) == 3 and len(_turns(w, 40)) == 1
+
+        # the worker fixes the code, commits, and lands again — its commit is pushed
+        fixed = w.work(wt, "fixed.txt", push=False)
+        r = _land(w, 4, wt, *red, "--set", "merge.strategy=rebase",
+                  "--set", "merge.delete_branch=false")
+        assert (r["outcome"], r["synced"], r["head"]) == ("merged", True, fixed), r
+        assert w.pr(40)["merged"] == {"strategy": "rebase", "head": fixed, "delete_branch": False}
+        assert w.sb.remote_ref(f"refs/heads/{branch}") == fixed       # config decides what stays
+
+
+def test_a_sync_conflict_on_the_turn_is_resolved_in_place_by_the_worker():
+    with world(issues=[issue(2, "ready-for-agent"), issue(8, "ready-for-agent")]) as w:
+        d, pr_head = with_pr(w, 2, 20, name="shared.txt", text="from the worker")
+        base_tip = w.advance_base("shared.txt", text="from someone else")
+        gate = local_gate("true")
+        wt = d["worktree"]
+        w.afk(*_turn(2, *gate))
+
+        r = _land(w, 2, wt, *gate)
+        assert (r["outcome"], r["files"]) == ("conflict", ["shared.txt"]), r
+        assert os.path.samefile(r["worktree"], wt)
+        assert "head" not in r and "gate" not in r               # nothing was gated or pushed
+        assert w.sb.remote_ref(f"refs/heads/{d['branch']}") == pr_head
+        assert w.sb.remote_ref(f"refs/heads/{w.sb.base}") == base_tip
+        # the merge is left IN PROGRESS, for the worker whose worktree this is
+        assert _merging(wt) and git(wt, "rev-parse", "MERGE_HEAD") == base_tip
+        assert _mine(w, gate, 2) == ("landing", "landing", "conflict")
+        assert w.issue(2)["labels"] == ["ready-for-agent"]       # a conflict is not a failure
+        # re-entrant: a re-run reports the same conflict rather than piling on a merge
+        assert _land(w, 2, wt, *gate)["files"] == ["shared.txt"]
+
+        # resolved but not committed: what would be gated is not what would land
+        with open(os.path.join(wt, "shared.txt"), "w") as f:
+            f.write("resolved: both\n")
+        git(wt, "add", "shared.txt")
+        assert "uncommitted" in _land_error(w, 2, wt, *gate)
+        git(wt, "commit", "-qm", "merge main: keep both")
+
+        r = _land(w, 2, wt, *gate)
+        assert (r["outcome"], r["synced"]) == ("merged", True), r
+        p = subprocess.run(["git", "--git-dir", w.sb.bare, "show", f"{w.sb.base}:shared.txt"],
+                           capture_output=True, text=True, env=ENV)
+        assert p.stdout == "resolved: both\n"
+
+        # a claim with no PR has nothing to land, for the tick or for the worker
+        w.afk("claim", "8", *ME, *NOW, *R)
+        assert "nothing to land" in w.error(*_turn(8, *gate))
+        assert "nothing to land" in _land_error(w, 8, wt, *gate)
+
+
+def test_turns_are_granted_one_at_a_time_in_merge_order():
+    """Three ready PRs: exactly one holds the turn at a time, granted in
+    `merge_order`; the next is granted the cycle after the first lands or is
+    failed. Mutually conflicting PRs therefore resolve once each — none is synced
+    against a tip that is about to move."""
+    gate = local_gate("true")
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2, 3, 4)]) as w:
+        d = {}
+        d[2], _ = with_pr(w, 2, 20, name="shared.txt", text="from #2")     # dispatched first…
+        d[1], _ = with_pr(w, 1, 10, name="shared.txt", text="from #1")     # …lower PR number
+        d[3], head3 = with_pr(w, 3, 30, name="shared.txt", text="from #3")
+        with_pr(w, 4, 40, instance="peer")                                  # a peer's, not mine
+
+        def rows():
+            ws = w.afk("rebuild", *ME, *R, *NOW, *gate)
+            return {m["number"]: m["status"] for m in ws["mine"]}, ws["merge_order"]
+
+        assert rows() == ({1: "awaiting_turn", 2: "awaiting_turn", 3: "awaiting_turn"}, [1, 2, 3])
+        # waiting for the turn is visible on the issue
+        w.afk("status", "3", "--phase", "awaiting_turn", "--pr", "30", *ME, *R, *gate)
+        assert "排队等落地轮次" in w.board(3) and "#30" in w.board(3)
+
+        assert w.afk(*_turn(1, *gate))["outcome"] == "granted"
+        w.orca_calls()
+        r = w.afk(*_turn(2, *gate))
+        assert (r["outcome"], r["holder"], r["pr"]) == ("waiting", 1, 20), r
+        assert w.afk(*_turn(3, *gate))["outcome"] == "waiting"
+        # a waiting PR is untouched: no marker, no word to its worker, not synced
+        assert w.orca_calls() == [] and _turns(w, 20) == [] and _turns(w, 30) == []
+        assert len(w.terminals()[2]["sent"]) == 1
+        assert git(d[3]["worktree"], "rev-parse", "HEAD") == head3
+        # the PR that holds the turn leads the order; waiting holds its slot
+        state, order = rows()
+        assert (state, order) == ({1: "landing", 2: "awaiting_turn", 3: "awaiting_turn"}, [1, 2, 3])
+        assert w.afk("rebuild", *ME, *R, *NOW, *gate)["free_slots"] == 0
+        # turns are per fleet instance: a peer's is its own to grant
+        assert w.afk(*_turn(4, *gate, instance="peer"))["outcome"] == "granted"
+        assert w.afk("rebuild", "--instance", "peer", *R, *NOW, *gate)["merge_order"] == [4]
+
+        # #1 lands: the next cycle gives #2 its turn, synced against a target that
+        # already holds #1 — ONE resolution
+        assert _land(w, 1, d[1]["worktree"], *gate)["outcome"] == "merged"
+        state, order = rows()
+        assert (state, order) == ({1: "closed", 2: "awaiting_turn", 3: "awaiting_turn"}, [2, 3])
+        assert w.afk(*_turn(2, *gate))["outcome"] == "granted"
+        assert _land(w, 2, d[2]["worktree"], *gate)["outcome"] == "conflict"
+        assert w.afk(*_turn(3, *gate))["outcome"] == "waiting"
+
+        # #2 is FAILED instead (its worker never resolved it): its PR closes, and
+        # that frees the turn — #3 spent no attempt of its own waiting
+        assert w.afk(*_fail(2, "landing turn never landed", *gate))["action"] == "retry"
+        assert w.pr(20)["state"] == "closed"
+        state, order = rows()
+        assert (state[2], state[3], order) == ("no_pr", "awaiting_turn", [3])
+        assert w.afk(*_turn(3, *gate))["outcome"] == "granted"
+        assert w.issue(3)["labels"] == ["ready-for-agent"]
+        assert _land(w, 3, d[3]["worktree"], *gate)["outcome"] == "conflict"
+
+
+def test_in_required_mode_the_turn_waits_for_checks_on_the_head_that_lands():
+    with world(issues=[issue(n, "ready-for-agent") for n in range(1, 6)]) as w:
+        heads, d = {}, {}
+        for n, conclusion in ((1, "SUCCESS"), (2, "FAILURE"), (3, "PENDING"), (4, None), (5, "SUCCESS")):
+            d[n], heads[n] = with_pr(w, n, n * 10, conclusion=conclusion)
+        base0 = w.sb.remote_ref(f"refs/heads/{w.sb.base}")
+
+        def branch_tip(n):
+            return w.sb.remote_ref("refs/heads/" + w.pr(n * 10)["headRefName"])
+
+        def land(n, *extra):
+            return _land(w, n, d[n]["worktree"], *extra)
+
+        # the tick's judgments come BEFORE the turn: red → fail it, pending → leave
+        # it, none → the tick's call. Nothing is granted, nobody is told
+        for n, outcome, checks in ((2, "gate_red", "red"), (3, "awaiting_ci", "pending"),
+                                   (4, "no_checks", None)):
+            r = w.afk(*_turn(n))
+            assert (r["outcome"], r["checks"], r["head"]) == (outcome, checks, heads[n]), (n, r)
+            assert _turns(w, n * 10) == [] and len(w.terminals()[n - 1]["sent"]) == 1
+        # (a PR with no checks is in the order: its turn is where the tick is asked)
+        assert w.afk("rebuild", *ME, *R, *NOW)["merge_order"] == [1, 4, 5]
+
+        # no checks at all: the turn is granted only on the tick's explicit judgment,
+        # which travels with the turn to the landing
+        assert w.afk(*_turn(4, "--allow-no-checks"))["outcome"] == "granted"
+        assert _turns(w, 40)[0].startswith(f"<!--afk:turn instance=me at={T0} allow_no_checks=1-->")
+        r = land(4)
+        assert (r["outcome"], r["head"], r["synced"]) == ("merged", heads[4], False), r
+        assert w.pr(40)["merged"]["head"] == heads[4] and "gate" not in r
+        assert not any(w.state()["pr_comments"].values())        # required mode publishes nothing
+
+        # the base moved (PR 40 landed): PR 10's green checks ran on a tree that will
+        # NOT land. The sync is pushed and CI must speak about the new head first.
+        assert w.afk(*_turn(1))["outcome"] == "granted"
+        r = land(1)
+        assert (r["outcome"], r["checks"], r["synced"]) == ("awaiting_ci", "green", True), r
+        assert r["head"] == branch_tip(1) != heads[1]
+        # the turn is KEPT while CI runs: nobody else is granted one meanwhile
+        assert w.claimed_by(1) == "me" and w.pr(10).get("state", "open") == "open"
+        row = next(m for m in w.afk("rebuild", *ME, *R, *NOW)["mine"] if m["number"] == 1)
+        assert (row["status"], row["stopped"]) == ("landing", "awaiting_ci")
+        assert w.afk(*_turn(5))["outcome"] == "waiting"
+        # a worker that stopped for the tick is not silent: it is not nudged or failed
+        t0 = int(time.time()) + 5000
+        np = w.no_pr("--issue", "1", *R, "--now", str(t0))
+        assert (np["outcome"], np["action"]) == ("coding", "leave"), np
+
+        # CI is green on the synced head (the fake's rollup still says SUCCESS): the
+        # tick tells the worker to land again — the same turn, the same marker
+        w.orca_calls()
+        r = w.afk(*_turn(1, now=T0 + 90))
+        assert (r["outcome"], r["again"], r["delivery"]) == ("granted", True, "terminal"), r
+        assert w.orca_calls() == ["terminal list", "terminal send"]
+        [mark] = _turns(w, 10)
+        assert mark.startswith(f"<!--afk:turn instance=me at={T0 + 90}-->")
+        r = land(1)
+        assert (r["outcome"], r["synced"], r["head"]) == ("merged", False, branch_tip(1) or r["head"])
+        assert {"feature1.txt", "feature4.txt"} <= w.remote_files(w.sb.base)
+
+        # checks that went red or pending on a head the worker pushed stop the landing
+        w.afk(*_turn(5))
+        prs = w.state()["prs"]
+        for p in prs:
+            if p["number"] == 50:
+                p["statusCheckRollup"] = pr(50, 5, "FAILURE")["statusCheckRollup"]
+        w.set(prs=prs)
+        # …a RED run is stale once the sync moved the head: it is not this head's verdict
+        assert land(5)["outcome"] == "awaiting_ci"
+        r = land(5)
+        assert (r["outcome"], r["checks"], r["synced"]) == ("gate_red", "red", False), r
+        # sync_before_merge: false → the PR head lands as it is, on its own checks
+        w.set(prs=[{**p, "statusCheckRollup": pr(50, 5)["statusCheckRollup"]}
+                   if p["number"] == 50 else p for p in w.state()["prs"]])
+        r = land(5, "--set", "merge.sync_before_merge=false")
+        assert (r["outcome"], r["synced"]) == ("merged", False), r
+        assert base0 != w.sb.remote_ref(f"refs/heads/{w.sb.base}")
+
+
+def test_the_adversarial_verify_is_settled_before_the_turn_and_pinned_to_the_head():
+    """A worker never verifies itself: the tick's verifier speaks about a head
+    BEFORE the turn is granted, and a landing whose sync moved that head stops
+    and waits for it to speak again."""
+    on = (*local_gate("true"), "--set", "gate.adversarial_verify=true")
+    with world(issues=[issue(6, "ready-for-agent")]) as w:
+        d, pr_head = with_pr(w, 6, 60)
+        wt = d["worktree"]
+        r = w.afk(*_turn(6, *on))
+        assert (r["outcome"], r["head"]) == ("needs_verify", pr_head) and _turns(w, 60) == []
+        assert w.afk(*_turn(6, *on, "--verified", "0" * 40))["outcome"] == "needs_verify"
+        assert w.afk(*_turn(6, *on, "--verified", pr_head))["outcome"] == "granted"
+        assert _turns(w, 60)[0].startswith(f"<!--afk:turn instance=me at={T0} verified={pr_head}-->")
+
+        # the target moved: what would land is not what was verified
+        w.advance_base("landed-meanwhile.txt")
+        r = _land(w, 6, wt, *on)
+        assert (r["outcome"], r["synced"], r["gate"]["status"]) == ("needs_verify", True, "green"), r
+        synced = r["head"]
+        assert synced != pr_head and w.pr(60).get("state", "open") == "open"
+        assert _mine(w, on, 6) == ("landing", "landing", "needs_verify")
+        # the tick verifies the new head and tells the worker to land again; a
+        # re-grant that names no head, or the old one, is refused with the new one
+        r = w.afk(*_turn(6, *on, now=T0 + 90))
+        assert (r["outcome"], r["head"]) == ("needs_verify", synced)
+        r = w.afk(*_turn(6, *on, "--verified", synced, now=T0 + 90))
+        assert (r["outcome"], r["again"]) == ("granted", True)
+        r = _land(w, 6, wt, *on)
+        assert (r["outcome"], r["head"], r["synced"]) == ("merged", synced, False), r
+
+
+# --------------------------------------------------------------------------- #
+# the worker's own gate run, and the landing that trusts it (ADR-0026)         #
+# --------------------------------------------------------------------------- #
+
+def test_a_recorded_worker_gate_run_is_not_repeated_by_the_landing():
     """#36. The worker gates through the line its brief gives it, the target does
-    not move, and `afk merge` lands the PR on that record: the gate command ran
-    ONCE across worker and merge — not twice on the same commit."""
+    not move, and `afk land` lands the PR on that record: the gate command ran
+    ONCE across the PR and its landing — not twice on the same commit."""
     with world(issues=[issue(3, "ready-for-agent"), issue(4, "ready-for-agent")]) as w:
         runs = os.path.join(w.sb.root, "gate-runs")
         command = f"echo gate-log; echo run >> {runs}"
@@ -1724,37 +1937,45 @@ def test_a_recorded_worker_gate_run_is_not_repeated_by_the_merge():
                        "head": head, "recorded": True, "detail": ran["detail"]}, ran
         assert count() == 1 and git(wt, "status", "--porcelain") == ""
 
-        r = w.afk(*_merge(3, *gate, *TRUST))
+        # the record survives the landing brief replacing the worker's first one
+        w.afk(*_turn(3, *gate, *TRUST))
+        r = _land(w, 3, wt, *gate, *TRUST)
         assert (r["outcome"], r["synced"], r["head"]) == ("merged", False, head), r
         # the outcome says the gate was trusted, not run, and names the recorded head
         assert r["gate"] == {"status": "green", "source": "recorded", "head": head,
                              "command": command, "recorded_at": r["gate"]["recorded_at"]}
-        assert count() == 1
-        assert w.pr(30)["merged"]["head"] == head and w.claimed_by(3) is None
+        assert count() == 1 and w.pr(30)["merged"]["head"] == head
 
-        # opt-in, default off: the same record, and the merge gates as it always did
-        d, head = with_pr(w, 4, 40, gate=gate)
+        # opt-in, default off: the same record, and the landing gates as it always did
+        d, _ = with_pr(w, 4, 40, gate=gate)
+        git(d["worktree"], "pull", "-q", "--no-edit", "origin", w.sb.base)   # the worker's own sync
+        head = git(d["worktree"], "rev-parse", "HEAD")
+        git(d["worktree"], "push", "-q", "origin", "HEAD")
         assert _gate(w, d["worktree"], command)["recorded"] is True and count() == 2
-        r = w.afk(*_merge(4, *gate))
+        w.afk(*_turn(4, *gate))
+        r = _land(w, 4, d["worktree"], *gate)
         assert (r["outcome"], r["gate"]) == \
             ("merged", {"status": "green", "source": "run", "head": head, "command": command})
         assert count() == 3
-        # and only local mode has a merge-time run to skip
-        assert "gate.trust_recorded_run" in w.error(*_merge(4, *TRUST))
+        # and only local mode has a landing run to skip
+        assert "gate.trust_recorded_run" in _land_error(w, 4, d["worktree"], *TRUST)
 
 
 def test_a_recorded_gate_run_is_void_unless_it_is_of_the_head_that_lands():
-    """With `gate.trust_recorded_run` on, the merge still runs the gate whenever the
-    record does not prove THIS command passed on THIS commit: no record, a red or
-    timed-out run, a dirty tree, another command, a later commit, a sync that moved
-    the head. (`needs_verify` holds the PR open between probes: the adversarial
-    verify still comes after the machine gate, pinned to the head.)"""
+    """With `gate.trust_recorded_run` on, the landing still runs the gate whenever
+    the record does not prove THIS command passed on THIS commit: no record, a red
+    or timed-out run, a dirty tree, another command, a later commit, a sync that
+    moved the head. (The turn here was granted on a verify of some older head, so
+    `needs_verify` holds the PR open between probes: the verify check still comes
+    after the machine gate, pinned to the head.)"""
     with world(issues=[issue(7, "ready-for-agent")]) as w:
         runs = os.path.join(w.sb.root, "gate-runs")
         command = f"echo run >> {runs}; test ! -f broken.txt"
         on = (*local_gate(command), *TRUST, "--set", "gate.adversarial_verify=true")
         d, head = with_pr(w, 7, 70)
         wt = d["worktree"]
+        w.set(comments={"70": [{"id": 2001, "html_url": "u", "body":
+                                afk_decide.turn_comment("me", T0, verified="0" * 40)}]})
 
         def count():
             if not os.path.exists(runs):
@@ -1763,9 +1984,9 @@ def test_a_recorded_gate_run_is_void_unless_it_is_of_the_head_that_lands():
                 return len(f.read().split())
 
         def probe(why, *extra, outcome="needs_verify"):
-            """One `afk merge`: it must RUN the gate, and say why the record was void."""
+            """One `afk land`: it must RUN the gate, and say why the record was void."""
             before = count()
-            r = w.afk(*_merge(7, *on, *extra))
+            r = _land(w, 7, wt, *on, *extra)
             assert (r["outcome"], r["gate"]["source"]) == (outcome, "run"), r
             assert why in r["gate"]["not_trusted"], r["gate"]
             assert count() == before + 1
@@ -1773,9 +1994,12 @@ def test_a_recorded_gate_run_is_void_unless_it_is_of_the_head_that_lands():
 
         # no record: the worker typed the bare command, or never gated
         probe("no green run")
+        # …and a landing's own green run IS a record: the next one need not repeat it
+        before = count()
+        r = _land(w, 7, wt, *on)
+        assert (r["outcome"], r["gate"]["source"], count()) == ("needs_verify", "recorded", before)
 
         # a red run leaves nothing — not even the green record that was there before it
-        assert _gate(w, wt, command)["recorded"] is True
         w.work(wt, "broken.txt")
         g = _gate(w, wt, command)
         assert (g["status"], g["exit_code"], g["recorded"]) == ("red", 1, False), g
@@ -1806,7 +2030,7 @@ def test_a_recorded_gate_run_is_void_unless_it_is_of_the_head_that_lands():
         w.work(wt, "afterthought.txt")
         assert g["head"] in probe("a later commit moved it")["gate"]["not_trusted"]
 
-        # the merge-time sync moved the head: what lands is not what the worker gated
+        # the landing's sync moved the head: what lands is not what the worker gated
         g = _gate(w, wt, command)
         w.advance_base("landed-meanwhile.txt")
         r = probe("not on the head that would land")
@@ -1815,525 +2039,143 @@ def test_a_recorded_gate_run_is_void_unless_it_is_of_the_head_that_lands():
         # a record of exactly the head that lands: trusted — and still verified first
         g = _gate(w, wt, command)
         before = count()
-        r = w.afk(*_merge(7, *on))
+        r = _land(w, 7, wt, *on)
         assert (r["outcome"], r["gate"]["source"], r["head"]) == ("needs_verify", "recorded", g["head"])
-        r = w.afk(*_merge(7, *on, "--verified", r["head"]))
+        assert w.afk(*_turn(7, *on, "--verified", r["head"]))["again"] is True
+        r = _land(w, 7, wt, *on)
         assert (r["outcome"], r["gate"]["source"], r["gate"]["head"]) == ("merged", "recorded", g["head"])
         assert count() == before and w.pr(70)["merged"]["head"] == g["head"]
 
 
 # --------------------------------------------------------------------------- #
-# act: fail / escalate / close                                                 #
+# a turn nobody lands, and a turn whose worker is gone                         #
 # --------------------------------------------------------------------------- #
 
-# --------------------------------------------------------------------------- #
-# act: hand-back                                                               #
-# --------------------------------------------------------------------------- #
-
-def _hand_back(n, *extra, now=T0, instance="me"):
-    return ("hand-back", "--issue", str(n), "--instance", instance, "--worker-command", WORKER,
-            *R, "--now", str(now), *extra)
-
-
-def _conflicted(w, n, pr_number, gate):
-    """Issue n as a tick finds it when a sibling PR landed first: its PR is open, the
-    base has since rewritten the same file, and `afk merge` has just reported the
-    conflict → (the dispatch result, the PR head, the base tip that conflicts)."""
-    d, pr_head = with_pr(w, n, pr_number, name="shared.txt", text="from the worker")
-    base_tip = w.advance_base("shared.txt", text=f"from the sibling that beat #{n}")
-    r = w.afk(*_merge(n, *gate))
-    assert (r["outcome"], r["files"]) == ("conflict", ["shared.txt"]), r
-    return d, pr_head, base_tip
-
-
-def _resolve(w, wt, pr_branch, text="resolved: both", name="shared.txt"):
-    """What a worker does with a hand-back: merge the target in, resolve, commit,
-    push to the PR's branch → the new head."""
-    git(wt, "fetch", "-q", "origin", w.sb.base)
-    p = subprocess.run(["git", "merge", "--no-edit", f"origin/{w.sb.base}"], cwd=wt,
-                       capture_output=True, text=True, env=ENV)
-    assert p.returncode != 0, "the fixture expects this merge to conflict"
-    with open(os.path.join(wt, name), "w") as f:
-        f.write(text + "\n")
-    git(wt, "add", name)
-    git(wt, "commit", "-qm", f"merge {w.sb.base}: keep both")
-    git(wt, "push", "-q", "origin", f"HEAD:refs/heads/{pr_branch}")
-    return git(wt, "rev-parse", "HEAD")
-
-
-def _handback_fields(w, pr_number, pr_branch, tip, files=("shared.txt",)):
-    return {"pr": pr_number, "pr_branch": pr_branch, "target": w.sb.base, "target_tip": tip,
-            "files": list(files)}
-
-
-def _prompt_fields(w, n, started):
-    return {"n": n, "title": f"issue {n}", "repo": REPO, "base_branch": w.sb.base,
-            "local_command": "true", "afk_path": AFK, "branch": started["branch"],
-            "worktree_path": started["worktree"], "launcher_terminal": LAUNCHER}
-
-
-def _template():
-    with open(os.path.join(SKILL, "references", "worker-prompt.md")) as f:
-        return f.read()
-
-
-def _mine(w, gate, n):
-    [row] = [m for m in w.afk("rebuild", *ME, *R, *NOW, *gate)["mine"] if m["number"] == n]
-    return row["status"], row["board_phase"], row["pr"]
-
-
-def test_hand_back_returns_a_sync_conflict_to_the_worker_that_wrote_the_branch():
-    """A sibling PR landed first and the finished, gate-green PR now conflicts with
-    the target. Failing it discards an hour of work to redo from base; instead ONE
-    call returns the conflict to the worker whose branch it is — the claim, the PR,
-    the branch and the worktree all kept, no attempt spent (ADR-0019)."""
+def test_a_worker_silent_on_its_turn_is_nudged_once_then_failed_and_the_turn_moves_on():
+    """A turn can never park the queue: a worker that goes silent on it — idle past
+    grace, nothing landed — is nudged once and then failed, like any other
+    silence. Only THEN is an attempt spent; its PR closes, and the next PR gets
+    the turn."""
     gate = local_gate("true")
-    with world(issues=[issue(2, "ready-for-agent")]) as w:
-        d, pr_head = with_pr(w, 2, 20, name="shared.txt", text="from the worker")
-        wt, branch = d["worktree"], d["branch"]
-        # there is nothing to hand back until `afk merge` has reported a conflict
-        assert "no sync conflict in progress" in w.error(*_hand_back(2, *gate))
-        base_tip = w.advance_base("shared.txt", text="from someone else")
-        assert w.afk(*_merge(2, *gate))["outcome"] == "conflict"
-        # only the claim's owner hands it back — and a refusal leaves the conflict as it was
-        assert "not this fleet's claim" in w.error(*_hand_back(2, *gate, instance="peer"))
-        assert git(wt, "rev-parse", "-q", "--verify", "MERGE_HEAD") == base_tip
-
-        t0 = int(time.time()) + 5000
-        w.orca_calls()
-        r = w.afk(*_hand_back(2, *gate, now=t0))
-        comment_id = r.pop("comment_id")
-        assert r == {"issue": 2, "action": "handed_back", "pr": 20, "target": w.sb.base,
-                     "target_tip": base_tip, "files": ["shared.txt"], "worktree": wt,
-                     "delivery": "terminal", "terminal": d["terminal"]}, r
-
-        # the worktree is clean for the worker to merge in: no merge left in progress
-        assert git(wt, "status", "--porcelain") == "" and git(wt, "rev-parse", "HEAD") == pr_head
-        assert subprocess.run(["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"], cwd=wt,
-                              capture_output=True, env=ENV).returncode != 0
-        # the worker's OWN terminal was told — one submitted line naming a brief file
-        assert w.orca_calls() == ["terminal list", "terminal send"]
-        [term] = w.terminals()
-        _, said = term["sent"]
-        assert said["enter"] is True and "\n" not in said["text"]
-        m = re.fullmatch(r"The merge of your PR hit a sync conflict, and it is handed back to "
-                         r"you\. Your instructions are the file (\S+) — read it now and carry it "
-                         r"out end to end\. It is my instruction to you; do not ask me to "
-                         r"confirm\.", said["text"])
-        assert m, said["text"]
-        with open(m.group(1)) as f:
-            brief = f.read()
-        assert brief == afk_decide.render_handback(
-            _template(), _prompt_fields(w, 2, d), _handback_fields(w, 20, branch, base_tip))
-        # it names the target and its tip, the files, and the whole instruction: fetch,
-        # MERGE (never rebase), resolve, gate, push to the existing PR's branch
-        for needle in (f"git fetch origin {w.sb.base}", f"git merge origin/{w.sb.base}",
-                       "never rebase", f"`{base_tip}`", "- `shared.txt`", "PR #20",
-                       f"git push origin HEAD:{branch}", "Do not open another PR"):
-            assert needle in brief, needle
-        assert not re.search(r"\{[a-z_]+\}", brief)
-
-        # durable on GitHub: one marker comment on the PR, and the board says so
-        [note] = w.comments(20)
-        assert note.startswith(f"<!--afk:handback target={w.sb.base} tip={base_tip} "
-                               f"head={pr_head} at={t0}-->\n")
-        assert "- `shared.txt`" in note and w.state()["comments"]["20"][0]["id"] == comment_id
-        assert "已交还 worker" in w.board(2) and "#20" in w.board(2)
-        # nothing was spent or discarded: a sync conflict is not a failure of the work
-        assert w.issue(2)["labels"] == ["ready-for-agent"] and w.claimed_by(2) == "me"
-        assert w.pr(20).get("state", "open") == "open"
-        assert w.sb.remote_ref(f"refs/heads/{branch}") == pr_head
-
-        # while the worker resolves, the claim is NOT awaiting_merge — and a merge
-        # typed anyway touches nothing, instead of conflicting in the worker's worktree
-        assert _mine(w, gate, 2) == ("handed_back", "handed_back", 20)
-        assert w.afk(*_merge(2, *gate))["outcome"] == "handed_back"
-        assert git(wt, "status", "--porcelain") == ""
-        # a push that does not bring the named tip in is not an answer
-        w.work(wt, "checkpoint.txt")
-        assert _mine(w, gate, 2)[0] == "handed_back"
-
-        # the hand-back is a sign of life: one grace period to start on it
-        cfg = ("--config", json.dumps({"base_branch": w.sb.base, "worker_idle_grace_seconds": 300}))
-        np = w.no_pr("--issue", "2", *R, *cfg, "--now", str(t0 + 60))
-        assert (np["outcome"], np["idle_seconds"], np["handed_back_at"]) == ("coding", 60, t0)
-
-        # the worker answers: the PR head now contains the tip the hand-back named
-        resolved = _resolve(w, wt, branch)
-        assert _mine(w, gate, 2) == ("awaiting_merge", "pr_open", 20)
-        np = w.no_pr("--issue", "2", *R, *cfg, "--now", str(t0 + 60))
-        assert np["handed_back_at"] is None
-        assert w.issue(2)["labels"] == ["ready-for-agent"]          # still no attempt label
-
-        # a SECOND conflict (the target moved again) is handed back again, as its own
-        # round: each one merges a newer tip, so it converges
-        tip2 = w.advance_base("shared.txt", text="from a third party")
-        assert w.afk(*_merge(2, *gate))["outcome"] == "conflict"
-        r2 = w.afk(*_hand_back(2, *gate, now=t0 + 600))
-        assert (r2["target_tip"], r2["delivery"], r2["comment_id"] != comment_id) == \
-            (tip2, "terminal", True)
-        first, second = w.comments(20)
-        assert first == note and f"tip={tip2} head={resolved} at={t0 + 600}" in second
-        assert _mine(w, gate, 2)[0] == "handed_back"
-        _resolve(w, wt, branch, text="resolved: all three")
-        r = w.afk(*_merge(2, *gate))
-        assert (r["outcome"], r["synced"]) == ("merged", False), r
-        p = subprocess.run(["git", "--git-dir", w.sb.bare, "show", f"{w.sb.base}:shared.txt"],
-                           capture_output=True, text=True, env=ENV)
-        assert p.stdout == "resolved: all three\n" and w.claimed_by(2) is None
-
-
-def test_an_unanswered_hand_back_falls_through_to_the_nudge_and_then_the_retry_ladder():
-    """A hand-back can never park a claim: a worker that goes silent on it — idle
-    past grace, the PR head unmoved — is nudged once and then failed, like any
-    other silence. Only THEN is an attempt spent."""
-    gate = local_gate("true")
-    with world(issues=[issue(5, "ready-for-agent")]) as w:
-        _conflicted(w, 5, 50, gate)
+    with world(issues=[issue(5, "ready-for-agent"), issue(6, "ready-for-agent")]) as w:
+        d, _ = with_pr(w, 5, 50)
+        with_pr(w, 6, 60)
         t0 = int(time.time()) + 5000
         cfg = ("--config", json.dumps({"base_branch": w.sb.base, "worker_idle_grace_seconds": 300}))
 
         def no_pr(at):
             r = w.no_pr("--issue", "5", *R, *cfg, "--now", str(at))
-            return r["outcome"], r["action"]
+            return r["outcome"], r["action"], r["turn_at"]
 
-        # a worker nudged BEFORE its PR is under a new instruction now: nudgeable again
+        # a worker nudged BEFORE its turn is under a new instruction now: nudgeable again
         w.afk("nudge", "--issue", "5", *ME, *R, *cfg, "--now", str(t0 - 9000))
-        w.afk(*_hand_back(5, *gate, now=t0))
-        assert no_pr(t0 + 299) == ("coding", "leave")
-        assert no_pr(t0 + 300) == ("idle_stalled", "nudge")
+        assert w.afk(*_turn(5, *gate, now=t0))["outcome"] == "granted"
+        # the turn is a sign of life: one grace period to start on it
+        assert no_pr(t0 + 299) == ("coding", "leave", t0)
+        assert no_pr(t0 + 300) == ("idle_stalled", "nudge", t0)
         w.afk("nudge", "--issue", "5", *ME, *R, *cfg, "--now", str(t0 + 300))
-        # the nudge points at the brief the hand-back wrote, not the original task
-        said = w.terminals()[-1]["sent"][-1]["text"]
-        brief = re.search(r"\((\S+)\)", said).group(1)
-        with open(brief) as f:
-            assert "handed back to you" in f.read()
-        assert no_pr(t0 + 599) == ("coding", "leave")
-        assert no_pr(t0 + 600) == ("idle_failed", "next_attempt")
-        assert _mine(w, gate, 5)[0] == "handed_back" and w.issue(5)["labels"] == ["ready-for-agent"]
+        # the nudge points at the brief the turn wrote, not the original task
+        said = w.terminals()[0]["sent"][-1]["text"]
+        with open(re.search(r"\((\S+)\)", said).group(1)) as f:
+            assert " land --issue 5 " in f.read()
+        assert no_pr(t0 + 599)[:2] == ("coding", "leave")
+        assert no_pr(t0 + 600)[:2] == ("idle_failed", "next_attempt")
+        assert _mine(w, gate, 5)[0] == "landing" and w.issue(5)["labels"] == ["ready-for-agent"]
+        assert w.afk(*_turn(6, *gate))["outcome"] == "waiting"
 
-        r = w.afk(*_fail(5, "sync conflict handed back and never answered", *gate))
+        # a worker still AT its landing is busy, and is left alone however long ago
+        # the turn was (busy is settled from orca alone, so the turn was not read)
+        w.worker(output=t0 + 900, state="working", since=t0 + 800, n=0)
+        np = w.no_pr("--issue", "5", *R, *cfg, "--now", str(t0 + 910))
+        assert (np["outcome"], np["worker_state"], np["turn_at"]) == ("coding", "working", None)
+        w.worker(output=t0, state="done", since=t0, n=0)
+
+        r = w.afk(*_fail(5, "given the landing turn and never landed", *gate))
         assert (r["action"], r["attempt"]) == ("retry", 1)
         assert w.issue(5)["labels"] == ["ready-for-agent", "afk-attempt/1"]
         assert w.pr(50)["state"] == "closed"
-        # the retry is a new attempt with no PR: the old hand-back went with the PR
+        # the retry is a new attempt with no PR: the old turn went with the PR
         assert _mine(w, gate, 5) == ("no_pr", "claimed", None)
+        assert w.afk(*_turn(6, *gate))["outcome"] == "granted"
 
 
-def test_merge_stays_out_of_a_worktree_whose_worker_is_still_working():
-    """#32, as it was observed: ~25 s after a hand-back the worker had merged the
-    target in and PUSHED — then went on to run the gate. The hand-back was answered
-    (the PR head contains the tip it named), so the claim read `awaiting_merge`
-    while its worker was still at work in the worktree, and a tick following the
-    skill ran `afk merge` — a sync and a gate — into it. A pushed head is not the
-    worker's outcome until the worker stops: until then `afk merge` touches nothing."""
-    gate = local_gate("touch gate-ran")
-    with world(issues=[issue(2, "ready-for-agent")]) as w:
-        d, pr_head, tip = _conflicted(w, 2, 20, gate)
-        wt, branch = d["worktree"], d["branch"]
-        t0 = int(time.time()) + 5000
-        cfg = ("--config", json.dumps({"base_branch": w.sb.base, "worker_idle_grace_seconds": 300}))
-
-        def merge(at):
-            return w.afk(*_merge(2, *gate, "--now", str(at)))
-
-        assert w.afk(*_hand_back(2, *gate, now=t0))["delivery"] == "terminal"
-        # recorded: the head does not contain the named tip, so every later tick
-        # reads `handed_back`, and a stopped worker's row says since when
-        assert _mine(w, gate, 2)[0] == "handed_back"
-        assert w.no_pr("--issue", "2", *R, *cfg, "--now", str(t0 + 5))["handed_back_at"] == t0
-
-        # the worker picks it up. Busy is settled from orca alone (ADR-0021), so
-        # `handed_back_at` is null because it was not read — not because the record
-        # is missing: the claim is still `handed_back`
-        w.worker(output=t0 + 20, state="working", since=t0 + 6)
-        np = w.no_pr("--issue", "2", *R, *cfg, "--now", str(t0 + 25))
-        assert (np["outcome"], np["worker_state"], np["handed_back_at"]) == ("coding", "working", None)
-        assert _mine(w, gate, 2)[0] == "handed_back"
-        assert merge(t0 + 25)["outcome"] == "handed_back"
-
-        # it merges the target in and pushes BEFORE gating: the hand-back is answered
-        resolved = _resolve(w, wt, branch)
-        assert _mine(w, gate, 2) == ("awaiting_merge", "pr_open", 20)
-        moved = w.advance_base("landed-meanwhile.txt")          # a sync would have work to do
-        w.calls(), w.orca_calls()
-        r = merge(t0 + 30)
-        assert r == {"issue": 2, "pr": 20, "outcome": "worker_busy", "worktree": wt,
-                     "detail": r["detail"]}, r
-        # nothing was touched: no sync in the worker's worktree, no gate run beside
-        # the worker's own, nothing pushed, merged, released or removed
-        assert git(wt, "rev-parse", "HEAD") == resolved and git(wt, "status", "--porcelain") == ""
-        assert not os.path.exists(os.path.join(wt, "gate-ran"))
-        assert w.sb.remote_ref(f"refs/heads/{branch}") == resolved
-        assert w.sb.remote_ref(f"refs/heads/{w.sb.base}") == moved
-        assert w.pr(20).get("state", "open") == "open" and w.claimed_by(2) == "me"
-        assert w.orca_calls() == ["worktree ps"]
-        assert not [c for c in w.calls() if c[:2] == ["pr", "merge"]]
-
-        # the worker stops (its gate is green, its turn ended): the same call lands it
-        w.worker(output=t0 + 380, state="done", since=t0 + 380)
-        r = merge(t0 + 390)
-        assert (r["outcome"], r["synced"]) == ("merged", True), r
-        assert w.claimed_by(2) is None and "landed-meanwhile.txt" in w.remote_files(w.sb.base)
-
-
-def test_merge_does_not_wait_on_a_worker_whose_stop_report_was_lost():
-    """Busy takes both signals (ADR-0021): a runtime still reporting `working`
-    over a terminal silent past grace is a lost stop report, and a merge parked
-    on it would never land."""
-    gate = local_gate("true")
-    with world(issues=[issue(3, "ready-for-agent")]) as w:
-        with_pr(w, 3, 30)
-        t0 = int(time.time()) + 5000
-        w.worker(output=t0, state="working", since=t0 - 60)
-        assert w.afk(*_merge(3, *gate, "--now", str(t0 + 299)))["outcome"] == "worker_busy"
-        assert w.afk(*_merge(3, *gate, "--now", str(t0 + 300)))["outcome"] == "merged"
-
-
-def _handbacks(w, pr_number):
-    return [c for c in w.comments(pr_number) if "<!--afk:handback" in c]
-
-
-def test_mutually_conflicting_prs_merge_one_at_a_time_each_resolving_once():
-    """#34. Three finished PRs all rewrite the same file. Handed back together,
-    whichever answers first lands and voids the resolutions the other two are
-    still making — up to n(n-1)/2 rounds. Queued, the second resolves against
-    the first, and the third is not even synced until the second has landed: one
-    resolution each (ADR-0025)."""
-    gate = local_gate("true")
-    issues = [issue(n, "ready-for-agent") for n in (1, 2, 3, 4, 5)]
-    with world(issues=issues) as w:
-        d = {}
-        for n, number in ((1, 10), (2, 20), (3, 30)):
-            d[n], _ = with_pr(w, n, number, name="shared.txt", text=f"from #{n}")
-        with_pr(w, 4, 15, name="other4.txt")                    # two that touch nothing shared
-        with_pr(w, 5, 16, name="other5.txt")
-        t0 = int(time.time()) + 5000
-
-        def rows():
-            ws = w.afk("rebuild", *ME, *R, *NOW, *gate)
-            return {m["number"]: (m["status"], m["behind"]) for m in ws["mine"]}, ws
-
-        def merge(n):
-            return w.afk(*_merge(n, *gate))
-
-        # nothing was handed back: PR-number order, and no PR's files are read
-        w.calls()
-        state, ws = rows()
-        assert ws["merge_order"] == [1, 4, 5, 2, 3] and set(state.values()) == {("awaiting_merge", None)}
-        assert not [c for c in w.calls() if any("/pulls/" in x for x in c)]
-
-        # a PR that was never handed back has nothing queued behind it — and asks nothing
-        w.calls()
-        r = merge(1)
-        assert (r["outcome"], r["unblocked"]) == ("merged", []), r
-        assert not [c for c in w.calls() if any("/pulls/" in x for x in c)]
-        assert merge(2)["outcome"] == "conflict"
-        w.afk(*_hand_back(2, *gate, now=t0))
-
-        # #3 would conflict too — it is neither synced nor handed back: it waits, visibly
-        head3 = w.sb.remote_ref(f"refs/heads/{d[3]['branch']}")
-        r = merge(3)
-        assert (r["outcome"], r["behind"], r["pr"]) == ("queued", 20, 30) and "worktree" not in r, r
-        wt3 = d[3]["worktree"]
-        assert git(wt3, "rev-parse", "HEAD") == head3 and git(wt3, "status", "--porcelain") == ""
-        assert subprocess.run(["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"], cwd=wt3,
-                              capture_output=True, env=ENV).returncode != 0
-        assert "no sync conflict in progress" in w.error(*_hand_back(3, *gate, now=t0))
-        assert _handbacks(w, 30) == [] and w.issue(3)["labels"] == ["ready-for-agent"]
-        assert "排队等合并" in w.board(3) and "等 PR #20 先合并" in w.board(3)
-        assert "交还" not in w.board(3) and "已交还 worker" in w.board(2)
-
-        # a PR that overlaps no hand-back merges exactly as before, at once
-        assert merge(4)["outcome"] == "merged"
-
-        state, ws = rows()
-        assert state == {2: ("handed_back", None), 3: ("queued", 20), 5: ("awaiting_merge", None)}
-        assert ws["merge_order"] == [5]
-        # waiting holds its slot, and the fleet keeps pacing at the busy interval
-        assert ws["free_slots"] == 0
-        st = w.afk("cycle", *ME, *R, *NOW)["state"]
-        paced = w.afk("cycle", *ME, *R, *NOW, "--state", json.dumps(st), "--summary",
-                      json.dumps({"in_flight": 3, "frontier_remaining": 0}))
-        assert paced["sleep_seconds"] == 90
-        # the tick's own render pass writes the same board the merge wrote
-        assert w.afk("status", "3", "--phase", "queued", "--behind", "20", "--pr", "30", *ME, *R,
-                     *gate)["action"] == "unchanged"
-
-        # #2's worker answers. Answered is not landed: #3 still waits, and #2 — handed
-        # back — now goes ahead of #5, which never was, lower PR number or not
-        _resolve(w, d[2]["worktree"], d[2]["branch"], text="#1 + #2")
-        state, ws = rows()
-        assert state == {2: ("awaiting_merge", None), 3: ("queued", 20), 5: ("awaiting_merge", None)}
-        assert ws["merge_order"] == [2, 5]
-        assert merge(3)["outcome"] == "queued"
-        # #2 lands and NAMES what it freed: the tick that read #3 as `queued` at its
-        # rebuild merges it next, in this same tick — no cycle is spent waiting (#36)
-        r = merge(2)
-        assert (r["outcome"], r["unblocked"]) == ("merged", [3]), r
-
-        # #3's turn, taken from `unblocked` with no rebuild in between: synced against
-        # a target that holds #1 and #2 — one hand-back, ever
-        assert merge(3)["outcome"] == "conflict"
-        state, ws = rows()
-        assert state == {3: ("awaiting_merge", None), 5: ("awaiting_merge", None)}
-        w.afk(*_hand_back(3, *gate, now=t0 + 600))
-        _resolve(w, wt3, d[3]["branch"], text="#1 + #2 + #3")
-        assert rows()[1]["merge_order"] == [3, 5]
-        assert merge(3)["outcome"] == "merged" and merge(5)["outcome"] == "merged"
-        assert (len(_handbacks(w, 20)), len(_handbacks(w, 30))) == (1, 1)
-        p = subprocess.run(["git", "--git-dir", w.sb.bare, "show", f"{w.sb.base}:shared.txt"],
-                           capture_output=True, text=True, env=ENV)
-        assert p.stdout == "#1 + #2 + #3\n" and rows()[0] == {}
-
-
-def test_a_landed_pr_names_the_claims_of_mine_it_freed_and_no_others():
-    """#36. `unblocked` is exactly what the tick may merge next: my claims that
-    waited behind the PR that landed, in merge order — never one still behind
-    another handed-back PR, and never a peer's."""
-    gate = local_gate("true")
-    with world(issues=[issue(n, "ready-for-agent") for n in range(1, 7)]) as w:
-        d = {}
-        d[1], _ = with_pr(w, 1, 10, name="shared.txt", text="from #1")
-        d[2], _ = with_pr(w, 2, 20, name="other.txt", text="from #2")
-        d[4], _ = with_pr(w, 4, 40, name="shared.txt", text="from #4")
-        d[3], _ = with_pr(w, 3, 30, name="shared.txt", text="from #3")
-        d[5], _ = with_pr(w, 5, 50, name="shared.txt", text="from #5")
-        w.work(d[5]["worktree"], "other.txt", text="from #5")       # #5 overlaps BOTH
-        with_pr(w, 6, 60, name="shared.txt", text="from a peer", instance="peer")
-        w.advance_base("shared.txt", text="landed first")
-        w.advance_base("other.txt", text="landed first")
-        t0 = int(time.time()) + 5000
-
-        def merge(n):
-            return w.afk(*_merge(n, *gate))
-
-        def behind():
-            ws = w.afk("rebuild", *ME, *R, *NOW, *gate)
-            return {m["number"]: m["behind"] for m in ws["mine"] if m["status"] == "queued"}
-
-        for n, at in ((1, t0), (2, t0 + 1)):
-            assert merge(n)["outcome"] == "conflict"
-            w.afk(*_hand_back(n, *gate, now=at))
-        assert behind() == {3: 10, 4: 10, 5: 10}
-
-        # #1 lands: #3 and #4 are free, in merge order (PR 30 before PR 40, whichever
-        # was dispatched first). #5 also changes the file #2 was handed back over, so
-        # it is still queued; #6 waited too, but it is a peer's to merge
-        _resolve(w, d[1]["worktree"], d[1]["branch"], text="base + #1")
-        r = merge(1)
-        assert (r["outcome"], r["unblocked"]) == ("merged", [3, 4]), r
-        assert behind() == {5: 20}
-        assert w.afk(*_merge(6, *gate, instance="peer"))["outcome"] != "queued"
-
-        _resolve(w, d[2]["worktree"], d[2]["branch"], text="base + #2", name="other.txt")
-        r = merge(2)
-        assert (r["outcome"], r["unblocked"]) == ("merged", [5]), r
-        assert behind() == {}
-
-
-def test_a_hand_back_never_answered_stops_holding_the_prs_queued_behind_it():
-    """Waiting is bounded by the ladder that already exists: an unanswered hand-back
-    is nudged, then failed — its PR is closed, and the PR that waited behind it is
-    free again, having spent no attempt of its own."""
-    gate = local_gate("true")
-    with world(issues=[issue(5, "ready-for-agent"), issue(6, "ready-for-agent")]) as w:
-        _conflicted(w, 5, 50, gate)
-        with_pr(w, 6, 60, name="shared.txt", text="from #6")
-        w.afk(*_hand_back(5, *gate))
-
-        def row(n):
-            [m] = [m for m in w.afk("rebuild", *ME, *R, *NOW, *gate)["mine"] if m["number"] == n]
-            return m["status"], m["behind"]
-
-        assert row(6) == ("queued", 50) and w.afk(*_merge(6, *gate))["outcome"] == "queued"
-        # a PEER's rebuild and merge see the same queue: the record is on the PR
-        assert w.afk("rebuild", "--instance", "peer", *R, *NOW, *gate)["mine"] == []
-
-        assert w.afk(*_fail(5, "sync conflict handed back and never answered", *gate))["action"] == "retry"
-        assert w.pr(50)["state"] == "closed"
-        assert row(6) == ("awaiting_merge", None) and w.issue(6)["labels"] == ["ready-for-agent"]
-        assert w.afk(*_merge(6, *gate))["outcome"] == "merged"
-
-
-def test_hand_back_with_no_terminal_continues_in_the_worktree_never_from_base():
+def test_a_turn_with_no_terminal_is_delivered_by_continuation_never_from_base():
     """The worker finished and its terminal is gone (closed, the machine restarted,
-    the claim taken over from another machine). The hand-back then STARTS a worker
-    by continuation — in the worktree still here, else one recreated at the PR
-    head — on the same instruction."""
+    the claim taken over from another machine). The turn then STARTS a worker by
+    continuation — in the worktree still here, else one recreated at the PR head —
+    briefed only to land the PR. There is no launcher-side merge to fall back on."""
     gate = local_gate("true")
     with world(issues=[issue(6, "ready-for-agent"), issue(7, "ready-for-agent")]) as w:
-        d, pr_head, base_tip = _conflicted(w, 6, 60, gate)
+        d, pr_head = with_pr(w, 6, 60, gate=gate)
         wt, branch = d["worktree"], d["branch"]
-        terms = w.terminals()
-        terms[-1]["open"] = False
-        w.orca(terminals=terms)
+        w.advance_base("landed-meanwhile.txt")
+        _close_terminals(w)
         w.orca_calls()
 
-        r = w.afk(*_hand_back(6, *gate))
-        assert (r["delivery"], r["worktree"], r["files"]) == ("continuation", wt, ["shared.txt"]), r
+        r = w.afk(*_turn(6, *gate))
+        assert (r["outcome"], r["delivery"], r["worktree"]) == ("granted", "continuation", wt), r
         assert w.orca_calls() == ["terminal list", "terminal close", "terminal create",
                                   "terminal wait", "terminal send"]
         _, new = w.terminals()
         assert (new["handle"], new["command"], new["worktreePath"]) == (r["terminal"], WORKER, wt)
         told = _told(new)
-        assert told == afk_decide.render_worker_prompt(
-            _template(), "continue", _prompt_fields(w, 6, d),
-            handback=_handback_fields(w, 60, branch, base_tip))
-        assert told.startswith("You are an afk-fleet worker **continuing**")
-        assert "## A sync conflict on your PR was handed back to you" in told
-        # in the existing worktree, at the PR head — nothing reset to base
+        assert told == _landing_brief(w, 6, d, 60, branch, *gate)
+        # briefed ONLY to land: not the task, not a new PR
+        assert told.startswith("## Your PR holds the landing turn") and "Closes #6" not in told
+        # in the existing worktree, at the PR head — nothing reset to base, nothing synced
         assert git(wt, "rev-parse", "HEAD") == pr_head and git(wt, "status", "--porcelain") == ""
-        assert len(w.worktrees()) == 1 and "已交还 worker" in w.board(6)
-        assert w.issue(6)["labels"] == ["ready-for-agent"] and _mine(w, gate, 6)[0] == "handed_back"
+        assert len(w.worktrees()) == 1 and "已轮到落地" in w.board(6)
+        assert w.issue(6)["labels"] == ["ready-for-agent"] and _mine(w, gate, 6)[0] == "landing"
 
         # the continued worker dies too: the claim reads as dead, and the plain
-        # orphan recovery — `afk dispatch` — starts its successor ON the hand-back
-        terms = w.terminals()
-        terms[-1]["open"] = False
-        w.orca(terminals=terms)
+        # orphan recovery — `afk dispatch` — starts its successor ON the turn
+        _close_terminals(w)
         np = w.no_pr("--issue", "6", *R, *gate)
         assert (np["outcome"], np["action"]) == ("dead", "orphan")
         r = w.afk(*dispatch(6, *gate, "--now", str(T0 + 90)))
-        assert (r["claim"], r["action"], r["prompt"], r["handed_back"]) == \
-            ("held", "reuse_worktree", "continue", 60)
-        assert "handed back to you" in _told(w.terminals()[-1])
-        assert "已交还 worker" in w.board(6) and len(w.comments(60)) == 1
+        assert (r["claim"], r["action"], r["prompt"], r["landing"]) == \
+            ("held", "reuse_worktree", "landing", 60)
+        assert _told(w.terminals()[-1]) == told and len(w.comments(60)) == 1
+        assert _land(w, 6, wt, *gate)["outcome"] == "merged"
+        w.afk("release", "6", *ME, *R, *gate)
 
-        # no worktree on this machine at all (a takeover from another machine): the
-        # merge recreates one at the PR head, and the hand-back continues THERE — the
-        # prompt carries orca's new local branch, the push goes to the PR's branch
-        w.afk("release", "6", *ME, *R)      # out of the merge queue: #7 is not behind PR 60
-        d7, head7, _ = _conflicted(w, 7, 70, gate)
+        # no worktree on this machine at all (a takeover from another machine): one is
+        # recreated at the PR's HEAD — the brief carries orca's new local branch, the
+        # landing pushes to the PR's branch
+        d7, head7 = with_pr(w, 7, 70, gate=gate)
+        base_tip = w.advance_base("landed-later.txt")
         git(w.cwd, "worktree", "remove", "--force", d7["worktree"])
         w.orca([row for row in w.worktrees() if row["linkedIssue"] != 7])
-        again = w.afk(*_merge(7, *gate))
-        assert again["outcome"] == "conflict" and again["worktree"] != d7["worktree"]
-        r = w.afk(*_hand_back(7, *gate))
-        assert (r["delivery"], r["worktree"]) == ("continuation", again["worktree"])
+        r = w.afk(*_turn(7, *gate))
+        assert (r["outcome"], r["delivery"]) == ("granted", "continuation")
+        wt7 = r["worktree"]
+        assert wt7 != d7["worktree"] and git(wt7, "rev-parse", "HEAD") == head7
         told = _told(w.terminals()[-1])
-        assert f"git push origin HEAD:{d7['branch']}" in told
-        assert f"**Your branch:** `{d7['branch']}-2`" in told
-        assert git(again["worktree"], "rev-parse", "HEAD") == head7
+        assert f"**Your branch:** `{d7['branch']}-2`" in told and f"`{d7['branch']}`" in told
+        r = _land(w, 7, wt7, *gate, "--set", "merge.delete_branch=false")
+        assert (r["outcome"], r["synced"]) == ("merged", True), r
+        assert w.sb.remote_ref(f"refs/heads/{d7['branch']}") == r["head"] != head7
+        assert {"feature7.txt", "landed-later.txt"} <= w.remote_files(w.sb.base)
+        git(w.cwd, "fetch", "-q", "origin", w.sb.base)
+        assert git(w.cwd, "merge-base", base_tip, r["head"]) == base_tip
 
     # a delivery that fails AFTER the record is repaired by the paths that exist: the
-    # claim is already `handed_back`, so no tick re-runs the merge into the worktree
+    # claim is already `landing`, and the orphan's continuation is started on the turn
     with world(issues=[issue(8, "ready-for-agent")]) as w:
-        _conflicted(w, 8, 80, gate)
-        terms = w.terminals()
-        terms[-1]["open"] = False
-        w.orca(terminals=terms, never_ready=True)
-        assert "not ready" in w.error(*_hand_back(8, *gate, "--ready-timeout", "1"))
-        assert _mine(w, gate, 8)[0] == "handed_back" and len(w.comments(80)) == 1
+        with_pr(w, 8, 80)
+        _close_terminals(w)
+        w.orca(never_ready=True)
+        assert "not ready" in w.error(*_turn(8, *gate, "--ready-timeout", "1"))
+        assert _mine(w, gate, 8)[0] == "landing" and len(w.comments(80)) == 1
         assert w.issue(8)["labels"] == ["ready-for-agent"] and w.claimed_by(8) == "me"
         w.orca(never_ready=False)
         r = w.afk(*dispatch(8, *gate, "--now", str(T0 + 90)))
-        assert (r["action"], r["handed_back"]) == ("reuse_worktree", 80)
-        # a claim with no PR has nothing to hand back
-        w.set(issues=w.state()["issues"] + [issue(9, "ready-for-agent")])
-        w.afk("claim", "9", *ME, *NOW, *R)
-        assert "nothing to hand back" in w.error(*_hand_back(9, *gate))
+        assert (r["action"], r["prompt"], r["landing"]) == ("reuse_worktree", "landing", 80)
 
+
+# --------------------------------------------------------------------------- #
+# act: fail / escalate / close                                                 #
+# --------------------------------------------------------------------------- #
 
 def _fail(n, reason, *extra):
     return ("fail", "--issue", str(n), *ME, "--worker-command", WORKER, *R, *NOW,
@@ -2594,7 +2436,7 @@ def test_every_failure_is_one_json_error():
         assert "invalid choice" in w.error("status", "4", "--phase", "bogus", *R)
         assert "invalid choice" in w.error("no-such-subcommand", bare=True)
         # the recipes that became transitions are gone, not aliased
-        for gone in ("fingerprint", "pace", "next-attempt", "gate-run"):
+        for gone in ("fingerprint", "pace", "next-attempt", "gate-run", "merge", "hand-back"):
             assert "invalid choice" in w.error(gone, bare=True), gone
 
 
@@ -2769,11 +2611,24 @@ def test_the_docs_route_on_exactly_the_words_the_code_returns():
         assert f"**{outcome}** / `{action}`" in skill, (outcome, action)
         assert outcome in row("no-pr"), outcome
 
-    # `afk merge`: the outcome table IS the set, row for row
+    # `afk turn`: the tick's outcome table IS the set, row for row — and so is the
+    # worker's, for `afk land`, in the one block every prompt variant carries
     table = re.findall(r"^\| `(\w+)` \|", skill, re.M)
-    assert table == ["outcome", *afk_decide.MERGE_OUTCOMES], table      # header, then rows
-    for outcome in afk_decide.MERGE_OUTCOMES:
-        assert outcome in row("merge"), outcome
+    assert table == ["outcome", *afk_decide.TURN_OUTCOMES], table      # header, then rows
+    for outcome in afk_decide.TURN_OUTCOMES:
+        assert outcome in row("turn"), outcome
+    prompt = docs["worker-prompt.md"]
+    land = re.search(r"<!--afk:block land-->\n(.*?)<!--/afk:block-->", prompt, re.S).group(1)
+    assert re.findall(r"^\| `(\w+)` \|", prompt, re.M) == \
+        re.findall(r"^\| `(\w+)` \|", land, re.M) == ["outcome", *afk_decide.LAND_OUTCOMES]
+    assert "{land_command}" in land
+    for outcome in afk_decide.LAND_OUTCOMES:
+        assert outcome in row("land"), outcome
+    # nothing a tick or a worker reads names a way to land that no longer exists
+    for name, text in docs.items():
+        for gone in ("afk merge", "afk hand-back", "handed_back", "awaiting_merge", "worker_busy",
+                     "`queued`", "`unblocked`"):
+            assert gone not in text, (name, gone)
 
     # the verdict marker is written into the worker prompt by the code that parses
     # it — the template never spells it — and each phase is explained to both readers
@@ -2784,7 +2639,7 @@ def test_the_docs_route_on_exactly_the_words_the_code_returns():
 
     # the tick's summary schema comes from `afk cycle`; the launcher is never given
     # one to copy, only told which two counts it must not lose
-    assert "`summary_schema`" in skill and "merged:[" not in skill
+    assert "`summary_schema`" in skill and "granted:[" not in skill
     for key in afk_decide.SUMMARY_COUNTS:
         assert f"`{key}`" in skill, key
 
@@ -2803,6 +2658,8 @@ def test_the_tools_table_is_the_one_the_parser_generates():
     assert gen_tools_doc.usage("dispatch", subs["dispatch"]) == \
         ("afk dispatch --issue <n> --instance <id> --worker-command <cmd> "
          "[--ready-timeout <s>] [--start <auto\\|fresh>]")
+    assert gen_tools_doc.usage("land", subs["land"]) == \
+        "afk land --issue <n> [--gate-timeout <s>] [--excerpt-lines <k>]"
 
 
 def test_the_docs_restate_config_only_as_the_schema_has_it():

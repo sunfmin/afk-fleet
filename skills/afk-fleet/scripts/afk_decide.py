@@ -93,11 +93,11 @@ BRANCH_NAMESPACE = "refs/heads"
 
 # The completion gate's two modes (ADR-0012), each with what the status board calls
 # that gate. `required` waits for the PR's GitHub checks; `local` never reads them
-# and makes `gate.local_command` the gate, re-run at merge time against the exact
+# and makes `gate.local_command` the gate, run by `afk land` against the exact
 # tree that lands.
 GATE_CI_MODES = {"required": "CI", "local": "本地门"}
 
-# How `afk merge` lands a PR — each is a `gh pr merge` flag of the same name.
+# How `afk land` lands a PR — each is a `gh pr merge` flag of the same name.
 MERGE_STRATEGIES = ("squash", "merge", "rebase")
 
 # Keys that were renamed, and why. A file still carrying the old name must fail
@@ -143,7 +143,7 @@ def validate_config(cfg):
                          "local mode that command IS the completion gate (ADR-0012), so an empty "
                          "one would merge every PR unverified")
     if gate.get("trust_recorded_run") and ci != "local":
-        raise ValueError("config gate.trust_recorded_run: only gate.ci: 'local' has a merge-time "
+        raise ValueError("config gate.trust_recorded_run: only gate.ci: 'local' has a landing "
                          "run of gate.local_command to skip (ADR-0026) — set gate.ci to 'local' "
                          "or leave this false")
     strategy = (cfg.get("merge") or {}).get("strategy")
@@ -422,11 +422,10 @@ def classify_claims(claims, heartbeats, me, now, ttl):
 
 # Every `status` a `mine` row can carry — what `subclassify_pr` returns, and the
 # vocabulary the tick's instructions route on (a test holds the docs to it).
-CLAIM_STATUSES = ("awaiting_merge", "queued", "awaiting_ci", "failure", "handed_back", "no_pr",
-                  "closed")
+CLAIM_STATUSES = ("awaiting_turn", "landing", "awaiting_ci", "failure", "no_pr", "closed")
 
 
-def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=False, queued=False):
+def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, landing=False):
     """
     Classify one of MY in-flight claims from its PR + checks → `(status,
     board_phase)`: what the tick does next, and what the status board shows a human
@@ -435,58 +434,52 @@ def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=Fals
       has_pr:       an open PR closes the issue
       checks_state: "green" | "red" | "pending" | None  (`pr_checks_state`)
       ci_mode:      gate.ci — "required" reads the checks; "local" never does
-      closed:       the claimed issue is itself CLOSED — a merge whose tick died
-                    before releasing, or a human finishing it by hand
-      handed_back:  a sync conflict on the PR was handed back to its worker and the
-                    PR head does not yet contain the target tip it named
-                    (`handback_open`)
-      queued:       the PR waits behind a handed-back PR ahead of it in the merge
-                    queue (`waits_behind`). Only a claim that would otherwise be
-                    `awaiting_merge` is ever `queued`: it is the merge that waits
+      closed:       the claimed issue is itself CLOSED — its worker landed the PR
+                    (`afk land` cannot release the claim), or a human finished it
+                    by hand
+      landing:      the PR holds this fleet instance's landing turn (`held_turn`)
 
       status           the tick…                                board_phase
-      closed           releases the leftover claim               None (not re-rendered)
+      closed           releases the leftover claim (and its      None (not re-rendered)
+                       worktree)
       no_pr            asks `afk no-pr` why                      claimed
-      handed_back      asks `afk no-pr` whether its worker is    handed_back
-                       still resolving — never `afk merge`
+      landing          asks `afk no-pr` whether its worker is    landing
+                       still at it — or, when the landing
+                       stopped for the tick, `afk turn` again
       awaiting_ci      leaves it: checks exist and are still     pr_open
                        running
       failure          runs `afk fail`                           ci_failed
-      awaiting_merge   runs `afk merge`                          awaiting_merge
-                       (`local`: an open PR, whatever its        (`local`, or no
-                       remote checks say)                        checks: pr_open)
-      queued           leaves it: its turn comes when the PR     queued
-                       it is behind has merged
+      awaiting_turn    grants it the landing turn (`afk turn`)   awaiting_turn
+                       when it is first in `merge_order` and
+                       no claim of mine is `landing`
+
+    A PR that holds the turn is `landing` whatever its checks say: its worker is
+    syncing, gating and pushing, so a pending or red run on the way is the
+    landing's own business (`afk land` answers `awaiting_ci` / `gate_red`), never
+    a second route into `afk fail`.
 
     In `local` mode (ADR-0012) there are no checks to wait on: gating is an
-    **action the tick takes at merge time** (sync → re-run the local gate → merge),
-    not an observation it waits for. So every open PR is `awaiting_merge` — a red
-    remote run, the repo's own `on: push` workflow the fleet does not gate on, must
-    not park the claim in `failure` forever — while its board stays at `pr_open`:
-    the gate that sequence runs has not passed yet, and the board must not show a
-    green gate nobody has run. (`merged` / `escalated`, the two terminal board
-    phases, are set by the merge and escalate steps themselves.)
+    **action `afk land` takes** (sync → the local gate → merge), not an
+    observation the tick waits for. So every open PR without the turn is
+    `awaiting_turn` — a red remote run, the repo's own `on: push` workflow the
+    fleet does not gate on, must not park the claim in `failure` forever.
 
-    A PR with **no checks at all** (`checks_state` None) is `awaiting_merge` in
+    A PR with **no checks at all** (`checks_state` None) is `awaiting_turn` in
     `required` mode too. Nothing is running, so nothing will ever arrive to wait
     for: `awaiting_ci` would park the claim forever in a repo that has no CI. What
-    such a PR needs is the tick's judgment, and `afk merge` is where that is asked
-    for (its `no_checks` outcome, answered with `--allow-no-checks`). Its board
-    stays at `pr_open`, as in `local` mode: no gate has passed yet.
+    such a PR needs is the tick's judgment, and `afk turn` is where that is asked
+    for (its `no_checks` outcome, answered with `--allow-no-checks`).
+    (`merged` / `escalated`, the two terminal board phases, are set by `afk land`
+    and the escalate step themselves.)
     """
     if closed:
         return "closed", None
     if not has_pr:
         return "no_pr", "claimed"
-    if handed_back:
-        # whatever the checks say: re-running the merge against the same head would
-        # hit the same conflict and hand it back again, every cycle
-        return "handed_back", "handed_back"
+    if landing:
+        return "landing", "landing"
     if ci_mode == "local" or checks_state in ("green", None):
-        if queued:
-            return "queued", "queued"
-        gated = ci_mode != "local" and checks_state == "green"
-        return "awaiting_merge", "awaiting_merge" if gated else "pr_open"
+        return "awaiting_turn", "awaiting_turn"
     if checks_state == "red":
         return "failure", "ci_failed"
     return "awaiting_ci", "pr_open"
@@ -497,14 +490,13 @@ def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=Fals
 # --------------------------------------------------------------------------- #
 #
 # In `gate.ci: local` the repo-local build/test command IS the completion gate:
-# the worker runs it after its pre-PR sync, and the tick re-runs it at merge time,
-# after the merge-time sync, in the branch's worktree. The invariant both runs
-# serve: *what lands on the target branch was tested in the form it lands.* With
-# `gate.trust_recorded_run` the second run is skipped when — and only when — the
-# worker's run is on record for the exact head that lands (`gate_record_void`,
-# ADR-0026). The verdict shape below is deliberately the SAME {status, excerpt} the ephemeral
-# CI-log sub-read returns in `required` mode, so the tick has one gate branch, and
-# a raw log never enters its context either way.
+# the worker runs it after its pre-PR sync, and `afk land` runs it again on the
+# landing turn, after the landing's sync, in the same worktree. The invariant
+# both runs serve: *what lands on the target branch was tested in the form it
+# lands.* With `gate.trust_recorded_run` the second run is skipped when — and
+# only when — a green run is on record for the exact head that lands
+# (`gate_record_void`, ADR-0026). A red run comes back as a bounded excerpt,
+# never a raw log.
 
 GATE_EXCERPT_LINES = 40
 
@@ -530,8 +522,9 @@ def gate_verdict(exit_code, output, max_lines=GATE_EXCERPT_LINES, timed_out=Fals
 
 def gate_record(head, command, clean, at):
     """
-    What `afk gate` writes down after a GREEN run of the local gate — never after a
-    red or timed-out one, so no record can be read as a pass that did not happen:
+    What `afk gate` (and a green run of `afk land`) writes down after a GREEN run
+    of the local gate — never after a red or timed-out one, so no record can be
+    read as a pass that did not happen:
 
       head:    the commit the worktree was at, before and after the run
       command: the `gate.local_command` that ran, verbatim
@@ -544,19 +537,19 @@ def gate_record(head, command, clean, at):
 
 def gate_record_void(record, head, command):
     """
-    Why a worker's recorded gate run does NOT stand in for the merge-time run — or
-    None when it does, which is the only case `afk merge` skips its own (ADR-0026).
+    Why a recorded gate run does NOT stand in for the landing's own run — or
+    None when it does, which is the only case `afk land` skips its own (ADR-0026).
 
       record:  the worktree's `gate_record`, None when it has none (never gated
                through `afk gate`, a red run since, a worktree recreated here)
-      head:    the head that would land, after the merge-time sync
+      head:    the head that would land, after the landing's sync
       command: the `gate.local_command` configured now
 
     The record proves the gate passed on one commit, with one command. Anything
-    that makes the tree that lands a different tree — the merge-time sync brought
+    that makes the tree that lands a different tree — the landing's sync brought
     the target in, the worker committed afterwards — or the test a different test
     voids it, and so does a run over uncommitted or untracked files, which tested
-    something no commit holds. Void is the safe side: the merge runs the gate.
+    something no commit holds. Void is the safe side: the landing runs the gate.
     """
     if not isinstance(record, dict) or not record.get("head"):
         return "no green run of the gate is on record in this worktree"
@@ -614,34 +607,20 @@ def protection_verdict(ci_mode, protection, unavailable=None):
             "detail": "target branch requires no status checks — a local gate can merge"}
 
 
-# Every `outcome` `afk merge` can stop with — the vocabulary the tick's
-# instructions route on (a test holds the docs to it).
-MERGE_OUTCOMES = ("merged", "conflict", "handed_back", "queued", "worker_busy", "gate_red", "awaiting_ci",
-                  "no_checks", "needs_verify")
-
-
-def merge_outcome(outcome):
-    """`outcome`, refused unless it is one of MERGE_OUTCOMES: `afk merge` cannot
-    stop with a word the tick was never told how to act on."""
-    if outcome not in MERGE_OUTCOMES:
-        raise ValueError(f"not a merge outcome: {outcome!r}")
-    return outcome
-
-
 def checks_gate(checks_state, pushed, allow_no_checks=False):
     """
-    The `gate.ci: required` half of `afk merge`'s gate: may this PR merge on what
-    its GitHub checks say, right now?
+    The `gate.ci: required` machine gate, for `afk turn` and `afk land` alike:
+    may this PR land on what its GitHub checks say, right now?
 
-      checks_state:    `pr_checks_state` of the PR as read BEFORE the merge-time sync
-      pushed:          the sync just pushed new commits to the PR — those checks
-                       describe a tree that is no longer the one that would land
-      allow_no_checks: the tick's judgment that a repo with no CI at all may merge
+      checks_state:    `pr_checks_state` of the PR as read BEFORE any sync
+      pushed:          the landing's sync just pushed new commits to the PR — those
+                       checks describe a tree that is no longer the one that would land
+      allow_no_checks: the tick's judgment that a repo with no CI at all may land
                        on its acceptance criteria (the progressive gate)
 
     Returns "green" | "awaiting_ci" | "gate_red" | "no_checks". A sync that moved
-    the head always waits: CI must run on the tree that lands, and a later tick's
-    merge finds the sync a no-op and reads the fresh verdict.
+    the head always waits: CI must run on the tree that lands, and the next
+    `afk land` finds the sync a no-op and reads the fresh verdict.
     """
     if checks_state is None:
         return "green" if allow_no_checks else "no_checks"
@@ -651,13 +630,14 @@ def checks_gate(checks_state, pushed, allow_no_checks=False):
 
 
 def gate_comment(verdict, command):
-    """The PR comment a red merge-time local gate leaves behind, so the retry's
-    worker re-reads the failure from where it lives (ADR-0012)."""
+    """The PR comment a red landing gate leaves behind, so whoever words the
+    failure — the worker fixing it, or the tick failing a worker that gave up —
+    re-reads it from where it lives (ADR-0012)."""
     how = (f"timed out (exit {verdict['exit_code']})" if verdict["timed_out"]
            else f"exit {verdict['exit_code']}")
     omitted = (f"\n\n_({verdict['omitted_lines']} earlier line(s) omitted)_"
                if verdict["omitted_lines"] else "")
-    return (f"**afk-fleet merge-time gate: red** — `{command}` → {how}, run after syncing "
+    return (f"**afk-fleet landing gate: red** — `{command}` → {how}, run after syncing "
             f"with the merge target.\n\n```\n{verdict['excerpt']}\n```{omitted}")
 
 
@@ -665,10 +645,10 @@ def gate_comment(verdict, command):
 # no_pr reconciliation — disambiguating a FINISHED worker from a CODING one    #
 # --------------------------------------------------------------------------- #
 #
-# `subclassify_pr` only says a claim has no PR yet — or that its PR's sync
-# conflict was handed back and the worker has not answered. Either way a worker
-# that finished and went idle looks identical, to a terminal probe, to one still
-# working, so three signals disambiguate (all gathered by `afk no-pr`):
+# `subclassify_pr` only says a claim has no PR yet — or that its PR holds the
+# landing turn and has not landed. Either way a worker that finished and went
+# idle looks identical, to a terminal probe, to one still working, so three
+# signals disambiguate (all gathered by `afk no-pr`):
 #   1. git PROGRESS in the worktree (commits ahead / dirty tree / last activity);
 #   2. the worker's VERDICT marker on the issue — its declared reason for opening
 #      no PR: `already-satisfied` (done in base, empty diff), `blocked` (a
@@ -955,10 +935,11 @@ def read_worker_state(row, now, grace_seconds, tui_idle=None):
 
 
 def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, blocker_states,
-                   now, grace_seconds, nudged_at=None, can_nudge=True, handed_back_at=None):
+                   now, grace_seconds, nudged_at=None, can_nudge=True, turn_at=None,
+                   turn_stopped=None):
     """
     The outcome for one of MY claims that is waiting on its WORKER — a `no_pr`
-    claim, or a `handed_back` one — from the raw signals.
+    claim, or a `landing` one — from the raw signals.
 
       progress:        the worktree's git progress {"commits_ahead", "dirty",
                        "last_commit_ts", "worktree_mtime_ts"}; {} / None if unreadable.
@@ -974,15 +955,21 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
                        it never was. A nudge is spent once: the second silence fails.
       can_nudge:       False when there is nowhere to record a nudge (no worktree
                        on this machine) — the silence then fails at once.
-      handed_back_at:  epoch seconds a sync conflict was handed back to this worker
-                       (`afk hand-back`) and is still unanswered; None otherwise. A
-                       sign of life like the nudge: the worker gets a whole grace
-                       period to start on it, and after that its silence takes the
-                       same nudge → failure path as any other.
+      turn_at:         epoch seconds this worker was last told to land its PR
+                       (`afk turn`), or its `afk land` last stopped; None when its
+                       PR holds no turn. A sign of life like the nudge: the worker
+                       gets a whole grace period to start on it, and after that
+                       its silence takes the same nudge → failure path as any other.
+      turn_stopped:    the LAND_OUTCOMES word this worker's `afk land` last stopped
+                       with, None when it has not stopped (or holds no turn). One of
+                       LAND_WAITS means the worker is idle because the next move is
+                       the tick's — its quiet is not a silence, and is never nudged
+                       or failed here (`afk turn` is what moves it).
 
     Returns {"outcome", "action", "idle_seconds", "pending_blockers"} — `action` is
     what the tick does, `outcome` the reason it is grouped under:
-      coding       leave         — busy, OR last activity within grace.
+      coding       leave         — busy, OR last activity within grace, OR its
+                                   landing stopped for the tick (`turn_stopped`).
       idle_done    close_release — idle past grace + `already-satisfied` + NO changes
                                    on the branch: the tick verifies the empty diff,
                                    closes + releases.
@@ -1004,8 +991,8 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
       dead         orphan        — no live worker/terminal → recovery by continuation.
 
     `idle_seconds` is the time since the MOST RECENT sign of life (last commit,
-    newest file mtime, terminal activity, the nudge, the hand-back — a nudged or
-    handed-back worker gets a whole grace period to answer); None when none is
+    newest file mtime, terminal activity, the nudge, the landing turn — a nudged
+    worker, or one just given its turn, gets a whole grace period to answer); None when none is
     known, which is never
     "within grace". `pending_blockers` is `blocked_route`'s: the blocked_by not yet
     done, [] for any other verdict.
@@ -1015,7 +1002,7 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
             if t is not None]
     if terminal_idle_seconds is not None:
         seen.append(int(now) - int(terminal_idle_seconds))
-    for told_at in (nudged_at, handed_back_at):
+    for told_at in (nudged_at, turn_at):
         if told_at is not None:
             seen.append(int(told_at))
     idle_seconds = max(0, int(now) - int(max(seen))) if seen else None
@@ -1037,6 +1024,10 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
     # idle past grace: route on the declared reason.
     verdict = worker_verdict or {}
     phase = verdict.get("phase") if verdict.get("found") else None
+    # …unless it declared none and its landing stopped for the tick: that quiet
+    # is the tick's to end (`afk turn`), not a silence.
+    if not verdict.get("found") and turn_stopped in LAND_WAITS:
+        return out("coding", "leave")
     if phase == _SATISFIED:
         # "nothing needed doing" is refuted by work sitting on the branch.
         has_changes = int(progress.get("commits_ahead") or 0) > 0 or bool(progress.get("dirty"))
@@ -1062,8 +1053,8 @@ def nudge_text(brief=None):
     confirmed, which is the stall this is sent to break."""
     task = f"your task brief ({brief})" if brief else "your task"
     return (f"You stopped without an outcome. Nobody is watching this terminal, so do not wait "
-            f"for a confirmation or an answer: continue {task} to the end, and finish with a PR "
-            f"or an afk:verdict marker comment.")
+            f"for a confirmation or an answer: continue {task} to the end, and finish with the "
+            f"outcome it asks for — a PR, a landing, or an afk:verdict marker comment.")
 
 
 def stall_tail(lines, limit=STALL_TAIL_LINES):
@@ -1084,163 +1075,155 @@ def stall_reason(reason, tail):
 
 
 # --------------------------------------------------------------------------- #
-# Hand-back — a sync conflict returned to the worker that wrote the branch     #
+# The landing turn — a worker lands its own PR, one PR at a time (ADR-0027)    #
 # --------------------------------------------------------------------------- #
 #
-# When `afk merge`'s sync conflicts, the work is finished and gate-green; only
-# the target moved. The conflict goes back to the worker (ADR-0019), and the
-# hand-back is recorded where it concerns — a marker comment on the PR:
+# A finished PR is landed by the worker that wrote it (`afk land`), on a landing
+# turn its fleet instance grants (`afk turn`) — one turn at a time. The turn is
+# recorded where it concerns, as ONE marker comment on the PR:
 #
-#   <!--afk:handback target=<branch> tip=<sha> head=<sha> at=<epoch>-->
+#   <!--afk:turn instance=<id> at=<epoch> [verified=<sha>] [allow_no_checks=1]
+#       [stopped=<outcome> head=<sha>]-->
 #
-# `tip` is the target tip the worker was told to merge in, `head` the PR head
-# that conflicted with it. The record is OPEN until the PR head contains `tip`;
-# while it is open the claim is `handed_back`, never `awaiting_merge`. It lives
-# and dies with the PR: a retry closes the PR, and its fresh attempt starts with
-# no hand-back.
+# `instance` is the fleet instance that granted it: `afk land` refuses a marker
+# that does not name the instance holding the claim, so a turn does not survive
+# a takeover. `verified` and `allow_no_checks` are the tick's two judgments, made
+# BEFORE the turn is granted and carried to the landing. `stopped` is where
+# `afk land` last stopped short of merging, on which `head`. The record lives
+# and dies with the PR: merged or closed, the turn is free.
 
-_HANDBACK_MARKER_RE = re.compile(r"<!--\s*afk:handback\b(.*?)-->", re.DOTALL)
-_HANDBACK_FILE_RE = re.compile(r"^- `(.+)`$", re.MULTILINE)
+_TURN_MARKER_RE = re.compile(r"<!--\s*afk:turn\b(.*?)-->", re.DOTALL)
+
+# Every `outcome` `afk land` can stop with — the vocabulary the worker's prompt
+# routes on (a test holds the prompt and the docs to it).
+LAND_OUTCOMES = ("merged", "conflict", "gate_red", "awaiting_ci", "needs_verify", "no_checks")
+
+# The landing outcomes where the next move is the TICK's, not the worker's: the
+# worker wakes the launcher and stops, and is told to land again (`afk turn`).
+LAND_WAITS = ("awaiting_ci", "needs_verify", "no_checks")
+
+# Every `outcome` `afk turn` can stop with — the vocabulary the tick's
+# instructions route on (a test holds the docs to it).
+TURN_OUTCOMES = ("granted", "waiting", "landing", "awaiting_ci", "gate_red", "no_checks",
+                 "needs_verify")
 
 
-def handback_comment(target, tip, head, files, at):
-    """The PR comment that records one hand-back: the marker `latest_handback`
-    reads back, then the same facts worded for a human reading the PR."""
-    listed = "\n".join(f"- `{f}`" for f in files) or "_(the sync reported no file)_"
-    return (f"<!--afk:handback target={target} tip={tip} head={head} at={int(at)}-->\n"
-            f"**afk-fleet: sync conflict handed back to the worker.** Merging `{target}` "
-            f"(`{tip[:12]}`) into this branch conflicts in:\n\n{listed}\n\n"
-            f"The worker that wrote this branch was told to merge `{target}` in, resolve the "
-            f"conflicts, re-run the gate and push here. Nothing was discarded and no retry was "
-            f"spent; this PR merges once its head contains that `{target}` tip.")
+def land_outcome(outcome):
+    """`outcome`, refused unless it is one of LAND_OUTCOMES: `afk land` cannot
+    stop with a word the worker was never told how to act on."""
+    if outcome not in LAND_OUTCOMES:
+        raise ValueError(f"not a landing outcome: {outcome!r}")
+    return outcome
 
 
-def handback_records(comments):
+def turn_outcome(outcome):
+    """`outcome`, refused unless it is one of TURN_OUTCOMES."""
+    if outcome not in TURN_OUTCOMES:
+        raise ValueError(f"not a turn outcome: {outcome!r}")
+    return outcome
+
+
+def turn_comment(instance, at, verified=None, allow_no_checks=False, stopped=None, head=None):
+    """The PR comment that records a landing turn: the marker `latest_turn` reads
+    back, then the same facts worded for a human reading the PR.
+
+      instance:        the fleet instance granting the turn
+      at:              when the worker was last told, or last stopped (epoch
+                       seconds) — the sign of life its silence is timed from
+      verified:        the head an adversarial verify passed, if one did
+      allow_no_checks: the tick judged a PR with no checks at all may land
+      stopped, head:   the LAND_OUTCOMES word `afk land` last stopped with short
+                       of merging, and the head it stopped on; None while the
+                       worker has not stopped
     """
-    Every hand-back recorded on a PR, from its comments ([{"id", "body"}...],
-    oldest first) → [{"target", "tip", "head", "at", "files", "comment_id"}...],
-    one per round, oldest first. A marker missing `tip` or `head` is not a
-    record: nothing could ever be compared against it.
+    parts = [f"instance={instance}", f"at={int(at)}",
+             *([f"verified={verified}"] if verified else []),
+             *(["allow_no_checks=1"] if allow_no_checks else []),
+             *([f"stopped={stopped}", f"head={head}"] if stopped else [])]
+    state = (f"Its last `afk land` stopped with `{stopped}` on `{(head or '')[:12]}`."
+             if stopped else "The worker has been told to land it.")
+    return (f"<!--afk:turn {' '.join(parts)}-->\n"
+            f"**afk-fleet: this PR holds the landing turn** of fleet instance `{instance}`. "
+            f"The worker that wrote the branch lands it with `afk land` — sync with the target, "
+            f"gate, merge — and the next PR's turn comes when this one has landed or failed. "
+            f"{state}")
+
+
+def latest_turn(comments):
     """
-    found = []
+    The landing turn recorded on a PR, from its comments ([{"id", "body"}...],
+    oldest first) → {"instance", "at", "verified", "allow_no_checks", "stopped",
+    "head", "comment_id"}, or None when the PR was never granted one. The latest
+    marker wins; one that names no instance is not a record — nobody could hold it.
+    """
+    found = None
     for c in comments or []:
-        body = c.get("body") or ""
-        m = _HANDBACK_MARKER_RE.search(body)
+        m = _TURN_MARKER_RE.search(c.get("body") or "")
         if not m:
             continue
         attrs = dict(tok.split("=", 1) for tok in m.group(1).split() if "=" in tok)
-        if not attrs.get("tip") or not attrs.get("head"):
+        if not attrs.get("instance"):
             continue
         at = attrs.get("at", "")
-        found.append({"target": attrs.get("target"), "tip": attrs["tip"], "head": attrs["head"],
-                      "at": int(at) if at.isdigit() else None,
-                      "files": _HANDBACK_FILE_RE.findall(body[m.end():]),
-                      "comment_id": c.get("id")})
+        stopped = attrs.get("stopped")
+        found = {"instance": attrs["instance"], "at": int(at) if at.isdigit() else None,
+                 "verified": attrs.get("verified"),
+                 "allow_no_checks": attrs.get("allow_no_checks") == "1",
+                 "stopped": stopped if stopped in LAND_OUTCOMES else None,
+                 "head": attrs.get("head") if stopped in LAND_OUTCOMES else None,
+                 "comment_id": c.get("id")}
     return found
 
 
-def latest_handback(comments):
-    """The LATEST hand-back recorded on a PR (`handback_records`), or None when the
-    PR was never handed back."""
-    records = handback_records(comments)
-    return records[-1] if records else None
+def held_turn(turn, owner):
+    """`turn` (`latest_turn`) when it is held by the claim's owner, else None.
 
+      owner: the instance id the claim ref is stamped with; None or "" when
+             there is no claim, or one that names nobody
 
-def handback_open(handback, pr_head, contains_tip):
+    A turn granted by another instance — the fleet the claim was taken over
+    from — is nobody's: the new owner grants its own.
     """
-    Is a PR's hand-back still unanswered?
+    return turn if turn and owner and turn["instance"] == owner else None
 
-      handback:     `latest_handback` of the PR's comments, or None
-      pr_head:      the PR's head sha now
-      contains_tip: whether `pr_head` contains the target tip the hand-back named
-                    (asked of GitHub; not consulted while the head has not moved)
 
-    Open while the head is the one that conflicted, and still open after a push
-    that did not bring the named tip in (a checkpoint commit, a half-done merge).
-    Closed — the claim is `awaiting_merge` again — only once the head contains it.
+def turn_gate(ci_mode, checks_state, allow_no_checks, adversarial_verify, verified, head):
     """
-    if not handback:
-        return False
-    return pr_head == handback["head"] or not contains_tip
+    May a landing turn be granted (or its worker told to land again) on what is
+    known of the PR right now? The tick's judgments are settled HERE, before the
+    worker is told — a worker never verifies itself.
 
+      ci_mode:            gate.ci
+      checks_state:       `pr_checks_state` of the PR's current head
+      allow_no_checks:    the tick's judgment that a PR with no checks may land
+      adversarial_verify: gate.adversarial_verify
+      verified:           the head the tick says an adversarial verify passed
+      head:               the PR's current head
 
-# --------------------------------------------------------------------------- #
-# The merge queue — conflicting PRs land one at a time                         #
-# --------------------------------------------------------------------------- #
-#
-# PRs that conflict with each other must each resolve against a target that
-# already holds everything landing before them, or every merge re-opens the
-# conflicts the others just resolved (ADR-0025). So the fleet's open PRs are
-# ORDERED, and a PR waits behind a handed-back one ahead of it whose conflict it
-# would re-open. A queue entry is one claim's open PR:
-#
-#   {"issue", "pr", "handbacks": <rounds recorded on the PR>,
-#    "handback": <its latest record, None when never handed back>,
-#    "open": <that record is still unanswered>}
-
-def queue_rank(entry):
+    Returns "ready", or the TURN_OUTCOMES word it is refused with: `awaiting_ci`
+    / `gate_red` / `no_checks` (`required` only — in `local` the machine gate is
+    run by `afk land`, so there is nothing to wait for), then `needs_verify`.
     """
-    The sort key of a queue entry — the ONE merge order, smallest first:
+    if ci_mode != "local":
+        checks = checks_gate(checks_state, False, allow_no_checks)
+        if checks != "green":
+            return checks
+    if adversarial_verify and verified != head:
+        return "needs_verify"
+    return "ready"
 
-      1. a PR that was handed back, before one that never was: its worker already
-         paid for a resolution, and anything landing ahead of it can void that;
-      2. among those, the most rounds first — the one that has waited longest;
-      3. then the one whose latest hand-back is oldest;
-      4. then the lower PR number — which is also the whole order among PRs
-         never handed back.
+
+def turn_order(rows):
     """
-    at = (entry["handback"] or {}).get("at") if entry["handbacks"] else None
-    return (-entry["handbacks"], at or 0, entry["pr"])
+    The order landing turns are granted in — the merge queue: the issue numbers
+    of the `mine` rows whose PR is ready, a PR that already holds a turn first,
+    then the lower PR number.
 
-
-def queue_order(entries):
-    """The issue numbers of the queue's entries, in merge order (`queue_rank`)."""
-    return [e["issue"] for e in sorted(entries, key=queue_rank)]
-
-
-def queue_ahead(entry, entries):
-    """The entries `entry` could have to wait behind: the handed-back PRs ahead of
-    it in the merge order — answered or not, for an answered one still has to
-    LAND before a PR behind it can resolve against what it brings. Empty for the
-    usual case (nothing was handed back), which is what lets a caller skip
-    reading the PR's changed files."""
-    mine = queue_rank(entry)
-    return sorted((e for e in entries if e["handbacks"] and e["pr"] != entry["pr"]
-                   and queue_rank(e) < mine), key=queue_rank)
-
-
-def waits_behind(changed_files, ahead):
+      rows: `mine` rows {"number", "status", "pr"}; only `landing` and
+            `awaiting_turn` ones are in the queue
     """
-    The PR number a PR waits behind, or None when it is free to merge.
-
-      changed_files: the paths the PR changes
-      ahead:         `queue_ahead` of its entry
-
-    It waits behind the first PR ahead whose latest hand-back conflicted in a
-    file this PR also changes: landing first would move the target under a
-    resolution in progress, and syncing now would resolve against a tip that PR
-    is about to move. A PR that touches none of those files waits for nobody.
-    """
-    changed = set(changed_files or [])
-    for e in ahead:
-        if changed & set(e["handback"]["files"]):
-            return e["pr"]
-    return None
-
-
-def freed_by(landed_pr, changed_files, ahead):
-    """
-    Does the landing of PR `landed_pr` free a PR that was queued behind it?
-
-      changed_files: the paths the waiting PR changes
-      ahead:         `queue_ahead` of its entry, read BEFORE the landing
-
-    True only when it waited behind that PR and, with it gone, waits behind
-    nothing: a PR that also overlaps another handed-back PR ahead of it is still
-    queued, and merging it now would resolve against a tip about to move.
-    """
-    rest = [e for e in ahead if e["pr"] != landed_pr]
-    return waits_behind(changed_files, ahead) == landed_pr and waits_behind(changed_files, rest) is None
+    ready = [r for r in rows if r["status"] in ("landing", "awaiting_turn")]
+    return [r["number"] for r in sorted(ready, key=lambda r: (r["status"] != "landing", r["pr"]))]
 
 
 # --------------------------------------------------------------------------- #
@@ -1520,24 +1503,27 @@ def select_recovery(worktree, branch):
 # it names four slots — {opening} and {step1}, each filled from the block of
 # that name for the chosen variant (`opening.fresh`, `step1.continue`, …),
 # {retry_reason}, filled from the `retry_reason` block only when a failure reason
-# is handed over, and {handback}, filled from the `handback` block only when the
-# worker is started on a sync conflict that was handed back (ADR-0019). That
-# block is also a brief of its own — `render_handback` — for a worker that is
-# still there to be told. Everything else in braces is a field — three of them
-# derived: {wake_command}, the line a worker runs to wake the launcher once its
-# outcome is on GitHub, built from the `launcher_terminal` field (ADR-0020),
-# {gate_command}, the line a worker runs the local gate with — `afk gate`, built
-# from the `afk_path` and `local_command` fields, so a green run is on record for
-# the merge (ADR-0026) — and {verdict_marker}, the marker a worker that opens no
-# PR must post (`verdict_marker_format`).
+# is handed over, and {land}, filled from the `land` block: the one command a
+# worker lands its PR with and what each of its outcomes asks for (ADR-0027).
+# The `landing` block is a brief of its own — `render_landing` — pointed at when
+# the worker is given its landing turn; it embeds the same `land` block, so the
+# command and the outcome table have one spelling. Everything else in braces is a
+# field — four of them derived: {wake_command}, the line a worker runs to wake
+# the launcher once its outcome is on GitHub, built from the `launcher_terminal`
+# field (ADR-0020), {gate_command}, the line a worker runs the local gate with —
+# `afk gate`, built from the `afk_path` and `local_command` fields, so a green
+# run is on record for the landing (ADR-0026) — {land_command}, `afk land` with
+# the run's config, built from `afk_path`, `n`, `repo` and `config`, and
+# {verdict_marker}, the marker a worker that opens no PR must post
+# (`verdict_marker_format`).
 
 _BLOCK_RE = re.compile(r"<!--afk:block ([a-z0-9_.]+)-->\n(.*?)\n?<!--/afk:block-->", re.DOTALL)
 PROMPT_VARIANTS = ("fresh", "continue")
-PROMPT_FIELDS = ("n", "title", "repo", "base_branch", "local_command", "afk_path", "branch",
-                 "worktree_path", "launcher_terminal")
-HANDBACK_FIELDS = ("pr", "pr_branch", "target", "target_tip", "files")
-_PROMPT_SLOTS = ("opening", "step1", "retry_reason", "handback")
-_PROMPT_DERIVED = ("wake_command", "gate_command", "verdict_marker")
+PROMPT_FIELDS = ("n", "title", "repo", "base_branch", "local_command", "afk_path", "config",
+                 "branch", "worktree_path", "launcher_terminal")
+LANDING_FIELDS = ("pr", "pr_branch", "target")
+_PROMPT_SLOTS = ("opening", "step1", "retry_reason", "land")
+_PROMPT_DERIVED = ("wake_command", "gate_command", "land_command", "verdict_marker")
 _NO_LOCAL_COMMAND = "true   # (no gate.local_command configured: run the repo's own build/test, if any)"
 _NO_WAKE = "true   # (no coordinator terminal to wake: it finds your outcome at its next poll)"
 _TERMINAL_HANDLE_RE = re.compile(r"[A-Za-z0-9_.:-]+")
@@ -1552,7 +1538,7 @@ def wake_line(number):
 def wake_command(launcher_terminal, number):
     """
     The command a worker runs once its outcome is on GitHub — a PR, a verdict
-    marker, a hand-back's resolution pushed — to wake the launcher out of its sleep
+    marker, a landing that merged or stopped for the tick — to wake the launcher out of its sleep
     (ADR-0020), so the next cycle opens now instead of a busy interval later.
 
       launcher_terminal: the orca handle of the terminal the launcher runs in; ""
@@ -1579,7 +1565,7 @@ def gate_command(afk_path, local_command):
       local_command: `gate.local_command`; empty → a no-op with a note
 
     The command travels inside the line, so a config that changes after the worker
-    was briefed records a command the merge no longer recognises: void, not wrong.
+    was briefed records a command the landing no longer recognises: void, not wrong.
     """
     command = (local_command or "").strip()
     if not command:
@@ -1598,38 +1584,52 @@ def _prompt_blocks(template):
     return block
 
 
-def _fill_prompt(text, fields, handback, reason=None):
+def land_command(afk_path, number, repo, config):
+    """
+    The one command a worker lands its PR with, on its landing turn: `afk land`,
+    carrying the run's config — the merge target and strategy, the gate, the
+    claim namespace the turn is checked against (ADR-0027).
+
+      afk_path: the afk executable on this machine (the worker runs here)
+      config:   the run's canonical config, as its JSON text
+    """
+    return (f"{shlex.quote(afk_path)} land --issue {number} --repo {shlex.quote(repo)} "
+            f"--config {shlex.quote(config)}")
+
+
+def _fill_prompt(text, fields, landing=None, reason=None):
     """Fill every field of an assembled prompt text. Raises ValueError on a missing
     field or a placeholder left unfilled; the free-text values (title, reason, the
-    conflicted file names) go in last, so one that happens to contain "{branch}"
-    is never itself substituted into."""
+    land command's config) go in last and in one pass, so one that happens to
+    contain "{branch}" is never itself substituted into."""
     missing = [k for k in PROMPT_FIELDS if k not in fields]
-    missing += [k for k in HANDBACK_FIELDS if handback is not None and k not in handback]
+    missing += [k for k in LANDING_FIELDS if landing is not None and k not in landing]
     if missing:
         raise ValueError(f"worker prompt: missing field(s) {', '.join(missing)}")
     values = {k: str(fields[k]) for k in PROMPT_FIELDS}
+    values["land_command"] = land_command(values["afk_path"], fields["n"], values["repo"],
+                                          values.pop("config"))
     values["gate_command"] = gate_command(values.pop("afk_path"), values["local_command"])
     values["local_command"] = values["local_command"].strip() or _NO_LOCAL_COMMAND
     values["wake_command"] = wake_command(values.pop("launcher_terminal"), fields["n"])
     values["verdict_marker"] = verdict_marker_format(fields["n"])
-    free_text = {"title": values.pop("title"), "reason": (reason or "").strip()}
-    if handback is not None:
-        values.update({k: str(handback[k]) for k in HANDBACK_FIELDS if k != "files"})
-        free_text["files"] = ("\n".join(f"- `{f}`" for f in handback["files"])
-                              or "- (the sync reported none — the merge itself will list them)")
+    # the land command carries the whole config, and a config may hold braces
+    free_text = {"title": values.pop("title"), "reason": (reason or "").strip(),
+                 "land_command": values.pop("land_command")}
+    if landing is not None:
+        values.update({k: str(landing[k]) for k in LANDING_FIELDS})
     for name, value in values.items():
         text = text.replace("{" + name + "}", value)
-    known = (*PROMPT_FIELDS, *HANDBACK_FIELDS, *_PROMPT_SLOTS, *_PROMPT_DERIVED)
+    known = (*PROMPT_FIELDS, *LANDING_FIELDS, *_PROMPT_SLOTS, *_PROMPT_DERIVED)
     left = sorted(set(re.findall(r"\{(?:%s)\}" % "|".join(known), text))
                   - {"{%s}" % k for k in free_text})
     if left:
         raise ValueError(f"worker prompt: unfilled placeholder(s) {', '.join(left)}")
-    for name, value in free_text.items():
-        text = text.replace("{" + name + "}", value)
+    text = re.sub(r"\{(%s)\}" % "|".join(free_text), lambda m: free_text[m.group(1)], text)
     return text.strip() + "\n"
 
 
-def render_worker_prompt(template, variant, fields, reason=None, handback=None):
+def render_worker_prompt(template, variant, fields, reason=None):
     """
     The prompt one worker is started with, from the template file's text.
 
@@ -1641,9 +1641,6 @@ def render_worker_prompt(template, variant, fields, reason=None, handback=None):
                 and so does the wake when `launcher_terminal` is empty
                 (`wake_command`).
       reason:   why the previous attempt failed, when this is a retry; None otherwise
-      handback: {name: value} for every one of HANDBACK_FIELDS when the worker is
-                started on a sync conflict handed back to it (`files` a list of
-                names); None otherwise
 
     Raises ValueError on a template missing a block, a missing field, or a
     placeholder left unfilled — a worker must never be started on a prompt with a
@@ -1655,21 +1652,25 @@ def render_worker_prompt(template, variant, fields, reason=None, handback=None):
     text = block("prompt")
     slots = {"opening": block(f"opening.{variant}"), "step1": block(f"step1.{variant}"),
              "retry_reason": block("retry_reason") if reason else "",
-             "handback": block("handback") if handback is not None else ""}
+             "land": block("land")}
     for name, body in slots.items():
         text = text.replace("{" + name + "}", body)
     text = re.sub(r"\n{3,}", "\n\n", text)      # an unfilled slot leaves no gap behind
-    return _fill_prompt(text, fields, handback, reason)
+    return _fill_prompt(text, fields, reason=reason)
 
 
-def render_handback(template, fields, handback):
+def render_landing(template, fields, landing):
     """
-    The brief a worker that is STILL THERE is pointed at when a sync conflict on
-    its PR is handed back: the template's `handback` block alone, filled from the
-    same `fields` and `handback` as `render_worker_prompt`. The worker already has
-    the rest of its prompt; this is the one new instruction.
+    The brief a worker is pointed at when its PR is given the landing turn: the
+    template's `landing` block, with the `land` block — the command and its
+    outcome table — set into it, filled from the same `fields` as
+    `render_worker_prompt` plus `landing`, {name: value} for every one of
+    LANDING_FIELDS. It is the whole brief either way: for the worker that wrote
+    the branch and is still there, and for one started in its worktree because
+    it is gone — that one is briefed only to land the PR (ADR-0027).
     """
-    return _fill_prompt(_prompt_blocks(template)("handback"), fields, handback)
+    block = _prompt_blocks(template)
+    return _fill_prompt(block("landing").replace("{land}", block("land")), fields, landing)
 
 
 # --------------------------------------------------------------------------- #
@@ -1693,29 +1694,28 @@ STATUS_MARKER = "<!--afk:status-->"
 
 # Happy-path milestones, in order — these are the task-list checkboxes.
 _STATUS_STEPS = (
-    ("claimed",        "已认领 · worker 实现中"),
-    ("pr_open",        "PR 已开{pr} · 等 {gate}"),
-    ("awaiting_merge", "门已绿 · 待合并"),
-    ("merged",         "已合并"),
+    ("claimed",  "已认领 · worker 实现中"),
+    ("pr_open",  "PR 已开{pr} · 等 {gate}"),
+    ("landing",  "轮到落地 · worker 同步、过门、合并"),
+    ("merged",   "已合并"),
 )
 
 # The closed set of lifecycle phases the board renders, each with everything the
 # board says about it: how far along the happy path it has reached (the index of
 # the last DONE step) and its single ▸/✅/⚠️ 'where are we now' line. Happy path
-# plus six off-ramps that reuse the same checkboxes + an annotation: ci_failed,
-# handed_back (a sync conflict returned to the worker — `afk hand-back`), queued
-# (waiting its turn in the merge queue behind a handed-back PR), escalated
-# (a terminal give-up, ticked specially in `render_status_board`), closed (the
-# worker found the issue already satisfied — `afk close`), and parked (the worker
-# found an open dependency; the claim is released until it closes — `afk park`).
+# plus five off-ramps that reuse the same checkboxes + an annotation: ci_failed,
+# awaiting_turn (the PR is ready and waits for the landing turn — one PR lands
+# at a time), escalated (a terminal give-up, ticked specially in
+# `render_status_board`), closed (the worker found the issue already satisfied —
+# `afk close`), and parked (the worker found an open dependency; the claim is
+# released until it closes — `afk park`).
 _NOTHING_REACHED = -1      # no step ticked: the phase is before, or outside, the happy path
 _PHASES = {
     "claimed":        (0, "▸ 当前:worker 实现中,尚无 PR"),
     "pr_open":        (1, "▸ 当前:等 {gate}"),
     "ci_failed":      (1, "▸ 当前:{gate} 失败,修复重试中({attempt}/{retry_max}) —— 见下方 {gate} 与评论"),
-    "handed_back":    (1, "▸ 当前:与目标分支同步冲突,已交还 worker 解决 —— 见 PR 评论"),
-    "queued":         (1, "▸ 当前:排队等合并 —— 等 PR #{behind} 先合并(改动与它的同步冲突文件重叠),轮到后自动继续"),
-    "awaiting_merge": (2, "▸ 当前:门已绿,待合并"),
+    "awaiting_turn":  (1, "▸ 当前:PR 已就绪,排队等落地轮次 —— 一次只落地一个 PR,轮到后由 worker 自己合并"),
+    "landing":        (2, "▸ 当前:已轮到落地,worker 正在与目标分支同步、过门并合并 —— 见 PR 评论"),
     "merged":         (3, "✅ 已合并,完成"),
     "escalated":      (1, "⚠️ 已升级给人处理 —— 见下方评论"),
     "closed":         (0, "✅ 主干已满足此需求,无需改动 —— 已关闭"),
@@ -1725,7 +1725,7 @@ STATUS_PHASES = tuple(_PHASES)
 
 
 def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attempt=0,
-                        blocked_by=(), behind=None):
+                        blocked_by=()):
     """
     Render the human-facing progress *status board* comment body. Pure: a function
     of the discrete lifecycle state the tick already derived from fleet state; no
@@ -1740,14 +1740,11 @@ def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attem
       pr:        the PR number, once one is open
       attempt:   the claim's current attempt (`current_attempt`)
       blocked_by: the open blockers the issue waits on, for parked only
-      behind:    the PR number this one waits behind, for queued only
 
     Returns the full markdown body, led by STATUS_MARKER (the find-or-create anchor).
     """
     if phase not in STATUS_PHASES:
         raise ValueError(f"unknown status phase: {phase!r}")
-    if phase == "queued" and not behind:
-        raise ValueError("a queued status board names the PR it waits behind")
     gate = GATE_CI_MODES[gate_ci]
     reached, current = _PHASES[phase]
     escalated = phase == "escalated"
@@ -1763,7 +1760,7 @@ def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attem
         label = label.format(pr=f" (#{pr})" if pr else "", gate=gate)
         lines.append(f"- [{'x' if done(i, key) else ' '}] {label}")
     lines.append("")
-    lines.append(current.format(gate=gate, attempt=attempt, retry_max=retry_max, behind=behind,
+    lines.append(current.format(gate=gate, attempt=attempt, retry_max=retry_max,
                                 blockers="、".join(f"#{n}" for n in blocked_by)))
     return "\n".join(lines)
 
@@ -1835,7 +1832,7 @@ def pace(did_work, in_flight, empty_streak, config):
     """
     The launcher's next sleep, in seconds.
 
-      did_work:     the tick that just ran merged / dispatched / reclaimed / escalated
+      did_work:     the tick that just ran granted a turn / dispatched / reclaimed / escalated
       in_flight:    claims this fleet holds
       empty_streak: consecutive empty cycles so far (`cycle_ticked` / `cycle_wake`)
       config:       read for busy_interval_seconds, idle_interval_seconds,
@@ -1881,11 +1878,11 @@ CYCLE_START = {"fingerprint": "", "skips": 0, "empty_streak": 0,
 # `summary_schema` is built from these, and it is what the launcher constrains a
 # tick's return with — so the writer and the reader of a summary share one shape.
 SUMMARY_WORK = {
-    "merged": "the issues whose PR this tick merged",
+    "granted": "the issues whose PR this tick gave the landing turn, or told to land again",
     "dispatched": "the issues this tick started a worker on",
     "reclaimed": "the issues this tick took over from a stale peer claim, to continue the work",
-    "cleared": "the phantom locks this tick deleted: claims (its own or a dead peer's) "
-               "whose issue was already closed",
+    "cleared": "the claims this tick released because their issue was already closed: a PR "
+               "its worker landed, an issue a human closed, or a dead peer's phantom lock",
     "escalated": "the issues this tick handed to a human",
     "parked": "the issues this tick left waiting on an open blocker",
 }
@@ -1959,7 +1956,7 @@ def cycle_ticked(state, summary, config):
     The bottom of a cycle that ran a tick: fold the tick's summary into the cycle
     state and say how long to sleep.
 
-      summary: the tick's return — {"merged":[], "escalated":[], "parked":[],
+      summary: the tick's return — {"granted":[], "escalated":[], "parked":[],
                "dispatched":[], "reclaimed":[], "cleared":[], "in_flight": int,
                "frontier_remaining": int, ...}
 
@@ -2250,7 +2247,7 @@ def superseded_prs(prs, number, branch_pattern):
 
 
 def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, config,
-                         closed=(), handed_back=(), queued=None, merge_queue=()):
+                         closed=(), turns=None):
     """
     The tick's whole working set from the raw observables. Pure — afk.py's
     `rebuild` gathers, this assembles, and a fixture pins the join.
@@ -2270,19 +2267,15 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
                    only open ones, so `afk rebuild` asks about each claim that is
                    missing from it). One of mine becomes a `closed` row; a stale
                    peer's moves from `stale` to `stale_closed`
-      handed_back: the numbers of MY claims whose PR carries an open hand-back
-                   (`handback_open` — `afk rebuild` asks about each of mine that
-                   has a PR)
-      queued:      {number: the PR number it waits behind} for MY claims whose PR
-                   waits its turn in the merge queue (`waits_behind`)
-      merge_queue: the issue numbers of every claim's open PR in merge order
-                   (`queue_order`); a claim missing from it keeps `mine`'s order
+      turns:       {number: its `held_turn`} for MY claims whose PR holds my
+                   landing turn (`afk rebuild` asks about each of mine that has
+                   a PR)
 
     Returns:
       {"frontier": {"dispatch": [{"number","title"}...], "excluded": [...]},
        "mine": [{"number","title","status","board_phase","pr","checks",
-                 "attempt","behind"}...],
-       "merge_order": [number...],   # the `awaiting_merge` rows, in the order to merge
+                 "attempt","stopped"}...],
+       "merge_order": [number...],   # the `landing` and `awaiting_turn` rows (`turn_order`)
        "peer_live": [{"number","instance"}...],
        "stale": [{"number","instance","sha"}...],   # sha feeds reclaim --expect-sha
        "stale_closed": [{"number","instance","sha"}...],  # sha feeds release --expect-sha
@@ -2291,12 +2284,13 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
        "now": now}
 
     `status` and `board_phase` are `subclassify_pr`'s pair; `attempt` is
-    `current_attempt` — the number `afk status` takes; `behind` is the PR a
-    `queued` row waits behind, None on every other row.
+    `current_attempt` — the number `afk status` takes; `stopped` is the
+    LAND_OUTCOMES word a `landing` row's `afk land` last stopped with, None while
+    it has not stopped and on every other row.
 
     `stale` holds only work to continue: a stale claim on an OPEN issue. One whose
-    issue is already closed — its fleet merged or closed it and died before
-    releasing — is a phantom lock with nothing behind it, and is listed in
+    issue is already closed — its worker landed it, or its fleet closed it, and the
+    fleet died before releasing — is a phantom lock with nothing behind it, and is listed in
     `stale_closed` instead, to be deleted rather than taken and dispatched.
     """
     ttl, ci_mode = config["claim_lease_ttl_seconds"], config["gate"]["ci"]
@@ -2316,27 +2310,23 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
         return [{"number": n, "instance": by_claim.get(n, {}).get("instance"),
                  "sha": by_claim.get(n, {}).get("sha")} for n in numbers]
 
-    queued = queued or {}
+    turns = turns or {}
     mine = []
     for n in part["mine"]:
         pr = pr_for.get(n)
         checks = pr_checks_state(pr.get("statusCheckRollup")) if pr else None
         issue = by_num.get(n, {})
         status, board_phase = subclassify_pr(pr is not None, checks, ci_mode,
-                                             closed=n in closed,
-                                             handed_back=n in set(handed_back),
-                                             queued=n in queued)
+                                             closed=n in closed, landing=n in turns)
         mine.append({"number": n, "title": issue.get("title"),
                      "status": status, "board_phase": board_phase,
                      "pr": pr.get("number") if pr else None, "checks": checks,
                      "attempt": current_attempt(issue.get("labels")),
-                     "behind": queued[n] if status == "queued" else None})
+                     "stopped": turns[n]["stopped"] if status == "landing" else None})
 
-    place = {n: i for i, n in enumerate(merge_queue)}
-    ready = [m["number"] for m in mine if m["status"] == "awaiting_merge"]
     return {"frontier": frontier,
             "mine": mine,
-            "merge_order": sorted(ready, key=lambda n: (place.get(n, len(place)), ready.index(n))),
+            "merge_order": turn_order(mine),
             "peer_live": [{"number": n, "instance": by_claim.get(n, {}).get("instance")}
                           for n in part["peer_live"]],
             "stale": stale_rows(n for n in part["stale"] if n not in closed),

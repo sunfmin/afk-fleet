@@ -54,11 +54,11 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
   answers bootstrap's one possible question up front.
 - `/afk-fleet --plan` — **dry-run**: a **tick short-circuited before the Act phase**. It does the full
   rebuild (frontier + in-flight + stale classification), prints the dispatch plan, and exits —
-  merges/dispatches/reclaims **nothing**: the way to look before launching. Same rebuild code path as `--tick`,
+  grants/dispatches/reclaims **nothing**: the way to look before launching. Same rebuild code path as `--tick`,
   so the plan can't drift from what a live tick would do (ADR-0002).
 - `/afk-fleet --tick` — **one reconciliation pass** and exit with a summary. This is what the
   launcher spawns each cycle (and what you'd run headless). Invoked cold it acts exactly as a
-  launcher's tick does, merges included.
+  launcher's tick does, landing turns included.
 - `/afk-fleet --takeover` — a **launcher bootstrap variant** for when a fleet hard-stopped (quota) and
   you will not wait for its lease to lapse: the *full* bootstrap, then the opening working set
   is seeded from a dead peer's claims instead of the frontier alone. Thereafter an ordinary standing
@@ -201,7 +201,7 @@ streak, what is in flight — lives in there, maintained by code.
    then discard the summary.
 4. **Sleep `sleep_seconds`** (`ScheduleWakeup`). The number already encodes the pacing rules — you
    apply none yourself: `busy_interval_seconds` (default 90) while the last tick did anything or anything is in
-   flight, so green PRs merge promptly; `idle_interval_seconds` (default 1500) once `idle_ticks_before_sleep`
+   flight, so finished PRs land promptly; `idle_interval_seconds` (default 1500) once `idle_ticks_before_sleep`
    consecutive cycles were **empty** (a tick that did nothing, or a skip, with nothing in flight and
    nothing left on the frontier); and never past `claim_lease_ttl_seconds`/2 while the fleet holds any claim.
    **A wake ends the sleep early.** A line `afk-wake #<n>` arriving in this terminal is a worker
@@ -213,10 +213,10 @@ streak, what is in flight — lives in there, maintained by code.
    instead of sleeping.
 5. **Stop** on the user's word: run one final **drain** tick that `afk release <n> --instance <id>`s claims with no PR
    yet and retains those with an open PR (see [Cooperative multi-fleet](references/cooperative-multi-fleet.md)), then
-   spawn no more ticks. In-flight workers finish on their own; their PRs are inherited and merged by a
+   spawn no more ticks. In-flight workers finish on their own; their PRs are inherited and landed by a
    peer (or a later run) once the lease expires; escalated issues stay labelled for the human.
 
-The launcher never dispatches, merges, or reads a worker itself, never computes the frontier in its own
+The launcher never dispatches, lands, or reads a worker itself, never computes the frontier in its own
 context, and never reads the tick's files (the `afk.py`/`afk_decide.py` source, `worker-prompt.md`) — it
 reads only the repo config, calls `afk` subcommands, and spawns ticks. All coordination happens inside a
 tick. This keeps the launcher thin *by construction*
@@ -227,7 +227,7 @@ tick. This keeps the launcher thin *by construction*
 Every **deterministic** step the skill runs is a subcommand of `afk.py`, each printing one JSON object:
 the tick orchestrates and judges, but calls the tool for the fixed mechanics rather than re-deriving
 git/gh/orca incantations from prose each pass (ADR-0004). That holds for the **Act half** too: starting
-a worker, landing a PR, handing a sync conflict back, failing, escalating, parking and closing a claim are each
+a worker, giving a PR its landing turn, failing, escalating, parking and closing a claim are each
 **one call that performs the whole ordered sequence** and returns an `outcome` wherever your judgment is needed (ADR-0017). A tick
 therefore runs **no raw `git`, `gh pr merge`, `gh issue edit` or `orca worktree`/`terminal create`** of
 its own — and no orca command at all: even whether a worker is busy is read in code (ADR-0021). The full interface table — every
@@ -267,30 +267,33 @@ instead of acting — same rebuild, zero side effects.
    It gathers issues + PRs + claim/heartbeat refs once (the same gatherer the launcher's cycle
    gate reads through — the raw 200-issue JSON lives and dies inside the tool) and returns the whole
    working set: `{frontier: {dispatch, excluded}, mine: [{number, status, board_phase, pr, checks,
-   attempt, behind}…], merge_order: [number…], peer_live, stale: [{number, sha}…], stale_closed:
+   attempt, stopped}…], merge_order: [number…], peer_live, stale: [{number, sha}…], stale_closed:
    [{number, sha}…], free_slots, fingerprint, now}`. Then act on it:
    - **Frontier** — `frontier.dispatch` is the dispatchable set (`open` + `ready_label` + no
      `epic_labels` + **unclaimed** + **no open linked PR** + zero open `blocked_by`) — the published
      contract; `--plan` and live agree because both are this one code path. `free_slots` is how many
      of them `concurrency` leaves room for.
    - **In-flight** — each of **`mine`** arrives subclassified, and its `status` names what you do
-     next: *awaiting_merge* → `afk merge`, in the order `merge_order` lists them (see
-     [Merge](#merge-serialized)); *queued* → **leave it**: its PR waits its turn behind PR `behind`
-     in the [merge queue](#the-merge-queue--conflicting-prs-land-one-at-a-time). Do not `afk merge`
-     a *queued* row and never hand it back — it holds its slot and counts in `in_flight`. Its turn
-     comes one way only: the `afk merge` that lands PR `behind` lists it in `unblocked`, and you
-     merge it then; *awaiting_ci* → leave (its checks are still running — a PR with **no checks at all** is never *awaiting_ci*: it arrives as *awaiting_merge*, and `afk merge` answers `no_checks`);
+     next: *awaiting_turn* → its PR is ready and waits for the **landing turn**: `afk turn` — but
+     only for the **first** issue of `merge_order`, and only when no row is *landing* (see
+     [Landing](#landing--the-worker-lands-its-own-pr-on-its-turn)); every other *awaiting_turn* row
+     you **leave** — it holds its slot and counts in `in_flight`;
+     *landing* → its PR holds the turn and its worker is landing it with `afk land`. You never merge
+     it. Read the row's `stopped`: `awaiting_ci`, `needs_verify` or `no_checks` → the worker stopped
+     **for you** — `afk turn` again; anything else (null, `conflict`, `gate_red`) → the worker is at
+     it: ask `afk no-pr` about it, exactly as for *no_pr*;
+     *awaiting_ci* → leave (its checks are still running — a PR with **no checks at all** is never *awaiting_ci*: it arrives as *awaiting_turn*, and `afk turn` answers `no_checks`);
      *failure* → `afk fail` (see [Failure handling](#failure-handling--bounded-retry--escalate-never-silently-drop));
-     *closed* → the issue is already closed but its claim outlived it (a merge or close that died
-     before releasing): `afk release <n> --instance <id>`, nothing else — count it in `cleared`; *handed_back* → a sync conflict on its PR is
-     with its worker and the PR head does not contain the target tip yet: **never `afk merge` it** —
-     ask `afk no-pr` about it, exactly as for *no_pr* (see [Hand-back](#hand-back--a-sync-conflict-goes-back-to-its-worker));
-     *no_pr* → see below. (In `gate.ci: local` only *awaiting_merge*, *queued*, *handed_back*, *closed* and
-     *no_pr* occur — no checks are read, and the gate runs inside `afk merge` instead; ADR-0012.) For
+     *closed* → the issue is already closed but its claim outlived it — its worker **landed the PR**
+     (the usual case: `afk land` settles neither the claim nor the worktree it runs in), or a close
+     died before releasing: `afk release <n> --instance <id> --repo <repo>`, which also removes the
+     worktree — count it in `cleared`;
+     *no_pr* → see below. (In `gate.ci: local` only *awaiting_turn*, *landing*, *closed* and
+     *no_pr* occur — no checks are read, and the gate runs inside `afk land` instead; ADR-0012.) For
      *no_pr*, **never look at a worker's terminal yourself.** A worker
      that ran to completion, concluded there was no PR to open, posted its reason, and went idle looks
-     *identical* on screen to one still coding. Make **one call** for every *no_pr* and *handed_back*
-     row of `mine` together:
+     *identical* on screen to one still coding. Make **one call** for every *no_pr* row and every
+     *landing* row that did not stop for you, together:
      ```bash
      <skill>/scripts/afk.py no-pr --issue <n> [--issue <m> …] --repo <repo> --config '<config json>'
      ```
@@ -303,9 +306,9 @@ instead of acting — same rebuild, zero side effects.
      git progress, the worker's `afk:verdict` marker, where every issue that marker says it is
      blocked by stands — computes how long the worker has been quiet, and returns `{outcome, action,
      idle_seconds, pending_blockers, worktree, progress, worker_verdict, blockers, nudged_at,
-     handed_back_at, worker_state}` (`worker_state` is the runtime's own report; null when it
-     reports none; `handed_back_at` is null for a busy or gone worker because it was **not read**,
-     never because no hand-back is open — the row's `status` says that; `pending_blockers` is the named blockers not yet done — still open, or closed
+     turn_at, worker_state}` (`worker_state` is the runtime's own report; null when it
+     reports none; `turn_at` is null for a busy or gone worker because it was **not read**,
+     never because its PR holds no turn — the row's `status` says that; `pending_blockers` is the named blockers not yet done — still open, or closed
      without the work; `blockers` is `[{number, standing, reason}]` for a `blocked` verdict — each named
      blocker is `closed`, `waiting` (open, and the backlog will resolve it: a fleet holds its claim,
      a PR is open for it, or it carries `ready_label`) or `unmet` (nothing will, and `reason` says
@@ -336,7 +339,8 @@ instead of acting — same rebuild, zero side effects.
        - **idle_stalled** / `nudge` (idle past grace with **no verdict at all**, not yet nudged) →
          the worker stopped without an outcome — usually it is waiting on a question nobody will
          answer. `afk nudge --issue <n> --instance <id>` tells it to carry on, **once**: no attempt is
-         spent, nothing is discarded, and the nudge buys it one more grace period (ADR-0018);
+         spent, nothing is discarded, and the nudge buys it one more grace period (ADR-0018). A
+         *landing* row gets here the same way: a worker given its turn that did not land;
        - **idle_failed** / `next_attempt` (verdict `giving-up`, an `already-satisfied` refuted by work
          on the branch, or still **no verdict** a grace period after the nudge) →
          `afk fail --issue <n> --reason "<why>"` (retry → escalate); after an unanswered nudge
@@ -344,7 +348,9 @@ instead of acting — same rebuild, zero side effects.
        - **dead** / `orphan` (no live worker/terminal at all) → **orphaned claim**: `afk dispatch
          --issue <n>` recovers it by **continuation** — it resumes from the worktree still here, else
          from the pushed branch, and starts from base only when nothing survived (see
-         [Recovery by continuation](references/recovery.md)). Or `afk release <n> --instance <id>` if the issue should
+         [Recovery by continuation](references/recovery.md)). For a *landing* row the same call
+         starts the new worker **on the turn**, briefed only to land the PR (the result carries
+         `landing: <pr>`). Or `afk release <n> --instance <id>` if the issue should
          go back to the frontier instead.
      The empty-diff verification stays judgment; `no-pr` is a separate call from
      `rebuild` because it asks *this machine* about a worktree, and `rebuild` stays machine-independent
@@ -357,17 +363,20 @@ instead of acting — same rebuild, zero side effects.
      *this* box). Count it in `reclaimed`. **`peer_live`** is left strictly alone. The human-gated,
      lease-skipping sibling of this reclaim is [`--takeover`](#takeover-mode---takeover).
    - **Phantom locks** — **`stale_closed`** is a stale peer claim whose issue is **already closed**:
-     its fleet merged or closed the issue and died before releasing. There is no work behind it, so it
+     its issue was landed or closed and its fleet died before releasing. There is no work left under it, so it
      is **never reclaimed, never dispatched, and never part of a dispatch plan** — one call deletes
      it: `afk release <n> --instance <id> --expect-sha <the sha rebuild reported>` (the same lease as
      a reclaim: it deletes nothing if somebody took the claim meanwhile). Count it in `cleared`, not
      `reclaimed`. It holds no slot of mine and frees none.
 2. **Act**, in this order — every step is one `afk` call that performs its whole sequence:
-   - **Merge** each *awaiting_merge* claim, one at a time, **in exactly the order of `merge_order`**
-     — it is the merge queue's order, not yours to rearrange: `afk merge --issue <n> --instance <id>`
-     (see [Merge](#merge-serialized) for its outcomes). A `merged` outcome has already upserted the
-     status board, released the claim and removed the worktree.
-   - **Fail / escalate / park** what the rebuild and the merges turned up (see
+   - **Release** each *closed* row — `afk release <n> --instance <id> --repo <repo>` — so a PR that
+     landed since the last tick frees its claim, its worktree and the landing turn.
+   - **Land** — at most **one** `afk turn` grant per tick: tell a *landing* row that stopped for you
+     to land again, or — when no row is *landing* — give the turn to the **first** issue of
+     `merge_order`. It is the merge queue's order, not yours to rearrange (see
+     [Landing](#landing--the-worker-lands-its-own-pr-on-its-turn) for the outcomes). You run no
+     merge: the worker does, with `afk land`.
+   - **Fail / escalate / park** what the rebuild and the turn turned up (see
      [Failure handling](#failure-handling--bounded-retry--escalate-never-silently-drop)).
    - **Dispatch** to fill the free slots (`free_slots`, plus one for every claim this tick settled),
      taking `frontier.dispatch` in order:
@@ -399,12 +408,12 @@ instead of acting — same rebuild, zero side effects.
      start, upsert the human-facing **status board** so a person reading the issue sees how far along
      it is (esp. the otherwise-invisible "claimed, coding, no PR yet" phase — the claim lives in the
      hidden `refs/afk/*` and the assignee is unused). `afk status <n> --phase <board_phase> --instance
-     <id> [--pr <pr>] [--attempt <k>] [--behind <pr>] --repo <repo>` renders a progress checklist and writes the one
+     <id> [--pr <pr>] [--attempt <k>] --repo <repo>` renders a progress checklist and writes the one
      marker-tagged comment **only when it changed** (idempotent — re-entrant ticks and retries never
      spam). Neither value is yours to derive: pass the `board_phase` and the `attempt` that `rebuild`
-     put on the claim's `mine` row — and, for a *queued* row, its `behind`. The **terminal** phases (merged, escalated, closed, parked) and the first
-     `claimed` are written by the transition that reaches them — `afk merge`, `afk escalate`, `afk
-     close`, `afk park`, `afk dispatch` — before it releases the claim. The board is human-read only — no tick ever
+     put on the claim's `mine` row. The **terminal** phases (merged, escalated, closed, parked), `landing` and the first
+     `claimed` are written by the transition that reaches them — `afk land`, `afk escalate`, `afk
+     close`, `afk park`, `afk turn`, `afk dispatch`. The board is human-read only — no tick ever
      parses it back (ADR-0006).
 3. **Return** the compact summary — in the shape your launcher constrained you to (the
    `summary_schema` of `afk cycle`) — and **exit**. Count `in_flight` (claims still mine) and
@@ -440,139 +449,92 @@ by design (see
 
 ## Completion gate
 
-A PR may merge only when **all** configured gates are green. Which **machine gate** applies is
+A PR may land only when **all** configured gates are green. Which **machine gate** applies is
 `gate.ci` ([ADR-0012](../../docs/adr/0012-local-completion-gate.md)): `required` (default) waits for
-the PR's GitHub checks; `local` makes `gate.local_command` the gate, re-run at merge time, and never
-reads checks. `afk merge` applies whichever is configured ([Merge](#merge-serialized)); the invariants
-behind them — the local gate's two-run rule, the one case `gate.trust_recorded_run` lets the merge
-skip its own run (the worker's `afk gate` run is on record for the exact head that lands;
+the PR's GitHub checks; `local` makes `gate.local_command` the gate, run by the landing on the head
+that lands, and never reads checks. `afk land` applies whichever is configured
+([Landing](#landing--the-worker-lands-its-own-pr-on-its-turn)); the invariants
+behind them — the local gate's two-run rule, the one case `gate.trust_recorded_run` lets the landing
+skip its own run (an `afk gate` run is on record for the exact head that lands;
 [ADR-0026](../../docs/adr/0026-a-recorded-gate-run-stands-in-for-the-merge-time-run.md)), the
 ephemeral CI sub-read, and the adversarial-verify procedure when `gate.adversarial_verify` is on — are
 disclosed in [references/completion-gate.md](references/completion-gate.md). Read it before running an
-adversarial verify or switching a repo to `gate.ci: local`. `afk gate` is the **worker's** subcommand:
-you never run it.
+adversarial verify or switching a repo to `gate.ci: local`. `afk gate` and `afk land` are the
+**worker's** subcommands: you never run them.
 
-## Merge (serialized)
+## Landing — the worker lands its own PR, on its turn
 
-Within a tick, merges are **strictly serialized** — one `afk merge` at a time — so parallel workers
-never corrupt the target branch:
+**You never merge a PR.** A finished PR is landed by the worker that wrote it, with `afk land`, in its
+own worktree — sync with `merge.target` (by **merging, never rebasing** — ADR-0012) → push → the
+machine gate on that exact head → `gh pr merge` **pinned to the gated head**. A sync conflict or a red
+gate at landing is fixed where the context is: by that worker, in place, with no round trip through
+you ([ADR-0027](../../docs/adr/0027-a-worker-lands-its-own-pr-on-a-landing-turn.md)). What is yours is
+the **landing turn**: `afk land` refuses to run until you have given its PR the turn, and you give
+**one turn at a time**, so no PR is synced against a tip that is about to move.
 
 ```bash
-<skill>/scripts/afk.py merge --issue <n> --instance <id> --repo <repo> --config '<config json>'
+<skill>/scripts/afk.py turn --issue <n> --instance <id> --worker-command '<worker_command>' \
+     --repo <repo> --config '<config json>'
 ```
 
-One call runs the whole sequence: **sync** the branch up to the latest `merge.target` (by **merging,
-never rebasing** — ADR-0012) and push it → **re-confirm the gate** against that exact head → `gh pr
-merge` **pinned to the gated head** (per `merge.strategy`) → status board → **release the claim** →
-remove the worktree (if `worktree_cleanup`). It needs no worktree path from you: it finds the issue's
-worktree through orca, and recreates one at the PR head when this machine has none (a `--takeover`
-from another machine). It stops, with an `outcome`, wherever the next move is yours:
+One call: it checks what must be settled **before** a worker is told (the PR's checks in `required`,
+your two judgments below), records the turn as a marker comment on the PR, tells the worker — one
+submitted line pointing at a landing brief — and upserts the status board. If the worker's terminal
+is gone (it finished and closed, the machine restarted, the claim came from another machine) a new
+worker is started by [continuation](references/recovery.md) **in the same worktree, on the same
+branch** — or in one recreated at the PR's head — briefed only to land the PR. There is no
+launcher-side merge to fall back on. It stops with an `outcome`:
 
 | `outcome` | What happened | What you do |
 |---|---|---|
-| `merged` | Landed; board upserted, claim released, worktree removed. `unblocked` lists the claims of yours that were *queued* behind this PR and are free now, in merge order. In `local`, `gate.source` says whether the gate was `run` here or trusted from the worker's `recorded` run of `gate.head`. | Count it in `merged`; the slot is free. Then `afk merge` each issue in `unblocked`, in that order, **before** going on down `merge_order` — and act on each outcome like any other. |
-| `conflict` | The sync conflicted. The merge is **left in progress** in `worktree`, `files` unmerged; nothing was pushed. | **Hand it back to its worker**: `afk hand-back --issue <n>` (see [Hand-back](#hand-back--a-sync-conflict-goes-back-to-its-worker)). Not `afk fail` — the work is not failing. |
-| `handed_back` | An earlier conflict on this PR is still with its worker. Nothing was touched. | Leave it — a *handed_back* row is never merged. |
-| `queued` | A handed-back PR ahead of this one in the merge queue (`behind`) conflicted in a file this PR also changes. Nothing was touched, nothing is handed back, and the status board already says it waits. | Leave it — it holds its slot; count it in `in_flight`. The merge that lands PR `behind` names it in `unblocked`. |
-| `worker_busy` | The worker is **still working** in the PR's worktree — typically it pushed its answer to a hand-back and is now running the gate on it. Nothing was touched. | Leave it; a later tick merges once the worker has stopped. Count it in `in_flight`. |
-| `gate_red` | `local`: the merge-time gate was red, and its `gate.excerpt` is now a PR comment. `required`: the PR's checks are red. | `afk fail --issue <n> --reason "<the failure>"`. |
-| `awaiting_ci` | `required`: checks are pending — or the sync just pushed a new head, so CI must speak about *that* head first. | Leave it; a later tick merges. |
-| `no_checks` | `required`, and the PR has no checks at all — the progressive gate. Such a PR reaches you as *awaiting_merge*, so this is the answer every one of them gets first. | If you judge the issue's acceptance criteria met, re-run with `--allow-no-checks`; else `afk fail`. |
-| `needs_verify` | `gate.adversarial_verify` is on, the machine gate is green, and `--verified` does not name `head`. | Run the [adversarial verify](references/completion-gate.md) against `head`. Passed → re-run with `--verified <head>`; refuted → `afk fail`. |
+| `granted` | The worker was told to land the PR (`delivery`: `terminal`, or `continuation` when a new worker had to be started). `again` is true when the PR already held the turn and its landing had stopped for you. | Count the issue in `granted`. Nothing else: the claim is *landing* from now on. |
+| `waiting` | Another claim of yours (`holder`) holds the turn. Nothing was touched. | Leave it — it holds its slot; count it in `in_flight`. Its turn comes when that one has landed or failed. |
+| `landing` | This PR already holds the turn and its worker has not stopped for you. Nothing was touched. | Leave it; `afk no-pr` is how you ask after it. |
+| `awaiting_ci` | `required`: the PR's checks are still running on its head. | Leave it; a later tick grants the turn. |
+| `gate_red` | `required`: the PR's checks are red. | `afk fail --issue <n> --reason "<the failure>"`. |
+| `no_checks` | `required`, and the PR has no checks at all — the progressive gate. Such a PR reaches you as *awaiting_turn*, so this is the answer every one of them gets first. | If you judge the issue's acceptance criteria met, re-run with `--allow-no-checks`; else `afk fail`. |
+| `needs_verify` | `gate.adversarial_verify` is on and `--verified` does not name the PR's `head`. | Run the [adversarial verify](references/completion-gate.md) against `head`. Passed → re-run with `--verified <head>`; refuted → `afk fail`. |
+
+**Who gets the turn** is not yours to decide: `merge_order` lists your ready PRs — the one that
+already holds a turn first, then the lower PR number — and the turn goes to its first issue. Every
+other finished PR waits as *awaiting_turn*: not synced, not told anything, never nudged or failed for
+waiting, spending no attempt. The next turn is granted the cycle after this one's PR has **landed**
+(its row turns *closed*: release it) or been **failed** (`afk fail` closes its PR).
+
+**While a claim is *landing*, the worker does everything** and reports through the PR — `afk rebuild`
+puts where its last `afk land` stopped on the row, as `stopped`:
+
+- `stopped` is null, `conflict` or `gate_red` — the worker is landing, or fixing what stopped it
+  (resolving the conflict in place, fixing the code). Ask `afk no-pr` about the row, with the *no_pr*
+  ones: `leave` while it is busy or within grace; `nudge` → `afk nudge`; still silent a grace period
+  later, `next_attempt` → `afk fail --reason "given the landing turn and never landed: <stopped>"`;
+  `orphan` → `afk dispatch --issue <n>`, which continues a new worker onto the turn. That ladder is
+  what bounds a turn: a worker that sits on it is failed, its PR closes, and the next PR gets the turn.
+- `stopped` is `awaiting_ci`, `needs_verify` or `no_checks` — the landing's sync moved the head, and
+  the next move is **yours**. Run `afk turn --issue <n>` again: it answers `awaiting_ci` while the
+  checks on the new head run (leave it), `needs_verify` with the new `head` (verify it, then re-run
+  with `--verified <head>`), `no_checks` (your call, `--allow-no-checks`) — and `granted` once
+  settled, which tells the worker to run `afk land` again. The turn stays with this PR throughout.
 
 The invariant every path keeps: **what lands on the target was gated in the form it lands.** A sync
 that moved the head invalidates checks and verifications of the old one, and gh refuses the merge if
-the branch moved after the gate. An `{"error": …}` settles nothing — the claim is still yours.
+the branch moved after the gate. No landing outcome spends an attempt or closes the PR; only your
+`afk fail` does. An `{"error": …}` settles nothing — the claim is still yours.
+
+The turn guards against a worker that **strays**, not a malicious one: worker and launcher share one
+`gh` credential, so nothing here stops a worker that decides to run `gh pr merge` itself.
 
 The fleet's mandate **ends at a green merge to `merge.target`.** Deploying is a separate,
 human-gated step — never done here.
 
-## The merge queue — conflicting PRs land one at a time
-
-PRs that conflict with each other must each be resolved against a target that already holds
-everything landing before them. Handed back together, whichever worker answers first lands, and that
-voids the resolutions the others are still making — every worker resolves the same conflict once per
-PR that beats it. So the tool keeps a queue
-([ADR-0025](../../docs/adr/0025-conflicting-prs-land-one-at-a-time.md)), and **you add no ordering
-of your own**:
-
-- **`merge_order` is the order.** A PR that was handed back goes before one that never was; among
-  those, the one handed back the most times first, then the one whose latest hand-back is oldest,
-  then the lower PR number (which is the whole order among PRs never handed back).
-- **A PR waits behind a handed-back PR it would collide with.** While a handed-back PR ahead of it —
-  still being resolved, **or answered and not yet merged** — conflicted in a file it also changes, the
-  PR is *queued*: `afk rebuild` reports `status: queued` with `behind: <pr>`, and `afk merge` on it
-  answers `queued` and touches nothing. It is not synced, so it is not handed back: only one PR of an
-  overlapping group is with its worker at a time, and the next resolves against a tip that already
-  holds the one ahead.
-- **A PR that changes none of those files is never held up.** It merges exactly as before.
-- **Waiting is bounded by what already exists.** A hand-back its worker never answers is nudged, then
-  failed (below): its PR closes and whatever waited behind it is free again. A *queued* claim is never
-  nudged, never failed and spends no attempt for waiting — do not ask `afk no-pr` about it.
-- **A landing names what it freed.** `afk rebuild` read the queue at the top of your pass, so a row it
-  called *queued* stays *queued* in your working set even after the PR ahead of it merges. You keep no
-  note of who waited behind whom: the `merged` outcome carries `unblocked` — your claims that waited
-  behind that PR and now wait behind nothing, in merge order — and you `afk merge` those next, in this
-  same pass. A claim that also waits behind another handed-back PR is not listed; it stays *queued*.
-
-## Hand-back — a sync conflict goes back to its worker
-
-A `conflict` means a finished, gate-green PR met a target that moved first. The work is not failing,
-so this is **not** a failure: the conflict goes back to the worker that wrote the branch
-([ADR-0019](../../docs/adr/0019-a-sync-conflict-is-handed-back-to-its-worker.md)). You have none of
-the context it takes to resolve it, and `afk fail` would throw the whole attempt away.
-
-```bash
-<skill>/scripts/afk.py hand-back --issue <n> --instance <id> --worker-command '<worker_command>' \
-     --repo <repo> --config '<config json>'
-```
-
-One call, right after the `conflict`. It aborts the merge (the worktree is clean again), tells the
-worker — the target and its tip, the conflicted files, *fetch → **merge**, never rebase → resolve →
-`gate.local_command` until green, run through `afk gate` so the run is on record → push to the same
-PR* — records the hand-back as a marker comment on
-the PR, and upserts the status board. **The claim, the PR, the branch and the worktree are kept, and
-`afk-attempt/<n>` is neither read nor written.** `delivery` says how the worker was reached:
-
-- `"terminal"` — its terminal is still there: one submitted line pointing at the brief.
-- `"continuation"` — its terminal is gone (it finished and closed, the machine restarted, the claim
-  came from another machine): a new terminal is opened **in the same worktree, on the same branch**,
-  a new worker is started there with the worker launch command, and it is given that instruction —
-  by [continuation](references/recovery.md), never from base.
-
-From then on `afk rebuild` reports the claim as **`handed_back`**, not `awaiting_merge`, until the PR
-head contains the target tip the hand-back named — so no tick re-runs the merge into a worktree the
-worker is resolving in. Treat a *handed_back* row as you treat a *no_pr* one: ask `afk no-pr --issue <n>`
-(in the same call as the *no_pr* rows), and act on its `action`:
-
-- `leave` — the worker is on it (busy, or within grace of the hand-back).
-- `nudge` → `afk nudge`; still silent a grace period later it is `next_attempt` → `afk fail --reason
-  "sync conflict handed back and never answered: <files>"`. **Only an unanswered hand-back enters the
-  retry ladder** — that is what keeps a hand-back from parking a claim forever.
-- `orphan` (no terminal) → `afk dispatch --issue <n>`: it continues in the worktree and starts the
-  new worker **on the hand-back** (the result carries `handed_back: <pr>`).
-
-Once the worker pushes a head that contains the tip, the row is *awaiting_merge* again and `afk merge`
-proceeds as usual — **once the worker has stopped.** A worker often pushes the merge first and gates
-it afterwards, so the row can read *awaiting_merge* seconds after the hand-back while the worker is
-still at work in the worktree; `afk merge` checks that itself and answers `worker_busy`, touching
-nothing ([ADR-0024](../../docs/adr/0024-merge-stays-out-of-a-busy-workers-worktree.md)). You add no
-guard of your own: call `afk merge` on every *awaiting_merge* row and act on its outcome. If the target moved again meanwhile, that merge conflicts again and you hand it
-back again: each round merges a newer tip, so it converges.
-
-**The one conflict you may still resolve yourself** is a purely mechanical one: both sides added
-independent adjacent lines (two imports, two list entries, two changelog lines) and the resolution is
-*keep both*, with nothing to understand about what the code is for. Resolve it in `worktree`,
-**commit**, and re-run `afk merge`. Anything else — the same lines rewritten, a file moved or deleted
-under an edit, more than a handful of hunks — is the worker's: hand it back.
-
 ## Failure handling — bounded retry → escalate, never silently drop
 
-Per issue, on any of {gate red — a *failure* row's CI checks *or* a red merge-time gate —
-adversarial refute, a `no_pr` or `handed_back` claim classified **idle_failed** — a `giving-up`
+Per issue, on any of {gate red — a *failure* row's CI checks, or `gate_red` from `afk turn` —
+adversarial refute, a `no_pr` or `landing` claim classified **idle_failed** — a `giving-up`
 verdict, or a worker still idle with **no verdict at all** a grace period after its one nudge (for a
-*handed_back* claim: a hand-back it never answered)}. A **sync conflict is not on this list** — it is
-[handed back](#hand-back--a-sync-conflict-goes-back-to-its-worker), and costs an attempt only if the worker never answers:
+*landing* claim: a turn it never landed)}. A **sync conflict or a red gate at landing is not on this
+list** — the worker fixes it in place on its [landing turn](#landing--the-worker-lands-its-own-pr-on-its-turn),
+and it costs an attempt only if the worker goes silent:
 
 ```bash
 <skill>/scripts/afk.py fail --issue <n> --instance <id> --worker-command '<worker_command>' \
@@ -580,7 +542,7 @@ verdict, or a worker still idle with **no verdict at all** a grace period after 
 ```
 
 `--reason` is your one contribution: the failure, **re-read from where it already lives** — the PR's
-CI checks, the merge-time gate excerpt on the PR, the verifier's review comment, the hand-back comment
+CI checks, the landing's gate excerpt on the PR, the verifier's review comment, the landing-turn comment
 on the PR — never carried in context. The call does the rest and reports which way it went:
 
 - `"action": "retry"` — under `retry` attempts (default 2). The attempt count lives as an
@@ -594,7 +556,7 @@ on the PR — never carried in context. The call does the rest and reports which
 
 An issue that should go to a human **without** consuming a retry — a DAG gap nothing will resolve —
 takes the same ordered transition directly: `afk escalate --issue <n> --instance <id> --reason "<…>"`.
-Never silently drop or silently merge bad work.
+Never silently drop or silently land bad work.
 
 A dependency a worker *discovered* is not such a gap while the backlog will resolve it: `afk park
 --issue <n> --instance <id>` records it as a native `blocked_by` edge and releases the claim, and the
@@ -613,13 +575,13 @@ open ones are workable backlog, escalated as a DAG gap only when nothing will re
 
 `concurrency` (default 3) bounds parallel workers. Semantic ordering is the backlog's dependency DAG
 (your responsibility when decomposing); textual conflicts between parallel PRs are caught by the
-serialized sync-before-merge and handed back to the worker that wrote the branch. Early machinery issues that all
+one-at-a-time landing turn and resolved there by the worker that wrote the branch. Early machinery issues that all
 touch shared root config are naturally throttled by the DAG — chain them with `blocked_by`.
 
 ## Guardrails
 
 - **The invocation is the authorization, and it covers only this.** Running the skill is the human's
-  go-ahead to push worker branches and auto-merge green PRs to `merge.target`, for this repo, for
+  go-ahead to push worker branches and land green PRs on `merge.target`, for this repo, for
   this run — ask for no further confirmation, and read it as permission for nothing else
   (ADR-0023). `--plan` is how to look without acting.
 - **Keep every credential inside the worker's own shell.** Push only to worker branches and the merge
@@ -640,17 +602,20 @@ touch shared root config are naturally throttled by the DAG — chain them with 
   verdict marker (see In-flight — *stopped* alone is never *finished*). A full transcript never enters a tick or the launcher; the one terminal read is
   `afk nudge` / `afk fail` taking the last screen of a worker that went silent, to say *where* it
   stopped — never its result (ADR-0018).
+- **Never merge a PR yourself.** No `gh pr merge`, no push to `merge.target`: a PR lands only through
+  its worker's `afk land`, on the turn `afk turn` gave it. A turn nobody lands is failed, not merged
+  around (ADR-0027).
 - **Claim before work; release on every terminal transition.** `afk dispatch` creates the
   `afk-claim/<n>` ref first — if the create is rejected, a peer owns it and nothing is started.
-  `afk merge`, `afk escalate`, `afk park` and `afk close` each delete it as their last step; an orphan-release and a
-  *closed* row are yours to `afk release`. A leaked ref is a phantom lock. Reconcile only your own claims, and take a peer's
+  `afk escalate`, `afk park` and `afk close` each delete it as their last step; an orphan-release and a
+  *closed* row — every landed PR leaves one — are yours to `afk release`. A leaked ref is a phantom lock. Reconcile only your own claims, and take a peer's
   only when its heartbeat is expired (a **stale claim**) — the single exception is an explicit human
   [`--takeover`](#takeover-mode---takeover). A stale claim on a closed issue (`stale_closed`) is not
   taken at all: it is deleted, with `afk release --expect-sha`.
 - **Preserve a dead worker's progress.** Recover a dead claim by **continuation** (a plain
   `afk dispatch`), and discard an attempt only where discarding is the point — `afk fail`'s retry, or
-  an explicit `--start fresh`. A finished PR that merely conflicts with a moved target is **handed
-  back** (`afk hand-back`), never failed. Never run `orca worktree rm` yourself: on a worktree that still holds
+  an explicit `--start fresh`. A finished PR that merely conflicts with a moved target is **resolved
+  by its worker on its landing turn**, never failed. Never run `orca worktree rm` yourself: on a worktree that still holds
   work it is the one unrecoverable act in the fleet.
 - **Take a live lease only on a human's word.** `afk takeover --from` runs only on the human's
   explicit selection from `--list`, with `--yes` only after relaying the fresh-heartbeat warning and
@@ -659,5 +624,5 @@ touch shared root config are naturally throttled by the DAG — chain them with 
   longer reads the assignee); keep the tracker honest so a peer fleet or a human never double-takes.
 - **Stay off the reserved namespaces.** The fleet manages the `afk-attempt/<n>` labels, the
   `refs/afk/*` ref namespace (the claim and heartbeat refs), the single status-board comment tagged
-  `<!--afk:status-->`, the `<!--afk:handback …-->` marker comment on a PR (which it parses), and the
+  `<!--afk:status-->`, the `<!--afk:turn …-->` marker comment on a PR (which it parses), and the
   worker-authored `<!--afk:verdict …-->` markers (which it parses) — leave them to the fleet, and reuse those prefixes / markers for nothing else.

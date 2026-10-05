@@ -1,6 +1,6 @@
 # ADR-0024 — `afk merge` stays out of a worktree whose worker is busy
 
-**Status:** accepted — adds one stop to the merge transition
+**Status:** superseded by [ADR-0027](0027-a-worker-lands-its-own-pr-on-a-landing-turn.md) — there is no tick-side merge to keep out of a worker's worktree: the worker is the one landing. `worker_busy` is removed. Originally: accepted — adds one stop to the merge transition
 ([ADR-0017](0017-the-act-half-is-transitions.md)), enforced in the seam
 ([ADR-0016](0016-the-seam-enforces-its-own-rules.md)) from the worker state
 [ADR-0021](0021-worker-state-is-mechanics.md) already reads. The hand-back record of

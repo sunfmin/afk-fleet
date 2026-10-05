@@ -2,8 +2,8 @@
 
 An unattended fleet that works a GitHub-issue backlog on its own, for days, without any session's
 context growing without bound: a thin **launcher** spawns a fresh disposable **tick** each cycle;
-each tick dispatches worktree-isolated **workers** per ready issue, gates them, and auto-merges green
-PRs to the target branch.
+each tick dispatches worktree-isolated **workers** per ready issue and gives each finished PR its
+**landing turn**, on which its worker gates it and lands it on the target branch — one PR at a time.
 
 ## Language
 
@@ -31,7 +31,7 @@ _Avoid_: node, worker (that is the per-issue coding agent), coordinator
 
 **Tick**:
 One fresh-context, disposable reconciliation pass, run as an Agent subagent. It rebuilds the working
-set from fleet state, acts once (merge green PRs, escalate exhausted, dispatch to free slots — each a
+set from fleet state, acts once (give a finished PR its **landing turn**, escalate exhausted, dispatch to free slots — each a
 single **transition**), returns
 a compact summary, and dies — without waiting for the workers it dispatched. Runtime is bounded
 because ticks are disposable, not because one session stays disciplined.
@@ -40,7 +40,7 @@ _Avoid_: batch (implies draining a whole wave), poll (a tick acts, not just obse
 **Plan tick**:
 A **tick** run in dry-run mode (`--plan`): it does the full **rebuild** (recompute the **frontier**,
 classify claims into mine/peer-live/stale) and then **stops before the Act phase**, returning the
-dispatch plan instead of merging/dispatching/reclaiming. It is the *same* procedure as an acting tick,
+dispatch plan instead of granting/dispatching/reclaiming. It is the *same* procedure as an acting tick,
 short-circuited — so the plan a human reads cannot drift from what a live tick will actually do. It
 is how to look before launching: `/afk-fleet --plan`. A launch itself spawns none (ADR-0023).
 _Avoid_: dry run (that is its mode, not its name), preview pass
@@ -48,7 +48,7 @@ _Avoid_: dry run (that is its mode, not its name), preview pass
 **Worker**:
 A fire-and-forget, ephemeral coding-agent session (Claude Code or qoderclicn — the run's **runtime**),
 isolated in one git worktree, that owns exactly one
-issue, opens a PR, reports done via GitHub, and then **wakes** the launcher. It never merges, and its terminal is never read for
+issue, opens a PR, reports done via GitHub, and then **wakes** the launcher. It merges only on its **landing turn** — its own PR, with `afk land`, never otherwise — and its terminal is never read for
 its result (only, once it has gone silent with no outcome, for *where it stopped* — see **Nudge**). Its worktree is created and later torn down by the **worker backend** — orca (`orca
 worktree create` / `orca worktree rm`), the only supported backend — never by the tick with raw `git
 worktree`; orca also names the branch (a `<user>/…` prefix), and the tick **reads that back** rather
@@ -103,26 +103,26 @@ _Avoid_: worker command (ambiguous with what the worker itself runs), agent comm
 The repo-local build/test command (`gate.local_command`) that, in `gate.ci: local` mode, *is* the
 completion gate — promoted from the worker's optional pre-PR filter to the only machine verification
 a PR must pass (ADR-0012). It runs twice in a PR's life: the **worker** runs it after its pre-PR
-**sync**, so it tests "my code + current base"; and the **tick** re-runs it at merge time, after the
-merge-time **sync**, in the branch's worktree (recreated from the branch tip when none survives
-locally — the **continuation** tier-2 move). The invariant both runs serve: *what lands on the target
+**sync**, so it tests "my code + current base"; and the worker's **landing** runs it again, after the
+landing's **sync**, in the same worktree. The invariant both runs serve: *what lands on the target
 branch was tested in the form it lands.* The worker runs it through `afk gate`, which puts a green
-run on record with the head it ran on; a repo that sets `gate.trust_recorded_run` lets the merge
+run on record with the head it ran on; a repo that sets `gate.trust_recorded_run` lets the landing
 skip its own run when — and only when — that record is of the command configured now, on a
-committed tree, at the exact head that would land. A merge-time sync that moved the head, a later
-commit, a changed command, or no record at all voids it, and the merge runs the gate as before
+committed tree, at the exact head that would land. A landing sync that moved the head, a later
+commit, a changed command, or no record at all voids it, and the landing runs the gate as before
 (ADR-0026). GitHub checks are never read in this mode — the repo is
 expected to scope remote CI away from worker branches, and a target branch whose protection requires
-checks is rejected at bootstrap. A red run's log excerpt is posted as a PR comment, so the retry
-ladder re-reads the failure from where it lives, never from a dead tick's context.
+checks is rejected at bootstrap. A red run at landing is the worker's to fix in place; its log
+excerpt is also posted as a PR comment, so a failure that does reach the retry ladder is re-read
+from where it lives, never from a dead tick's context.
 _Avoid_: local CI (it substitutes for CI; it is not CI), pre-push check, local build
 
 **Sync**:
 The one way a worker branch catches up with its base: merging `origin/<base>` into the branch —
 never rebasing (ADR-0012). It happens twice in a PR's life: the **worker** syncs and pushes right
 before its pre-PR **local gate**, so integration conflicts surface inside the worker's own session,
-where they are cheapest to fix; and the **tick** syncs again at merge time (serialized), picking up
-whatever the base gained since the worker's sync. Merge rather than rebase because a rebase drops
+where they are cheapest to fix; and the worker's **landing** syncs again, on its **landing turn**, picking up
+whatever the base gained since — a conflict there is left in progress for the same worker to resolve. Merge rather than rebase because a rebase drops
 merge commits and re-ignites the conflicts already resolved inside them, and because squash-merging
 makes the target-branch history identical either way. Retires `rebase_before_merge` (the config key
 becomes `sync_before_merge`).
@@ -143,12 +143,11 @@ code/LLM ownership split), script vs agent (the tick is not a script)
 **Transition**:
 One change of a **claim**'s state, performed as a single `afk` call that runs its whole ordered
 sequence in code: **dispatch** (claim → worktree at the right commit → worker started → prompt
-delivered → status board), **merge** (sync → gate → merge pinned to the gated head → status board →
-release → cleanup; its `merged` outcome names the claims the landing freed in the **merge queue**), **hand-back** (abort the conflicted sync → instruct the worker → record on the PR
-→ status board), **fail** (count the attempt, then a fresh retry or an escalation), **escalate**
+delivered → status board), **turn** (grant the **landing turn**: the tick's judgments checked → the
+brief written → the turn recorded on the PR → the worker told, or continued onto it → status board), **fail** (count the attempt, then a fresh retry or an escalation), **escalate**
 (status board → relabel → comment → release, the release last), **park** (dependency edge → status
 board → release → cleanup), **close** (status board → close → release → cleanup). A transition stops with an **outcome** exactly where the next move is judgment —
-a sync conflict, a PR with no checks, a verification still owed — and takes the tick's judgment as an
+a PR with no checks, a verification still owed — and takes the tick's judgment as an
 argument (a reason, a verified head, "start fresh"). The tick therefore types no raw `git`, `gh` or
 `orca` to act; orderings such as "relabel before release" are code under test, not prose (ADR-0017).
 _Avoid_: recipe, procedure, step list (those were the prose a tick used to re-derive), action
@@ -274,7 +273,7 @@ verdict; park is what the fleet does about it), escalate (that hands the issue t
 
 **Wake**:
 The one line a **worker** types into the **launcher**'s terminal once its outcome is on GitHub — a PR,
-a verdict marker, a **hand-back**'s resolution pushed: `afk-wake #<n>`. It ends the launcher's sleep
+a verdict marker, a **landing** that merged or stopped for the tick: `afk-wake #<n>`. It ends the launcher's sleep
 so the next cycle opens now rather than a busy interval later, and it carries nothing: the cycle it
 triggers reads GitHub like any other, and the launcher never acts on the line itself. A lost wake
 costs only the wait it would have saved — polling is unchanged underneath. The worker is handed the
@@ -283,34 +282,42 @@ line ready-made in its prompt; the launcher's terminal handle is read from the e
 _Avoid_: notification (nothing is conveyed, and no human is told), callback, done signal (the outcome
 is the PR or the verdict, not this), **nudge** (that is fleet → worker; a wake is worker → launcher)
 
-**Hand-back**:
-Returning a **sync** conflict to the **worker** that wrote the branch, instead of failing the claim.
-When the merge-time sync conflicts, the work is finished and gate-green — only the target moved — so
-the **tick** hands the conflict back in one **transition** (`afk hand-back`): the worker is told to
-merge the target in (never rebase), resolve, re-run the **local gate** and push to the same PR. The
-claim, the PR, the branch and the worktree are kept and no **retry** is spent. It is recorded as a
-marker comment on the PR naming the target tip; while the PR head does not contain that tip the claim
-is `handed_back` — never `awaiting_merge` — and its worker is watched like a PR-less one, so an
-unanswered hand-back is **nudged** and then failed. A worker whose terminal is gone is replaced by
-**continuation** in the same worktree, started on the hand-back (ADR-0019). The push that answers a
-hand-back is not yet the worker's outcome: it usually pushes the merge and gates it afterwards, so a
-claim can be `awaiting_merge` with its worker still busy — and the **merge** transition stays out of
-a worktree whose worker is busy, stopping with `worker_busy` (ADR-0024).
-_Avoid_: retry (nothing is discarded), bounce, re-dispatch (the worker and its worktree are kept),
-conflict resolution (that is what the worker then does)
+**Landing turn**:
+The fleet's permission for one finished PR to land, granted by the **tick** in one **transition**
+(`afk turn`) and held by one PR of a **fleet instance** at a time. It is recorded as a single marker
+comment on the PR naming the instance that granted it — so it dies with the PR, and does not survive
+a **takeover** — and it carries the tick's judgments made *before* the grant (the head an adversarial
+verify passed, a PR with no checks waived) and where the worker's last `afk land` stopped. While its
+PR holds the turn the claim is `landing`, and its worker is watched like a PR-less one: silent past
+grace it is **nudged**, then failed, which closes the PR and frees the turn. A worker whose terminal
+is gone is replaced by **continuation** in the same worktree, briefed only to land the PR. The check
+guards against a worker that strays, not a malicious one — worker and launcher share one `gh`
+credential (ADR-0027).
+_Avoid_: lock, merge lock (nothing is held on the target; the turn is a record on the PR), token,
+approval (no human or review is involved)
+
+**Landing**:
+What a **worker** does on its **landing turn**, with one command in its own worktree (`afk land`):
+**sync** with the merge target → push → the machine gate on that exact head → merge pinned to the
+gated head. It stops with an outcome the worker acts on itself: a **sync** conflict is left in
+progress and resolved in place, a red gate is fixed in place, and the worker lands again — no round
+trip through the tick, no **retry** spent, the PR and the turn kept. Where the next move is the
+tick's (checks still running on the pushed head, a verify owed on a moved head, absent checks) the
+worker **wakes** the launcher and stops, and the tick tells it to land again. The claim and the
+worktree are settled by the next cycle, from the claim whose issue is now closed (ADR-0027).
+_Avoid_: hand-back (retired: the tick no longer syncs a PR and returns its conflict — the worker
+meets the conflict itself, on its turn), tick-side merge, auto-merge (the tick merges nothing),
+merge-time gate run (the gate run is the landing's)
 
 **Merge queue**:
-The one order in which the fleet's open PRs land, and the rule that keeps conflicting PRs from being
-resolved against each other more than once (ADR-0025). A PR that was **handed back** goes before one
-that never was — most rounds first, then the oldest latest hand-back, then the lower PR number — and
-`afk rebuild` returns that order as `merge_order`. A PR is **queued** while a handed-back PR ahead of
-it, answered or not, conflicted in a file it also changes: it is neither merged nor synced (so never
-handed back) until the one ahead has merged, it holds its slot, and its **status board** names the PR
-it waits behind. The queue is every **claim**'s open PR, a peer fleet's included; a PR whose claim was
-released is not in it. Waiting is bounded by the unanswered-hand-back ladder, and spends no **retry**.
-When the PR ahead lands, the **merge** that landed it names the claims it freed (`unblocked`), and the
-**tick** merges them next, in that same pass — a queued PR never waits a cycle for a PR that has
-already merged (ADR-0026).
+The order **landing turns** are granted in (ADR-0027): among a **fleet instance**'s ready PRs, the
+one that already holds a turn first, then the lower PR number. `afk rebuild` returns it as
+`merge_order`, and the **tick** grants the turn to its first PR only when none of its claims is
+landing. Every other ready PR waits as `awaiting_turn` — not synced, not told anything, holding its
+slot, its **status board** saying so — so PRs that conflict with each other are each resolved once,
+against a target that already holds everything landed before them. Waiting is bounded by the
+silent-worker ladder on the PR that holds the turn, and spends no **retry**. Turns are per fleet
+instance: two fleets on one repo each grant their own.
 _Avoid_: merge train (nothing is batched or speculatively gated), lock (nothing is held: the order
 is recomputed from GitHub every time), priority (it is not configurable)
 
@@ -332,7 +339,7 @@ progress)
 **Status board** (a.k.a. progress comment):
 The human-facing projection of an issue's lifecycle onto the issue surface: a **single** comment the
 owning **fleet instance**'s **tick** upserts each **rebuild**, rendering a milestone checklist (claimed
-→ PR open → gate green → merged, with the *ci-failed*, *handed-back*, *queued*, *escalated* and *parked* off-ramps) **derived** from
+→ PR open → landing turn → merged, with the *ci-failed*, *awaiting-turn*, *escalated* and *parked* off-ramps) **derived** from
 **fleet state**. It exists because the **claim** lives in a hidden ref namespace and the assignee is
 unused, so the "claimed but no PR yet" phase is otherwise invisible to a reader. It is a *rendering* of
 existing state, **never a source of truth** and **never read back by a tick**; it is edited in place
