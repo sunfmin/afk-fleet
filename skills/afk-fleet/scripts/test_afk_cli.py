@@ -2796,6 +2796,31 @@ def test_a_gate_run_the_remote_will_not_record_is_still_green_and_the_landing_ga
         assert (r["outcome"], r["gate"]["source"]) == ("merged", "run"), r
 
 
+def test_a_ref_afk_did_not_write_is_not_a_recorded_gate_run():
+    """A record is fetched by a name made of the tree and the command, so what
+    it is of is never compared again. The one thing left to guard against is a
+    ref at that name that `afk` did not write: without the time of a run in its
+    message it reads as no record, and the landing runs the gate."""
+    with world(issues=[issue(6, "ready-for-agent")]) as w:
+        runs = os.path.join(w.sb.root, "gate-runs")
+        gate = local_gate(f"echo run >> {runs}")
+        d, head = with_pr(w, 6, 60, gate=gate)
+        wt = d["worktree"]
+        tree = git(wt, "rev-parse", "HEAD^{tree}")
+        ref = afk_decide.gate_record_ref(tree, f"echo run >> {runs}")
+        for message in ("afk-gate green", "afk-gate green\n\n[1700000000]",
+                        'afk-gate green\n\n{"tree": "%s", "at": "yesterday"}' % tree):
+            forged = git(wt, "commit-tree", tree, "-m", message)
+            git(wt, "push", "-q", "--force", "origin", f"{forged}:{ref}")
+            w.set(comments={"60": [{"id": 2001, "html_url": "u", "body":
+                                    afk_decide.turn_comment("me", T0, verified="0" * 40)}]})
+            r = _land(w, 6, wt, *gate, "--set", "gate.adversarial_verify=true")
+            assert (r["outcome"], r["gate"]["source"]) == ("needs_verify", "run"), r
+            assert "no green run" in r["gate"]["not_trusted"], r["gate"]
+        with open(runs) as f:
+            assert len(f.read().split()) == 3
+
+
 # --------------------------------------------------------------------------- #
 # a turn nobody lands, and a turn whose worker is gone                         #
 # --------------------------------------------------------------------------- #
