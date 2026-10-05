@@ -484,7 +484,10 @@ the call does the rest and reports which way it went:
   swaps the label up by one, **discards the failed attempt** (closes its PR, deletes its branch, removes
   its worktree — so the claim cannot loop on the same red PR) and starts a **fresh** worker from base
   under the same claim, handing it the reason. After an unanswered nudge it appends the worker's
-  last screen to the reason itself.
+  last screen to the reason itself. **A failure spends one attempt however often `afk fail` runs**:
+  the same edit adds `afk-attempt/starting`, which the started worker removes — so if the call
+  errors after counting (a PR close refused, orca down), **run it again**: it finishes the retry
+  without counting twice, and the next tick does the same by itself.
 - `"action": "escalate"` — the attempts are exhausted. In one fixed order: status board → relabel
   (add `escalate_label`, remove `ready_label` and the attempt label) → comment the reason (if
   `escalate_comment`) → release the claim. The PR and the worktree are left for the human.
