@@ -870,9 +870,7 @@ def _probe_gate_records(rem, now):
             leaf = name[len(_LOCAL_GATE) + 1:]
             body = _git(["log", "-1", "--format=%b", name], check=False).stdout
             _git(["update-ref", "-d", name], check=False)
-            at = (_parse_gate_record(body) or {}).get("at")
-            if leaf != "probe" and not (isinstance(at, int) and
-                                        now - at <= afk_decide.GATE_RECORD_TTL):
+            if leaf != "probe" and afk_decide.gate_record_void(_parse_gate_record(body), now):
                 expired.append(f"{ns}/{leaf}")
     _git(["push", "--quiet", rem, "--delete", *expired], check=False)
     return {"verdict": "ok", "pruned": len(expired) - 1,
@@ -1916,11 +1914,14 @@ def _gate_record(rem, path, tree, command):
 
 
 def _parse_gate_record(body):
+    """The `afk_decide.gate_record` in a record commit's message, or None. `afk`
+    writes every record with the time of its run, so a commit that carries none
+    is a ref under the namespace that `afk` did not write: it reads as no record."""
     try:
         record = json.loads(body)
     except ValueError:
         return None
-    return record if isinstance(record, dict) else None
+    return record if isinstance(record, dict) and isinstance(record.get("at"), int) else None
 
 
 def _record_gate(rem, path, tree, command, now):
@@ -1961,6 +1962,33 @@ def _gate_run(cfg, rem, path, timeout, excerpt_lines, now, live=False):
     if dirty or _git(["-C", path, "rev-parse", "HEAD"], check=False).stdout.strip() != head:
         return gate, head, dirty, "the run was not on a committed tree"
     return gate, head, dirty, _record_gate(rem, path, tree, gate["command"], now)
+
+
+def _gated(cfg, rem, path, timeout, excerpt_lines, now):
+    """Is the committed tree of a worktree gated green by the configured local
+    gate? — the one question a landing asks of it, a single PR's and a merge
+    batch's alike. Answered from the recorded gate run the remote holds for that
+    tree and that command, else by a run made now, which is put on record in its
+    turn (`_gate_run`, ADR-0030):
+
+      {"status": "green", "source": "recorded", "head", "command", "recorded_at"}
+      {"status": "green", "source": "run", "head", "command", "not_trusted"}
+      {**`_run_gate`'s red verdict, "source": "run", "head", "not_trusted"}
+
+    `head` is the commit that was asked about; `not_trusted` is why no record
+    stood in for the run."""
+    command = cfg["gate"]["local_command"]
+    head, tree = _git(["-C", path, "rev-parse", "HEAD", "HEAD^{tree}"]).stdout.split()
+    record = _gate_record(rem, path, tree, command)
+    void = afk_decide.gate_record_void(record, now)
+    if void is None:
+        return {"status": "green", "source": "recorded", "head": head, "command": command,
+                "recorded_at": record["at"]}
+    gate, *_ = _gate_run(cfg, rem, path, timeout, excerpt_lines, now)
+    if gate["status"] != "green":
+        return {**gate, "source": "run", "head": head, "not_trusted": void}
+    return {"status": "green", "source": "run", "head": head, "command": command,
+            "not_trusted": void}
 
 
 def cmd_gate(a):
@@ -2262,23 +2290,13 @@ def cmd_land(a):
 
     # --- the machine gate, against exactly `head` ---
     if cfg["gate"]["ci"] == "local":
-        command = cfg["gate"]["local_command"]
-        tree = _git(["-C", path, "rev-parse", "HEAD^{tree}"]).stdout.strip()
-        record = _gate_record(rem, path, tree, command)
-        void = afk_decide.gate_record_void(record, tree, command, _now(a))
-        if void is None:
-            out["gate"] = {"status": "green", "source": "recorded", "head": head,
-                           "command": command, "recorded_at": record["at"]}
-        else:
-            gate, *_ = _gate_run(cfg, rem, path, a.gate_timeout, a.excerpt_lines, _now(a))
-            gate = {**gate, "source": "run", "head": head, "not_trusted": void}
-            if gate["status"] != "green":
-                _pr_comment(a.repo, pr["number"], afk_decide.gate_comment(gate, gate["command"]))
-                return stop("gate_red", gate=gate,
-                            detail="the gate is red on the synced head — fix the code, commit, "
-                                   "and run this again")
-            out["gate"] = {k: gate[k] for k in ("status", "source", "head", "command", "not_trusted")
-                           if k in gate}
+        gate = _gated(cfg, rem, path, a.gate_timeout, a.excerpt_lines, _now(a))
+        if gate["status"] != "green":
+            _pr_comment(a.repo, pr["number"], afk_decide.gate_comment(gate, gate["command"]))
+            return stop("gate_red", gate=gate,
+                        detail="the gate is red on the synced head — fix the code, commit, "
+                               "and run this again")
+        out["gate"] = gate
     else:
         checks = afk_decide.pr_checks_state(pr.get("statusCheckRollup"))
         if pushed or checks == "pending":
@@ -2759,23 +2777,20 @@ def _land_batch(a, cfg, rem):
 
     # --- the gate, once, on the stack ---
     _record_batch(a.repo, cfg, instance, now, batch, stacked, "gating")
-    tree = _git(["-C", path, "rev-parse", "HEAD^{tree}"]).stdout.strip()
-    record = _gate_record(rem, path, tree, cfg["gate"]["local_command"])
-    if afk_decide.gate_record_void(record, tree, cfg["gate"]["local_command"], _now(a)) is None:
-        gate = {"status": "green"}       # this very stack was gated green: a run cut short
-    else:
+    gate = _gated(cfg, rem, path, a.gate_timeout, a.excerpt_lines, _now(a))
+    gone = not os.path.isdir(path)       # a gate run is long: an abandon removes the worktree
+    if gate["source"] == "run" and not gone:   # a stack found on record is not a run
         state["gate_runs"] += 1
         _save_batch_state(path, state)
-        gate, *_ = _gate_run(cfg, rem, path, a.gate_timeout, a.excerpt_lines, _now(a))
     if gate["status"] != "green":
         _record_batch(a.repo, cfg, instance, _now(a), batch, stacked, "fixing")
-        return result("gate_red", stacked, gate=gate, **more,
+        verdict = {k: v for k, v in gate.items() if k not in ("source", "head", "not_trusted")}
+        return result("gate_red", stacked, gate=verdict, **more,
                       detail="the gate is red on the stack and nothing landed — fix the stack "
                              "with one more commit on top (do not hunt for the PR at fault), "
                              "and run this again")
 
     # --- land: a gate run is long, so the turn is checked again; then the fast-forward ---
-    gone = not os.path.isdir(path)       # an abandon removes the batch's worktree
     still = [] if gone else _batch_turns(a, cfg, rem, batch, stacked)[0]
     if len(still) != len(stacked):
         raise RuntimeError(f"merge batch {batch} no longer holds the landing turn (it was "
