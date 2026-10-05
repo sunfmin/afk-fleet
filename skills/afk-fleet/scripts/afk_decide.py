@@ -554,31 +554,28 @@ def gate_record(tree, command, at):
     return {"tree": tree, "command": command, "at": int(at)}
 
 
-def gate_record_void(record, tree, command, now):
+def gate_record_void(record, now):
     """
     Why a recorded gate run does NOT stand in for a run of the gate — or None
     when it does, which is the only case a landing skips its own (ADR-0030).
 
-      record:  the `gate_record` the remote holds for this tree and command, None
-               when it holds none (never gated through `afk`, a red run since,
-               a record that could not be written or read)
-      tree:    the tree that would land, after the landing's sync
-      command: the `gate.local_command` configured now
+      record:  the `gate_record` the remote holds at `gate_record_ref` for the
+               tree that would land, after the landing's sync, and the
+               `gate.local_command` configured now — None when it holds none
+               (never gated through `afk`, a red run since, a record that could
+               not be written or read)
       now:     epoch seconds
 
-    The record proves one command passed on one tree. A sync that brought the
-    target in or a later commit makes what lands another tree, and that tree has
-    its own record or none; a record older than `GATE_RECORD_TTL` is no longer
-    believed. Void is the safe side: the landing runs the gate.
+    The record proves one command passed on one tree, and it was asked for by
+    exactly that tree and that command: its name is its key, so which tree and
+    which command it is of are not questions left to ask here. A sync that
+    brought the target in, a later commit or another command is another name,
+    with its own record or none; a record older than `GATE_RECORD_TTL` is no
+    longer believed. Void is the safe side: the landing runs the gate.
     """
-    if not isinstance(record, dict) or not record.get("tree"):
+    if record is None:
         return "no green run of the gate is on record for the tree that would land"
-    if record.get("command") != command:
-        return (f"the recorded run was of a different command ({record.get('command')!r}) "
-                f"than the gate.local_command configured now")
-    if record["tree"] != tree:
-        return f"the recorded run was on tree {record['tree']}, not on the tree that would land ({tree})"
-    age = int(now) - int(record.get("at") or 0)
+    age = int(now) - record["at"]
     if age > GATE_RECORD_TTL:
         return (f"the recorded run is {age}s old — a record is trusted for "
                 f"{GATE_RECORD_TTL}s")
