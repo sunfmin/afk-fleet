@@ -47,11 +47,11 @@ has. If what it shows plainly is not worth continuing (a wrecked tree, a branch 
 approach), discard it and start over: `afk dispatch --issue <n> --start fresh` closes the fleet's PR
 for the issue, deletes its work branches, removes the worktree, and starts from base.
 
-**A hand-back is continued the same way.** When the claim's PR carries an open hand-back — a sync
-conflict returned to its worker (ADR-0019) — the worker `afk dispatch` starts gets the continue-mode
-prompt **with the hand-back instruction appended**: merge the target in, resolve, re-run the gate,
-push to the same PR. The result says so (`handed_back: <pr>`). `afk hand-back` itself takes this path
-when the worker's terminal is already gone.
+**A landing turn is continued the same way.** When the claim's PR holds the fleet's landing turn
+(ADR-0027), the worker `afk dispatch` starts is put **on the turn**: in the worktree still here, else
+one recreated at the PR's head — never from base — and briefed only to land the PR with `afk land`,
+not with the task. The result says so (`prompt: landing`, `landing: <pr>`). `afk turn` itself takes
+this path when the worker's terminal is already gone.
 
 **This is not the retry path.** A red gate / adversarial refute / `giving-up` verdict goes through
 `afk fail`, which discards the attempt and starts *fresh* with the failure reason (see

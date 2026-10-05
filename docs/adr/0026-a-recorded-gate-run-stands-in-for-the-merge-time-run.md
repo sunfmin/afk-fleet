@@ -1,6 +1,6 @@
 # ADR-0026 — A recorded gate run stands in for the merge-time run, and a landing names what it freed
 
-**Status:** accepted — an opt-in relaxation of the merge-time re-run of
+**Status:** accepted; amended by [ADR-0027](0027-a-worker-lands-its-own-pr-on-a-landing-turn.md) — the recorded gate run stands, now trusted by the worker's `afk land` instead of `afk merge`; the `unblocked` list of the `merged` outcome is removed with the queue it served. Originally: an opt-in relaxation of the merge-time re-run of
 [ADR-0012](0012-local-completion-gate.md), whose invariant is unchanged; and one addition to the
 `merged` outcome of the merge transition ([ADR-0017](0017-the-act-half-is-transitions.md)) for the
 merge queue of [ADR-0025](0025-conflicting-prs-land-one-at-a-time.md). Both are enforced in the seam

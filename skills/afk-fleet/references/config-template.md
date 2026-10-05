@@ -36,7 +36,7 @@ worker: orca                           # the only supported backend: orca create
                                       #   (ADR-0005), then the fleet starts a real Claude Code in it with
                                       #   the run's worker launch command — NOT a key here (ADR-0010)
 concurrency: 3                         # max workers running at once
-worktree_cleanup: true                 # after a merge or a close, remove the worker's worktree (via orca).
+worktree_cleanup: true                 # after a landing or a close, remove the worker's worktree (via orca).
                                       #   An escalated issue's worktree is always left for the human.
 worker_idle_grace_seconds: 300         # a no-PR worker that went idle is judged "finished" only after
                                       #   this much quiet (no commits, clean tree, no recent file activity);
@@ -48,28 +48,28 @@ gate:
   ci: required                         # required | local  (ADR-0012)
                                       #   required — wait for the PR's GitHub checks to go green
                                       #   local    — never read GitHub checks: local_command IS the gate,
-                                      #              run by the worker pre-PR and RE-RUN by the tick at
-                                      #              merge time against the exact tree that lands.
+                                      #              run by the worker pre-PR and RE-RUN by its landing
+                                      #              (`afk land`) against the exact tree that lands.
                                       #              Requires a non-empty local_command (load-time error).
   local_command: ""                    # the repo's build/test command (e.g. "pnpm build && pnpm test").
                                       #   In `required` mode: the worker's pre-PR filter. In `local` mode:
                                       #   the completion gate itself, at both ends.
-  trust_recorded_run: false            # `local` only (ADR-0026). true → `afk merge` skips its own run of
+  trust_recorded_run: false            # `local` only (ADR-0026). true → `afk land` skips its own run of
                                       #   local_command when the worker's `afk gate` run is on record,
                                       #   green, for the exact head that would land — same command, a
                                       #   committed tree. A sync that moved the head, a later commit or
-                                      #   a changed command voids the record and the merge gates as usual.
+                                      #   a changed command voids the record and the landing gates as usual.
   adversarial_verify: false            # set true for content repos: an independent agent re-derives
-                                       # the result and refutes wrong output before merge (refute-first)
+                                       # the result and refutes wrong output before it lands (refute-first)
   adversarial_verify_prompt: ""        # what the verifier checks (e.g. "re-solve; assert final == official answer:")
 
 # --- merge ---
 merge:
   strategy: squash                     # squash | merge | rebase
   target: main                         # fleet stops here; deploy is a separate human-gated step
-  sync_before_merge: true              # serialized: MERGE origin/<target> into the branch (never rebase —
-                                      #   a rebase drops merge commits and re-ignites the conflicts already
-                                      #   resolved inside them), re-gate, then merge. Renamed from
+  sync_before_merge: true              # on the landing turn: MERGE origin/<target> into the branch (never
+                                      #   rebase — a rebase drops merge commits and re-ignites the conflicts
+                                      #   already resolved inside them), re-gate, then merge. Renamed from
                                       #   rebase_before_merge in ADR-0012; the old key is a load-time error.
   delete_branch: true
 
@@ -119,9 +119,9 @@ force_tick_after_skips: 6              # safety net: a full tick at least every 
 - **`gate.ci: local` — when to switch, and what the repo owes it (ADR-0012).** Workers push after
   every completed step (progress preservation), so on `required` every one of those pushes fires the
   repo's `on: push` / `on: pull_request` workflows while the fleet reads only the last run — and then
-  the serialized merge path waits for yet another full run. In `local` mode the local command is the
-  whole gate, run twice: by the worker after its pre-PR **sync**, and by the tick at merge time after
-  the merge-time sync — or once, with `gate.trust_recorded_run`, when nothing moved in between (next
+  the landing waits for yet another full run. In `local` mode the local command is the
+  whole gate, run twice: by the worker after its pre-PR **sync**, and by its landing after
+  the landing's sync — or once, with `gate.trust_recorded_run`, when nothing moved in between (next
   note). Three obligations come with it:
   - **Scope remote CI away from worker branches** (e.g. trigger `on: push` for the target branch only,
     and drop `on: pull_request`). The fleet cannot edit your workflows — if you leave them broad you
@@ -131,13 +131,13 @@ force_tick_after_skips: 6              # safety net: a full tick at least every 
     refuses to use it. Bootstrap probes the protection and **hard-errors** on this combination.
   - **Own the environment parity.** `ci: local` is a claim that `local_command` is CI-equivalent. If
     your CI needs a Linux-only toolchain, service containers, or secrets, stay on `required`.
-- **`gate.trust_recorded_run` — stop gating an unchanged commit twice (ADR-0026).** On the
-  serialized merge path the gate's run time is the fleet's throughput: a 6-minute gate lands about
-  ten PRs an hour, and when the target has not moved since the worker synced, the merge-time run
-  re-tests the commit the worker just tested. Turn this on and `afk merge` trusts the worker's run
+- **`gate.trust_recorded_run` — stop gating an unchanged commit twice (ADR-0026).** PRs land one
+  at a time, so the gate's run time is the fleet's throughput: a 6-minute gate lands about
+  ten PRs an hour, and when the target has not moved since the worker synced, the landing's run
+  re-tests the commit the worker just tested. Turn this on and `afk land` trusts the recorded run
   instead — only one made through `afk gate` (the worker prompt says so), green, on a committed tree,
-  of the command configured now, at the exact head that lands; anything else and the merge runs the
-  gate itself. It is off by default because it relaxes ADR-0012's "the merge-time run is the only
+  of the command configured now, at the exact head that lands; anything else and the landing runs the
+  gate itself. It is off by default because it relaxes ADR-0012's "the landing's own run is the only
   machine gate": you give up the second, independent run on an unchanged commit, which is what
   catches a flaky test that happened to pass once. A gate that leaves untracked, un-ignored files
   behind makes every later run "not on a committed tree" — ignore its artifacts.

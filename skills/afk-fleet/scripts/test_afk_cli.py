@@ -2627,7 +2627,7 @@ def test_the_docs_route_on_exactly_the_words_the_code_returns():
     # nothing a tick or a worker reads names a way to land that no longer exists
     for name, text in docs.items():
         for gone in ("afk merge", "afk hand-back", "handed_back", "awaiting_merge", "worker_busy",
-                     "`queued`", "unblocked"):
+                     "`queued`", "`unblocked`"):
             assert gone not in text, (name, gone)
 
     # the verdict marker is written into the worker prompt by the code that parses

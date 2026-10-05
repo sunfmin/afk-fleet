@@ -329,7 +329,7 @@ def test_a_recorded_gate_run_counts_only_for_the_commit_and_command_it_ran():
     void = d.gate_record_void(rec, "def456", "make test")
     assert "abc123" in void and "def456" in void
 
-    # only local mode has a merge-time run to skip: on `required` the key would be
+    # only local mode has a landing run to skip: on `required` the key would be
     # one a human sets to no effect
     on = {"local_command": "make test", "trust_recorded_run": True}
     d.validate_config(d.resolve_config({"gate": {**on, "ci": "local"}}))

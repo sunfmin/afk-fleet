@@ -6,6 +6,7 @@ progress preservation and reuses its continuation tier-2 move for merge-time wor
 The merge-time re-run of decision 2 can be skipped, opt-in, when the worker's run is on record for
 the exact head that lands ([ADR-0026](0026-a-recorded-gate-run-stands-in-for-the-merge-time-run.md));
 the invariant is unchanged.
+**Superseded in part by [ADR-0027](0027-a-worker-lands-its-own-pr-on-a-landing-turn.md):** the merge-time sync and gate run are no longer the tick's — the worker runs them, on its landing turn, with `afk land`. The invariant (what lands was gated in the form it lands) and merge-never-rebase stand.
 
 ## Context
 

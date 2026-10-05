@@ -1,6 +1,6 @@
 # ADR-0025 — Conflicting PRs land one at a time: a merge queue
 
-**Status:** accepted — orders the merge transition of [ADR-0017](0017-the-act-half-is-transitions.md)
+**Status:** superseded in part by [ADR-0027](0027-a-worker-lands-its-own-pr-on-a-landing-turn.md) — PRs still land one at a time, in `merge_order`, but as landing turns: the hand-back-round ordering and the file-overlap queue (`queued`, `behind`) are removed. Originally: accepted — orders the merge transition of [ADR-0017](0017-the-act-half-is-transitions.md)
 and adds a waiting status beside the hand-back of
 [ADR-0019](0019-a-sync-conflict-is-handed-back-to-its-worker.md), whose record and unanswered ladder
 are unchanged. Enforced in the seam ([ADR-0016](0016-the-seam-enforces-its-own-rules.md)).
