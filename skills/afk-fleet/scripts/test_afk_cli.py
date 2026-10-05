@@ -182,11 +182,19 @@ if argv[0] == "pr" and argv[1] in ("merge", "close", "comment"):
         finish(code=1, err="fake gh: no open pull request %%s\n" %% argv[2])
     notes = st.setdefault("pr_comments", {}).setdefault(argv[2], [])
     ref = "refs/heads/" + row["headRefName"]
+
+    def note(body):                  # a PR's comment is one of its issue comments
+        every = st.setdefault("comments", {})
+        new = 1 + max([c["id"] for rs in every.values() for c in rs], default=1000)
+        every.setdefault(argv[2], []).append(
+            {"id": new, "body": body, "html_url": "https://gh/c/%%d" %% new})
+        notes.append(body)
+
     if argv[1] == "comment":
-        notes.append(opt("--body"))
+        note(opt("--body"))
         finish()
     if argv[1] == "close":
-        notes.append(opt("--comment"))
+        note(opt("--comment"))
         row["state"] = "closed"
         if "--delete-branch" in argv:
             bare("update-ref", "-d", ref)
@@ -1193,6 +1201,200 @@ def test_a_tick_in_code_settles_every_row_the_rebuild_routes():
         moved = cycle(w, forced["state"], "--set", "concurrency=5")
         assert moved["reason"] == "changed" and w.board(7) != board and "(#70)" not in w.board(7)
         assert comment_reads() == [f"repos/{REPO}/issues/7/comments"]
+
+
+@contextmanager
+def inside(w):
+    """Call afk's helpers in THIS process, against the world `w`: its fakes on
+    PATH, its clone as the working directory, and nothing read yet → the remote."""
+    env, cwd = afk._GIT_ENV, os.getcwd()
+    afk._GIT_ENV = {**env, **w.env}
+    os.chdir(w.cwd)
+    afk._forget()
+    try:
+        yield f"https://github.com/{REPO}.git"
+    finally:
+        afk._forget()
+        os.chdir(cwd)
+        afk._GIT_ENV = env
+
+
+def _read_everything(rem, issue_no, pr_number):
+    """Make every shared read once, so a write has something to leave stale."""
+    return (afk._open_issues(REPO), afk._issue(REPO, issue_no), afk._issue_state(REPO, issue_no),
+            afk._open_prs(REPO), afk._remote_heads(rem), afk._issue_comments(REPO, pr_number))
+
+
+def test_a_closed_pr_is_gone_from_the_reads_after_it():
+    """PR close: the open PRs, its comments, and — when its branch goes with it —
+    the remote's heads are read again, and show it."""
+    with world(issues=[issue(1, "ready-for-agent")]) as w:
+        d, _ = with_pr(w, 1, 10)
+        with inside(w) as rem:
+            *_, prs, heads, comments = _read_everything(rem, 1, 10)
+            assert [p["number"] for p in prs] == [10] and d["branch"] in heads and not comments
+            afk._close_pr(REPO, rem, 10, "superseded", delete_branch=True)
+            assert afk._open_prs(REPO) == [] and d["branch"] not in afk._remote_heads(rem)
+            assert [c["body"] for c in afk._issue_comments(REPO, 10)] == ["superseded"]
+
+
+def test_a_merged_pr_and_the_issue_it_closed_are_gone_from_the_reads_after_it():
+    """PR merge: the PR is no longer open, its branch is off the remote, and the
+    issue it closes reads as closed — the issue, its state, the open list."""
+    with world(issues=[issue(1, "ready-for-agent"), issue(2, "ready-for-agent")]) as w:
+        d, head = with_pr(w, 1, 10)
+        with inside(w) as rem:
+            issues, one, state, prs, heads, _ = _read_everything(rem, 1, 10)
+            assert (len(issues), one["state"], state) == (2, "open", "open")
+            afk._merge_pr(REPO, rem, prs[0], head, "squash", delete_branch=True)
+            assert afk._open_prs(REPO) == [] and d["branch"] not in afk._remote_heads(rem)
+            assert afk._issue_state(REPO, 1) == "closed" and afk._issue(REPO, 1)["state"] == "closed"
+            assert [i["number"] for i in afk._open_issues(REPO)] == [2]
+
+
+def test_a_pr_comment_is_in_the_comments_read_after_it():
+    """PR comment: the comments already read of that PR are read again."""
+    with world(issues=[issue(1, "ready-for-agent")]) as w:
+        with_pr(w, 1, 10)
+        with inside(w):
+            assert afk._issue_comments(REPO, 10) == []
+            afk._pr_comment(REPO, 10, "the gate is red")
+            assert [c["body"] for c in afk._issue_comments(REPO, 10)] == ["the gate is red"]
+
+
+def test_a_deleted_or_pushed_branch_is_in_the_reads_after_it():
+    """Branch delete: the remote's heads no longer name it. Branch push: they name
+    a new one, and an open PR of a branch that moved shows its new head."""
+    with world(issues=[issue(1, "ready-for-agent"), issue(2, "ready-for-agent")]) as w:
+        d, head = with_pr(w, 1, 10)
+        with inside(w) as rem:
+            *_, prs, heads, _ = _read_everything(rem, 1, 10)
+            assert prs[0]["headRefOid"] == head and "afk/extra" not in heads
+            afk._push_branch(REPO, rem, w.cwd, head, "afk/extra")
+            assert "afk/extra" in afk._remote_heads(rem)
+            afk._delete_branch(rem, "afk/extra")
+            assert "afk/extra" not in afk._remote_heads(rem)
+            new = w.work(d["worktree"], "more.txt", push=False)
+            afk._push_branch(REPO, rem, d["worktree"], new, d["branch"])
+            assert afk._open_prs(REPO)[0]["headRefOid"] == new != head
+
+
+def test_an_issue_write_is_in_the_reads_after_it():
+    """Label edit, blocker edge, issue close: the issue, its state and the open
+    list — which carries every issue's labels and open-blocker count — show it."""
+    issues = [issue(1, "ready-for-agent"), issue(2, "ready-for-agent")]
+    with world(issues=issues, labels=["ready-for-agent", "ready-for-human"]) as w:
+        with inside(w) as rem:
+            def listed():
+                return {i["number"]: (i["labels"], i["blocked_by"]) for i in afk._open_issues(REPO)}
+
+            assert listed()[1] == (["ready-for-agent"], 0)
+            assert afk._issue(REPO, 1)["labels"] == ["ready-for-agent"]
+            afk._edit_labels(REPO, 1, ["ready-for-human"], ["ready-for-agent"])
+            assert afk._issue(REPO, 1)["labels"] == ["ready-for-human"]
+            assert listed()[1] == (["ready-for-human"], 0)
+            afk._add_blocker(REPO, 1, 2)
+            assert listed()[1] == (["ready-for-human"], 1)
+            assert afk._issue_state(REPO, 2) == "open"
+            afk._close_issue(REPO, 2)
+            assert afk._issue_state(REPO, 2) == "closed" and afk._issue(REPO, 2)["state"] == "closed"
+            assert listed() == {1: (["ready-for-human"], 0)}
+
+
+def test_a_claim_ref_write_is_in_the_scan_made_before_it():
+    """Claim ref write: a claim taken, re-stamped or released, and a heartbeat
+    refreshed, are in the scan this process already made — it is not made again."""
+    with world(issues=[issue(1, "ready-for-agent")]) as w:
+        w.afk("claim", "2", "--instance", "peer", *NOW, *R)
+        with inside(w) as rem:
+            cfg = afk_decide.resolve_config({})
+            ns = cfg["claim_namespace"]
+
+            def owners():
+                return {c["number"]: c["instance"] for c in afk._scan(rem, ns)[0]}
+
+            scan = afk._scan(rem, ns)
+            assert owners() == {2: "peer"} and scan[1] == {}
+            assert afk._claim(rem, cfg, 1, "me", T0, "host")["won"]
+            assert owners() == {1: "me", 2: "peer"}
+            peer = next(c["sha"] for c in scan[0] if c["number"] == 2)
+            assert afk._force_take(rem, cfg, 2, peer, "me", T0 + 1, "host")["won"]
+            assert owners() == {1: "me", 2: "me"}
+            assert afk._beat(rem, cfg, "me", T0)["refreshed"]
+            assert afk._scan(rem, ns)[1] == {"me": T0}
+            afk._release(rem, cfg, 1)
+            mine = next(c["sha"] for c in scan[0] if c["number"] == 2)
+            afk._clear(rem, cfg, 2, mine)
+            assert owners() == {} and afk._scan(rem, ns) is scan          # one scan, kept in step
+            # a claim it lost was not in the scan: that one is made again
+            w.afk("claim", "3", "--instance", "peer", *NOW, *R)
+            assert not afk._claim(rem, cfg, 3, "me", T0, "host")["won"]
+            assert owners() == {3: "peer"}
+
+
+def test_a_turn_marker_write_is_in_the_turn_read_after_it():
+    """Turn marker write: a turn granted, then rewritten, is the turn read next."""
+    with world(issues=[issue(1, "ready-for-agent")]) as w:
+        with_pr(w, 1, 10)
+        with inside(w):
+            pr_row = {"number": 10}
+            assert afk._turn(REPO, pr_row) is None
+            afk._record_turn(REPO, pr_row, afk_decide.turn_comment("me", T0), None)
+            turn = afk._turn(REPO, pr_row)
+            assert (turn["instance"], turn["at"], turn["stopped"]) == ("me", T0, None)
+            afk._record_turn(REPO, pr_row,
+                             afk_decide.turn_comment("me", T0 + 9, stopped="gate_red", head="abc"),
+                             turn)
+            again = afk._turn(REPO, pr_row)
+            assert (again["at"], again["stopped"], again["comment_id"]) == \
+                (T0 + 9, "gate_red", turn["comment_id"])
+            assert len(_turns(w, 10)) == 1
+
+
+# The helpers that read GitHub or the remote's refs, and the ones that write to
+# them: the only code that may know a read cache exists.
+_KNOWS_THE_READS = {
+    "_once", "_forget",
+    "_open_issues", "_open_prs", "_gather", "_comment", "_claim_written",
+    "_issue_written", "_pr_comment", "_close_pr", "_merge_pr", "_push_branch", "_delete_branch",
+    "_claim", "_force_take",
+}
+_WRITES = {
+    ("gh", "pr"): {"_pr_comment", "_close_pr", "_merge_pr"},
+    ("gh", "issue"): {"_edit_labels", "_close_issue"},
+    ("gh", "label"): {"_ensure_label"},
+    ("gh", "--method"): {"_comment", "_add_blocker"},
+    ("git", "push"): {"_push_branch", "_delete_branch", "_claim", "_force_take", "_release",
+                      "_clear", "_beat", "_usable_namespace", "_probe_gate_records",
+                      "_record_gate", "_drop_gate_record"},
+}
+
+
+def test_only_the_read_and_write_helpers_know_the_read_cache():
+    """No transition names a cache key: `_forget` and `_READS` are named only by
+    the helpers that read or write, and every write to GitHub or to the remote's
+    refs is made by one of those helpers."""
+    import ast
+    with open(AFK) as f:
+        tree = ast.parse(f.read())
+    knows, writes = set(), {}
+    for fn in [n for n in tree.body if isinstance(n, ast.FunctionDef)]:
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Name) and node.id in ("_forget", "_READS"):
+                knows.add(fn.name)
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id in ("_gh", "_git") and node.args):
+                words = [e.value for e in ast.walk(node.args[0])
+                         if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+                tool = node.func.id[1:]
+                for kind in _WRITES:
+                    if kind[0] != tool or kind[1] not in words:
+                        continue
+                    if kind == ("gh", "pr") and "list" in words:
+                        continue                                      # the one read among them
+                    writes.setdefault(kind, set()).add(fn.name)
+    assert knows == _KNOWS_THE_READS, knows ^ _KNOWS_THE_READS
+    assert writes == _WRITES, writes
 
 
 def _overlap(spans):
