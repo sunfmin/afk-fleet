@@ -146,7 +146,7 @@ if argv[:2] == ["pr", "list"]:
     for r in rows:                   # a PR whose checks a test scripted: one step per read
         if r.get("rollups"):
             r["statusCheckRollup"] = r["rollups"].pop(0)
-    rows = [{**r, "headRefOid": r.get("stale_head") or head_of(r)} for r in rows]
+    rows = [{**r, "headRefOid": head_of(r)} for r in rows]
     fields = opt("--json").split(",")
     finish(json.dumps([{k: r[k] for k in fields} for r in rows]))
 
@@ -235,6 +235,7 @@ if parts[0] == "issues" and parts[2:] == ["comments"]:
         assert body is not None, argv
         new = 1 + max([c["id"] for rs in comments.values() for c in rs], default=1000)
         rows.append({"id": new, "body": body, "html_url": "https://gh/c/%%d" %% new})
+        st["issues"] += st.pop("arrives_mid_tick", [])     # someone files one meanwhile
         finish(json.dumps({"id": new, "html_url": "https://gh/c/%%d" %% new}))
     assert jq == ".[] | {id, body, url: .html_url}", "fake gh: unsupported jq %%r" %% jq
     finish("\n".join(json.dumps({"id": c["id"], "body": c["body"], "url": c["html_url"]})
@@ -773,14 +774,13 @@ def test_rebuild_assembles_the_working_set_from_gh_and_refs():
         assert ws["stale"][0]["sha"] == w.sb.remote_ref("refs/afk/claim/6")
         assert ws["now"] == T0
 
-        # the per-issue blocked_by read is paid ONLY by issues that passed every
-        # cheaper check — two of nine here, not one per open issue — and the
-        # landing-turn read only by a claim of mine that has a PR
-        api = [c for c in w.calls() if c[0] == "api"]
-        blocker_reads = sorted(c[1] for c in api if ".issue_dependencies_summary.blocked_by" in c)
-        assert blocker_reads == [f"repos/{REPO}/issues/1", f"repos/{REPO}/issues/2"], blocker_reads
-        assert [c[2] for c in api if c[1] == "--paginate"] == [f"repos/{REPO}/issues/30/comments"]
-        assert len(api) == 3
+        # the frontier costs NO read of its own, however many candidates it has (two
+        # of nine here): every open-blocker count came with the issue list. The one
+        # per-thing read is the landing turn of a claim of mine that has a PR
+        calls = w.calls()
+        assert sorted(c[2] for c in calls if c[:2] == ["api", "--paginate"]) == [
+            f"repos/{REPO}/issues/30/comments", f"repos/{REPO}/issues?state=open&per_page=100"]
+        assert len(calls) == 3 and ["pr", "list"] in [c[:2] for c in calls]
 
         # the stale sha it reported is exactly what reclaim's compare-and-swap needs
         took = w.afk("reclaim", "6", "--instance", "me", "--expect-sha", ws["stale"][0]["sha"],
@@ -814,7 +814,7 @@ def test_rebuild_reads_the_dispatch_contract_from_config_and_set():
         assert (ws["mine"][0]["status"], ws["mine"][0]["board_phase"]) == ("failure", "ci_failed")
 
         # --repo is the one repo handle, and a wrong one is an error, not an empty fleet
-        assert "unknown repo" in w.error("rebuild", "--instance", "me", "--repo", "acme/other")
+        assert "Not Found" in w.error("rebuild", "--instance", "me", "--repo", "acme/other")
 
 
 def test_rebuild_reports_free_slots_and_a_claim_whose_issue_is_closed():
@@ -929,17 +929,14 @@ def test_cycle_gates_ticks_paces_and_beats_through_a_whole_run():
         assert (first["judgments"], first["sleep_seconds"]) == ([], 90)
         assert w.claimed_by(1) == "me" and w.sb.remote_ref(hb)
         assert [t["command"] for t in w.terminals()] == [WORKER]
-        # the digest is the SAME one rebuild reports: one gatherer, one function
-        assert first["state"]["fingerprint"] == before
+        # the digest it keeps is of the fleet as the tick LEFT it — claim, board and
+        # all — and is the SAME one rebuild reports now: one gatherer, one function
+        assert first["state"]["fingerprint"] == w.afk("rebuild", *ME, *R)["fingerprint"] != before
+        held = first["state"]
 
-        # cycle 2: the claim moved the digest → tick; its worker is coding: left alone
-        woke = cycle(w, first["state"])
-        assert (woke["action"], woke["reason"], woke["sleep_seconds"]) == ("tick", "changed", 90)
-        assert woke["progress"] == "1 in flight, 0 left on the frontier"
-        held = woke["state"]
-
-        # cycle 3: nothing moved, but the fleet HOLDS a claim → skip, in the same
-        # one call, with the lease looked after and the sleep returned
+        # cycle 2: nothing moved but what that tick wrote itself, and the fleet HOLDS
+        # a claim → skip, in the same one call, with the lease looked after and the
+        # sleep returned
         w.calls()
         skip = cycle(w, held)
         assert (skip["action"], skip["reason"], skip["sleep_seconds"]) == ("skip", "unchanged", 90)
@@ -949,7 +946,7 @@ def test_cycle_gates_ticks_paces_and_beats_through_a_whole_run():
         assert skip["heartbeat"]["refreshed"] is False                # the tick beat at T0
         assert skip["state"]["empty_streak"] == 0                     # holding a claim is not empty
         # a skipped cycle is cheap by construction: the two lists, no per-issue read
-        assert [c[:2] for c in w.calls()] == [["issue", "list"], ["pr", "list"]]
+        assert sorted(c[:2] for c in w.calls()) == [["api", "--paginate"], ["pr", "list"]]
         # the beat is stateless and self-limiting…
         late = cycle(w, skip["state"], now=T0 + TTL // 2)
         assert (late["action"], late["heartbeat"]["refreshed"]) == ("skip", True)
@@ -971,8 +968,8 @@ def test_cycle_gates_ticks_paces_and_beats_through_a_whole_run():
         assert idle["progress"] == "cleared #1; 0 in flight, 0 left on the frontier"
         assert (idle["state"]["empty_streak"], idle["sleep_seconds"]) == (0, 90)   # work: not empty
         assert w.claimed_by(1) is None and w.worktrees() == []
-        e1 = cycle(w, idle["state"])                                  # the release moved the digest
-        assert (e1["action"], e1["state"]["empty_streak"], e1["sleep_seconds"]) == ("tick", 1, 90)
+        e1 = cycle(w, idle["state"])                                  # its own release: no tick
+        assert (e1["action"], e1["state"]["empty_streak"], e1["sleep_seconds"]) == ("skip", 1, 90)
         s2 = cycle(w, e1["state"])
         assert (s2["action"], s2["state"]["empty_streak"], s2["sleep_seconds"]) == ("skip", 2, 90)
         assert "heartbeat" not in s2                                  # holding nothing: no beat
@@ -994,8 +991,8 @@ def test_cycle_gates_ticks_paces_and_beats_through_a_whole_run():
         # a state the caller mangled is an error, never a fleet paced on zeros
         assert "--state" in w.error("cycle", *R, "--state", json.dumps({"fingerprint": "x"}))
         w.error("cycle", *R, "--state", "{not json")
-        assert "gh issue list failed" in w.error("cycle", *ME, "--worker-command", WORKER,
-                                                 "--repo", "acme/other")
+        assert "gh api --paginate failed" in w.error("cycle", *ME, "--worker-command", WORKER,
+                                                     "--repo", "acme/other")
 
 
 def test_the_cycle_state_carries_the_instance_and_the_worker_launch_command():
@@ -1014,7 +1011,8 @@ def test_the_cycle_state_carries_the_instance_and_the_worker_launch_command():
         assert (state["instance"], state["worker_command"]) == ("fl-9", WORKER)
 
         # only the state: #2 is claimed by fl-9 and its worker started with WORKER
-        nxt = w.afk("cycle", *R, *NOW, "--state", json.dumps(state))
+        # (a slot opened by the config, which no digest sees: the cycle is woken)
+        nxt = w.afk("cycle", *R, *NOW, "--state", json.dumps(state), "--wake")
         assert nxt["progress"] == "dispatched #2; 2 in flight, 0 left on the frontier"
         assert w.claimed_by(2) == "fl-9" and [t["command"] for t in w.terminals()] == [WORKER] * 2
         assert nxt["state"]["instance"] == "fl-9" and nxt["state"]["worker_command"] == WORKER
@@ -1161,10 +1159,211 @@ def test_a_tick_in_code_settles_every_row_the_rebuild_routes():
         # each claim still held shows where it stands to a human reading the issue
         assert "(#70)" in w.board(7) and w.board(8) and w.board(6)
 
-        # the next cycle finds every worker coding: nothing to do, nothing asked
+        # everything that tick wrote — claims, releases, boards, a heartbeat — is in
+        # the digest it kept: the next cycle has nothing to do, and does not tick
+        w.calls()
         nxt = cycle(w, r["state"], "--set", "concurrency=5")
-        assert (nxt["action"], nxt["judgments"]) == ("tick", [])
-        assert nxt["progress"] == "5 in flight, 1 left on the frontier"
+        assert (nxt["action"], nxt["reason"], nxt["judgments"]) == ("skip", "unchanged", [])
+        assert nxt["progress"] == "nothing moved; 5 in flight, 1 left on the frontier"
+        assert len(w.calls()) == 2                                   # the two lists, nothing else
+        # a forced tick finds every worker coding, and every board as it left it:
+        # no claim's comments are read to conclude `unchanged` — the one comments
+        # read left is the landing turn on #7's PR
+        for n in range(len(w.terminals())):
+            w.worker(output=T0 - 1, state="working", since=T0 - 60, n=n)
+
+        def comment_reads():
+            return sorted(c[2] for c in w.calls() if c[:2] == ["api", "--paginate"]
+                          and c[2].endswith("/comments"))
+
+        forced = cycle(w, {**nxt["state"], "skips": 5}, "--set", "concurrency=5")
+        assert (forced["action"], forced["reason"]) == ("tick", "forced")
+        assert forced["progress"] == "5 in flight, 1 left on the frontier"
+        assert comment_reads() == [f"repos/{REPO}/issues/70/comments"]
+        assert sorted(forced["state"]["boards"]) == ["1", "2", "6", "7", "8"]
+        # a board the state does not know is found in place, at the cost of one read
+        cycle(w, {**forced["state"], "boards": {}, "skips": 5}, "--set", "concurrency=5")
+        assert comment_reads() == [f"repos/{REPO}/issues/{n}/comments" for n in (1, 2, 6, 7, 70, 8)]
+        # …and one whose phase moved is rewritten: #7's worker landed nothing, a
+        # human closed the PR, and the claim is back to waiting on its worker
+        board = w.board(7)
+        w.set(prs=[{**p, "state": "closed"} for p in w.state()["prs"]])
+        moved = cycle(w, forced["state"], "--set", "concurrency=5")
+        assert moved["reason"] == "changed" and w.board(7) != board and "(#70)" not in w.board(7)
+        assert comment_reads() == [f"repos/{REPO}/issues/7/comments"]
+
+
+def _overlap(spans):
+    """Whether every one of these calls was still running when the last began."""
+    return max(s["start"] for s in spans) < min(s["end"] for s in spans)
+
+
+def test_a_skipping_cycle_makes_its_three_reads_at_once():
+    """The gather's reads — open issues, open PRs, the claim scan — do not depend
+    on each other: a cycle that skips costs the slowest of them, not their sum."""
+    with world(issues=[issue(1, "ready-for-agent")]) as w:
+        held = cycle(w)["state"]
+        r = w.afk("cycle", *R, *NOW, "--state", json.dumps(held), env=w.spans(slow=1.0))
+        assert r["action"] == "skip", r
+        reads = [w.spanned("gh", "api", "/issues?"), w.spanned("gh", "pr list"),
+                 w.spanned("git", "fetch", "afk-scan")]
+        assert [len(x) for x in reads] == [1, 1, 1], reads
+        assert _overlap([x[0] for x in reads]), reads
+
+
+def test_the_frontier_considers_every_open_issue_and_never_a_pull_request():
+    """GitHub's issue list is paged, and lists pull requests among the issues. All
+    the pages are read — the frontier does not stop at a 200th issue — the PRs are
+    left out, and the list carries each issue's open-blocker count: N candidates
+    cost no read of their own."""
+    issues = [issue(n, "ready-for-agent") for n in range(1, 251)]
+    issues[9]["blocked_by"] = 2                                       # #10
+    issues += [{**issue(n, "ready-for-agent"), "pull_request": {"url": "u"}} for n in (300, 301)]
+    with world(issues=issues, prs=[pr(300, closes=7), pr(301, closes=999)]) as w:
+        ws = w.afk("rebuild", *ME, *R, *NOW)
+        ready = [i["number"] for i in ws["frontier"]["dispatch"]]
+        assert ready == [n for n in range(1, 251) if n not in (7, 10)]
+        excluded = {e["number"]: e["reason"] for e in ws["frontier"]["excluded"]}
+        assert "2 open blocker" in excluded[10] and 7 in excluded
+        assert not {300, 301} & (set(ready) | set(excluded))
+        # 248 candidates: the two lists, and not one read more
+        assert sorted(c[:2] for c in w.calls()) == [["api", "--paginate"], ["pr", "list"]]
+
+
+def test_one_tick_reads_each_thing_once_and_sees_its_own_writes():
+    """A tick that grants a turn, asks after a stopped worker, reclaims a dead
+    peer's claim and starts workers reads the open PRs once, the claim refs once
+    and the PR's turn comment once — what a transition needs, the rebuild or the
+    transition before it already read. Its own writes are in what it reads next:
+    the claim it just reclaimed is known to be its own without a second scan."""
+    issues = [issue(n, "ready-for-agent") for n in (1, 6, 7, 8)]
+    with world(issues=issues) as w:
+        with_pr(w, 6, 60)                                             # ready for its turn
+        w.afk(*dispatch(7, "--now", str(T0 + 1)))                     # its worker stopped
+        w.afk("claim", "8", "--instance", "peer-dead", *NOW, *R)
+        w.afk("heartbeat", "--instance", "peer-dead", "--now", str(T0 - TTL - 60), *R)
+        now = int(time.time()) + 5000
+        w.afk("heartbeat", *ME, "--now", str(now - 30), *R)
+        w.worker(output=now - 3, state="working", since=now - 900, n=0)
+        w.worker(output=now - 3, state="done", since=now - 600, n=1)
+        w.calls()
+
+        r = w.afk("cycle", *R, *ME, "--worker-command", WORKER, "--now", str(now),
+                  "--set", "concurrency=4", "--set", "fingerprint_gate=false", env=w.spans())
+        assert "errors" not in r and r["judgments"] == [], r
+        assert r["progress"] == ("landing turn to #6; dispatched #1; reclaimed #8; nudged #7; "
+                                 "4 in flight, 0 left on the frontier"), r["progress"]
+        calls = w.calls()
+        assert len([c for c in calls if c[:2] == ["pr", "list"]]) == 1
+        assert len([c for c in calls if c[:2] == ["api", "--paginate"]
+                    and "/issues?" in c[2]]) == 1
+        assert len(w.spanned("git", "fetch", "afk-scan")) == 1
+        turn_reads = [c for c in calls if c[:2] == ["api", "--paginate"]
+                      and c[2] == f"repos/{REPO}/issues/60/comments"]
+        assert len(turn_reads) == 1 and len(_turns(w, 60)) == 1
+        # the reclaim's write was seen: #8 was started as a claim already held —
+        # no create-only push it would lose to itself, no second look at the refs
+        assert w.claimed_by(8) == "me" and 8 in {wt["linkedIssue"] for wt in w.worktrees()}
+        assert len(w.spanned("git", "push", "refs/afk/claim/8")) == 1
+        # with the gate on, the one further gather is the digest of what the tick
+        # left — taken after its last write, so it holds every one of them
+        state = cycle(w, None, "--set", "concurrency=4", now=now + 1)["state"]
+        assert state["fingerprint"] == w.afk("rebuild", *ME, *R)["fingerprint"]
+
+
+def test_a_write_is_in_every_read_this_process_makes_after_it():
+    """The reads a tick shares are kept in step by the writes it makes: a comment
+    posted or rewritten is in the comments already read, with no second read."""
+    asked, real = [], afk._gh
+
+    def gh(args, check=True):
+        asked.append(args)
+        out = json.dumps({"id": 7, "html_url": "u7"}) if "POST" in args else \
+            json.dumps({"id": 5, "body": "old", "url": "u5"})
+        return subprocess.CompletedProcess(args, 0, out, "")
+
+    afk._gh = gh
+    try:
+        afk._forget()
+        assert [c["body"] for c in afk._issue_comments(REPO, 9)] == ["old"]
+        assert afk._comment(REPO, 9, "new") == 7
+        afk._comment(REPO, 9, "rewritten", comment_id=5)
+        assert afk._issue_comments(REPO, 9) == [{"id": 5, "body": "rewritten", "url": "u5"},
+                                                {"id": 7, "body": "new", "url": "u7"}]
+        assert len([c for c in asked if "--paginate" in c]) == 1      # read once
+    finally:
+        afk._gh = real
+        afk._forget()
+
+
+def test_workers_are_started_at_once_and_never_past_concurrency():
+    """Filling N free slots takes about as long as filling one: each start is
+    begun in turn, then every agent is waited for and handed its prompt together.
+    A start that cannot begin ends the starting for that tick, and the claims
+    held never exceed `concurrency`."""
+    with world(issues=[issue(n, "ready-for-agent") for n in range(1, 6)]) as w:
+        r = w.afk("cycle", *R, *NOW, *ME, "--worker-command", WORKER, env=w.spans(slow=1.5))
+        assert r["progress"] == "dispatched #1, #2, #3; 3 in flight, 2 left on the frontier"
+        waits = w.spanned("orca", "terminal wait")
+        assert len(waits) == 3 and _overlap(waits), waits
+        # three free slots, five ready issues: three claims pushed, ever
+        assert len(w.spanned("git", "push", "refs/afk/claim/")) == 3
+        assert [w.claimed_by(n) for n in range(1, 6)] == ["me"] * 3 + [None] * 2
+        assert all(_told(t) for t in w.terminals()) and len(w.terminals()) == 3
+
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2, 3)]) as w:
+        w.orca(create_fails=[2])
+        r = cycle(w)
+        # #2 could not get a worktree: #3 is not even claimed — every further
+        # dispatch would take a claim it cannot staff — and #1, begun before, runs
+        assert [(e["step"], e["issue"]) for e in r["errors"]] == [("dispatch", 2)]
+        assert r["progress"].startswith("dispatched #1; ")
+        assert w.claimed_by(1) == "me" and w.claimed_by(3) is None
+        assert len(w.terminals()) == 1 and _told(w.terminals()[0])
+        # the claim it took for #2 is not left behind unstaffed, and the next tick
+        # starts it and fills the slot still free
+        w.orca(create_fails=[])
+        nxt = cycle(w, r["state"])
+        assert nxt["action"] == "tick" and "errors" not in nxt, nxt
+        assert [w.claimed_by(n) for n in (1, 2, 3)] == ["me"] * 3
+
+
+def test_what_changed_while_a_tick_ran_still_gets_a_tick():
+    """The state keeps the digest of the fleet as the tick left it, so a change
+    made on GitHub while the tick ran is inside that digest, unseen. Nothing is
+    lost: the forced tick finds it, and a wake that arrived meanwhile — which the
+    launcher passes on as `--wake` — makes the very next cycle tick."""
+    forced = ("--set", "force_tick_after_skips=2", "--set", "concurrency=5")
+    with world(issues=[issue(1, "ready-for-agent")]) as w:
+        # #2 is filed while the tick that dispatches #1 is writing #1's board
+        w.set(arrives_mid_tick=[issue(2, "ready-for-agent")])
+        first = cycle(w, None, *forced)
+        assert first["progress"].startswith("dispatched #1; 1 in flight")
+        assert w.issue(2)["state"] == "open" and w.claimed_by(2) is None
+        # no wake said so, and the digest already holds it: the next cycle skips…
+        quiet = cycle(w, first["state"], *forced)
+        assert (quiet["action"], quiet["reason"]) == ("skip", "unchanged")
+        # …and the forced tick picks it up
+        caught = cycle(w, quiet["state"], *forced)
+        assert (caught["action"], caught["reason"]) == ("tick", "forced")
+        assert caught["progress"].startswith("dispatched #2; 2 in flight")
+
+        # #4 is filed while the tick that dispatches #3 runs, and this time a wake
+        # arrived: the next cycle ticks at once, whatever the digest says
+        w.set(issues=w.state()["issues"] + [issue(3, "ready-for-agent")],
+              arrives_mid_tick=[issue(4, "ready-for-agent")])
+        again = cycle(w, caught["state"], *forced)
+        assert again["progress"].startswith("dispatched #3; 3 in flight")
+        assert w.claimed_by(4) is None
+        assert cycle(w, again["state"], *forced)["action"] == "skip"
+        woke = cycle(w, again["state"], *forced, "--wake")
+        assert (woke["action"], woke["reason"]) == ("tick", "wake")
+        assert woke["progress"].startswith("dispatched #4; 4 in flight")
+        # a wake with nothing behind it costs one tick that finds nothing, no more
+        idle = cycle(w, woke["state"], *forced, "--wake")
+        assert (idle["reason"], idle["progress"]) == \
+            ("wake", "4 in flight, 0 left on the frontier")
+        assert cycle(w, idle["state"], *forced)["action"] == "skip"
 
 
 def test_a_tick_in_code_carries_out_every_no_pr_action_whose_reason_is_on_record():
@@ -1210,7 +1409,8 @@ def test_a_tick_in_code_carries_out_every_no_pr_action_whose_reason_is_on_record
 
         # a grace period on, the nudged worker is still silent: that is a failure
         # whose reason is on record too
-        later = cycle(w, r["state"], "--set", "concurrency=8", now=t + 400)
+        # (silence moves no digest: it is the forced tick that notices it)
+        later = cycle(w, {**r["state"], "skips": 5}, "--set", "concurrency=8", now=t + 400)
         assert "retried #4" in later["progress"] and w.issue(4)["labels"][-1] == "afk-attempt/1"
         assert "after its nudge" in _told(_worker_of(w, 4))
 
@@ -1305,20 +1505,18 @@ def test_a_failed_transition_is_reported_and_leaves_its_claim_held():
         assert (nxt["action"], nxt["reason"]) == ("tick", "unsettled") and "errors" not in nxt
         assert nxt["progress"] == "escalated #1; retried #2; 1 in flight, 0 left on the frontier"
 
-    # a worker that cannot be STARTED ends the starting for this tick: the remote
-    # or orca is unwell, and every further dispatch would take a claim it cannot staff
-    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
+    # a worker whose agent never comes up is an error of ITS start: the claim it
+    # took is held, and the next tick finds it with no worker… which here is one
+    # whose terminal is still there: left to its grace period
+    with world(issues=[issue(1, "ready-for-agent")]) as w:
         w.orca(never_ready=True)
         r = cycle(w, None, "--ready-timeout", "1")
         assert [(e["step"], e["issue"]) for e in r["errors"]] == [("dispatch", 1)]
         assert "not ready" in r["errors"][0]["error"]
-        assert w.claimed_by(1) == "me" and w.claimed_by(2) is None
-        # the claim it took is held, and the next tick finds it with no worker… which
-        # here is one whose terminal is still there: left to its grace period
+        assert w.claimed_by(1) == "me" and r["state"]["unsettled"] is True
         w.orca(never_ready=False)
         nxt = cycle(w, r["state"], "--ready-timeout", "1")
-        assert "errors" not in nxt and "dispatched #2" in nxt["progress"]
-        assert w.claimed_by(1) == w.claimed_by(2) == "me"
+        assert (nxt["reason"], "errors" in nxt) == ("unsettled", False)
 
 
 # --------------------------------------------------------------------------- #
@@ -2261,44 +2459,72 @@ def test_in_required_mode_the_turn_waits_for_checks_on_the_head_that_lands():
         assert w.pr(40)["merged"]["head"] == heads[4] and "gate" not in r
         assert not any(w.state()["pr_comments"].values())        # required mode publishes nothing
 
-        # the base moved (PR 40 landed): PR 10's green checks ran on a tree that will
-        # NOT land. The sync is pushed and CI must speak about the new head first.
-        assert w.afk(*_turn(1))["outcome"] == "granted"
-        r = land(1)
-        assert (r["outcome"], r["checks"], r["synced"]) == ("awaiting_ci", "green", True), r
-        assert r["head"] == branch_tip(1) != heads[1]
-        # the turn is KEPT while CI runs: nobody else is granted one meanwhile
-        assert w.claimed_by(1) == "me" and w.pr(10).get("state", "open") == "open"
-        row = next(m for m in w.afk("rebuild", *ME, *R, *NOW)["mine"] if m["number"] == 1)
-        assert (row["status"], row["stopped"]) == ("landing", "awaiting_ci")
-        assert w.afk(*_turn(5))["outcome"] == "waiting"
-        # a worker that stopped for the tick is not silent: it is not nudged or failed
-        t0 = int(time.time()) + 5000
-        np = w.no_pr("--issue", "1", *R, "--now", str(t0))
-        assert (np["outcome"], np["action"]) == ("coding", "leave"), np
+        def checks_run(n, *conclusions):
+            """Script PR n's checks: what each read of the PR from now on shows."""
+            rollups = [pr(n * 10, n, c)["statusCheckRollup"] for c in conclusions]
+            w.set(prs=[{**p, "rollups": rollups} if p["number"] == n * 10 else p
+                       for p in w.state()["prs"]])
 
-        # CI is green on the synced head (the fake's rollup still says SUCCESS): the
-        # tick tells the worker to land again — the same turn, the same marker
+        def pr_reads():
+            return len([c for c in w.calls() if c[:2] == ["pr", "list"]])
+
+        wait = ("--checks-poll", "0.05")
+
+        # the base moved (PR 40 landed): PR 10's green checks ran on a tree that will
+        # NOT land. The sync is pushed, and the landing WAITS for CI to speak about
+        # the new head — queued, running, green — then merges it: one run of `afk
+        # land`, no wake, no second `afk turn` in between
+        assert w.afk(*_turn(1))["outcome"] == "granted"
+        checks_run(1, "SUCCESS", None, "PENDING", "PENDING", "SUCCESS")
+        told, turns = len(w.terminals()[0]["sent"]), _turns(w, 10)
+        w.calls(), w.orca_calls()
+        r = land(1, *wait)
+        assert (r["outcome"], r["synced"]) == ("merged", True), r
+        assert r["head"] == w.pr(10)["merged"]["head"] != heads[1]
+        assert {"feature1.txt", "feature4.txt"} <= w.remote_files(w.sb.base)
+        # the PR as it stood, then one look per step of the run: none yet, two
+        # running, green
+        assert pr_reads() == 5
+        # nobody was told anything meanwhile, and the turn was never marked stopped
+        assert len(w.terminals()[0]["sent"]) == told and _turns(w, 10) == turns
+        assert w.orca_calls() == []
+
+        # checks that go RED on the head the sync pushed are that head's verdict, in
+        # the same run: the worker's to fix
+        assert w.afk(*_turn(5))["outcome"] == "granted"
+        checks_run(5, "SUCCESS", "PENDING", "FAILURE")
+        r = land(5, *wait)
+        assert (r["outcome"], r["checks"], r["synced"]) == ("gate_red", "red", True), r
+        assert r["head"] == branch_tip(5) != heads[5]
+        row = next(m for m in w.afk("rebuild", *ME, *R, *NOW)["mine"] if m["number"] == 5)
+        assert (row["status"], row["stopped"]) == ("landing", "gate_red")
+
+        # the worker's fix is pushed by its next landing, whose checks are still
+        # running when the bound runs out: THEN it stops with `awaiting_ci`…
+        w.work(d[5]["worktree"], "fix5.txt", push=False)
+        checks_run(5, "FAILURE", *["PENDING"] * 50)
+        r = land(5, *wait, "--checks-timeout", "0")
+        assert (r["outcome"], r["checks"], r["synced"]) == ("awaiting_ci", "pending", True), r
+        assert "0s" in r["detail"]
+        # …the turn is KEPT while CI runs, and the worker — stopped for the tick —
+        # is not silent: it is not nudged or failed
+        assert w.claimed_by(5) == "me" and w.pr(50).get("state", "open") == "open"
+        row = next(m for m in w.afk("rebuild", *ME, *R, *NOW)["mine"] if m["number"] == 5)
+        assert (row["status"], row["stopped"]) == ("landing", "awaiting_ci")
+        np = w.no_pr("--issue", "5", *R, "--now", str(int(time.time()) + 5000))
+        assert (np["outcome"], np["action"]) == ("coding", "leave"), np
+        # …and the path that was there before takes over: once CI is green the tick
+        # tells the worker to land again — the same turn, the same marker
+        checks_run(5, "SUCCESS")
         w.orca_calls()
-        r = w.afk(*_turn(1, now=T0 + 90))
+        r = w.afk(*_turn(5, now=T0 + 90))
         assert (r["outcome"], r["again"], r["delivery"]) == ("granted", True, "terminal"), r
         assert w.orca_calls() == ["terminal list", "terminal send"]
-        [mark] = _turns(w, 10)
+        [mark] = _turns(w, 50)
         assert mark.startswith(f"<!--afk:turn instance=me at={T0 + 90}-->")
-        r = land(1)
-        assert (r["outcome"], r["synced"], r["head"]) == ("merged", False, branch_tip(1) or r["head"])
-        assert {"feature1.txt", "feature4.txt"} <= w.remote_files(w.sb.base)
-
-        # checks that went red or pending on a head the worker pushed stop the landing
-        w.afk(*_turn(5))
-        prs = w.state()["prs"]
-        for p in prs:
-            if p["number"] == 50:
-                p["statusCheckRollup"] = pr(50, 5, "FAILURE")["statusCheckRollup"]
-        w.set(prs=prs)
-        # …a RED run is stale once the sync moved the head: it is not this head's verdict
-        assert land(5)["outcome"] == "awaiting_ci"
-        r = land(5)
+        # a head whose checks are running when the landing starts is waited for too
+        checks_run(5, "PENDING", "PENDING", "FAILURE")
+        r = land(5, *wait)
         assert (r["outcome"], r["checks"], r["synced"]) == ("gate_red", "red", False), r
         # sync_before_merge: false → the PR head lands as it is, on its own checks
         w.set(prs=[{**p, "statusCheckRollup": pr(50, 5)["statusCheckRollup"]}
@@ -2859,7 +3085,7 @@ def test_every_failure_is_one_json_error():
         # in, a missing file, a failing gh — so a tick never has to parse a traceback
         w.error("cycle", *R, "--state", "{not json")
         w.error("rebuild", *ME, *R, "--config", "{not json")
-        assert "gh issue list failed" in w.error("rebuild", *ME, "--repo", "acme/other")
+        assert "gh api --paginate failed" in w.error("rebuild", *ME, "--repo", "acme/other")
         # …and so is a bad command line: argparse's usage error is the same one shape
         assert "--instance" in w.error("rebuild", *R)
         assert "--reason" in w.error("escalate", "--issue", "4", *ME, *R)
@@ -3119,7 +3345,8 @@ def test_the_tools_table_is_the_one_the_parser_generates():
         ("afk dispatch --issue <n> --instance <id> --worker-command <cmd> "
          "[--ready-timeout <s>] [--start <auto\\|fresh>]")
     assert gen_tools_doc.usage("land", subs["land"]) == \
-        "afk land --issue <n> [--gate-timeout <s>] [--excerpt-lines <k>]"
+        ("afk land --issue <n> [--gate-timeout <s>] [--excerpt-lines <k>] "
+         "[--checks-timeout <s>] [--checks-poll <s>]")
 
 
 def test_the_docs_restate_config_only_as_the_schema_has_it():

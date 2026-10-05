@@ -35,7 +35,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 5. It starts a **worker** there with the run's **worker launch command**, waits until the agent is
    ready, and delivers the worker prompt, filled with the branch and path orca returned, as a brief
    file plus one submitted line pointing at it.
-   `skills/afk-fleet/scripts/afk.py:_start_terminal`
+   `skills/afk-fleet/scripts/afk.py:_submit_prompt`
 6. It upserts the issue's **status board** to "claimed"; the tick refreshes its **heartbeat**
    and ends, without waiting for the worker.
    `skills/afk-fleet/scripts/afk.py:_upsert_board`
