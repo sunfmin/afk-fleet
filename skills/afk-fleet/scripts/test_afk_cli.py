@@ -1817,7 +1817,8 @@ def test_dispatch_continues_from_whatever_progress_survived():
 # act: the landing turn (`afk turn`) and the landing (`afk land`) — ADR-0027   #
 # --------------------------------------------------------------------------- #
 
-TRUST = ("--set", "gate.trust_recorded_run=true")
+TRUST = ("--set", "gate.trust_recorded_run=true")      # the default, spelled out
+RERUN = ("--set", "gate.trust_recorded_run=false")     # the landing always gates itself
 
 
 def _turn(n, *extra, now=T0, instance="me"):
@@ -1947,8 +1948,11 @@ def test_a_worker_lands_its_own_pr_on_the_turn_the_fleet_grants():
         r = json.loads(p.stdout)
         assert p.returncode == 0 and (r["outcome"], r["pr"], r["synced"], r["head"]) == \
             ("merged", 30, False, synced), r
-        assert r["gate"] == {"status": "green", "source": "run", "head": synced,
-                             "command": "test -f feature3.txt && test -f landed-meanwhile.txt"}
+        # the landing gh refused had gated this very head, green: that run is on
+        # record, so this one does not gate it again (ADR-0026)
+        assert r["gate"] == {"status": "green", "source": "recorded", "head": synced,
+                             "command": "test -f feature3.txt && test -f landed-meanwhile.txt",
+                             "recorded_at": r["gate"]["recorded_at"]}
         # gh was pinned to the gated head, with the configured strategy
         assert w.pr(30)["merged"] == {"strategy": "squash", "head": synced, "delete_branch": True}
         # what landed contains both sides, by MERGE (the base tip is an ancestor)
@@ -2281,19 +2285,17 @@ def test_a_recorded_worker_gate_run_is_not_repeated_by_the_landing():
                              "command": command, "recorded_at": r["gate"]["recorded_at"]}
         assert count() == 1 and w.pr(30)["merged"]["head"] == head
 
-        # opt-in, default off: the same record, and the landing gates as it always did
+        # turned off: the same record, and the landing gates for itself anyway
         d, _ = with_pr(w, 4, 40, gate=gate)
         git(d["worktree"], "pull", "-q", "--no-edit", "origin", w.sb.base)   # the worker's own sync
         head = git(d["worktree"], "rev-parse", "HEAD")
         git(d["worktree"], "push", "-q", "origin", "HEAD")
         assert _gate(w, d["worktree"], command)["recorded"] is True and count() == 2
-        w.afk(*_turn(4, *gate))
-        r = _land(w, 4, d["worktree"], *gate)
+        w.afk(*_turn(4, *gate, *RERUN))
+        r = _land(w, 4, d["worktree"], *gate, *RERUN)
         assert (r["outcome"], r["gate"]) == \
             ("merged", {"status": "green", "source": "run", "head": head, "command": command})
         assert count() == 3
-        # and only local mode has a landing run to skip
-        assert "gate.trust_recorded_run" in _land_error(w, 4, d["worktree"], *TRUST)
 
 
 def test_a_recorded_gate_run_is_void_unless_it_is_of_the_head_that_lands():

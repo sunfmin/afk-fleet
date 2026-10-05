@@ -376,8 +376,8 @@ A PR may land only when **all** configured gates are green. Which **machine gate
 the PR's GitHub checks; `local` makes `gate.local_command` the gate, run by the landing on the head
 that lands, and never reads checks. `afk land` applies whichever is configured
 ([Landing](#landing--the-worker-lands-its-own-pr-on-its-turn)); the invariants
-behind them — the local gate's two-run rule, the one case `gate.trust_recorded_run` lets the landing
-skip its own run (an `afk gate` run is on record for the exact head that lands;
+behind them — the local gate's two-run rule, the one case the landing
+skips its own run unless `gate.trust_recorded_run` is turned off (an `afk gate` run is on record for the exact head that lands;
 [ADR-0026](../../docs/adr/0026-a-recorded-gate-run-stands-in-for-the-merge-time-run.md)), the
 ephemeral CI sub-read, and the adversarial-verify procedure when `gate.adversarial_verify` is on — are
 disclosed in [references/completion-gate.md](references/completion-gate.md). Read it before running an

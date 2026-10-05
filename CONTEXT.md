@@ -111,8 +111,8 @@ a PR must pass (ADR-0012). It runs twice in a PR's life: the **worker** runs it 
 **sync**, so it tests "my code + current base"; and the worker's **landing** runs it again, after the
 landing's **sync**, in the same worktree. The invariant both runs serve: *what lands on the target
 branch was tested in the form it lands.* The worker runs it through `afk gate`, which puts a green
-run on record with the head it ran on; a repo that sets `gate.trust_recorded_run` lets the landing
-skip its own run when — and only when — that record is of the command configured now, on a
+run on record with the head it ran on; unless a repo turns `gate.trust_recorded_run` off, the landing
+skips its own run when — and only when — that record is of the command configured now, on a
 committed tree, at the exact head that would land. A landing sync that moved the head, a later
 commit, a changed command, or no record at all voids it, and the landing runs the gate as before
 (ADR-0026). GitHub checks are never read in this mode — the repo is
