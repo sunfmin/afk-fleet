@@ -98,7 +98,11 @@ def test_subclassify_pr():
     assert d.subclassify_pr(True, "green", "required") == ("awaiting_merge", "awaiting_merge")
     assert d.subclassify_pr(True, "red", "required") == ("failure", "ci_failed")
     assert d.subclassify_pr(True, "pending", "required") == ("awaiting_ci", "pr_open")
-    assert d.subclassify_pr(True, None, "required") == ("awaiting_ci", "pr_open")
+    # no checks at all is not "checks pending": nothing is running, so waiting
+    # would park the claim forever in a repo with no CI. It goes to `afk merge`,
+    # whose `no_checks` outcome asks the tick — and the board claims no green gate
+    assert d.subclassify_pr(True, None, "required") == ("awaiting_merge", "pr_open")
+    assert d.subclassify_pr(True, None, "required", queued=True) == ("queued", "queued")
     # with no PR the checks are nobody's: stale rollup data cannot invent a status
     assert d.subclassify_pr(False, "green", "required") == ("no_pr", "claimed")
 
