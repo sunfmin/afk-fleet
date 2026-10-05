@@ -1854,6 +1854,8 @@ def _begin_worker(run, instance, agent, issue, start, reason=None):
 
     def ready():
         handle = submit()
+        if afk_decide.attempt_starting(issue["labels"]):    # the counted attempt has its worker
+            _edit_labels(run.repo, number, [], [afk_decide.ATTEMPT_STARTING])
         if cfg["progress_comment"]:
             if turn:
                 _upsert_board(run.repo, number, cfg, "landing", instance=instance,
@@ -2966,7 +2968,18 @@ def cmd_fail(a):
 
     `--reason` is the tick's judgment — the failure, re-read from where it lives.
     This is the one writer of the attempt label, as `current_attempt` is its one
-    reader."""
+    reader.
+
+    A failure spends ONE attempt, however often this has to run to finish. The
+    edit that swaps the label up also adds `afk-attempt/starting` — "this failure
+    is counted, its fresh worker has not started" — and starting a worker on the
+    issue removes it. Everything a retry does after that edit can be refused (the
+    PR's close, a branch's deletion, orca) with the claim still held and the
+    failure still there; run again, by hand or by the next tick, it finds the
+    label, adds nothing, and does what is left. A failure of the fresh attempt
+    finds no such label and is counted. The one step that is not covered is that
+    removal: refused after the worker has started, it leaves the label on a
+    running attempt, whose next failure is then retried without being counted."""
     return _fail_claim(_run(a), a.instance, _agent(a), a.number, a.reason)
 
 
@@ -2977,13 +2990,17 @@ def _fail_claim(run, instance, agent, number, reason):
     _require_mine(rem, cfg, number, instance)
     issue = _issue(run.repo, number)
     reason = _stalled_reason(run.repo, number, reason)     # before the worktree is discarded
-    decision = afk_decide.next_attempt(afk_decide.current_attempt(issue["labels"]), cfg["retry"])
+    labels = issue["labels"]
+    decision = afk_decide.next_attempt(afk_decide.current_attempt(labels), cfg["retry"],
+                                       counted=afk_decide.attempt_starting(labels))
     if decision["action"] == "escalate":
         return _escalate(run, instance, issue, decision["attempt"], reason)
-    _ensure_label(run.repo, decision["to_label"])
-    _edit_labels(run.repo, number, [decision["to_label"]],
-                 [lb for lb in afk_decide.attempt_labels(issue["labels"])
-                  if lb != decision["to_label"]])
+    add, remove = afk_decide.retry_labels(labels, decision["to_label"])
+    if add or remove:
+        for label in add:
+            _ensure_label(run.repo, label)
+        _edit_labels(run.repo, number, add, remove)
+        issue = {**issue, "labels": [lb for lb in labels if lb not in remove] + add}
     worker = _start_worker(run, instance, agent, issue, "fresh", reason)
     return {"issue": number, "action": "retry", "attempt": decision["attempt"],
             "retry_max": cfg["retry"], "worker": worker}
