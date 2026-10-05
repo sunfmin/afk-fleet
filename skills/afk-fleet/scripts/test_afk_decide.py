@@ -494,6 +494,55 @@ def test_gate_verdict():
     assert r["status"] == "red" and r["timed_out"] is True
 
 
+def test_records_kept_on_refs_share_one_encoding():
+    """ADR-0031. A claim, a heartbeat and a recorded gate run each declare a word
+    and their fields; one pair of functions writes and reads them all, with one
+    rule each for an unknown field, a missing one, and a commit that is no record."""
+    claim = {"instance": "fl-1", "host": "mac.local", "ts": 1700000000}
+    assert d.record_message(d.CLAIM_RECORD, claim) == "afk-claim instance=fl-1 host=mac.local ts=1700000000"
+    assert d.record_message(d.HEARTBEAT_RECORD, {"instance": "fl-1", "ts": 5.9}) == \
+        "afk-heartbeat instance=fl-1 ts=5"
+    for kind, record in ((d.CLAIM_RECORD, claim), (d.HEARTBEAT_RECORD, {"instance": "fl-1", "ts": 5}),
+                         (d.GATE_RUN_RECORD, d.gate_record("abc123", "make  test\n# 100% é k=v", 7))):
+        message = d.record_message(kind, record)
+        assert "\n" not in message and d.read_record(kind, message) == record
+        assert d.read_record(kind, message + "\n\nany body at all") == record
+
+    # the formats on remotes today, pinned: what a fleet wrote before it updated
+    assert d.read_record(d.CLAIM_RECORD, "afk-claim instance=fl-7fbd5e host=Felixs-MacBook-Pro.local "
+                                         "ts=1000000") == \
+        {"instance": "fl-7fbd5e", "host": "Felixs-MacBook-Pro.local", "ts": 1000000}
+    assert d.read_record(d.CLAIM_RECORD, "afk-claim instance=by-hand host=box") == \
+        {"instance": "by-hand", "host": "box"}                      # the documented by-hand claim
+    assert d.read_record(d.HEARTBEAT_RECORD, "afk-heartbeat instance=fl-7fbd5e ts=1000000") == \
+        {"instance": "fl-7fbd5e", "ts": 1000000}
+
+    # a field left out is not written, and an optional one not stated is absent
+    assert d.record_message(d.CLAIM_RECORD, {"instance": "a", "host": None, "ts": 1}) == \
+        d.record_message(d.CLAIM_RECORD, {"instance": "a", "host": "", "ts": 1}) == "afk-claim instance=a ts=1"
+    assert d.read_record(d.CLAIM_RECORD, "afk-claim instance=a host= ts=soon") == {"instance": "a"}
+    # an unknown field is read past
+    assert d.read_record(d.CLAIM_RECORD, "afk-claim instance=a pid=7 loose ts=1") == {"instance": "a", "ts": 1}
+    # not a record: another word, no word, a required field missing or ill-typed
+    for kind, message in ((d.CLAIM_RECORD, "afk-heartbeat instance=a ts=1"), (d.CLAIM_RECORD, ""),
+                          (d.CLAIM_RECORD, None), (d.CLAIM_RECORD, "not a marker at all"),
+                          (d.CLAIM_RECORD, "afk-claim host=mac ts=1"), (d.CLAIM_RECORD, "afk-claim instance="),
+                          (d.HEARTBEAT_RECORD, "afk-heartbeat instance=a"),
+                          (d.HEARTBEAT_RECORD, "afk-heartbeat ts=-1"),
+                          (d.GATE_RUN_RECORD, "afk-gate green"),
+                          (d.GATE_RUN_RECORD, 'afk-gate green\n\n{"tree": "t", "command": "c", "at": 1}'),
+                          (d.GATE_RUN_RECORD, "afk-gate tree=t command=c at=yesterday")):
+        assert d.read_record(kind, message) is None, message
+    # writing a record that is not one is the caller's defect, not a quiet hole
+    for kind, record in ((d.CLAIM_RECORD, {"ts": 1}), (d.CLAIM_RECORD, {"instance": ""}),
+                         (d.HEARTBEAT_RECORD, {"instance": "a", "pid": 7, "ts": 1})):
+        try:
+            d.record_message(kind, record)
+        except ValueError:
+            continue
+        raise AssertionError(record)
+
+
 def test_a_recorded_gate_run_counts_only_for_the_tree_and_command_it_ran():
     """ADR-0030. A landing skips its own run of the local gate on ONE proof: a green
     run of the command configured now, on the tree that would land, no more than a

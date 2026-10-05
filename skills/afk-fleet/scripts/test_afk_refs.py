@@ -374,21 +374,26 @@ def test_probe_says_whether_gate_runs_can_be_recorded_and_sweeps_the_expired():
         local = ("--set", "gate.ci=local", "--set", "gate.local_command=make test", "--now", str(T0))
         tree = git(w, "rev-parse", "HEAD^{tree}")
 
-        def record(command, at):
-            body = json.dumps(afk_decide.gate_record(tree, command, at))
-            sha = git(w, "commit-tree", tree, "-m", f"afk-gate green\n\n{body}")
+        def record(command, at, message=None):
+            message = message or afk_decide.record_message(
+                afk_decide.GATE_RUN_RECORD, afk_decide.gate_record(tree, command, at))
+            sha = git(w, "commit-tree", tree, "-m", message)
             ref = afk_decide.gate_record_ref(tree, command)
             git(w, "push", "-q", "origin", f"{sha}:{ref}")
             return ref
 
         fresh = record("make test", T0 - afk_decide.GATE_RECORD_TTL)
         stale = record("make old", T0 - afk_decide.GATE_RECORD_TTL - 1)
+        # one written before records shared an encoding (a JSON body): it cannot be
+        # read, so it is no record — swept like any other ref that is not one
+        unreadable = record("make older", T0, "afk-gate green\n\n" + json.dumps(
+            afk_decide.gate_record(tree, "make older", T0)))
         junk = "refs/afk/gate/not-a-record"
         git(w, "push", "-q", "origin", f"HEAD:{junk}")
         before = sb.all_refs()
         r = afk(w, "probe", *local)["gate_records"]
-        assert (r["verdict"], r["pruned"]) == ("ok", 2) and "refs/afk/gate" in r["detail"], r
-        assert sb.all_refs() == before - {stale, junk} and fresh in sb.all_refs()
+        assert (r["verdict"], r["pruned"]) == ("ok", 3) and "refs/afk/gate" in r["detail"], r
+        assert sb.all_refs() == before - {stale, unreadable, junk} and fresh in sb.all_refs()
         assert not git(w, "for-each-ref", "refs/afk-gate")           # no mirror left behind
 
         # a remote that refuses the records: said, and the launch goes on
@@ -469,25 +474,93 @@ def test_a_failed_push_is_an_error_not_a_lost_race():
         assert "remote rejected" in afk_error(w, "heartbeat", "--instance", "me", "--now", str(T0))
 
 
+def test_every_kind_of_record_kept_on_a_ref_round_trips_through_the_remote():
+    """ADR-0031. A claim, a heartbeat and a recorded gate run are written by one
+    mechanism and read back by it: written in one clone, pushed, fetched in
+    another, read back equal — whatever a value holds."""
+    import afk as tool
+    with sandbox(clones=2) as sb:
+        a, b = sb.clones
+        tree = git(a, "rev-parse", "HEAD^{tree}")
+        command = "make test && echo 100% > 'out file'\n# naïve"
+        for kind, record, of_tree in (
+                (afk_decide.CLAIM_RECORD, {"instance": "fl-1", "host": "mac.local", "ts": T0}, None),
+                (afk_decide.CLAIM_RECORD, {"instance": "fl-1", "ts": T0}, None),     # no host
+                (afk_decide.HEARTBEAT_RECORD, {"instance": "fl-1", "ts": T0}, None),
+                (afk_decide.GATE_RUN_RECORD, afk_decide.gate_record(tree, command, T0), tree)):
+            sha = tool._record_commit(kind, record, tree=of_tree, path=a)
+            git(a, "push", "-q", "--force", "origin", f"{sha}:refs/afk/round-trip")
+            git(b, "fetch", "-q", "origin", "refs/afk/round-trip")
+            assert tool._read_record(kind, "FETCH_HEAD", path=b) == record, kind.word
+            # a record of one kind is not a record of another
+            others = [k for k in (afk_decide.CLAIM_RECORD, afk_decide.HEARTBEAT_RECORD,
+                                  afk_decide.GATE_RUN_RECORD) if k is not kind]
+            assert all(tool._read_record(k, "FETCH_HEAD", path=b) is None for k in others)
+        # the gate run's commit is OF the tree it tested; the others drag nothing along
+        assert git(b, "rev-parse", "FETCH_HEAD^{tree}") == tree
+
+
+def test_a_claim_and_a_heartbeat_already_on_the_remote_are_still_read():
+    """A fleet that updates mid-run loses no claim: the refs a fleet wrote before
+    records shared one encoding are read as what they are, and what is written
+    now is the same bytes — so a peer that has not updated reads it too."""
+    claim_subject = "afk-claim instance=fl-7fbd5e host=Felixs-MacBook-Pro.local ts=1000000"
+    heartbeat_subject = "afk-heartbeat instance=fl-7fbd5e ts=1000000"
+    with sandbox() as sb:
+        w = sb.clones[0]
+        empty = git(w, "hash-object", "-t", "tree", os.devnull)
+        claim = git(w, "commit-tree", empty, "-m", claim_subject)
+        beat = git(w, "commit-tree", empty, "-m", heartbeat_subject)
+        git(w, "push", "-q", "origin", f"{claim}:refs/afk/claim/71",
+            f"{beat}:refs/afk/heartbeat/fl-7fbd5e")
+
+        assert afk(w, "scan") == {
+            "claims": [{"number": 71, "instance": "fl-7fbd5e", "host": "Felixs-MacBook-Pro.local",
+                        "ts": T0, "sha": claim}],
+            "heartbeats": {"fl-7fbd5e": T0}}
+        part = afk(w, "classify-claims", "--instance", "fl-7fbd5e", "--now", str(T0 + TTL))
+        assert part["mine"] == [71] and part["stale"] == []
+        # its owner is still live to a peer, and a peer that races for it loses to it
+        assert afk(w, "classify-claims", "--instance", "peer", "--now", str(T0 + TTL))["peer_live"] == [71]
+        lost = afk(w, "claim", "71", "--instance", "peer", "--now", str(T0))
+        assert lost["won"] is False and lost["owner"] == {
+            "instance": "fl-7fbd5e", "host": "Felixs-MacBook-Pro.local", "ts": T0}
+
+        # and what is written today is, byte for byte, what was written before
+        won = afk(w, "claim", "72", "--instance", "fl-7fbd5e", "--host", "Felixs-MacBook-Pro.local",
+                  "--now", str(T0))
+        git(w, "fetch", "-q", "origin", "refs/afk/claim/72")
+        assert git(w, "log", "-1", "--format=%B", won["sha"]) == claim_subject
+        afk(w, "heartbeat", "--instance", "other", "--now", str(T0))
+        git(w, "fetch", "-q", "origin", "refs/afk/heartbeat/other")
+        assert git(w, "log", "-1", "--format=%B", "FETCH_HEAD") == "afk-heartbeat instance=other ts=1000000"
+
+
 def test_malformed_refs_in_the_namespace_are_ignored_not_fatal():
     """Anything can be pushed under a ref namespace. A claim ref that is not an issue
     number, or a marker with no fields, must not take the scan (and so every tick) down."""
     with sandbox() as sb:
         w = sb.clones[0]
         afk(w, "claim", "5", "--instance", "me", "--now", str(T0))
-        junk = git(w, "commit-tree", git(w, "hash-object", "-t", "tree", os.devnull),
-                   "-m", "not a marker at all")
+        empty = git(w, "hash-object", "-t", "tree", os.devnull)
+        junk = git(w, "commit-tree", empty, "-m", "not a marker at all")
+        # a claim that names nobody, and a heartbeat that says no time: neither is a record
+        nobody = git(w, "commit-tree", empty, "-m", f"afk-claim host=mac ts={T0}")
+        timeless = git(w, "commit-tree", empty, "-m", "afk-heartbeat instance=me ts=soon")
         git(w, "push", "-q", "origin", f"{junk}:refs/afk/claim/not-a-number",
-            f"{junk}:refs/afk/claim/6", f"{junk}:refs/afk/heartbeat/ghost")
+            f"{junk}:refs/afk/claim/6", f"{junk}:refs/afk/heartbeat/ghost",
+            f"{nobody}:refs/afk/claim/7", f"{timeless}:refs/afk/heartbeat/me")
 
         scan = afk(w, "scan")
         by = {c["number"]: c for c in scan["claims"]}
-        assert set(by) == {5, 6}                       # the non-numeric ref is not a claim
+        assert set(by) == {5, 6, 7}                    # the non-numeric ref is not a claim
         assert by[6]["instance"] is None and by[6]["ts"] is None and by[6]["sha"] == junk
+        # a record missing a required field is no record at all — not one with a hole in it
+        assert by[7] == {"number": 7, "instance": None, "host": None, "ts": None, "sha": nobody}
         assert scan["heartbeats"] == {}                # a heartbeat with no ts is no heartbeat
         # an ownerless claim is nobody's: reclaimable as stale, never "mine"
         part = afk(w, "classify-claims", "--instance", "me", "--now", str(T0))
-        assert part["mine"] == [5] and part["stale"] == [6] and part["peer_live"] == []
+        assert part["mine"] == [5] and part["stale"] == [6, 7] and part["peer_live"] == []
 
 
 def test_every_ref_op_round_trips_under_the_refs_heads_fallback():
