@@ -1,6 +1,6 @@
 # ADR-0029 — A merge batch lands N ready PRs behind one gate run
 
-**Amended by [ADR-0033](0033-every-pr-lands-as-a-merge-commit-and-batches-need-no-switch.md):** a
+**Amended by [ADR-0034](0034-every-pr-lands-as-a-merge-commit-and-batches-need-no-switch.md):** a
 batch is no longer opt-in (`merge.batch` is removed), its stack is one **merge** commit per PR, and
 a batched PR reads *merged* on GitHub, not *closed*. Read "squash commit", "with the option on"
 and "closed with a comment" below as they were decided then.
@@ -44,7 +44,13 @@ turn marker, the same single comment, on **every** member PR:
 
 There is no other record. `afk rebuild` reads a batch back from those markers: each member's row is
 `landing` with `batch: {id, members, phase}`, and `batches` lists every batch a PR of my claims is
-in. A member's own branch, worktree and worker are not touched, and its worker is told nothing.
+in. The batch worker's own commands read them too: the batch's worktree keeps no list of the PRs
+it lands. Which batch a worktree is the worktree of is its branch's name; which PRs that batch
+holds is whatever the markers say on the run that asks — any member's marker names them all, and
+one is found through the PRs of the claims. So a worktree recreated from the batch's pushed branch
+lands the same members with nothing copied into it, and a PR whose marker says it left is not
+stacked, with no second list to bring into step. A member's own branch, worktree and worker are
+not touched, and its worker is told nothing.
 
 ### Who is batched — the cycle's decision, in code
 
@@ -93,7 +99,7 @@ carries the batch's marker naming the fleet instance that holds its issue's clai
 
 | outcome | the batch worker |
 |---|---|
-| `landed` — `landed`, `left_out`, `gate_runs`, `fix_commits` | wakes the launcher and stops |
+| `landed` — `landed`, `left_out`, `fix_commits` | wakes the launcher and stops |
 | `gate_red` — nothing landed | fixes the stack with one more commit on top, runs it again |
 | `target_moved` — the push was refused, nothing landed | runs it again: re-stacked, re-gated |
 | `too_small` — fewer than two PRs stacked; the batch is dissolved | wakes the launcher and stops |
@@ -193,5 +199,14 @@ the new owner's single turns.
   turn the option on.
 - A second kind of worker exists — one with no issue, no claim and no slot — and a second worktree
   name the tick sweeps. Both are opt-in with the option.
-- `gate_runs` in the `landed` outcome counts the runs made in the batch's current worktree; a batch
-  continued on another machine starts that count again.
+- The result of `afk land --batch` describes the run that returned it and nothing before: there
+  is no count of gate runs (it was a figure kept by read → add one → write in the worktree, and no
+  input to anything), and `left_out` names the PRs *this* run left out — one left out by an earlier
+  run is no longer a member, and its own marker says why.
+- Reading the members from the markers costs a landing no GitHub read it was not already making:
+  the marker that names the members is one the landing reads anyway, to check the turn, and each
+  is read once per run. Counted on a three-PR batch against the fake GitHub, one landing makes 11
+  reads with a list in the worktree and 11 without — six comment lists (each member PR's marker,
+  each issue's status board), three issue states, the open PRs twice. The one added cost is a
+  comments read for each PR of a claim that is asked before a member is found, and the claims of
+  the instance that formed the batch are asked first.

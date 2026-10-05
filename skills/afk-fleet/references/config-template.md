@@ -59,7 +59,7 @@ gate:
   adversarial_verify_prompt: ""        # what the verifier checks (e.g. "re-solve; assert final == official answer:")
 
 # --- merge ---
-merge:                                 # a PR always lands as a MERGE COMMIT (ADR-0033): no squash, no rebase
+merge:                                 # a PR always lands as a MERGE COMMIT (ADR-0034): no squash, no rebase
   target: main                         # fleet stops here; deploy is a separate human-gated step
   sync_before_merge: true              # on the landing turn: MERGE origin/<target> into the branch (never
                                       #   rebase — a rebase drops merge commits and re-ignites the conflicts
@@ -68,7 +68,7 @@ merge:                                 # a PR always lands as a MERGE COMMIT (AD
   delete_branch: true
                                       # No key turns MERGE BATCHES on: with `gate.ci: local` and
                                       #   adversarial_verify off, two or more finished PRs that wait for the
-                                      #   landing turn together always land as one batch (ADR-0029, ADR-0033)
+                                      #   landing turn together always land as one batch (ADR-0029, ADR-0034)
                                       #   — stacked on the target with one merge commit per PR, gated ONCE,
                                       #   pushed as a fast-forward. That needs a target that accepts a direct
                                       #   push (checked at bootstrap).
@@ -134,7 +134,7 @@ force_tick_after_skips: 6              # safety net: a full tick at least every 
 - **A tree is gated once (ADR-0030).** PRs land one at a time, so the gate's run time is the
   fleet's throughput: a 6-minute gate lands about ten PRs an hour. A green run made through
   `afk gate` or `afk land` on a committed tree is put on record on the remote
-  (`refs/afk/gate/<tree>-<command>`), and a landing skips its own run whenever a record of the
+  (`refs/afk/gate/<tree>-<hash of the command>`), and a landing skips its own run whenever a record of the
   command configured now stands for the tree that would land — in this worktree, a recreated one,
   or on another machine. A sync that moved the head, a later commit, a changed command, a red run
   of the same tree since, or a record more than a day old, and the landing runs the gate itself.
@@ -149,7 +149,7 @@ force_tick_after_skips: 6              # safety net: a full tick at least every 
 - **Deploy is out of scope.** The fleet's mandate ends at a green merge to `merge.target`. Deploying
   (secrets, live infra) is never done by the fleet.
 - **Reserved labels, refs & the status comment.** The fleet manages, durably in GitHub, the
-  `afk-attempt/<n>` labels (retry count), the hidden `refs/afk/*` ref namespace — `afk-claim/<n>` (the
+  `afk-attempt/<n>` labels (retry count) and `afk-attempt/starting` (a retry under way), the hidden `refs/afk/*` ref namespace — `afk-claim/<n>` (the
   claim, one per owned issue) and `afk-heartbeat/<id>` (per-instance liveness) — and, when
   `progress_comment` is on, the single status-board comment tagged `<!--afk:status-->` (found and
   overwritten by that marker each tick). This is what keeps ticks stateless and lets fleets cooperate

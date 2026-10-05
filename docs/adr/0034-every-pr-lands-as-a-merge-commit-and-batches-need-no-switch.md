@@ -1,4 +1,4 @@
-# ADR-0033 — Every PR lands as a merge commit, and merge batches need no switch
+# ADR-0034 — Every PR lands as a merge commit, and merge batches need no switch
 
 **Status:** accepted — removes two config keys, `merge.strategy` and `merge.batch`. Amends
 [ADR-0029](0029-a-merge-batch-lands-n-prs-behind-one-gate-run.md): a batch is no longer opt-in, its

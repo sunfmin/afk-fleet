@@ -222,7 +222,7 @@ if argv[0] == "pr" and argv[1] in ("merge", "close", "comment"):
     if opt("--match-head-commit") != head_of(row):
         finish(code=1, err="GraphQL: Head branch was modified. Review and try the merge again.\n")
     # the head already contains the target (the sync merged it in), so landing it
-    # is a fast-forward of the target — the same tree a real squash would produce
+    # is a fast-forward of the target — the same tree a real merge would produce
     bare("update-ref", "refs/heads/" + st["base"], head_of(row))
     row.update(state="merged", merged={"head": head_of(row),
                                        "delete_branch": "--delete-branch" in argv})
@@ -3436,7 +3436,7 @@ def test_a_merge_batch_lands_three_prs_behind_one_gate_run():
         # ONE gate run for three PRs, and the outcome says exactly what happened
         assert _gate_runs(w) == 1
         assert r == {"outcome": "landed", "batch": batch, "issues": [1, 2, 3],
-                     "prs": [10, 20, 30], "left_out": [], "gate_runs": 1, "fix_commits": 0,
+                     "prs": [10, 20, 30], "left_out": [], "fix_commits": 0,
                      "head": tip, "target": w.sb.base, "detail": r["detail"], "unmerged": [],
                      "landed": [{"issue": n, "pr": n * 10, "commit": landed[i][0]}
                                 for i, n in enumerate((1, 2, 3))]}, r
@@ -3503,6 +3503,19 @@ def test_a_batched_pr_github_does_not_show_merged_keeps_its_branch_and_is_closed
             assert not w.sb.remote_ref(f"refs/heads/{d[n][0]['branch']}")
 
 
+def _fleet_files(wt):
+    """What the fleet keeps about the worker of a worktree, in its git dir."""
+    return sorted(f for f in os.listdir(git(wt, "rev-parse", "--absolute-git-dir"))
+                  if f.startswith("afk-"))
+
+
+def _github_reads(calls):
+    """The gh calls that only read GitHub, each as the thing it read → sorted."""
+    return sorted(c[1] if c[0] == "pr" else c[-3].split("/issues/")[1] if "--paginate" in c
+                  else "issue " + c[1].split("/issues/")[1]
+                  for c in calls if c[:2] == ["pr", "list"] or (c[0] == "api" and "--method" not in c))
+
+
 def _the_batch(w, gate):
     """The batch that holds my turn, as its worker knows it → {"batch", "worktree"}."""
     [batch] = w.afk("rebuild", *ME, *R, *NOW, *gate)["batches"]
@@ -3539,8 +3552,7 @@ def test_a_pr_that_conflicts_with_the_stack_is_left_out_and_never_batched_again(
         assert c["progress"].startswith("landing turn to #1, #2, #3, #4, #5; "), c["progress"]
         b = _the_batch(w, gate)
         r = _land_batch(w, b, *gate)
-        assert (r["outcome"], r["issues"], r["prs"], r["gate_runs"]) == \
-            ("landed", [1, 4, 5], [10, 40, 50], 1), r
+        assert (r["outcome"], r["issues"], r["prs"]) == ("landed", [1, 4, 5], [10, 40, 50]), r
         assert r["left_out"] == [{"issue": n, "pr": n * 10, "reason": "conflict",
                                   "files": ["shared.txt"]} for n in (2, 3)]
         assert [s for _, s, _ in _history(w, base0)] == [f"feature {n} (#{n * 10})" for n in (1, 4, 5)]
@@ -3605,8 +3617,7 @@ def test_a_red_batch_lands_nothing_and_is_repaired_with_a_fix_commit_on_top():
         batch, bwt = b["batch"], b["worktree"]
 
         r = _land_batch(w, b, *gate, now=T0 + 10)
-        assert (r["outcome"], r["issues"], r["gate_runs"], r["fix_commits"]) == \
-            ("gate_red", [1, 2], 1, 0), r
+        assert (r["outcome"], r["issues"], r["fix_commits"]) == ("gate_red", [1, 2], 0), r
         assert (r["gate"]["status"], r["gate"]["exit_code"]) == ("red", 1)
         # nothing landed: the target is where it was, every PR and issue open
         assert _target(w) == base0
@@ -3642,8 +3653,8 @@ def test_a_red_batch_lands_nothing_and_is_repaired_with_a_fix_commit_on_top():
         # the fix: ONE more commit on top of the stack — then the same command
         fix = w.work(bwt, "fix.txt", push=False)
         r = _land_batch(w, b, *gate, now=T0 + 20)
-        assert (r["outcome"], r["issues"], r["gate_runs"], r["fix_commits"], r["left_out"]) == \
-            ("landed", [1, 2], 2, 1, []), r
+        assert (r["outcome"], r["issues"], r["fix_commits"], r["left_out"]) == \
+            ("landed", [1, 2], 1, []), r
         landed = _history(w, base0)
         assert [s for _, s, _ in landed] == ["feature 1 (#10)", "feature 2 (#20)", "work: fix.txt"]
         assert landed[-1][0] == _target(w) == r["head"] and fix != r["head"]
@@ -3673,7 +3684,8 @@ def test_a_target_that_moves_while_the_batch_gates_refuses_the_push():
         b = w.afk(*_turn_batch(*gate))
 
         r = _land_batch(w, b, *gate, now=T0 + 10)
-        assert (r["outcome"], r["issues"], r["gate_runs"]) == ("target_moved", [1, 2], 1), r
+        assert (r["outcome"], r["issues"]) == ("target_moved", [1, 2]), r
+        assert _gate_runs(w) == 1
         # the target holds THEIR commit and nothing of the batch
         assert _target(w) == theirs and "feature1.txt" not in w.remote_files(w.sb.base)
         assert [w.pr(p).get("state", "open") for p in (10, 20)] == ["open", "open"]
@@ -3683,7 +3695,7 @@ def test_a_target_that_moves_while_the_batch_gates_refuses_the_push():
 
         # run again: re-stacked on the new tip, gated again, landed
         r = _land_batch(w, b, *gate, now=T0 + 20)
-        assert (r["outcome"], r["gate_runs"], r["fix_commits"]) == ("landed", 2, 0), r
+        assert (r["outcome"], r["fix_commits"]) == ("landed", 0), r
         assert [s for _, s, _ in _history(w, base0)] == \
             ["base: theirs.txt", "feature 1 (#10)", "feature 2 (#20)"]
         assert _gate_runs(w) == 2
@@ -3857,6 +3869,8 @@ def test_a_batch_whose_worker_is_gone_is_continued_from_its_worktree_else_its_br
             ("granted", batch, [1, 2], True, "branch"), r
         bwt2 = r["worktree"]
         assert bwt2 != bwt and git(bwt2, "rev-parse", "HEAD") == stack == w.sb.remote_ref(ref)
+        # nothing of the batch was copied into it: its members are on the PRs' markers
+        assert _fleet_files(bwt2) == ["afk-worker-prompt.md"]
         # the continued worker fixes the stack and lands it, with the one command
         w.work(bwt2, "fix.txt", push=False)
         r = _land_batch(w, {"batch": batch, "worktree": bwt2}, *gate)
@@ -4170,6 +4184,114 @@ def test_fail_retries_from_a_clean_base_then_escalates_when_exhausted():
         r = w.afk(*_fail(6, "gave up", "--set", "retry=0"))
         assert (r["action"], r["attempt"], r["pr"]) == ("escalate", 0, None)
         assert w.orca_calls() == []
+
+
+def _refuse_branch_deletes(w, refuse):
+    """The remote refuses (or takes again) the deletion of a branch."""
+    hook = os.path.join(w.sb.bare, "hooks", "update")
+    if not refuse:
+        os.remove(hook)
+        return
+    os.makedirs(os.path.dirname(hook), exist_ok=True)
+    with open(hook, "w") as f:
+        f.write('#!/bin/sh\ncase "$1 $3" in refs/heads/*\\ 0000*) echo "deletion refused" >&2; '
+                'exit 1;; esac\n')
+    os.chmod(hook, 0o755)
+
+
+# Every step of a retry that comes after the attempt label is written, as
+# (what goes wrong, what `afk fail` then says, how it is put right).
+_CUTS = {
+    "the PR's close refused": (lambda w: w.set(fail=["pr close"]), "gh pr close failed",
+                               lambda w: w.set(fail=[])),
+    "the branch delete refused": (lambda w: _refuse_branch_deletes(w, True), "deletion refused",
+                                  lambda w: _refuse_branch_deletes(w, False)),
+    "the worker start failing": (lambda w: w.orca(create_fails=[5]), "worktree_create_failed",
+                                 lambda w: w.orca(create_fails=[])),
+}
+
+
+def _a_failure_cut_short(w, cut):
+    """Issue 5 with a red PR (#50) and a branch an earlier attempt left behind,
+    and an `afk fail` of it that `cut` stopped after the attempt label was
+    written → (the dispatch, the branch left behind, how to put `cut` right)."""
+    breaks, says, mends = _CUTS[cut]
+    first, _ = with_pr(w, 5, 50, conclusion="FAILURE")
+    left = "tester/issue-5-left-behind"
+    git(first["worktree"], "push", "-q", "origin", f"HEAD:refs/heads/{left}")
+    breaks(w)
+    assert says in w.error(*_fail(5, "CI red: TestNames fails")), cut
+    # the failure is counted, and nothing is settled: the claim is still held
+    assert "afk-attempt/1" in w.issue(5)["labels"] and w.claimed_by(5) == "me", cut
+    return first, left, mends
+
+
+def _the_retry_completed(w, cut, first, left):
+    """…exactly one attempt spent, the failed attempt gone, a fresh worker on it."""
+    assert w.issue(5)["labels"] == ["ready-for-agent", "afk-attempt/1"], cut
+    assert w.pr(50)["state"] == "closed", cut
+    assert not w.sb.remote_ref(f"refs/heads/{first['branch']}"), cut
+    assert not w.sb.remote_ref(f"refs/heads/{left}"), cut
+    assert not os.path.isdir(first["worktree"]) and w.claimed_by(5) == "me", cut
+    assert "## Why the previous attempt failed" in _told(_worker_of(w, 5)), cut
+
+
+def test_a_failure_spends_one_attempt_however_often_fail_runs_to_finish():
+    """`afk fail` counts the attempt and only then discards the failed attempt
+    and starts a fresh worker. Cut short at any of those later steps, the claim is
+    still held and the same failure is still there to be failed again — which
+    must finish the retry, not count the failure a second time."""
+    for cut in _CUTS:
+        with world(issues=[issue(5, "ready-for-agent")]) as w:
+            first, left, mends = _a_failure_cut_short(w, cut)
+            w.error(*_fail(5, "CI red: TestNames fails"))         # …and cut short again
+            mends(w)
+            r = w.afk(*_fail(5, "CI red: TestNames fails"))
+            assert (r["action"], r["attempt"], r["retry_max"]) == ("retry", 1, 2), (cut, r)
+            _the_retry_completed(w, cut, first, left)
+            assert "CI red: TestNames fails" in _told(_worker_of(w, 5)), cut
+            row = w.afk("rebuild", *ME, *R, *NOW)["mine"][0]
+            assert (row["status"], row["attempt"], row["starting"]) == ("no_pr", 1, False), cut
+
+            # a NEW failure, of the fresh attempt, is counted…
+            w.work(r["worker"]["worktree"], "attempt1.txt")
+            w.open_pr(51, closes=5, branch=r["worker"]["branch"], conclusion="FAILURE")
+            r2 = w.afk(*_fail(5, "still red"))
+            assert (r2["action"], r2["attempt"]) == ("retry", 2), (cut, r2)
+            assert w.issue(5)["labels"] == ["ready-for-agent", "afk-attempt/2"], cut
+            # …and the one after the last retry escalates, once
+            w.work(r2["worker"]["worktree"], "attempt2.txt")
+            w.open_pr(52, closes=5, branch=r2["worker"]["branch"], conclusion="FAILURE")
+            r3 = w.afk(*_fail(5, "needs a human"))
+            assert (r3["action"], r3["attempt"]) == ("escalate", 2), (cut, r3)
+            assert w.issue(5)["labels"] == ["ready-for-human"] and w.claimed_by(5) is None, cut
+            assert ["escalated to a human" in c for c in w.comments(5)].count(True) == 1, cut
+
+
+def test_the_next_tick_finishes_a_retry_that_was_cut_short_without_counting_it_again():
+    """The same, when it is the next tick that comes back to the failure: by the
+    judgment a red PR still asks for, or — the PR already closed — by itself,
+    from the claim saying its failure is counted and no fresh worker started."""
+    for cut in _CUTS:
+        with world(issues=[issue(5, "ready-for-agent")]) as w:
+            t = int(time.time()) + 5000                 # the worker has been quiet past the grace
+            first, left, mends = _a_failure_cut_short(w, cut)
+            row = w.afk("rebuild", *ME, *R, *NOW)["mine"][0]
+            assert (row["attempt"], row["starting"]) == (1, True), cut
+            mends(w)
+
+            r = cycle(w, None, now=t)
+            for j in r["judgments"]:                    # the PR is still open, and red
+                assert (j["kind"], j["issue"]) == ("reason", 5), (cut, j)
+                assert answer(w, j["if_yes"])["attempt"] == 1, cut
+            if not r["judgments"]:
+                assert r["progress"].startswith("retried #5"), (cut, r)
+            _the_retry_completed(w, cut, first, left)
+
+            # the fresh worker is not the failure: the tick after spends nothing
+            cycle(w, r["state"], now=t)
+            assert w.issue(5)["labels"] == ["ready-for-agent", "afk-attempt/1"], cut
+            assert w.claimed_by(5) == "me", cut
 
 
 def test_escalate_relabels_before_it_releases():
@@ -4645,6 +4767,104 @@ def test_the_docs_restate_config_only_as_the_schema_has_it():
     for name, text in docs.items():
         assert not short.findall(text), f"{name}: {sorted(set(short.findall(text)))}"
 
+    # the one phrasing the scan above reads: a default written any other way is unheld
+    for name, text in docs.items():
+        assert not re.findall(r"defaults to `?\d", text), name
+
+    # the template glosses a duration in minutes, and the lease as a multiple of the
+    # idle pace: both are arithmetic on the values beside them
+    template = docs["config-template.md"]
+    glossed = re.findall(r"^(\w+_seconds): (\d+) +#[^\n]*?~([\d.]+) min", template, re.M)
+    assert [key for key, _, _ in glossed] == \
+        ["busy_interval_seconds", "idle_interval_seconds", "claim_lease_ttl_seconds"], glossed
+    for key, seconds, minutes in glossed:
+        assert int(seconds) == defaults[key] == float(minutes) * 60, key
+    times, = re.findall(r"(\d+)× idle\b", template)
+    assert defaults["claim_lease_ttl_seconds"] == int(times) * defaults["idle_interval_seconds"]
+
+
+def test_the_docs_restate_a_flags_default_only_as_the_parser_has_it():
+    """A flag's default is defined once, in `build_parser()`. Prose that quotes it —
+    how long a landing waits for checks, how often it looks — is a copy, held here;
+    and a flag two subcommands take has one default, not one per subcommand."""
+    subs = afk.build_parser().subcommands
+    flags = {}
+    for name, parser in subs.items():
+        for action in parser._actions:
+            if action.option_strings and isinstance(action.default, (int, float)) \
+                    and not isinstance(action.default, bool):
+                flags.setdefault(action.option_strings[-1], {})[name] = action.default
+    for flag, by_sub in flags.items():
+        assert len(set(by_sub.values())) == 1, (flag, by_sub)
+    # the two that are taken twice really are
+    assert sorted(flags["--gate-timeout"]) == ["gate", "land"]
+    assert sorted(flags["--ready-timeout"]) == ["cycle", "dispatch", "fail", "turn"]
+
+    docs = _skill_docs()
+    quoted = {}
+    for name, text in docs.items():
+        for flag, value in re.findall(r"`(--[a-z-]+)`[^`\n]{0,30}?\bdefault (\w+)", text):
+            assert flag in flags, f"{name}: `{flag}` has no numeric default"
+            default, = set(flags[flag].values())
+            assert value == str(default), f"{name}: `{flag}` default {value}, the parser's is {default}"
+            quoted.setdefault(flag, set()).add(name)
+    # the scan really found the ones the references state
+    assert quoted == {"--checks-timeout": {"completion-gate.md", "tools.md"},
+                      "--checks-poll": {"tools.md"}}, quoted
+
+
+def _spoken(seconds):
+    """A duration as prose writes it: `a day`, `12 hours`, `90 minutes`."""
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60)):
+        if seconds % size == 0:
+            n = seconds // size
+            return f"{'an' if unit == 'hour' else 'a'} {unit}" if n == 1 else f"{n} {unit}s"
+    return f"{seconds} seconds"
+
+
+def test_the_docs_describe_a_recorded_gate_run_as_the_code_keeps_it():
+    """Where a recorded gate run lives and how long it is believed have one home
+    each — `gate_record_ref` and `GATE_RECORD_TTL` (ADR-0030). The documents that
+    spell the ref or say the duration are copies, held to them here."""
+    assert [_spoken(s) for s in (86400, 43200, 3600, 5400, 172800, 45)] == \
+        ["a day", "12 hours", "an hour", "90 minutes", "2 days", "45 seconds"]
+
+    # the ref is named for the tree and a HASH of the command — never the command
+    ns = afk_decide.GATE_RECORD_NAMESPACE
+    command = "make test"
+    ref = afk_decide.gate_record_ref("<tree>", command)
+    head, _, tail = ref.rpartition("-")
+    assert head == f"{ns}/<tree>" and command not in ref
+    assert re.fullmatch(r"[0-9a-f]{16}", tail)
+    assert afk_decide.gate_record_ref("<tree>", "make check") != ref
+    spelled = f"{head}-<hash of the command>"
+
+    docs = _skill_docs()
+    # the decision that made the record spells it too (source repo only)
+    adr_dir = os.path.join(SKILL, "..", "..", "docs", "adr")
+    for f in sorted(os.listdir(adr_dir)) if os.path.isdir(adr_dir) else []:
+        with open(os.path.join(adr_dir, f)) as fh:
+            docs[f] = fh.read()
+    where = set()
+    for name, text in docs.items():
+        for span in re.findall(r"`(%s[^`]*)`" % re.escape(ns), text):
+            # the namespace, a glob over it, or one record's ref — spelled the one way
+            assert span in (ns + "/", ns + "/*", spelled), f"{name}: `{span}`"
+            where |= {name} if span == spelled else set()
+    assert {"config-template.md", "completion-gate.md", "tools.md"} <= where, where
+
+    # how long a record is believed, wherever a document says it
+    day = _spoken(afk_decide.GATE_RECORD_TTL)
+    old = f"more than {day} old"
+    assert f"a record {old}" in docs["config-template.md"]
+    assert f"no {old}" in docs["completion-gate.md"]
+    assert f"is not asked again for {day}." in docs["completion-gate.md"]
+    probe = next(ln for ln in docs["tools.md"].splitlines() if ln.startswith("| `afk probe"))
+    assert f"records {old} swept" in probe
+    context = docs.get("CONTEXT.md")
+    if context is not None:               # an installed skill ships without it
+        assert f"run red, or after {day}." in context
+
 
 def test_every_flow_anchor_still_names_something():
     """docs/flows.md anchors each step to `path:Symbol`. A renamed function leaves
@@ -4671,3 +4891,48 @@ def run_all():
 
 if __name__ == "__main__":
     run_all()
+
+
+
+def test_a_batchs_members_are_read_from_the_turn_markers_on_its_prs():
+    """Which PRs a batch holds has ONE home: the turn marker on each of them. The
+    batch's worktree keeps no list, so its landing follows the markers — a PR
+    whose marker says it left is not stacked, with nothing else to update — and
+    asks GitHub for no more than the markers, the open PRs and each issue it
+    closes."""
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2, 3, 4)]) as w:
+        gate = _counted(w)
+        for n in (2, 3, 4):
+            with_pr(w, n, n * 10, gate=gate)
+        w.afk("claim", "1", *ME, *R, *NOW)                            # mine, and no PR yet
+        base0 = _target(w)
+        b = w.afk(*_turn_batch(*gate))
+        assert (b["issues"], _fleet_files(b["worktree"])) == ([2, 3, 4], ["afk-worker-prompt.md"])
+
+        # #3 leaves the batch — only its own marker says so
+        marked = w.state()["comments"]
+        [note] = marked["30"]
+        w.set(comments={**marked, "30": [{**note, "body": afk_decide.turn_comment(
+            afk_decide.unbatched_turn(afk_decide.latest_turn([note]), "me", T0, b["batch"],
+                                      "abandoned"))}]})
+        w.calls()
+        r = _land_batch(w, b, *gate)
+        assert (r["outcome"], r["issues"], r["prs"], r["left_out"]) == \
+            ("landed", [2, 4], [20, 40], []), r
+        assert [s for _, s, _ in _history(w, base0)] == ["feature 2 (#20)", "feature 4 (#40)"]
+        assert w.pr(30).get("state", "open") == "open" and w.issue(3)["state"] == "open"
+        # the reads of one landing: each marker once, the open PRs (again once
+        # the PRs it closes changed them), and each landed issue's state and board
+        assert _github_reads(w.calls()) == [
+            "2/comments", "20/comments", "30/comments", "4/comments", "40/comments",
+            "issue 2", "issue 4", "list", "list"]
+        # a member is found through any PR that carries the marker: the batch
+        # whose every PR is closed is still the same batch
+        again = _land_batch(w, b, *gate)
+        assert (again["outcome"], again["landed"]) == ("landed", r["landed"])
+        assert _gate_runs(w) == 1
+
+        # no PR carries the marker: there is no batch to land
+        w.set(comments={})
+        err = w.error("land", "--batch", b["batch"], *R, *NOW, *gate, cwd=b["worktree"])
+        assert "no PR carries the turn marker" in err, err

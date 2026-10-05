@@ -141,7 +141,7 @@ before its pre-PR **local gate**, so integration conflicts surface inside the wo
 where they are cheapest to fix; and the worker's **landing** syncs again, on its **landing turn**, picking up
 whatever the base gained since — a conflict there is left in progress for the same worker to resolve. Merge rather than rebase because a rebase drops
 merge commits and re-ignites the conflicts already resolved inside them — and those merge commits
-land on the target as they are: a PR lands as a merge commit, never squashed (ADR-0033). Retires `rebase_before_merge` (the config key
+land on the target as they are: a PR lands as a merge commit, never squashed (ADR-0034). Retires `rebase_before_merge` (the config key
 becomes `sync_before_merge`).
 _Avoid_: rebase (retired from the merge path), rebase onto latest, update branch
 
@@ -279,6 +279,20 @@ takeover never counts as a **retry** (ADR-0011).
 _Avoid_: failover (implies automatic), rescue (it seeds a standing fleet, not a bounded mission),
 stale reclaim (that is the unattended, lease-gated path)
 
+**Retry**:
+What a failed attempt costs and gets: the failure is counted on the issue — its `afk-attempt/<n>`
+label goes up by one — the failed attempt is discarded (its PR closed, its branch deleted, its
+worktree removed) and a fresh **worker** starts from the base under the same **claim**, told why the
+last attempt failed. Config `retry` is how many an issue gets; the failure after the last one is
+escalated to a human instead. One **transition** (`afk fail`), and its one writer. A failure is
+counted **once**: the edit that raises the number also adds `afk-attempt/starting` — this failure is
+counted, its fresh worker has not started — and starting a worker removes it, so an `afk fail` that
+was cut short after counting and runs again (by hand, or from the next **tick**, which reads the
+label as the row's `starting`) finishes the same retry instead of spending another. A new failure
+of the fresh attempt finds no such label and is counted.
+_Avoid_: re-dispatch (that is a **continuation**: nothing discarded, nothing counted), nudge,
+attempt (the attempt is the thing that failed; the retry is what replaces it)
+
 **Nudge**:
 The one line the fleet types at a live **worker** that went idle past the grace period with no PR and
 no verdict — the `idle_stalled` **outcome** of `afk no-pr`. Such a worker has not failed; it stopped
@@ -348,8 +362,9 @@ merge-time gate run (the gate run is the landing's)
 **Merge batch**:
 One **landing turn** held by several finished PRs of a **fleet instance** at once, so that they land
 behind ONE run of the **local gate** instead of one each (ADR-0029; `gate.ci: local` only, and
-never an option: where it can form it does, ADR-0033). Its whole record is the turn marker on every member PR, naming the batch,
-its members and its phase — `stacking`, `gating` or `fixing`. A **batch worker** stacks the members
+never an option: where it can form it does, ADR-0034). Its whole record is the turn marker on every member PR, naming the batch,
+its members and its phase — `stacking`, `gating` or `fixing` — and it is the only place the members
+are kept: the batch's worktree holds no list of them. A **batch worker** stacks the members
 on the target's tip with one merge commit per PR, in **merge queue** order, gates the stack once, and
 pushes it to the target as a fast-forward: that push is the only lock, and a target that moved
 refuses it. Each PR's own head is then on the target, so GitHub shows it *merged* by itself. A red stack is repaired with a fix commit on top, never

@@ -301,11 +301,11 @@ CONFIG_REMOVED = {
         "whenever a green run of the configured command is on record for the tree that lands. "
         "Delete the key."),
     "merge.strategy": (
-        "every PR lands as a merge commit now (ADR-0033): a PR's own head reaches the target, so "
+        "every PR lands as a merge commit now (ADR-0034): a PR's own head reaches the target, so "
         "GitHub shows it merged whether it landed alone or in a merge batch. There is no squash "
         "and no rebase. Delete the key."),
     "merge.batch": (
-        "merge batches are no longer an option (ADR-0033): with gate.ci 'local' and "
+        "merge batches are no longer an option (ADR-0034): with gate.ci 'local' and "
         "gate.adversarial_verify off, two or more PRs that are ready together always land as "
         "one batch. Delete the key."),
 }
@@ -1659,6 +1659,12 @@ def batch_id(instance, now):
     return f"{_BATCH_ID_UNSAFE.sub('-', instance)}-{int(now)}"
 
 
+def batch_formed_by(batch, instance):
+    """Is `batch` an id `batch_id` gives a batch of `instance`?"""
+    return bool(instance) and bool(
+        re.fullmatch(rf"{re.escape(_BATCH_ID_UNSAFE.sub('-', instance))}-\d+", batch or ""))
+
+
 def batch_name(batch):
     """The name a batch's worktree is created under — and so, behind orca's
     `<user>/` prefix, its branch (`batch_branch_regex`)."""
@@ -1741,6 +1747,13 @@ def stack_message(title, pr, issue):
     return f"{(title or '').strip() or f'PR {pr}'} (#{pr})\n\nCloses #{issue}\n"
 
 
+def stacked_pr(subject):
+    """The PR a commit subject names the way `stack_message` writes it — its
+    trailing ` (#<pr>)` — or None."""
+    m = re.search(r" \(#(\d+)\)$", subject or "")
+    return int(m.group(1)) if m else None
+
+
 def read_stack(commits, prs):
     """
     A batch worktree's commits above the target, read back → (stacked, fixes):
@@ -1757,9 +1770,9 @@ def read_stack(commits, prs):
     """
     stacked, fixes = {}, []
     for sha, subject in commits:
-        m = re.search(r" \(#(\d+)\)$", subject or "")
-        if m and int(m.group(1)) in prs and int(m.group(1)) not in stacked:
-            stacked[int(m.group(1))] = sha
+        pr = stacked_pr(subject)
+        if pr in prs and pr not in stacked:
+            stacked[pr] = sha
         else:
             fixes.append(sha)
     return stacked, fixes
@@ -2428,20 +2441,51 @@ def attempt_labels(labels):
                   if isinstance(lb, str) and lb.startswith(_ATTEMPT_PREFIX))
 
 
-def next_attempt(attempt, retry_max):
+# Beside the attempt label while a retry is under way: the failure in hand is
+# already counted in it, and the fresh worker of that attempt has not started.
+# Written in the same edit as the count and removed once a worker has started,
+# so a failure handled twice — `afk fail` cut short, then run again — is told
+# from a new failure of the fresh attempt.
+ATTEMPT_STARTING = f"{_ATTEMPT_PREFIX}starting"
+
+
+def attempt_starting(labels):
+    """Whether the failure an issue's claim is in has already been counted
+    (`ATTEMPT_STARTING`) — a retry that was begun and has not put a worker on
+    the issue yet. Never so for an issue that carries no counted attempt."""
+    return ATTEMPT_STARTING in (labels or []) and current_attempt(labels) > 0
+
+
+def next_attempt(attempt, retry_max, counted=False):
     """
     Retry-or-escalate for a failed issue on attempt `attempt` (`current_attempt`).
 
       {"action":"retry","attempt":<n+1>,"to_label":"afk-attempt/<n+1>"}
       {"action":"escalate","attempt":<n>}                when n >= retry_max
+      {"action":"retry","attempt":<n>,"to_label":"afk-attempt/<n>"}
+                                 when `counted` (`attempt_starting`): this failure
+                                 is the one that made the attempt n — the retry
+                                 is finished, and nothing is added
 
     `afk fail` is the one caller, and the one writer of the label: it applies
-    `to_label` and removes every `attempt_labels` the issue carried.
+    `retry_labels` of `to_label`.
     """
+    if counted:
+        return {"action": "retry", "attempt": attempt, "to_label": f"{_ATTEMPT_PREFIX}{attempt}"}
     if attempt >= retry_max:
         return {"action": "escalate", "attempt": attempt}
     return {"action": "retry", "attempt": attempt + 1,
             "to_label": f"{_ATTEMPT_PREFIX}{attempt + 1}"}
+
+
+def retry_labels(labels, to_label):
+    """The label edit that counts a failure: `(add, remove)`, made in ONE edit of
+    the issue. Adds `to_label` and `ATTEMPT_STARTING` where the issue lacks them
+    and removes every other attempt label it carries — so for a failure already
+    counted there is nothing to add or remove, and no edit to make."""
+    present, wanted = set(labels or []), [to_label, ATTEMPT_STARTING]
+    return ([lb for lb in wanted if lb not in present],
+            [lb for lb in attempt_labels(labels) if lb not in wanted])
 
 
 def escalation_comment(reason, attempt, pr=None):
@@ -2807,7 +2851,9 @@ def worker_step(call, row, worker, config):
       ("park", None)        blockers_waiting: `afk park`
       ("nudge", None)       silent: `afk nudge`
       ("escalate", reason)  `afk escalate`: the reason is on record
-      ("fail", reason)      `afk fail`: the reason is on record
+      ("fail", reason)      `afk fail`: the reason is on record — or the row is
+                            `starting`, and whatever its worker is, short of at
+                            work, the retry already counted is finished
       ("judge", {...})      satisfied → `empty_diff`; a failure or an escalation
                             whose reason is NOT on record → `reason`
 
@@ -2822,6 +2868,9 @@ def worker_step(call, row, worker, config):
     said = {"verdict": verdict.get("comment_url")}
     if cause in ("working", "just_stopped", "within_grace", "awaiting_tick"):
         return "leave", None
+    if row.get("starting") and WORKER_CAUSES[cause][1] != "next_attempt":
+        # a retry cut short: whatever is here is the attempt it was discarding
+        return "fail", "the retry of its failed attempt was cut short before a fresh worker started"
     if cause in ("blockers_closed", "gone"):
         return "dispatch", None
     if cause == "blockers_waiting":
@@ -3502,7 +3551,7 @@ def assemble_working_set(issues, prs, claims, heartbeats, me, now, config,
     Returns:
       {"frontier": {"dispatch": [{"number","title"}...], "excluded": [...]},
        "mine": [{"number","title","status","board_phase","pr","checks",
-                 "attempt","stopped","batch","unbatched"}...],
+                 "attempt","starting","stopped","batch","unbatched"}...],
        "merge_order": [number...],   # the `landing` and `awaiting_turn` rows (`turn_order`)
        "batches": [{"id","instance","members":[{"issue","pr"}...],"phase","at"}...],
        "peer_live": [{"number","instance"}...],
@@ -3513,7 +3562,8 @@ def assemble_working_set(issues, prs, claims, heartbeats, me, now, config,
        "now": now}
 
     `status` and `board_phase` are `subclassify_pr`'s pair; `attempt` is
-    `current_attempt` — the number `afk status` takes; `stopped` is the
+    `current_attempt` — the number `afk status` takes; `starting` is
+    `attempt_starting` — a retry cut short, for `afk fail` to finish; `stopped` is the
     LAND_OUTCOMES word a `landing` row's `afk land` last stopped with, None while
     it has not stopped and on every other row. `batch` is {"id", "members":
     [issue...], "phase"} on a `landing` row whose turn is a merge batch's, else
@@ -3567,6 +3617,7 @@ def assemble_working_set(issues, prs, claims, heartbeats, me, now, config,
                      "status": status, "board_phase": None if batch else board_phase,
                      "pr": pr.get("number") if pr else None, "checks": checks,
                      "attempt": current_attempt(issue.get("labels")),
+                     "starting": attempt_starting(issue.get("labels")),
                      "stopped": held.get("stopped") if status == "landing" else None,
                      "batch": {"id": batch, "members": [m["issue"] for m in held["members"]],
                                "phase": held["phase"]} if batch else None,

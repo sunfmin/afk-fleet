@@ -61,8 +61,9 @@ its path: the pass asks after it with `afk no-pr --batch`, and when its terminal
 commits and all), else in one cut from the batch's pushed branch, which holds the stack as of its
 last `afk land --batch`; a batch that had stacked nothing yet starts again at the target's tip. The
 result says which (`delivery: worktree | branch | fresh`, `again: true`). The command it is briefed
-with rebuilds the stack from the target's tip every time, so a continued batch needs nothing
-remembered. A batch recorded by a fleet that **died** is different: the fleet that takes its claims
+with rebuilds the stack from the target's tip every time and reads the batch's members from the
+turn markers on its PRs, so a continued batch needs nothing remembered and nothing copied into its
+new worktree. A batch recorded by a fleet that **died** is different: the fleet that takes its claims
 abandons it (`afk turn --abandon`), and the PRs land on that fleet's single turns.
 
 **This is not the retry path.** A red gate / adversarial refute / `giving-up` verdict goes through

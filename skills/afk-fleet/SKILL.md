@@ -442,7 +442,7 @@ the branch moved after the gate. No landing outcome spends an attempt or closes 
 **A merge batch — several PRs on one turn** (`gate.ci: local` with `gate.adversarial_verify` off;
 there is no switch —
 [ADR-0029](../../docs/adr/0029-a-merge-batch-lands-n-prs-behind-one-gate-run.md),
-[ADR-0033](../../docs/adr/0033-every-pr-lands-as-a-merge-commit-and-batches-need-no-switch.md)). When two or more
+[ADR-0034](../../docs/adr/0034-every-pr-lands-as-a-merge-commit-and-batches-need-no-switch.md)). When two or more
 finished PRs may land together, the pass gives the turn to all of them at once — `afk turn --batch`
 — instead of to the first: it records one marker on every member PR and starts a **batch worker**
 in a worktree of the batch's own. That worker runs `afk land --batch`, which stacks the PRs on the
@@ -486,7 +486,10 @@ the call does the rest and reports which way it went:
   swaps the label up by one, **discards the failed attempt** (closes its PR, deletes its branch, removes
   its worktree — so the claim cannot loop on the same red PR) and starts a **fresh** worker from base
   under the same claim, handing it the reason. After an unanswered nudge it appends the worker's
-  last screen to the reason itself.
+  last screen to the reason itself. **A failure spends one attempt however often `afk fail` runs**:
+  the same edit adds `afk-attempt/starting`, which the started worker removes — so if the call
+  errors after counting (a PR close refused, orca down), **run it again**: it finishes the retry
+  without counting twice, and the next tick does the same by itself.
 - `"action": "escalate"` — the attempts are exhausted. In one fixed order: status board → relabel
   (add `escalate_label`, remove `ready_label` and the attempt label) → comment the reason (if
   `escalate_comment`) → release the claim. The PR and the worktree are left for the human.

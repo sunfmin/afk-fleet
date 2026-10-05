@@ -303,6 +303,12 @@ def test_a_batch_is_known_by_its_id_wherever_orca_puts_its_branch():
     heads = ["main", "felix/afk-batch-fl-1-170", "afk-batch-fl-1-170-2", "felix/afk-batch-fl-1-1700",
              "felix/afk-batch-fl-2-170", "felix/issue-3-x", "felix/afk-batch-fl-1-170-x"]
     assert d.batch_branches(heads, "fl-1-170") == ["afk-batch-fl-1-170-2", "felix/afk-batch-fl-1-170"]
+    # a batch's id says which instance formed it — and only that one
+    assert d.batch_formed_by(batch, "fl-1/x") and not d.batch_formed_by(batch, "fl-1")
+    assert not d.batch_formed_by(batch, "") and not d.batch_formed_by(None, "fl-1/x")
+    # the PR a stacked merge commit's subject names
+    assert d.stacked_pr(d.stack_message("a title", 12, 3).splitlines()[0]) == 12
+    assert d.stacked_pr("work: fix.txt") is None and d.stacked_pr(None) is None
     assert d.batch_branches(heads, "fl-9-1") == [] and d.batch_branches(None, "fl-1-170") == []
 
     def wt(branch, at=1, **more):
@@ -457,7 +463,7 @@ def test_validate_config():
     except ValueError as e:
         assert "gate.ci" in str(e) and "required" in str(e)
 
-    # how a PR lands is not a choice (ADR-0033): a config that still names a
+    # how a PR lands is not a choice (ADR-0034): a config that still names a
     # strategy, or switches batches on or off, is refused with the reason
     for key, value in (("strategy", "squash"), ("strategy", "merge"), ("batch", "true"),
                        ("batch", "false")):
@@ -1462,6 +1468,27 @@ def test_next_attempt():
     assert n == 3
 
 
+def test_a_failure_already_counted_is_retried_without_being_counted_again():
+    one, starting = "afk-attempt/1", d.ATTEMPT_STARTING
+    # counting a failure: the number and "its worker has not started" in ONE edit
+    assert d.retry_labels(["ready-for-agent"], one) == ([one, starting], [])
+    assert d.retry_labels(["bug", one], "afk-attempt/2") == (["afk-attempt/2", starting], [one])
+    assert d.attempt_starting(["bug", one, starting]) and d.current_attempt([one, starting]) == 1
+    assert not d.attempt_starting(["bug", one]) and not d.attempt_starting(None)
+    assert not d.attempt_starting([starting])           # a hand-edit: no attempt it could mean
+
+    # the same failure again: the attempt it already made, and no edit to make
+    again = d.next_attempt(1, 2, counted=True)
+    assert again == {"action": "retry", "attempt": 1, "to_label": one}
+    assert d.retry_labels(["bug", one, starting], again["to_label"]) == ([], [])
+    # …even when it was the last retry: what is cut short is that retry, not an escalation
+    assert d.next_attempt(2, 2, counted=True)["action"] == "retry"
+    # a worker started ends it (`afk` removes the label), so the next failure is counted
+    assert d.next_attempt(1, 2, counted=d.attempt_starting(["bug", one]))["attempt"] == 2
+    # an escalation strips it with the rest
+    assert d.escalation_labels([one, starting], d.resolve_config({}))[1] == [one, starting]
+
+
 def test_attempt_and_escalation_labels():
     labels = ["ready-for-agent", "afk-attempt/2", "bug", "afk-attempt/1", "xafk-attempt/9", 7]
     # every attempt label the issue carries — a hand-edit can leave more than one
@@ -1844,6 +1871,17 @@ def test_worker_step_routes_every_cause_or_returns_the_judgment():
 
     for cause in ("working", "just_stopped", "within_grace", "awaiting_tick"):
         assert step(cause) == ("leave", None), cause
+    # a retry cut short (its failure counted, no fresh worker started) is FINISHED,
+    # whatever is left of the attempt it was discarding — never continued, nudged
+    # or parked — and a worker still at work is left alone
+    cut = _mine(4, starting=True)
+    for cause in d.WORKER_CAUSES:
+        do, reason = step(cause, cut, worker_verdict=_declared("giving-up", "no fixture"))
+        if d.WORKER_CAUSES[cause][1] == "leave":
+            assert do == "leave", cause
+        else:
+            assert do == "fail", cause
+            assert ("cut short" in reason) == (d.WORKER_CAUSES[cause][1] != "next_attempt"), cause
     assert step("blockers_waiting") == ("park", None) and step("silent") == ("nudge", None)
     # a claim with no worker left is CONTINUED, with no judgment asked: an unattended
     # run never releases it back to the frontier
