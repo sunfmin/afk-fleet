@@ -4,6 +4,8 @@
 [ADR-0030](0030-a-gate-run-is-recorded-on-the-remote-under-the-tree-it-tested.md) (its decision 2:
 the fields are the same, how they are written is not). The claim and heartbeat of
 [ADR-0003](0003-cooperative-multi-fleet-claims.md) keep their format, byte for byte.
+[ADR-0032](0032-records-kept-in-comments-share-the-encoding-of-records-on-refs.md) carries the same
+encoding to records kept in comments, and widens decision 2's types.
 
 ## Context
 
