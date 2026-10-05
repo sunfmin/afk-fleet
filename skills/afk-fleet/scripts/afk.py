@@ -315,12 +315,9 @@ def _issue_written(repo, number):
 
 
 def _edit_labels(repo, number, add, remove):
-    args = ["issue", "edit", str(number), "--repo", repo]
-    for lb in add:
-        args += ["--add-label", lb]
-    for lb in remove:
-        args += ["--remove-label", lb]
-    _gh(args)
+    _gh(["issue", "edit", str(number), "--repo", repo,
+         *(x for lb in add for x in ("--add-label", lb)),
+         *(x for lb in remove for x in ("--remove-label", lb))])
     _issue_written(repo, number)
 
 
