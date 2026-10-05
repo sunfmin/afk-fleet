@@ -788,107 +788,352 @@ def test_rebuild_and_cycle_fail_when_the_claim_refs_cannot_be_read():
 
         git(w.cwd, "config", "--unset", f"url.{w.sb.bare}.insteadOf")   # git loses the remote
         assert "fetch" in w.error("rebuild", *ME, *R)
-        assert "fetch" in w.error("cycle", *ME, *R)
+        assert "fetch" in w.error("cycle", *ME, "--worker-command", WORKER, *R)
 
 
-def test_cycle_gates_paces_and_beats_through_a_whole_run():
-    """The launcher's loop as it actually runs: one `afk cycle` at the top of every
-    cycle, one more after each tick, and an opaque `state` threaded between them.
-    The launcher holds no counter and does no arithmetic — in particular none for the
-    empty streak, which nothing used to produce at all: the idle interval was
-    unreachable."""
+def cycle(w, state=None, *extra, now=T0):
+    """One `afk cycle` → its result. The first is handed the run's two facts; every
+    later one only the `state` the last returned — as a caller holds nothing else."""
+    carried = ("--state", json.dumps(state)) if state else (*ME, "--worker-command", WORKER)
+    return w.afk("cycle", *R, "--now", str(now), *carried, *extra)
+
+
+def answer(w, command):
+    """Run the command a judgment handed back, exactly as written → its JSON."""
+    p = subprocess.run(command, shell=True, cwd=w.cwd, capture_output=True, text=True, env=w.env)
+    assert p.returncode == 0, f"{command}\n{p.stdout}\n{p.stderr}"
+    return json.loads(p.stdout)
+
+
+def say(w, n, body):
+    """A comment on issue n — what a worker's verdict marker is."""
+    comments = w.state()["comments"]
+    new = 1 + max([c["id"] for rows in comments.values() for c in rows], default=1000)
+    comments.setdefault(str(n), []).append(_comment(new, body))
+    w.set(comments=comments)
+
+
+def verdict(w, n, phase, *blocked_by, reason=None):
+    say(w, n, afk_decide.verdict_marker(n, phase, blocked_by, reason) + "\nexplanation")
+
+
+def test_cycle_gates_ticks_paces_and_beats_through_a_whole_run():
+    """The loop as it actually runs: ONE `afk cycle` per cycle, and an opaque `state`
+    threaded between them. The caller holds no counter, does no arithmetic and
+    carries no summary: a tick runs inside the call, and folds what it did itself."""
     with world(issues=[issue(1, "ready-for-agent")], prs=[pr(30, closes=2)]) as w:
         hb = "refs/afk/heartbeat/me"
+        before = w.afk("rebuild", *ME, *R)["fingerprint"]
 
-        def top(state, *extra, now=T0):
-            return w.afk("cycle", *ME, *R, "--now", str(now), "--state", json.dumps(state), *extra)
-
-        def ticked(state, *extra, **summary):
-            body = {"granted": [], "dispatched": [], "in_flight": 0, "frontier_remaining": 0, **summary}
-            return w.afk("cycle", *ME, *R, *NOW, "--state", json.dumps(state),
-                         "--summary", json.dumps(body), *extra)
-
-        # cycle 1: no state at all → the first tick
-        first = w.afk("cycle", *ME, *R, *NOW)
+        # cycle 1: no state at all → the first cycle always ticks, and the tick is
+        # this call: #1 is dispatched, the lease published, the sleep returned
+        first = cycle(w)
         assert (first["action"], first["reason"]) == ("tick", "first")
-        # a tick owes no sleep yet; it carries the schema its summary returns in
-        assert set(first) == {"action", "reason", "state", "summary_schema"}
-        st = first["state"]
+        assert set(first) == {"action", "reason", "state", "sleep_seconds", "progress", "judgments"}
+        assert first["progress"] == "dispatched #1; 1 in flight, 0 left on the frontier"
+        assert (first["judgments"], first["sleep_seconds"]) == ([], 90)
+        assert w.claimed_by(1) == "me" and w.sb.remote_ref(hb)
+        assert [t["command"] for t in w.terminals()] == [WORKER]
         # the digest is the SAME one rebuild reports: one gatherer, one function
-        assert st["fingerprint"] == w.afk("rebuild", *ME, *R)["fingerprint"]
+        assert first["state"]["fingerprint"] == before
 
-        # …the tick dispatched #1 and now holds it
-        w.afk("claim", "1", *ME, *NOW, *R)
-        after = ticked(st, dispatched=[1], in_flight=1)
-        assert after["sleep_seconds"] == 90 and set(after) == {"state", "sleep_seconds"}
+        # cycle 2: the claim moved the digest → tick; its worker is coding: left alone
+        woke = cycle(w, first["state"])
+        assert (woke["action"], woke["reason"], woke["sleep_seconds"]) == ("tick", "changed", 90)
+        assert woke["progress"] == "1 in flight, 0 left on the frontier"
+        held = woke["state"]
 
-        # cycle 2: the claim moved the digest → tick
-        woke = top(after["state"])
-        assert (woke["action"], woke["reason"]) == ("tick", "changed")
-        held = ticked(woke["state"], in_flight=1)["state"]
-
-        # cycle 3: nothing moved, but the fleet HOLDS a claim → skip, and the lease
-        # no tick will refresh is refreshed here, in the same call
-        assert not w.sb.remote_ref(hb)
+        # cycle 3: nothing moved, but the fleet HOLDS a claim → skip, in the same
+        # one call, with the lease looked after and the sleep returned
         w.calls()
-        skip = top(held)
+        skip = cycle(w, held)
         assert (skip["action"], skip["reason"], skip["sleep_seconds"]) == ("skip", "unchanged", 90)
-        assert skip["heartbeat"]["refreshed"] is True and w.sb.remote_ref(hb)
+        assert set(skip) == {"action", "reason", "state", "sleep_seconds", "progress", "judgments",
+                             "heartbeat"}
+        assert skip["progress"] == "nothing moved; 1 in flight, 0 left on the frontier"
+        assert skip["heartbeat"]["refreshed"] is False                # the tick beat at T0
         assert skip["state"]["empty_streak"] == 0                     # holding a claim is not empty
         # a skipped cycle is cheap by construction: the two lists, no per-issue read
         assert [c[:2] for c in w.calls()] == [["issue", "list"], ["pr", "list"]]
         # the beat is stateless and self-limiting…
-        again = top(skip["state"])
-        assert (again["action"], again["heartbeat"]["refreshed"]) == ("skip", False)
-        late = top(again["state"], now=T0 + TTL // 2)
-        assert late["heartbeat"]["refreshed"] is True
+        late = cycle(w, skip["state"], now=T0 + TTL // 2)
+        assert (late["action"], late["heartbeat"]["refreshed"]) == ("skip", True)
         # …and does not itself move the digest it is gated on
-        assert top(late["state"])["action"] == "skip"
+        assert cycle(w, late["state"])["action"] == "skip"
         # the sleep under a held claim is capped at half the lease, whatever the config
-        assert top(held, "--set", "busy_interval_seconds=99999")["sleep_seconds"] == TTL // 2
+        assert cycle(w, held, "--set", "busy_interval_seconds=99999")["sleep_seconds"] == TTL // 2
 
         # each kind of movement a tick would act on wakes it
         w.set(prs=[pr(30, closes=2, conclusion="FAILURE")])
-        red = top(late["state"])
+        red = cycle(w, late["state"])
         assert (red["action"], red["reason"], red["state"]["skips"]) == ("tick", "changed", 0)
         w.set(issues=[issue(1)])                                      # ready label pulled
-        assert top(red["state"])["reason"] == "changed"
+        assert cycle(w, red["state"])["reason"] == "changed"
 
-        # the fleet goes quiet: #1 merged and released, nothing left on the frontier
-        w.afk("release", "1", *ME, *R)
-        st = top(red["state"])["state"]
-        idle = ticked(st, granted=[1])                                 # work was done: not empty
-        assert (idle["state"]["empty_streak"], idle["sleep_seconds"]) == (0, 90)
-        s1 = top(idle["state"])
-        assert (s1["action"], s1["state"]["empty_streak"], s1["sleep_seconds"]) == ("skip", 1, 90)
-        assert "heartbeat" not in s1                                  # holding nothing: no beat
-        s2 = top(s1["state"])
-        s3 = top(s2["state"])
+        # the fleet goes quiet: #1's PR landed, so its claim outlived its issue
+        w.set(issues=[issue(1, state="closed")])
+        idle = cycle(w, red["state"])
+        assert idle["progress"] == "cleared #1; 0 in flight, 0 left on the frontier"
+        assert (idle["state"]["empty_streak"], idle["sleep_seconds"]) == (0, 90)   # work: not empty
+        assert w.claimed_by(1) is None and w.worktrees() == []
+        e1 = cycle(w, idle["state"])                                  # the release moved the digest
+        assert (e1["action"], e1["state"]["empty_streak"], e1["sleep_seconds"]) == ("tick", 1, 90)
+        s2 = cycle(w, e1["state"])
+        assert (s2["action"], s2["state"]["empty_streak"], s2["sleep_seconds"]) == ("skip", 2, 90)
+        assert "heartbeat" not in s2                                  # holding nothing: no beat
+        s3 = cycle(w, s2["state"])
         assert (s3["state"]["empty_streak"], s3["sleep_seconds"]) == (3, 1500)   # idle, at last
-        assert top(s2["state"], "--set", "idle_ticks_before_sleep=9")["sleep_seconds"] == 90
-        # an empty TICK counts exactly like an empty skip
-        assert ticked(s2["state"])["sleep_seconds"] == 1500
-        # …and anything it did, holds, or could not take resets the streak
-        assert ticked(s3["state"], frontier_remaining=2)["sleep_seconds"] == 90
+        assert cycle(w, s2["state"], "--set", "idle_ticks_before_sleep=9")["sleep_seconds"] == 90
 
         # the forced full tick: default every 6 skips, from --config, or --set — --set wins
-        assert top({**s3["state"], "skips": 5})["reason"] == "forced"
-        short = ("--config", json.dumps({"force_tick_after_skips": 4}))
-        assert top(s3["state"], *short)["reason"] == "forced"
-        assert top(s3["state"], *short, "--set", "force_tick_after_skips=9")["action"] == "skip"
-
-        # the gate switched off: always a tick — and nothing was gathered to decide it
-        w.calls()
-        off = top(s3["state"], "--set", "fingerprint_gate=false")
+        assert cycle(w, {**s3["state"], "skips": 5})["reason"] == "forced"
+        short = ("--config", json.dumps({"force_tick_after_skips": 3}))
+        assert cycle(w, s3["state"], *short)["reason"] == "forced"
+        assert cycle(w, s3["state"], *short, "--set", "force_tick_after_skips=9")["action"] == "skip"
+        # an empty TICK counts exactly like an empty skip
+        assert cycle(w, {**s2["state"], "skips": 5})["sleep_seconds"] == 1500
+        # the gate switched off: always a tick
+        off = cycle(w, s3["state"], "--set", "fingerprint_gate=false")
         assert (off["action"], off["reason"], off["state"]["skips"]) == ("tick", "gate_off", 0)
-        assert w.calls() == []
 
-        # a state or summary the launcher mangled is an error, never a fleet paced on zeros
-        assert "--state" in w.error("cycle", *ME, *R, "--state", json.dumps({"fingerprint": "x"}))
-        w.error("cycle", *ME, *R, "--state", "{not json")
-        for bad in ({}, {"in_flight": 1}, {"in_flight": "1", "frontier_remaining": 0}):
-            assert "--summary" in w.error("cycle", *ME, *R, "--summary", json.dumps(bad)), bad
-        assert "gh issue list failed" in w.error("cycle", *ME, "--repo", "acme/other")
+        # a state the caller mangled is an error, never a fleet paced on zeros
+        assert "--state" in w.error("cycle", *R, "--state", json.dumps({"fingerprint": "x"}))
+        w.error("cycle", *R, "--state", "{not json")
+        assert "gh issue list failed" in w.error("cycle", *ME, "--worker-command", WORKER,
+                                                 "--repo", "acme/other")
+
+
+def test_the_cycle_state_carries_the_instance_and_the_worker_launch_command():
+    """The run's two launcher-held facts are passed once. Afterwards a caller that
+    kept nothing but `state` — a launcher after a context compaction — still
+    dispatches as the same fleet instance, with the same worker launch command."""
+    with world(issues=[issue(1, "ready-for-agent"), issue(2, "ready-for-agent")]) as w:
+        # a first cycle cannot run without them: nothing would say who claims, or how
+        assert "--worker-command" in w.error("cycle", *R, *ME)
+        assert "--instance" in w.error("cycle", *R, "--worker-command", WORKER)
+        w.calls()
+        first = w.afk("cycle", *R, *NOW, "--instance", "fl-9", "--worker-command", WORKER,
+                      "--set", "concurrency=1")
+        assert first["progress"] == "dispatched #1; 1 in flight, 1 left on the frontier"
+        state = first["state"]
+        assert (state["instance"], state["worker_command"]) == ("fl-9", WORKER)
+
+        # only the state: #2 is claimed by fl-9 and its worker started with WORKER
+        nxt = w.afk("cycle", *R, *NOW, "--state", json.dumps(state))
+        assert nxt["progress"] == "dispatched #2; 2 in flight, 0 left on the frontier"
+        assert w.claimed_by(2) == "fl-9" and [t["command"] for t in w.terminals()] == [WORKER] * 2
+        assert nxt["state"]["instance"] == "fl-9" and nxt["state"]["worker_command"] == WORKER
+
+        # a state without them is an error — exit 3 — never a guess at either
+        for gone in ("instance", "worker_command"):
+            bare = {k: v for k, v in state.items() if k != gone}
+            assert "--state" in w.error("cycle", *R, "--state", json.dumps(bare)), gone
+        # …and so is one handed back beside a DIFFERENT fact: two fleets, one state
+        assert "fl-9" in w.error("cycle", *R, "--state", json.dumps(state), *ME)
+        assert "--worker-command" in w.error("cycle", *R, "--state", json.dumps(state),
+                                             "--worker-command", "claude")
+
+
+def test_a_tick_in_code_settles_every_row_the_rebuild_routes():
+    """One `afk cycle` does what a tick used to read 300 lines to do: release a
+    claim that outlived its issue, delete a dead peer's phantom lock under its sha,
+    reclaim a dead peer's work and continue it, continue an orphaned claim with
+    nothing asked, leave a landing worker alone, and fill what slots are then free
+    from the frontier, in its order."""
+    issues = [issue(n, "ready-for-agent") for n in (1, 2, 3, 6, 7, 8, 9)]
+    issues += [issue(4, "ready-for-agent", state="closed"),          # mine: its PR landed
+               issue(5, "ready-for-agent", state="closed")]          # a dead peer finished it
+    with world(issues=issues) as w:
+        with_pr(w, 7, 70)
+        assert w.afk(*_turn(7))["outcome"] == "granted"              # #7 is landing
+        for n, inst in ((4, "me"), (8, "me"), (5, "peer-dead"), (6, "peer-dead"), (9, "peer-live")):
+            w.afk("claim", str(n), "--instance", inst, *NOW, *R)     # #8: mine, and no worker
+        w.afk("heartbeat", "--instance", "peer-dead", "--now", str(T0 - TTL - 60), *R)
+        w.afk("heartbeat", "--instance", "peer-live", "--now", str(T0 - 60), *R)
+        phantom = w.sb.remote_ref("refs/afk/claim/5")
+        told, turns = len(w.terminals()[0]["sent"]), _turns(w, 70)
+
+        r = cycle(w, None, "--set", "concurrency=5")
+        assert r["judgments"] == [] and "errors" not in r
+        assert r["progress"] == ("dispatched #8, #1, #2; reclaimed #6; cleared #4, #5; "
+                                 "5 in flight, 1 left on the frontier")
+        # a `closed` row released; a `stale_closed` lock deleted — it was the sha read
+        assert w.claimed_by(4) is None and w.claimed_by(5) is None
+        assert phantom and not w.sb.remote_ref("refs/afk/claim/5")
+        # a `stale` claim reclaimed, then dispatched; an orphan continued, unasked
+        assert w.claimed_by(6) == "me" and w.claimed_by(8) == "me"
+        # free slots filled in frontier order: 5 − {4,7,8} + the one #4 freed − #6 = 2
+        assert w.claimed_by(1) == w.claimed_by(2) == "me" and w.claimed_by(3) is None
+        # every one of them has a worker, started with the run's launch command
+        started = {wt["linkedIssue"] for wt in w.worktrees()}
+        assert started == {1, 2, 6, 7, 8}
+        assert [t["command"] for t in w.terminals()] == [WORKER] * 5
+        # the `landing` row was left alone: not told again, its turn not rewritten
+        assert len(w.terminals()[0]["sent"]) == told and _turns(w, 70) == turns
+        assert _mine(w, (), 7)[0] == "landing"
+        # a live peer's claim is never touched
+        assert w.claimed_by(9) == "peer-live"
+        # each claim still held shows where it stands to a human reading the issue
+        assert "(#70)" in w.board(7) and w.board(8) and w.board(6)
+
+        # the next cycle finds every worker coding: nothing to do, nothing asked
+        nxt = cycle(w, r["state"], "--set", "concurrency=5")
+        assert (nxt["action"], nxt["judgments"]) == ("tick", [])
+        assert nxt["progress"] == "5 in flight, 1 left on the frontier"
+
+
+def test_a_tick_in_code_carries_out_every_no_pr_action_whose_reason_is_on_record():
+    """What `afk no-pr` concludes about a stopped worker is a table lookup away from
+    a transition, and the tick runs it: re-dispatch, park, escalate, nudge, fail —
+    then gives the one landing turn, leaves what is still running, and fills the
+    slots the settled claims freed."""
+    issues = [issue(n, "ready-for-agent") for n in (1, 2, 3, 4, 5, 6, 7, 8, 12)]
+    issues += [issue(11, "ready-for-agent", state="closed")]
+    with world(issues=issues) as w:
+        t = int(time.time()) + 5000                # every worker has been quiet past the grace
+        for n in (1, 2, 3, 4, 5, 6):
+            w.afk(*dispatch(n))
+        with_pr(w, 7, 70, conclusion="PENDING")
+        with_pr(w, 8, 80)
+        verdict(w, 1, "blocked", 11)                               # its blocker has closed
+        verdict(w, 2, "blocked", 12)                               # the backlog will resolve it
+        verdict(w, 3, "blocked", 13)                               # nothing will: no such issue
+        verdict(w, 5, "giving-up", reason="the fixture is unbuildable")
+        w.worker(output=t - 1, state="working", since=t - 60, n=5)  # #6 is at it
+        told = [len(term["sent"]) for term in w.terminals()]
+
+        r = cycle(w, None, "--set", "concurrency=8", now=t)
+        assert r["judgments"] == [] and "errors" not in r, r
+        assert r["progress"] == ("landing turn to #8; dispatched #1, #12; escalated #3; parked #2; "
+                                 "retried #5; nudged #4; 7 in flight, 0 left on the frontier")
+        # park: the edge recorded, the claim released, ready_label kept
+        assert w.state()["deps"]["2"] == [12] and w.claimed_by(2) is None
+        assert w.issue(2)["labels"] == ["ready-for-agent"]
+        # escalate: relabelled for a human, with the reason the blockers row carried
+        assert w.issue(3)["labels"] == ["ready-for-human"] and w.claimed_by(3) is None
+        assert "#13 could not be read" in w.comments(3)[-1]
+        # fail: the attempt counted, a fresh worker handed the worker's own reason
+        assert w.issue(5)["labels"] == ["ready-for-agent", "afk-attempt/1"]
+        assert "the fixture is unbuildable" in _told(_worker_of(w, 5))
+        # nudge: one line typed at the silent worker, nothing spent
+        assert len(w.terminals()[3]["sent"]) == told[3] + 1 and w.issue(4)["labels"] == ["ready-for-agent"]
+        # leave: the busy worker, and the PR whose checks are still running
+        assert len(w.terminals()[5]["sent"]) == told[5] and len(w.terminals()[6]["sent"]) == told[6]
+        assert _turns(w, 70) == [] and len(_turns(w, 80)) == 1
+        # the two claims it settled freed two slots: the re-dispatch needed none
+        assert w.claimed_by(12) == "me" and w.claimed_by(1) == "me"
+
+        # a grace period on, the nudged worker is still silent: that is a failure
+        # whose reason is on record too
+        later = cycle(w, r["state"], "--set", "concurrency=8", now=t + 400)
+        assert "retried #4" in later["progress"] and w.issue(4)["labels"][-1] == "afk-attempt/1"
+        assert "after its nudge" in _told(_worker_of(w, 4))
+
+
+def _worker_of(w, n):
+    """The terminal of the worker now on issue n."""
+    path = next(wt["path"] for wt in w.worktrees() if wt["linkedIssue"] == n)
+    return [t for t in w.terminals() if t["open"] and t["worktreePath"] == path][-1]
+
+
+def _judged(r):
+    return {j["issue"]: j for j in r["judgments"]}
+
+
+def test_a_tick_returns_each_judgment_with_a_command_for_either_answer():
+    """What code cannot decide comes back as a judgment: a question, and the one
+    `afk` transition for each answer — runnable as handed over. Every answer is a
+    transition, so whichever is run, the next cycle does not ask again."""
+    for pick in ("if_yes", "if_no"):
+        for verify in ((), ("--set", "gate.adversarial_verify=true")):
+            issues = [issue(n, "ready-for-agent") for n in (1, 2, 3)]
+            with world(issues=issues) as w:
+                w.afk(*dispatch(1))
+                verdict(w, 1, "already-satisfied")                  # idle, nothing on its branch
+                with_pr(w, 2, 20, conclusion="FAILURE")             # its checks are red
+                _, head = with_pr(w, 3, 30, conclusion=None)        # no checks at all
+                t = int(time.time()) + 5000
+
+                r = cycle(w, None, *verify, now=t)
+                asked = _judged(r)
+                assert {n: j["kind"] for n, j in asked.items()} == {
+                    1: "empty_diff", 2: "reason", 3: "adversarial_verify" if verify else "no_checks"}
+                # judgments open: answer them and come straight back
+                assert r["sleep_seconds"] == 0 and "3 judgments open" in r["progress"]
+                for j in asked.values():
+                    assert set(j) - {"bulky"} == {"issue", "kind", "question", "context",
+                                                  "if_yes", "if_no"}
+                # the two whose answer means reading something long say so
+                assert sorted(n for n, j in asked.items() if j.get("bulky")) == ([2, 3] if verify else [2])
+                assert asked[1]["context"]["worktree"] == w.worktrees()[0]["path"]
+                assert asked[3]["context"]["head"] == head
+                # nothing was decided for the caller: every claim is as it was
+                assert w.issue(1)["state"] == "open" and "state" not in w.pr(20)
+                assert _turns(w, 30) == [] and all(w.claimed_by(n) == "me" for n in (1, 2, 3))
+                # a `reason` judgment's transition is fixed; the answer is its wording
+                assert asked[2]["if_yes"] == asked[2]["if_no"]
+
+                # the caller that never answered is asked again, digest unmoved or not
+                again = cycle(w, r["state"], *verify, now=t)
+                assert (again["reason"], _judged(again).keys()) == ("unsettled", asked.keys())
+
+                done = {n: answer(w, j[pick]) for n, j in asked.items()}
+                assert done[2]["action"] == "retry" and w.pr(20)["state"] == "closed"
+                if pick == "if_yes":
+                    assert done[1]["action"] == "closed" and w.issue(1)["state"] == "closed"
+                    assert done[3]["outcome"] == "granted" and len(_turns(w, 30)) == 1
+                    turn = afk_decide.latest_turn([{"body": b} for b in _turns(w, 30)])
+                    assert turn["allow_no_checks"] and turn["verified"] == (head if verify else None)
+                else:
+                    assert done[1]["action"] == done[3]["action"] == "retry"
+                    assert w.pr(30)["state"] == "closed" and w.claimed_by(1) == "me"
+
+                after = cycle(w, again["state"], *verify, now=int(time.time()))
+                assert after["action"] == "tick" and after["judgments"] == [], after
+                assert after["sleep_seconds"] == 90 and after["state"]["unsettled"] is False
+
+
+def test_a_failed_transition_is_reported_and_leaves_its_claim_held():
+    """An `{"error": …}` from one transition of a tick is not "nothing to do": it
+    is reported in the result, the claim it was about stays held, the rest of the
+    tick goes on, and the next cycle ticks again whatever the digest says."""
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
+        t = int(time.time()) + 5000
+        w.afk(*dispatch(1))
+        w.afk(*dispatch(2))
+        verdict(w, 1, "blocked", 13)                               # → escalate: no such issue
+        verdict(w, 2, "giving-up", reason="cannot build")          # → fail
+        w.set(fail=["issue edit"])                                 # GitHub refuses a relabel
+
+        r = cycle(w, None, now=t)
+        assert [(e["step"], e["issue"]) for e in r["errors"]] == [("escalate", 1), ("fail", 2)]
+        assert all("gh issue edit failed" in e["error"] for e in r["errors"])
+        assert r["progress"] == "2 errors; 2 in flight, 0 left on the frontier"
+        # nothing settled: both claims held, nobody handed a half-escalated issue
+        assert w.claimed_by(1) == w.claimed_by(2) == "me"
+        assert w.issue(1)["labels"] == w.issue(2)["labels"] == ["ready-for-agent"]
+        assert (r["sleep_seconds"], r["state"]["unsettled"]) == (90, True)
+
+        # nothing observable moved, and it is NOT skipped: the work is still owed
+        w.set(fail=[])
+        nxt = cycle(w, r["state"], now=t)
+        assert (nxt["action"], nxt["reason"]) == ("tick", "unsettled") and "errors" not in nxt
+        assert nxt["progress"] == "escalated #1; retried #2; 1 in flight, 0 left on the frontier"
+
+    # a worker that cannot be STARTED ends the starting for this tick: the remote
+    # or orca is unwell, and every further dispatch would take a claim it cannot staff
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
+        w.orca(never_ready=True)
+        r = cycle(w, None, "--ready-timeout", "1")
+        assert [(e["step"], e["issue"]) for e in r["errors"]] == [("dispatch", 1)]
+        assert "not ready" in r["errors"][0]["error"]
+        assert w.claimed_by(1) == "me" and w.claimed_by(2) is None
+        # the claim it took is held, and the next tick finds it with no worker… which
+        # here is one whose terminal is still there: left to its grace period
+        w.orca(never_ready=False)
+        nxt = cycle(w, r["state"], "--ready-timeout", "1")
+        assert "errors" not in nxt and "dispatched #2" in nxt["progress"]
+        assert w.claimed_by(1) == w.claimed_by(2) == "me"
 
 
 # --------------------------------------------------------------------------- #
@@ -1242,9 +1487,8 @@ def test_config_file_loads_validates_and_round_trips():
         assert cfg["retry"] == 4 and cfg["claim_namespace"] == "refs/heads"
         assert cfg["gate"] == {**defaults["gate"], "ci": "local", "local_command": "make test"}
         # canonical JSON fed back as --config is a fixed point for every consumer
-        quiet = json.dumps({"in_flight": 0, "frontier_remaining": 3})
-        assert w.afk("cycle", *ME, *R, "--summary", quiet, "--config", json.dumps(cfg)) == \
-            w.afk("cycle", *ME, *R, "--summary", quiet, "--config", "{}")
+        assert w.afk("rebuild", *ME, *R, *NOW, "--config", json.dumps(cfg))["free_slots"] == \
+            w.afk("rebuild", *ME, *R, *NOW, "--config", "{}")["free_slots"]
         assert w.afk("probe", "--config", json.dumps(cfg), "--now", str(T0))["config"] == cfg
 
         for bad, why in (("retyr: 4", "unknown key"),
@@ -2426,7 +2670,7 @@ def test_every_failure_is_one_json_error():
     with world() as w:
         # every operational failure is exit 3 with one {"error": …} object — bad JSON
         # in, a missing file, a failing gh — so a tick never has to parse a traceback
-        w.error("cycle", *ME, *R, "--summary", "{not json")
+        w.error("cycle", *R, "--state", "{not json")
         w.error("rebuild", *ME, *R, "--config", "{not json")
         assert "gh issue list failed" in w.error("rebuild", *ME, "--repo", "acme/other")
         # …and so is a bad command line: argparse's usage error is the same one shape
@@ -2492,7 +2736,6 @@ def test_config_is_required_and_resolves_one_way_on_every_subcommand():
 
         # what `_cfg` hands a subcommand is always a config `afk config` would accept:
         # --config and --set are validated like the file is
-        quiet = json.dumps({"in_flight": 0, "frontier_remaining": 1})
         for bad, why in ((("--config", json.dumps({"gate": {"ci": "local"}})), "local_command"),
                          (("--config", json.dumps({"claim_namespace": "refs/x"})), "claim_namespace"),
                          (("--config", "{}", "--set", "gate.ci=optional"), "gate.ci"),
@@ -2500,11 +2743,10 @@ def test_config_is_required_and_resolves_one_way_on_every_subcommand():
                          (("--config", "{}", "--set", "retyr=3"), "--set"),
                          (("--config", "{}", "--set", "retry=soon"), "retry"),
                          (("--config", "{not json"), "")):
-            assert why in w.error("cycle", *ME, *R, "--summary", quiet, *bad), bad
+            assert why in w.error("rebuild", *ME, *R, *bad), bad
         # …while a valid combination split across the two is accepted as a whole
-        assert w.afk("cycle", *ME, *R, "--summary", quiet,
-                     "--config", json.dumps({"gate": {"ci": "local"}}),
-                     "--set", "gate.local_command=make test")["sleep_seconds"] == 90
+        assert w.afk("rebuild", *ME, *R, "--config", json.dumps({"gate": {"ci": "local"}}),
+                     "--set", "gate.local_command=make test")["free_slots"] == 3
 
     # only ref ops have a second way to name the remote; gh ops need --repo, full stop
     for name, sub in parser.subcommands.items():

@@ -1114,91 +1114,116 @@ def test_pace():
         pass
 
 
+FACTS = {"instance": "fl-1", "worker_command": "ckimi --yolo"}
+
+
 def test_cycle_state_is_validated_not_guessed():
-    assert d.cycle_state(None) == d.CYCLE_START and d.cycle_state("") == d.CYCLE_START
-    assert d.cycle_state(None) is not d.CYCLE_START           # a copy: the constant is not shared
+    # the first cycle is handed the run's two facts, and the state carries them from then on
+    first = d.cycle_state(None, **FACTS)
+    assert first == {**d.CYCLE_START, **FACTS} == d.cycle_state("", **FACTS)
+    assert d.cycle_state(first) == first                      # …so a later cycle passes neither
+    assert d.cycle_state(first, **FACTS) == first             # the same ones again are harmless
     st = {"fingerprint": "abc", "skips": 2, "empty_streak": 1, "in_flight": 0,
-          "frontier_remaining": 4}
+          "frontier_remaining": 4, "unsettled": True, **FACTS}
     assert d.cycle_state(st) == st
-    # a launcher that mangled the state must hear so — run on zeros, a fleet
-    # holding claims would be paced as if it held none
-    for bad in ({"fingerprint": "abc"}, {**st, "extra": 1}, [], "abc", {**st, "skips": "x"}):
+    # a caller that mangled the state must hear so — run on zeros, a fleet holding
+    # claims would be paced as if it held none; without the facts it could start no worker
+    no_facts = {k: v for k, v in st.items() if k not in FACTS}
+    for bad in ({"fingerprint": "abc"}, {**st, "extra": 1}, [], "abc", {**st, "skips": "x"},
+                no_facts, {**no_facts, "instance": "fl-1"}, {**st, "worker_command": ""},
+                {**st, "instance": None}):
         try:
             d.cycle_state(bad)
             assert False, f"expected ValueError for {bad!r}"
         except ValueError:
             pass
+    # a first cycle without them, and a fact that disagrees with the state's
+    for raw, given in ((None, {}), (None, {"instance": "fl-1"}), ("", {"worker_command": "x"}),
+                       (st, {"instance": "fl-2"}), (st, {"worker_command": "claude"})):
+        try:
+            d.cycle_state(raw, **given)
+            assert False, f"expected ValueError for {given!r}"
+        except ValueError as e:
+            assert "--instance" in str(e) or "--worker-command" in str(e)
 
 
-def test_cycle_ticked_folds_the_summary_and_counts_empty_ticks():
-    cfg, st = PACE_CFG, d.cycle_state(None)
+def _did(**did):
+    return {**{k: [] for k in d.TICK_DID}, "in_flight": 0, "frontier_remaining": 0, **did}
 
-    def ticked(state, **summary):
-        return d.cycle_ticked(state, {"in_flight": 0, "frontier_remaining": 0, **summary}, cfg)
+
+def test_cycle_ticked_folds_what_the_tick_did_and_counts_empty_ticks():
+    cfg, st = PACE_CFG, d.cycle_state(None, **FACTS)
+
+    def ticked(state, **did):
+        return d.cycle_ticked(state, _did(**did), cfg)
 
     # an EMPTY tick: nothing done, nothing in flight, nothing left to dispatch
     r = ticked(st)
     assert r["state"]["empty_streak"] == 1 and r["sleep_seconds"] == 90
+    assert r["progress"] == "0 in flight, 0 left on the frontier"
     r = ticked(r["state"])
     r = ticked(r["state"])
     assert r["state"]["empty_streak"] == 3 and r["sleep_seconds"] == 1500     # idle at last
     # anything that is not empty resets the streak — work done, a claim held, or
     # frontier the tick could not take (e.g. no free slot)
-    for summary in ({"granted": [3]}, {"escalated": [4]}, {"dispatched": [1]}, {"reclaimed": [6]},
-                    {"parked": [5]}, {"cleared": [7]},
-                    {"in_flight": 2}, {"frontier_remaining": 5}):
-        back = ticked(r["state"], **summary)
-        assert back["state"]["empty_streak"] == 0 and back["sleep_seconds"] == 90, summary
+    for did in ({"granted": [3]}, {"escalated": [4]}, {"dispatched": [1]}, {"reclaimed": [6]},
+                {"parked": [5]}, {"cleared": [7]},
+                {"in_flight": 2}, {"frontier_remaining": 5}):
+        back = ticked(r["state"], **did)
+        assert back["state"]["empty_streak"] == 0 and back["sleep_seconds"] == 90, did
+    # a nudge or a retry is told to the human but is not what keeps the fleet busy:
+    # the claim it is about is (pacing is what it was when a tick summarised itself)
+    assert ticked(r["state"], nudged=[4])["sleep_seconds"] == 1500
     # what the next skipped cycle paces and beats on is carried in the state
     held = ticked(st, in_flight=2, frontier_remaining=7)["state"]
     assert (held["in_flight"], held["frontier_remaining"]) == (2, 7)
-    assert ticked({**st, "fingerprint": "abc", "skips": 4})["state"]["fingerprint"] == "abc"
+    kept = ticked({**st, "fingerprint": "abc", "skips": 4})["state"]
+    assert kept["fingerprint"] == "abc" and {k: kept[k] for k in FACTS} == FACTS
 
-    # in_flight / frontier_remaining are REQUIRED: defaulted to 0, a fleet holding
-    # claims would pace to idle and let its own lease lapse
-    for bad in ({}, {"in_flight": 1}, {"frontier_remaining": 0}, {"in_flight": "2",
-                "frontier_remaining": 0}, {"in_flight": True, "frontier_remaining": 0}, [], None):
-        try:
-            d.cycle_ticked(st, bad, cfg)
-            assert False, f"expected ValueError for {bad!r}"
-        except ValueError:
-            pass
+    # the progress line: every list the tick filled, then where the fleet stands
+    line = ticked(st, cleared=[1], granted=[2], dispatched=[3, 4], retried=[5], nudged=[6],
+                  in_flight=4, frontier_remaining=1)["progress"]
+    assert line == ("landing turn to #2; dispatched #3, #4; cleared #1; retried #5; nudged #6; "
+                    "4 in flight, 1 left on the frontier")
+
+    # a tick that returned a judgment sleeps 0 — the caller answers and opens the
+    # next cycle at once — and one that left a judgment or an error is unsettled:
+    # never empty, and the next cycle ticks whatever the digest says
+    asked = d.cycle_ticked(r["state"], _did(), cfg, judgments=2)
+    assert (asked["sleep_seconds"], asked["state"]["unsettled"]) == (0, True)
+    assert asked["state"]["empty_streak"] == 0 and "2 judgments open" in asked["progress"]
+    failed = d.cycle_ticked(r["state"], _did(), cfg, errors=1)
+    assert (failed["sleep_seconds"], failed["state"]["unsettled"]) == (90, True)
+    assert "1 error;" in failed["progress"]
+    assert ticked(asked["state"])["state"]["unsettled"] is False     # a clean tick settles it
 
 
 def test_cycle_wake_gates_beats_and_paces_a_skipped_cycle():
-    cfg, st = PACE_CFG, d.cycle_state(None)
+    cfg, st = PACE_CFG, d.cycle_state(None, **FACTS)
     first = d.cycle_wake(st, "aaa", cfg)
     assert (first["action"], first["reason"]) == ("tick", "first")
     assert first["state"]["fingerprint"] == "aaa"
     # a tick owes its sleep to cycle_ticked, not to the gate
-    assert "sleep_seconds" not in first and "heartbeat" not in first
-    # …and comes with the shape its summary must return in: every key cycle_ticked
-    # reads, the two counts as integers, all of them required
-    schema = first["summary_schema"]
-    assert set(schema["properties"]) == {*d.SUMMARY_WORK, *d.SUMMARY_COUNTS, "note"}
-    assert set(schema["required"]) == {*d.SUMMARY_WORK, *d.SUMMARY_COUNTS}
-    assert all(schema["properties"][k]["type"] == "integer" for k in d.SUMMARY_COUNTS)
-    assert "summary_schema" not in d.cycle_wake(
-        d.cycle_ticked(first["state"], {"in_flight": 0, "frontier_remaining": 0}, cfg)["state"],
-        "aaa", cfg)                                           # a skip spawns no tick
+    assert set(first) == {"action", "reason", "state"}
 
     # unchanged + idle fleet → skip; each such skip is itself an empty cycle
-    idle = d.cycle_ticked(first["state"], {"in_flight": 0, "frontier_remaining": 0}, cfg)["state"]
+    idle = d.cycle_ticked(first["state"], _did(), cfg)["state"]
     s1 = d.cycle_wake(idle, "aaa", cfg)
     assert (s1["action"], s1["reason"], s1["heartbeat"]) == ("skip", "unchanged", False)
     assert (s1["state"]["skips"], s1["state"]["empty_streak"], s1["sleep_seconds"]) == (1, 2, 90)
+    assert s1["progress"] == "nothing moved; 0 in flight, 0 left on the frontier"
     s2 = d.cycle_wake(s1["state"], "aaa", cfg)
     assert (s2["state"]["empty_streak"], s2["sleep_seconds"]) == (3, 1500)
 
     # unchanged while HOLDING claims → skip, but beat, stay busy, and never count as empty
-    held = d.cycle_ticked(first["state"], {"in_flight": 2, "frontier_remaining": 0}, cfg)["state"]
+    held = d.cycle_ticked(first["state"], _did(in_flight=2), cfg)["state"]
     h = d.cycle_wake(held, "aaa", cfg)
     assert (h["action"], h["heartbeat"], h["sleep_seconds"]) == ("skip", True, 90)
     assert h["state"]["empty_streak"] == 0
     long_busy = {**cfg, "busy_interval_seconds": 999999}
     assert d.cycle_wake(held, "aaa", long_busy)["sleep_seconds"] == TTL // 2     # the lease cap
     # frontier left over (the tick had no free slot) is not empty either
-    waiting = d.cycle_ticked(first["state"], {"in_flight": 0, "frontier_remaining": 3}, cfg)["state"]
+    waiting = d.cycle_ticked(first["state"], _did(frontier_remaining=3), cfg)["state"]
     assert d.cycle_wake(waiting, "aaa", cfg)["state"]["empty_streak"] == 0
 
     # changed → tick; the Nth consecutive skip → a forced tick
@@ -1209,10 +1234,153 @@ def test_cycle_wake_gates_beats_and_paces_a_skipped_cycle():
     # the streak survives a tick decision: only cycle_ticked resets it
     assert moved["state"]["empty_streak"] == 3
 
+    # the last tick left a judgment open or met an error: unchanged is not a skip
+    owed = d.cycle_wake({**idle, "unsettled": True, "skips": 2}, "aaa", cfg)
+    assert (owed["action"], owed["reason"], owed["state"]["skips"]) == ("tick", "unsettled", 0)
+
     # fingerprint_gate off → always a tick, and nothing was gathered to digest
     off = d.cycle_wake({**idle, "skips": 3}, None, {**cfg, "fingerprint_gate": False})
     assert (off["action"], off["reason"]) == ("tick", "gate_off")
     assert off["state"]["fingerprint"] == "aaa" and off["state"]["skips"] == 0
+
+
+CALL = {"afk_path": "/skill/scripts/afk.py", "repo": "acme/widgets", "instance": "fl-1",
+        "worker_command": "ckimi --yolo", "config": '{"retry": 2}'}
+
+
+def _argv(command):
+    """A judgment's command as the shell would split it: (subcommand, argv)."""
+    argv = shlex.split(command)
+    assert argv[0] == CALL["afk_path"]
+    for flag, value in (("--repo", CALL["repo"]), ("--config", CALL["config"]),
+                        ("--instance", CALL["instance"])):
+        assert argv[argv.index(flag) + 1] == value, command
+    return argv[1], argv
+
+
+def _mine(n, status="no_pr", **more):
+    return {"number": n, "status": status, "pr": None, "stopped": None, **more}
+
+
+def test_a_tick_asks_after_waiting_workers_and_grants_one_turn():
+    mine = [_mine(1), _mine(2, "awaiting_turn", pr=22), _mine(3, "landing", pr=21),
+            _mine(4, "landing", pr=20, stopped="awaiting_ci"), _mine(5, "awaiting_ci", pr=23),
+            _mine(6, "failure", pr=24), _mine(7, "closed"),
+            _mine(8, "landing", pr=19, stopped="gate_red")]
+    # `afk no-pr` is asked about a PR-less claim, and a landing one that did not stop for the tick
+    assert d.asks_after(mine) == [1, 3, 8]
+
+    # the turn goes to the head of the merge queue, and only when its worker is not at it
+    assert d.turn_due(mine, []) is None
+    assert d.turn_due(mine, [2]) == 2                             # awaiting its turn
+    assert d.turn_due(mine, [4, 2]) == 4                          # stopped for the tick: again
+    assert d.turn_due(mine, [3, 2]) is None                       # landing: leave it, and #2 waits
+    assert d.turn_due(mine, [8, 2]) is None                       # fixing a red gate in place
+
+
+def test_turn_step_routes_every_outcome_or_returns_the_judgment():
+    cfg = d.resolve_config({})
+    verify = d.resolve_config({"gate": {"adversarial_verify": True,
+                                        "adversarial_verify_prompt": "be harsh"}})
+
+    def step(outcome, config=cfg):
+        return d.turn_step(CALL, {"issue": 4, "pr": 30, "head": "abc123", "outcome": outcome},
+                           config)
+
+    assert step("granted") == ("granted", None)
+    for outcome in ("waiting", "landing", "awaiting_ci"):
+        assert step(outcome) == ("leave", None), outcome
+    routed = {"granted", "waiting", "landing", "awaiting_ci", "gate_red", "no_checks", "needs_verify"}
+    assert routed == set(d.TURN_OUTCOMES)             # a new outcome needs a route here
+
+    do, j = step("no_checks")
+    assert (do, j["kind"], j["issue"], j.get("bulky")) == ("judge", "no_checks", 4, None)
+    assert j["context"] == {"pr": 30, "head": "abc123"} and "acceptance criteria" in j["question"]
+    sub, argv = _argv(j["if_yes"])
+    assert sub == "turn" and "--allow-no-checks" in argv and "--verified" not in argv
+    assert argv[argv.index("--worker-command") + 1] == CALL["worker_command"]
+    sub, argv = _argv(j["if_no"])
+    assert sub == "fail" and argv[-2] == "--reason" and "PR #30" in argv[-1]
+
+    do, j = step("needs_verify", verify)
+    assert (do, j["kind"], j["bulky"]) == ("judge", "adversarial_verify", True)
+    assert j["context"]["prompt"] == "be harsh" and "abc123" in j["question"]
+    sub, argv = _argv(j["if_yes"])
+    assert sub == "turn" and argv[-2:] == ["--verified", "abc123"]
+    assert "--allow-no-checks" not in argv
+    assert _argv(j["if_no"])[0] == "fail"
+    # no checks AND a verify owed: `afk turn` records neither judgment until both are
+    # in, so they are asked as one — never a `no_checks` whose yes changes nothing
+    do, j = step("no_checks", verify)
+    assert j["kind"] == "adversarial_verify" and "only gate" in j["question"]
+    assert _argv(j["if_yes"])[1][-3:] == ["--allow-no-checks", "--verified", "abc123"]
+
+    # red checks: the transition is fixed, its wording is not — and lives in a CI log
+    do, j = step("gate_red")
+    assert (do, j["kind"], j["bulky"]) == ("judge", "reason", True)
+    assert j["if_yes"] == j["if_no"] and _argv(j["if_yes"])[0] == "fail"
+    assert _argv(j["if_yes"])[1][-2] == "--reason"
+    assert d.failure_judgment(CALL, _mine(6, "failure", pr=24))["if_yes"] == \
+        d.afk_command(CALL, "fail", 6, "--reason", "the checks of PR #24 are red")
+
+
+def _declared(phase=None, reason=None, blocked_by=()):
+    return {"found": phase is not None, "phase": phase, "blocked_by": list(blocked_by),
+            "reason": reason, "comment_url": "https://gh/c/7" if phase else None}
+
+
+def test_worker_step_routes_every_no_pr_action_or_returns_the_judgment():
+    cfg = d.resolve_config({})
+
+    def step(action, row=None, **worker):
+        return d.worker_step(CALL, row or _mine(4), {"action": action, **worker}, cfg)
+
+    routed = {"leave", "close_release", "redispatch", "park", "escalate", "nudge",
+              "next_attempt", "orphan"}
+    assert routed == {action for _, action in d.NO_PR_ROUTES}     # a new action needs a route
+
+    assert step("leave") == ("leave", None)
+    assert step("park") == ("park", None) and step("nudge") == ("nudge", None)
+    # a claim with no worker left is CONTINUED, with no judgment asked: an unattended
+    # run never releases it back to the frontier
+    assert step("orphan") == step("redispatch") == ("dispatch", None)
+
+    # already-satisfied: whether the diff really is empty stays a judgment
+    do, j = step("close_release", worktree="/wt/4", worker_verdict=_declared("already-satisfied"))
+    assert (do, j["kind"], j.get("bulky")) == ("judge", "empty_diff", None)
+    assert j["context"] == {"worktree": "/wt/4", "base_branch": "main", "verdict": "https://gh/c/7"}
+    sub, argv = _argv(j["if_yes"])
+    assert sub == "close" and "--worker-command" not in argv
+    assert _argv(j["if_no"])[0] == "fail"
+
+    # an escalation whose reason is on record is carried out; one that is not is asked
+    unmet = [{"number": 9, "standing": "unmet", "reason": "was closed as not planned"},
+             {"number": 8, "standing": "waiting", "reason": None}]
+    assert step("escalate", blockers=unmet, worker_verdict=_declared("blocked", blocked_by=[9, 8])) == \
+        ("escalate", "blocked by a dependency nothing will resolve: #9 was closed as not planned")
+    do, why = step("escalate", blockers=[], worker_verdict=_declared("blocked", reason="no design yet"))
+    assert do == "escalate" and "no design yet" in why
+    do, j = step("escalate", blockers=[], worker_verdict=_declared("blocked"))
+    assert (do, j["kind"], j.get("bulky")) == ("judge", "reason", None)
+    assert j["if_yes"] == j["if_no"] and _argv(j["if_yes"])[0] == "escalate"
+    assert j["context"]["verdict"] == "https://gh/c/7"
+
+    # a failure: the same line between a reason on record and one to be worded
+    assert step("next_attempt", worker_verdict=_declared("giving-up", reason="flaky build")) == \
+        ("fail", "its worker gave up: flaky build")
+    do, j = step("next_attempt", worker_verdict=_declared("giving-up"))
+    assert (do, j["kind"]) == ("judge", "reason") and _argv(j["if_yes"])[0] == "fail"
+    do, why = step("next_attempt", worker_verdict=_declared("already-satisfied"))
+    assert do == "fail" and "holds changes" in why
+    do, why = step("next_attempt", worker_verdict=_declared("on-holiday"))
+    assert do == "fail" and "on-holiday" in why
+    do, why = step("next_attempt", worker_verdict=_declared(), nudged_at=NOW)
+    assert do == "fail" and "after its nudge" in why
+    do, why = step("next_attempt", worker_verdict=_declared(), nudged_at=None)
+    assert do == "fail" and "no worktree" in why
+    do, why = step("next_attempt", _mine(4, "landing", pr=30, stopped="conflict"),
+                   worker_verdict=_declared(), nudged_at=NOW)
+    assert (do, why) == ("fail", "given the landing turn and never landed: conflict")
 
 
 def test_checks_gate_and_gate_comment():

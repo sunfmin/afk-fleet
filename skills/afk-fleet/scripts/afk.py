@@ -704,13 +704,13 @@ def cmd_worker_command(a):
 
 
 # --------------------------------------------------------------------------- #
-# the launcher's cycle                                                         #
+# the cycle: gate, tick, pace                                                  #
 # --------------------------------------------------------------------------- #
 
 def _gather(a, cfg):
     """The ONE gatherer of the observable fleet inputs (ADR-0008): open issues,
-    open PRs, and the claim/heartbeat ref scan. Both `rebuild` and the launcher's
-    `cycle` gate read through here, so their views cannot drift. Issues leave here
+    open PRs, and the claim/heartbeat ref scan. Both `rebuild` and the `cycle`
+    gate read through here, so their views cannot drift. Issues leave here
     with `labels` as a list of names — the one shape afk_decide reads; the raw
     JSON lives and dies in this process."""
     issues = json.loads(_gh(["issue", "list", "--repo", a.repo, "--state", "open",
@@ -721,46 +721,175 @@ def _gather(a, cfg):
 
 
 def cmd_cycle(a):
-    """One launcher cycle's mechanics, in two shapes (ADR-0017):
+    """One cycle, whole, in one call (ADR-0017): digest what a rebuild would
+    observe (ADR-0007) → tick-or-skip, and on a tick RUN it — the rebuild and
+    every transition whose next step is a table lookup (`_tick`) — then fold
+    what it did into the state and return the sleep.
 
-      afk cycle [--state S]             the top: digest what a rebuild would observe
-                                        (ADR-0007) → tick-or-skip. A tick comes with
-                                        the schema its summary must return in. On a
-                                        skip it also refreshes the lease when the
-                                        fleet holds claims, and returns the sleep.
-      afk cycle --state S --summary T   the bottom, after a tick returned T: fold it
-                                        into the state and return the sleep.
+      {"action": "tick"|"skip", "reason", "state", "sleep_seconds", "progress",
+       "judgments": [...]}        (+ "heartbeat" on a skip that holds claims,
+                                   "errors" when a transition of the tick failed)
 
-    `state` is opaque to the launcher: it hands back the last one verbatim. Only
-    the verdict, the state and the sleep ever reach a context — the raw
+    `state` is opaque to the caller: it hands back the last one verbatim, and
+    after the first cycle that is where the instance id and the worker launch
+    command come from. No `--state` is a first cycle, which always ticks. What the
+    tick could not decide comes back as `judgments`, each with the `afk` command
+    for either answer; the caller runs one and opens the next cycle at once
+    (`sleep_seconds` is then 0). Only that ever reaches a context — the raw
     issue/PR/ref JSON lives and dies here."""
     cfg = _cfg(a)
-    state = afk_decide.cycle_state(json.loads(a.state) if a.state else None)
-    if a.summary is not None:
-        return afk_decide.cycle_ticked(state, json.loads(a.summary), cfg)
-    fp = None
-    if cfg["fingerprint_gate"]:
-        issues, prs, claims, _ = _gather(a, cfg)  # heartbeats: see afk_decide.fingerprint
-        fp = afk_decide.fingerprint(issues, prs, claims)
-    result = afk_decide.cycle_wake(state, fp, cfg)
-    if result.pop("heartbeat", False):
-        result["heartbeat"] = _beat(_remote(a), cfg, a.instance, _now(a))
-    return result
+    state = afk_decide.cycle_state(json.loads(a.state) if a.state else None,
+                                   a.instance, a.worker_command)
+    a.instance, a.worker_command = state["instance"], state["worker_command"]
+    gathered = _gather(a, cfg) if cfg["fingerprint_gate"] else None
+    fp = afk_decide.fingerprint(*gathered[:3]) if gathered else None  # heartbeats: see fingerprint
+    woke = afk_decide.cycle_wake(state, fp, cfg)
+    if woke["action"] == "skip":
+        if not woke.pop("heartbeat"):
+            return {**woke, "judgments": []}
+        return {**woke, "judgments": [],
+                "heartbeat": _beat(_remote(a), cfg, a.instance, _now(a))}
+    did, judgments, errors = _tick(a, cfg, _rebuild(a, cfg, gathered))
+    return {"action": "tick", "reason": woke["reason"],
+            **afk_decide.cycle_ticked(woke["state"], did, cfg, len(judgments), len(errors)),
+            "judgments": judgments, **({"errors": errors} if errors else {})}
+
+
+def _tick(a, cfg, ws):
+    """One reconciliation pass over the working set `ws`, in code → (did,
+    judgments, errors). In order: `no-pr` for the claims waiting on a worker →
+    the landing turn → nudge / fail / park / escalate where the reason is on
+    record → release `closed` rows and `stale_closed` phantom locks → reclaim
+    `stale` → start workers (continuations first, then the frontier into the
+    free slots) → heartbeat → status boards.
+
+    Each transition is the subcommand's own function, so the tick and a human
+    typing `afk park` run one code path. One that fails is recorded in `errors`
+    and settles nothing: its claim is still held, and the next cycle ticks. A
+    failure to START a worker also ends the starting for this tick — it is orca
+    or the remote that is unwell, and every further dispatch would take a claim
+    it cannot staff. Re-entrant like any tick: killed at any point, the next
+    one rebuilds from GitHub."""
+    call = {"afk_path": os.path.abspath(__file__), "repo": a.repo, "instance": a.instance,
+            "worker_command": a.worker_command, "config": json.dumps(cfg, ensure_ascii=False)}
+    did = {k: [] for k in afk_decide.TICK_DID}
+    judgments, errors = [], []
+    mine = {r["number"]: r for r in ws["mine"]}
+    settled, touched = set(), set()      # claims released / claims whose board a transition wrote
+
+    def run(step, fn, number=None, **fields):
+        try:
+            return fn(argparse.Namespace(**{**vars(a), "number": number, **fields}))
+        except (OSError, ValueError, RuntimeError) as e:
+            errors.append({"step": step, **({"issue": number} if number else {}),
+                           "error": str(e)})
+            return None
+
+    # --- observe: the claims waiting on their worker ---
+    asked = afk_decide.asks_after(ws["mine"])
+    seen = run("no-pr", cmd_no_pr, numbers=asked, worktree=None) if asked else None
+    routes = [(w["issue"], *afk_decide.worker_step(call, mine[w["issue"]], w, cfg))
+              for w in (seen or {}).get("workers", [])]
+
+    # --- the landing turn: at most one grant a tick ---
+    due = afk_decide.turn_due(ws["mine"], ws["merge_order"])
+    turn = run("turn", cmd_turn, due, allow_no_checks=False, verified=None) if due else None
+    if turn:
+        do, asks = afk_decide.turn_step(call, turn, cfg)
+        if do == "granted":
+            did["granted"].append(due)
+            touched.add(due)
+        elif do == "judge":
+            judgments.append(asks)
+
+    # --- nudge / fail / park / escalate, or the judgment that stands in for one ---
+    judgments += [afk_decide.failure_judgment(call, r) for r in ws["mine"]
+                  if r["status"] == "failure"]
+    for number, do, detail in routes:
+        if do == "judge":
+            judgments.append(detail)
+        elif do == "nudge" and run("nudge", cmd_nudge, number, worktree=None):
+            did["nudged"].append(number)
+        elif do == "park" and run("park", cmd_park, number):
+            did["parked"].append(number)
+            settled.add(number)
+        elif do in ("fail", "escalate"):
+            fn = cmd_fail if do == "fail" else cmd_escalate
+            done = run(do, fn, number, reason=detail)
+            if done and done["action"] == "escalate":
+                did["escalated"].append(number)
+                settled.add(number)
+            elif done:
+                did["retried"].append(number)
+                touched.add(number)
+
+    # --- release what outlived its issue ---
+    for row in ws["mine"]:
+        if row["status"] == "closed" and run("release", cmd_release, row["number"],
+                                             expect_sha=None):
+            did["cleared"].append(row["number"])
+            settled.add(row["number"])
+    for row in ws["stale_closed"]:
+        if run("release", cmd_release, row["number"], expect_sha=row["sha"]):
+            did["cleared"].append(row["number"])
+
+    # --- start workers: continuations of claims already held, then the frontier ---
+    starting, taken = True, 0
+
+    def start(number):
+        nonlocal starting
+        worker = run("dispatch", cmd_dispatch, number, start="auto") if starting else None
+        starting = starting and worker is not None
+        return worker
+
+    for number, do, _ in routes:
+        if do == "dispatch" and (start(number) or {}).get("started"):
+            did["dispatched"].append(number)
+            touched.add(number)
+    for row in ws["stale"]:
+        took = run("reclaim", cmd_reclaim, row["number"], expect_sha=row["sha"]) \
+            if starting else None
+        if took and took["won"]:
+            taken += 1
+            if (start(row["number"]) or {}).get("started"):
+                did["reclaimed"].append(row["number"])
+    slots = ws["free_slots"] + len(settled) - taken
+    left = len(ws["frontier"]["dispatch"])
+    for issue in ws["frontier"]["dispatch"]:
+        if slots <= 0 or not starting:
+            break
+        worker = start(issue["number"])
+        if worker:
+            left -= 1                    # started, or a peer won it: off the frontier either way
+        if worker and worker["started"]:
+            did["dispatched"].append(issue["number"])
+            taken, slots = taken + 1, slots - 1
+
+    did["in_flight"] = len(mine) - len(settled) + taken
+    did["frontier_remaining"] = left
+
+    # --- the lease, and what a human reads on each issue ---
+    if did["in_flight"]:
+        run("heartbeat", cmd_heartbeat)
+    if cfg["progress_comment"]:
+        for row in ws["mine"]:
+            if row["board_phase"] and row["number"] not in settled | touched:
+                run("status", cmd_status, row["number"], phase=row["board_phase"],
+                    pr=row["pr"], attempt=row["attempt"])
+    return did, judgments, errors
 
 
 # --------------------------------------------------------------------------- #
 # observation: rebuild / no-pr / recovery                                      #
 # --------------------------------------------------------------------------- #
 
-def cmd_rebuild(a):
-    """One read-only call → the tick's whole working set (ADR-0008). The
-    per-issue blocked_by read is paid only by issues that pass every cheaper
-    eligibility check, the per-issue state read only by a claim whose issue is
-    missing from the open list, and the landing-turn read only by a claim of
-    mine that has a PR. Strictly observation: nothing here writes a ref, a
-    comment, or a PR."""
-    cfg = _cfg(a)
-    issues, prs, claims, heartbeats = _gather(a, cfg)
+def _rebuild(a, cfg, gathered=None):
+    """The working set (`afk_decide.assemble_working_set`), from `gathered` — a
+    `_gather` the caller already made — or a fresh one. The per-issue blocked_by
+    read is paid only by issues that pass every cheaper eligibility check, the
+    per-issue state read only by a claim whose issue is missing from the open
+    list, and the landing-turn read only by a claim of mine that has a PR."""
+    issues, prs, claims, heartbeats = gathered or _gather(a, cfg)
     blocked = {}
     for n in afk_decide.frontier_candidates(issues, prs, claims,
                                             cfg["ready_label"], cfg["epic_labels"]):
@@ -773,6 +902,13 @@ def cmd_rebuild(a):
     return afk_decide.assemble_working_set(
         issues, prs, claims, heartbeats, blocked, a.instance, _now(a), cfg, closed=closed,
         turns=_held_turns(a.repo, prs, claims, a.instance))
+
+
+def cmd_rebuild(a):
+    """One read-only call → the tick's whole working set (ADR-0008) — what a tick
+    acts on, and what `--plan` prints instead. Strictly observation: nothing here
+    writes a ref, a comment, or a PR."""
+    return _rebuild(a, _cfg(a))
 
 
 def _issue_worktree(repo, number):
@@ -1916,17 +2052,22 @@ def build_parser():
     p.add_argument("--excerpt-lines", type=int, default=afk_decide.GATE_EXCERPT_LINES, metavar="k",
                    help="how many trailing log lines a red gate's excerpt keeps")
 
-    # --- the launcher's cycle ---
+    # --- the cycle ---
     p = command("cycle", cmd_cycle, remote="gh",
-                help="one launcher cycle: tick-or-skip at the top (with the skipped cycle's "
-                     "heartbeat and sleep), or — with --summary — the sleep after a tick")
-    mine(p)
+                help="one whole cycle: tick-or-skip, and on a tick the pass itself — rebuild "
+                     "and every routed transition — returning the state, the sleep, a "
+                     "progress line and the judgments it could not make")
     p.add_argument("--state", default=None, metavar="json",
                    help="the `state` the previous `afk cycle` returned, verbatim (omit on "
-                        "the first cycle)")
-    p.add_argument("--summary", default=None, metavar="json",
-                   help="the summary JSON of the tick that just ran: folds it into the "
-                        "state and returns the sleep")
+                        "the first cycle, which always ticks)")
+    p.add_argument("--instance", default=None, metavar="id",
+                   help="my fleet instance id — the first cycle only; then --state carries it")
+    p.add_argument("--host", default=socket.gethostname())
+    p.add_argument("--worker-command", default=None, metavar="cmd",
+                   help="the run's worker launch command, verbatim (ADR-0010) — the first "
+                        "cycle only; then --state carries it")
+    p.add_argument("--ready-timeout", type=int, default=120, metavar="s",
+                   help="seconds to wait for a started agent to accept a prompt")
 
     # --- claim refs ---
     command("scan", cmd_scan, "debug: read all claim + heartbeat refs", remote="refs")
