@@ -50,6 +50,25 @@ A PR may land only when **all** configured gates are green. Which **machine gate
   code it observed; a worker reporting "the gate is green" proves nothing and leaves none. What is
   given up is the second run's independence on an unchanged commit — a flaky test that passed once
   is not asked again — so the default is off.
+- **`merge.batch` — one landing run for several PRs**
+  ([ADR-0028](../../../docs/adr/0028-a-merge-batch-lands-n-prs-behind-one-gate-run.md); `local`
+  only, opt-in). The landing's run is the fleet's landing throughput: N finished PRs are N runs.
+  With the option on, when two or more finished PRs may land together the landing turn goes to all
+  of them as a **merge batch**: a batch worker, in a worktree of the batch's own, stacks them on the
+  target's tip — one squash commit per PR, in merge order — and `afk land --batch` runs
+  `gate.local_command` **once, on the stack**, then pushes the stack to the target as a
+  fast-forward. The invariant is kept literally — the commit the target is moved to is the commit
+  the gate passed on — but what the gate proves is the **stack**, not each PR alone: the
+  intermediate commits were never gated by themselves. A recorded run is never trusted here
+  (`gate.trust_recorded_run` does not apply: no record is of a stack). A red run lands nothing and
+  is the batch worker's `outcome: gate_red`: it fixes the stack with one more commit on top and runs
+  the command again — nobody bisects for the PR at fault. The push is the only lock: a target that
+  moved while the gate ran refuses it (`target_moved`), nothing lands, and the same command
+  re-stacks and gates again. A PR that conflicts with the stack is left out and lands on a single
+  turn. Never batched: a PR that owes an adversarial verify (so with `gate.adversarial_verify` on,
+  none is), one whose own worker is still working, a peer's. The target must accept a direct push:
+  bootstrap **hard-errors** when its protection requires pull request reviews, restricts pushes, or
+  is locked.
 - **Independent adversarial verification** (if `gate.adversarial_verify`) — a *separate* agent (not
   the author, doesn't see its reasoning) re-derives the result and tries to **refute** it (e.g.
   re-solve and assert `final == official answer:`, audit the derivation). Refute-first: any

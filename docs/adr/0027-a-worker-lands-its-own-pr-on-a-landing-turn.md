@@ -13,6 +13,9 @@ and ADR-0026's recorded gate run, are kept. Reuses the silent-worker ladder of
 [ADR-0018](0018-nudge-a-silent-worker-before-failing-it.md) and the continuation tiers of
 [ADR-0011](0011-takeover-and-progress-preservation.md) unchanged; enforced in the seam
 ([ADR-0016](0016-the-seam-enforces-its-own-rules.md)).
+**Extended, opt-in, by [ADR-0028](0028-a-merge-batch-lands-n-prs-behind-one-gate-run.md):** with
+`merge.batch` one landing turn may be held by several PRs — a merge batch — and landed by a batch
+worker behind a single gate run.
 
 ## Context
 

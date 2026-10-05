@@ -55,6 +55,16 @@ one recreated at the PR's head — never from base — and briefed only to land 
 not with the task. The result says so (`prompt: landing`, `landing: <pr>`). `afk turn` itself takes
 this path when the worker's terminal is already gone.
 
+**A merge batch is continued too** (ADR-0028). Its worker has no claim, so `afk dispatch` is not
+its path: the pass asks after it with `afk no-pr --batch`, and when its terminal is gone
+`afk turn --batch` starts a new batch worker — in the batch's worktree if it is on this machine (fix
+commits and all), else in one cut from the batch's pushed branch, which holds the stack as of its
+last `afk land --batch`; a batch that had stacked nothing yet starts again at the target's tip. The
+result says which (`delivery: worktree | branch | fresh`, `again: true`). The command it is briefed
+with rebuilds the stack from the target's tip every time, so a continued batch needs nothing
+remembered. A batch recorded by a fleet that **died** is different: the fleet that takes its claims
+abandons it (`afk turn --abandon`), and the PRs land on that fleet's single turns.
+
 **This is not the retry path.** A red gate / adversarial refute / `giving-up` verdict goes through
 `afk fail`, which discards the attempt and starts *fresh* with the failure reason (see
 [Failure handling](../SKILL.md#failure-handling--bounded-retry--escalate-never-silently-drop)) — there the previous
