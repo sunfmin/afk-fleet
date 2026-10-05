@@ -18,7 +18,8 @@ where it actually lives — executables on PATH:
 
   gh    a stand-in backed by one JSON state file (native dependency edges
         included: an issue's open-blocker count is derived from them). It projects exactly the fields
-        asked for (asking for one GitHub does not have is a KeyError), applies only
+        asked for (asking for one GitHub does not have is a KeyError), pages a list
+        nobody asked to have paginated, applies only
         the `--jq` filters it knows (a changed filter fails loudly rather than
         silently diverging), refuses what GitHub refuses (an unknown label, a merge
         pinned to a head the branch has left), and logs every call so a test can
@@ -33,11 +34,16 @@ where it actually lives — executables on PATH:
 
 git is real, against the same bare-repo sandbox as `test_afk_refs.py`; `--repo
 owner/name` reaches it through a `url.<bare>.insteadOf` rewrite in the clone.
+
+A test that counts round trips, or needs to see two of them overlap, asks for
+`spans`: every gh, orca and git call is then logged with when it started and
+ended, and the ones a test names are made slow enough to overlap visibly.
 """
 import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -53,19 +59,52 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SKILL = os.path.dirname(HERE)
 AFK = os.path.join(HERE, "afk.py")
 
-FAKE_GH = r'''#!%(python)s
-import json, os, subprocess, sys
+# Both stand-ins keep their state in one JSON file, and afk calls them several
+# at a time: each holds a lock from reading the file to replacing it. A call
+# made slow (to be seen overlapping another) sleeps BEFORE taking the lock.
+FAKE_PREAMBLE = r'''
+import fcntl, json, os, subprocess, sys, time
 
+argv = sys.argv[1:]
+
+
+def spanned(tool, slow):
+    """Log this call's start and end when the test asked for spans, sleeping
+    AFK_FAKE_SLOW seconds in between when it is one the test made slow."""
+    log = os.environ.get("AFK_FAKE_SPANS")
+    if not log:
+        return
+    start = time.time()
+    if slow:
+        time.sleep(float(os.environ.get("AFK_FAKE_SLOW", "0")))
+    with open(log, "a") as f:
+        f.write(json.dumps({"tool": tool, "argv": argv, "start": start, "end": time.time()}) + "\n")
+
+
+def locked(path):
+    lock = open(path + ".lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    return lock
+
+
+def replace(path, doc):
+    with open(path + ".tmp", "w") as f:
+        json.dump(doc, f)
+    os.replace(path + ".tmp", path)
+'''
+
+FAKE_GH = r'''#!%(python)s
+%(preamble)s
 path = os.environ["AFK_FAKE_GH"]
+spanned("gh", argv[:2] == ["pr", "list"] or (argv[0] == "api" and "/issues?" in " ".join(argv)))
+lock = locked(path)
 with open(path) as f:
     st = json.load(f)
-argv = sys.argv[1:]
 st.setdefault("calls", []).append(argv)
 
 
 def finish(out=None, code=0, err=""):
-    with open(path, "w") as f:
-        json.dump(st, f)
+    replace(path, st)
     if out is not None:
         print(out)
     sys.stderr.write(err)
@@ -101,12 +140,13 @@ if " ".join(argv[:2]) in st.get("fail", []):
 if argv[0] in ("issue", "pr", "label") and opt("--repo") != st["repo"]:
     finish(code=1, err="fake gh: unknown repo %%s\n" %% opt("--repo"))
 
-if argv[:2] in (["issue", "list"], ["pr", "list"]):
+if argv[:2] == ["pr", "list"]:
     assert opt("--state") == "open", argv
-    rows = [r for r in st["issues" if argv[0] == "issue" else "prs"]
-            if r.get("state", "open") == "open"]
-    if argv[0] == "pr":
-        rows = [{**r, "headRefOid": head_of(r)} for r in rows]
+    rows = [r for r in st["prs"] if r.get("state", "open") == "open"]
+    for r in rows:                   # a PR whose checks a test scripted: one step per read
+        if r.get("rollups"):
+            r["statusCheckRollup"] = r["rollups"].pop(0)
+    rows = [{**r, "headRefOid": r.get("stale_head") or head_of(r)} for r in rows]
     fields = opt("--json").split(",")
     finish(json.dumps([{k: r[k] for k in fields} for r in rows]))
 
@@ -173,6 +213,8 @@ endpoint = next(x for x in argv[1:] if x.startswith("repos/"))
 prefix = "repos/%%s/" %% st["repo"]
 if not endpoint.startswith(prefix):
     finish(code=1, err="gh: Not Found (HTTP 404)\n")
+endpoint, _, query = endpoint.partition("?")
+query = dict(kv.split("=") for kv in query.split("&") if kv)
 parts = endpoint[len(prefix):].split("/")
 method, jq = opt("--method", "GET"), opt("--jq")
 body = next((x[len("body="):] for x in argv if x.startswith("body=")), None)
@@ -193,7 +235,7 @@ if parts[0] == "issues" and parts[2:] == ["comments"]:
         assert body is not None, argv
         new = 1 + max([c["id"] for rs in comments.values() for c in rs], default=1000)
         rows.append({"id": new, "body": body, "html_url": "https://gh/c/%%d" %% new})
-        finish(json.dumps({"id": new}))
+        finish(json.dumps({"id": new, "html_url": "https://gh/c/%%d" %% new}))
     assert jq == ".[] | {id, body, url: .html_url}", "fake gh: unsupported jq %%r" %% jq
     finish("\n".join(json.dumps({"id": c["id"], "body": c["body"], "url": c["html_url"]})
                      for c in rows))
@@ -208,6 +250,28 @@ def issue_row(number):
 def issue_id(row):
     return row.get("id", 9000 + row["number"])
 
+
+def open_blockers(row):
+    edges = st.get("deps", {}).get(str(row["number"]))
+    if edges is None:                     # a count the test set by hand, or none at all
+        return row.get("blocked_by")
+    return len([n for n in edges if issue_row(n).get("state", "open") == "open"])
+
+
+if parts == ["issues"]:                  # the list: issues AND pull requests, a page at a time
+    assert query.get("state") == "open", argv
+    rows = [r for r in st["issues"] if r.get("state", "open") == "open"]
+    if "--paginate" not in argv:
+        rows = rows[:int(query.get("per_page", 30))]
+    assert jq == (".[] | select(.pull_request == null) | {number, title, "
+                  "labels: [.labels[].name], updatedAt: .updated_at, "
+                  "blocked_by: (.issue_dependencies_summary.blocked_by // 0)}"), \
+        "fake gh: unsupported jq %%r" %% jq
+    finish("\n".join(json.dumps({"number": r["number"], "title": r["title"],
+                                  "labels": [lb["name"] for lb in r["labels"]],
+                                  "updatedAt": r["updatedAt"],
+                                  "blocked_by": open_blockers(r) or 0})
+                      for r in rows if "pull_request" not in r))
 
 if parts[0] == "issues" and parts[2:] == ["dependencies", "blocked_by"]:
     issue_row(parts[1])
@@ -239,11 +303,7 @@ if parts[0] == "issues" and len(parts) == 2:
     if jq == "{title, state, labels: [.labels[].name]}":
         finish(json.dumps({"title": row["title"], "state": row.get("state", "open"),
                            "labels": [lb["name"] for lb in row["labels"]]}))
-    assert jq == ".issue_dependencies_summary.blocked_by", "fake gh: unsupported jq %%r" %% jq
-    edges = st.get("deps", {}).get(parts[1])
-    if edges is None:                     # a count the test set by hand, or none at all
-        finish(json.dumps(row.get("blocked_by")))
-    finish(json.dumps(len([n for n in edges if issue_row(n).get("state", "open") == "open"])))
+    assert False, "fake gh: unsupported jq %%r" %% jq
 
 if parts[0] == "branches" and parts[2:] == ["protection"]:
     prot = st.get("protection", {}).get(parts[1])
@@ -257,10 +317,10 @@ finish(code=1, err="fake gh: unsupported call %%r\n" %% argv)
 '''
 
 FAKE_ORCA = r'''#!%(python)s
-import json, os, subprocess, sys
-
+%(preamble)s
 path = os.environ["AFK_FAKE_ORCA"]
-argv = sys.argv[1:]
+spanned("orca", argv[:2] == ["terminal", "wait"])
+lock = locked(path)
 with open(path) as f:
     raw = f.read()
 if argv == ["worktree", "list", "--json"]:       # verbatim, so a test can make it garbage
@@ -274,8 +334,7 @@ fake["calls"].append(argv[:-1])
 
 
 def finish(result=None, error=None):
-    with open(path, "w") as f:
-        json.dump(doc, f)
+    replace(path, doc)
     print(json.dumps({"id": "x", "ok": error is None, "result": result,
                       **({"error": {"code": error, "message": error}} if error else {})}))
     sys.exit(1 if error else 0)
@@ -310,6 +369,8 @@ if cmd == ["worktree", "create"]:
     if repo is None:
         finish(error="selector_not_found")
     assert "--no-parent" in argv, argv
+    if int(opt("--issue")) in fake.get("create_fails", []):
+        finish(error="worktree_create_failed")
     taken = git(repo["path"], "for-each-ref", "--format=%%(refname:short)", "refs/heads").splitlines()
     name, n = opt("--name"), 1
     while "tester/" + name + ("" if n == 1 else "-%%d" %% n) in taken:     # orca never reuses a branch
@@ -419,6 +480,18 @@ sys.exit(1)
 '''
 
 
+# git stays real. This only stands in front of it when a test asked for spans —
+# to log each call, and to make the claim scan slow enough to be seen overlapping.
+FAKE_GIT = r'''#!/bin/sh
+[ -z "$AFK_FAKE_SPANS" ] && exec %(git)s "$@"
+exec %(python)s - "$@" <<'PY'
+%(preamble)s
+spanned("git", "fetch" in argv and any("afk-scan" in x for x in argv))
+os.execv("%(git)s", ["git", *argv])
+PY
+'''
+
+
 def issue(n, *labels, **extra):
     """One issue as GitHub's API returns it (labels are objects, not names)."""
     return {"number": n, "title": f"issue {n}", "updatedAt": f"T{n}",
@@ -444,11 +517,15 @@ class World:
         git(self.cwd, "config", f"url.{sb.bare}.insteadOf", f"https://github.com/{REPO}.git")
         bindir = os.path.join(sb.root, "bin")
         os.mkdir(bindir)
-        for name, src in (("gh", FAKE_GH), ("orca", FAKE_ORCA), ("fakeshell", FAKE_SHELL)):
+        real_git = shutil.which("git", path=ENV["PATH"])
+        for name, src in (("gh", FAKE_GH), ("orca", FAKE_ORCA), ("fakeshell", FAKE_SHELL),
+                          ("git", FAKE_GIT)):
             exe = os.path.join(bindir, name)
             with open(exe, "w") as f:
-                f.write(src % {"python": sys.executable})
+                f.write(src % {"python": sys.executable, "git": real_git,
+                               "preamble": FAKE_PREAMBLE})
             os.chmod(exe, 0o755)
+        self.span_file = os.path.join(sb.root, "spans.jsonl")
         self.gh_file = os.path.join(sb.root, "gh.json")
         self.orca_file = os.path.join(sb.root, "orca.json")
         self.env = {**ENV, "PATH": bindir + os.pathsep + ENV["PATH"],
@@ -482,6 +559,23 @@ class World:
         if reset:
             self.set(calls=[])
         return calls
+
+    def spans(self, slow=0.0):
+        """The env that has one `afk` call log every gh / orca / git call it makes
+        (`spanned`), the ones a fake calls slow taking `slow` seconds each."""
+        if os.path.exists(self.span_file):
+            os.remove(self.span_file)
+        return {"AFK_FAKE_SPANS": self.span_file, "AFK_FAKE_SLOW": str(slow)}
+
+    def spanned(self, tool, *words):
+        """The logged calls of `tool` whose argv holds every one of `words` (a
+        word matches as a substring of the joined argv)."""
+        if not os.path.exists(self.span_file):
+            return []
+        with open(self.span_file) as f:
+            rows = [json.loads(ln) for ln in f if ln.strip()]
+        return [r for r in rows if r["tool"] == tool
+                and all(w in " ".join(r["argv"]) for w in words)]
 
     def issue(self, n):
         row = next(i for i in self.state()["issues"] if i["number"] == n)
