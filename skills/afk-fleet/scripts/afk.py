@@ -2100,8 +2100,7 @@ def _upsert_board(repo, number, cfg, phase, instance=None, pr=None, attempt=0, b
     key = afk_decide.board_key(body)
     if _BOARDS.get(number) == key:
         return {"action": "known", "issue": number}
-    board = next((c for c in _issue_comments(repo, number)
-                  if afk_decide.STATUS_MARKER in (c["body"] or "")), None)
+    _, board = afk_decide.latest_record(afk_decide.STATUS_RECORD, _issue_comments(repo, number))
     if board is None:
         done = {"action": "created", "comment_id": _comment(repo, number, body)}
     elif board["body"].strip() == body.strip():

@@ -95,33 +95,75 @@ BRANCH_NAMESPACE = "refs/heads"
 
 
 # --------------------------------------------------------------------------- #
-# Records kept on refs — one encoding (ADR-0031)                               #
+# Records — one encoding, on a ref or in a comment (ADR-0031, ADR-0032)        #
 # --------------------------------------------------------------------------- #
 #
-# What the fleet keeps on a git ref is a record: a set of named fields, carried
-# as the subject of the small commit the ref points at —
+# What the fleet remembers is a record: a set of named fields, written as
 #
 #     <word> <field>=<value> <field>=<value> …
 #
+# and carried one of two ways — as the subject of the small commit a ref points
+# at (`record_message` / `read_record`), or as a marker in a comment on an issue
+# or a PR, `<!--<word> <field>=<value> …-->`, with the same facts worded for a
+# human under it (`record_comment` / `read_marker` / `latest_record`).
+#
 # A kind of record declares its word and its fields and nothing else; writing
-# one (`record_message`) and reading one back (`read_record`) are the same code
-# for every kind, and so are the three rules of reading:
+# one and reading one back are the same code for every kind and both carriers,
+# and so are the rules of reading:
 #
 #   - a field the kind does not declare is ignored — a newer fleet may write one
 #     an older fleet reads past;
 #   - a field with no value, or a value that is not of its type, is a field that
 #     is missing; a missing optional field is simply absent from the record;
-#   - a commit whose subject does not open with the kind's word, or that lacks a
-#     required field, is not a record: it reads as None, never as a record with
-#     holes in it.
+#   - a commit whose subject does not open with the kind's word, a comment with
+#     no marker of the kind, or either one lacking a required field, is not a
+#     record: it reads as None, never as a record with holes in it;
+#   - of the comments on one issue or PR, the latest that carries a record is
+#     the record (`latest_record`).
 #
 # A value is percent-encoded only where it would break a word (whitespace, `%`,
 # anything outside ASCII), so an instance id or a hostname is written as itself.
+# The one value written raw is a kind's `tail`: the field a person fills in with
+# a phrase, which runs from its name to the end of the record.
 
 class RecordKind(NamedTuple):
-    word: str           # the subject's first word: what kind of record this is
-    fields: dict        # field → str | int, in the order they are written
-    required: tuple     # the fields without which a commit is not this record
+    word: str           # the record's first word: what kind of record this is
+    fields: dict        # field → its type, in the order they are written
+    required: tuple     # the fields without which a commit or a marker is not this record
+    tail: str = None    # the field, declared last, whose value runs to the record's end
+
+
+class FieldType(NamedTuple):
+    """How one field's value is spelled. `str` and `int` are declared as
+    themselves; the rest are below, or beside the one kind that needs them."""
+    write: object       # value → its text; "" when there is nothing to write
+    read: object        # text (never empty) → value; None when it is no such value
+
+
+def _digits(raw):
+    return int(raw) if raw.isascii() and raw.isdigit() else None
+
+
+_FIELD_TYPES = {str: FieldType(str, lambda raw: raw),
+                int: FieldType(lambda value: str(int(value)), _digits)}
+
+# A fact that is either so or not: written `=1` when so, left out when not.
+FLAG = FieldType(lambda value: "1" if value else "", lambda raw: True if raw == "1" else None)
+
+# Whole numbers, comma-separated; anything else in the list is dropped.
+INTS = FieldType(lambda values: ",".join(str(int(v)) for v in values),
+                 lambda raw: [int(x) for x in re.split(r"[,\s]+", raw) if _digits(x) is not None]
+                 or None)
+
+
+def one_of(vocabulary):
+    """A word of a closed vocabulary: any other is not written (a defect in the
+    caller: it raises) and not read (the field is missing)."""
+    def write(value):
+        if value not in vocabulary:
+            raise ValueError(f"not one of {', '.join(vocabulary)}: {value!r}")
+        return value
+    return FieldType(write, lambda raw: raw if raw in vocabulary else None)
 
 
 # A claim names the fleet instance that holds an issue (ADR-0003). The ref is the
@@ -139,40 +181,103 @@ PROBE_RECORD = RecordKind("afk-probe", {"ts": int}, ("ts",))
 _RECORD_SAFE = "!\"#$&'()*+,/:;<=>?@[\\]^`{|}~"
 
 
-def record_message(kind, record):
-    """A record → the commit message that carries it. Fields are written in the
-    kind's order; one that is None or empty is left out. A field the kind does not
-    declare, or a required one left out, is a defect in the caller and raises."""
+def _field_words(kind, record, spell):
+    """The `<field>=<value>` words of `record`, in the kind's order — each value
+    as `spell(name, value)` gives it, a field it gives no text for left out."""
     unknown = sorted(set(record) - set(kind.fields))
     if unknown:
         raise ValueError(f"{kind.word} record has no field {', '.join(unknown)}")
-    words = [kind.word]
-    for name, type_ in kind.fields.items():
+    words = []
+    for name in kind.fields:
         value = record.get(name)
-        if value is None or value == "":
-            if name in kind.required:
-                raise ValueError(f"{kind.word} record needs {name}")
+        text = "" if value is None else spell(name, value)
+        if text:
+            words.append(f"{name}={text}")
+        elif name in kind.required:
+            raise ValueError(f"{kind.word} record needs {name}")
+    return words
+
+
+def record_message(kind, record):
+    """A record → the one line that carries it: a commit's message as it is, a
+    comment's marker inside `<!--` and `-->` (`record_marker`). Fields are written
+    in the kind's order; one that is None or empty is left out. A field the kind
+    does not declare, or a required one left out, is a defect in the caller and
+    raises."""
+    def spell(name, value):
+        text = _FIELD_TYPES.get(kind.fields[name], kind.fields[name]).write(value)
+        return text if name == kind.tail else urllib.parse.quote(text, safe=_RECORD_SAFE)
+    return " ".join([kind.word, *_field_words(kind, record, spell)])
+
+
+def _read_fields(kind, text):
+    """What follows a kind's word → the record, or None when a required field is
+    missing. A comma may be followed by whitespace: a list is still one value."""
+    record = {}
+    tail = re.search(rf"\b{kind.tail}=(.*)$", text, re.DOTALL) if kind.tail else None
+    if tail:
+        text = text[:tail.start()]
+        if tail.group(1).strip():
+            record[kind.tail] = tail.group(1).strip()
+    for word in re.sub(r",\s+", ",", text).split():
+        name, _, raw = word.partition("=")
+        type_ = kind.fields.get(name)
+        if type_ is None or not raw:
             continue
-        words.append(f"{name}={urllib.parse.quote(str(type_(value)), safe=_RECORD_SAFE)}")
-    return " ".join(words)
+        value = _FIELD_TYPES.get(type_, type_).read(urllib.parse.unquote(raw))
+        if value is not None:
+            record[name] = value
+    return record if all(name in record for name in kind.required) else None
 
 
 def read_record(kind, message):
     """A commit message → the record of `kind` it carries, as {field: value} with
     every required field present and each optional one present only when the
     commit states it — or None when the commit is not such a record."""
-    words = (message or "").split("\n", 1)[0].split()
-    if not words or words[0] != kind.word:
-        return None
-    record = {}
-    for word in words[1:]:
-        name, _, raw = word.partition("=")
-        type_ = kind.fields.get(name)
-        if type_ is int and raw.isdigit():
-            record[name] = int(raw)
-        elif type_ is str and raw:
-            record[name] = urllib.parse.unquote(raw)
-    return record if all(name in record for name in kind.required) else None
+    word, _, rest = (message or "").split("\n", 1)[0].strip().partition(" ")
+    return _read_fields(kind, rest) if word == kind.word else None
+
+
+def record_marker(kind, record):
+    """A record → the marker that carries it in a comment."""
+    return f"<!--{record_message(kind, record)}-->"
+
+
+def marker_format(kind, shown, optional=()):
+    """A kind's marker as it is shown to whoever must write one by hand: each
+    field of `shown` ({field: placeholder, or the value already known}) under
+    its own name and in the kind's order, the `optional` ones in brackets."""
+    words = _field_words(kind, shown, lambda name, value: str(value))
+    words = [f"[{word}]" if word.partition("=")[0] in optional else word for word in words]
+    return f"<!--{' '.join([kind.word, *words])}-->"
+
+
+def record_comment(kind, record, text):
+    """The comment that keeps a record: its marker, then the same facts worded
+    for a human reading the issue or the PR."""
+    return f"{record_marker(kind, record)}\n{text}"
+
+
+def read_marker(kind, body):
+    """A comment body → the record of `kind` its first marker carries, read as
+    `read_record` reads a commit; None when the body has no such marker, or the
+    marker lacks a required field."""
+    m = re.search(rf"<!--\s*{re.escape(kind.word)}\b(.*?)-->", body or "", re.DOTALL)
+    return _read_fields(kind, m.group(1)) if m else None
+
+
+def latest_record(kind, comments):
+    """The record of `kind` kept on one issue or PR, from its comments
+    ([{"id", "body", "url"}...], oldest first) → (record, the comment that
+    carries it), or (None, None). The latest marker wins — and a comment whose
+    marker is not a record is passed over, not read as the latest. The comment
+    is where a rewrite goes: a record is kept in ONE comment, rewritten in place."""
+    found = (None, None)
+    for comment in comments or []:
+        record = read_marker(kind, comment.get("body"))
+        if record is not None:
+            found = (record, comment)
+    return found
 
 # The completion gate's two modes (ADR-0012), each with what the status board calls
 # that gate. `required` waits for the PR's GitHub checks; `local` never reads them
@@ -797,8 +902,6 @@ def gate_comment(verdict, command):
 # what this code concludes from all three signals. Whether to TRUST the marker
 # stays the tick's call.
 
-_VERDICT_MARKER_RE = re.compile(r"<!--\s*afk:verdict\b(.*?)-->", re.DOTALL)
-
 # The phases a worker may declare in its marker (worker-prompt.md asks for exactly
 # these; anything else `classify_stopped` treats as a failure).
 VERDICT_PHASES = ("already-satisfied", "blocked", "giving-up")
@@ -836,83 +939,60 @@ WORKER_CAUSES = {
 NO_PR_ROUTES = tuple(dict.fromkeys(WORKER_CAUSES.values()))
 
 
-def _verdict_text(n, phase, blocked_by, reason, optional=str):
-    """The marker's one spelling: its fields, their names and their order."""
-    parts = [f"n={n}", f"phase={phase}",
-             *([optional(f"blocked_by={blocked_by}")] if blocked_by else []),
-             *([optional(f"reason={reason}")] if reason else [])]
-    return f"<!--afk:verdict {' '.join(parts)}-->"
+# A worker's verdict, kept as a marker leading a comment on its issue:
+#
+#   <!--afk:verdict n=<issue> phase=<one of VERDICT_PHASES> \
+#       [blocked_by=<csv of issue numbers>] [reason=<short>]-->
+#
+# The worker writes it by hand, so nothing is required of it: a marker with no
+# phase, or one the fleet does not know, is still a verdict — what it means is
+# `classify_stopped`'s call. `reason` is the kind's tail: a short human phrase,
+# spaces and all, to the end of the marker.
+VERDICT_RECORD = RecordKind("afk:verdict",
+                            {"n": int, "phase": str, "blocked_by": INTS, "reason": str},
+                            (), tail="reason")
+
+# Every field a verdict gives back, at the value that says nothing.
+_NO_VERDICT = {"n": None, "phase": None, "blocked_by": [], "reason": None}
 
 
 def verdict_marker(n, phase, blocked_by=(), reason=None):
     """The marker a worker posts for one verdict — what `parse_verdict_marker`
     reads back (a test round-trips every phase)."""
-    return _verdict_text(n, phase, ",".join(str(b) for b in blocked_by), reason)
+    return record_marker(VERDICT_RECORD, {"n": n, "phase": phase, "blocked_by": list(blocked_by),
+                                          "reason": reason})
 
 
 def verdict_marker_format(n):
     """The marker as the worker prompt shows it to issue <n>'s worker: its own
     number filled in, the rest as placeholders, optional fields in brackets."""
-    return _verdict_text(n, f"<{'|'.join(VERDICT_PHASES)}>", "<csv of issue numbers>", "<short>",
-                         optional=lambda field: f"[{field}]")
+    return marker_format(VERDICT_RECORD,
+                         {"n": n, "phase": f"<{'|'.join(VERDICT_PHASES)}>",
+                          "blocked_by": "<csv of issue numbers>", "reason": "<short>"},
+                         optional=("blocked_by", "reason"))
 
 
 def parse_verdict_marker(body):
     """
-    Parse the FIRST afk:verdict marker in one comment body → a verdict dict, or
-    None if the body carries no marker. The marker is `verdict_marker`'s:
-
-      <!--afk:verdict n=<issue> phase=<one of VERDICT_PHASES> \
-          [blocked_by=<csv of issue numbers>] [reason=<short>]-->
-
-    LENIENT — a marker with a missing/unknown field still parses
-    ({"found": True, "phase": None|<raw>}); what an unrecognised phase means is
-    `classify_stopped`'s call. `reason` (if present) must be the last field — it captures to the end
-    of the marker so a short human phrase with spaces survives. Returns:
+    The verdict one comment body carries (`VERDICT_RECORD`), or None if the body
+    carries no marker. Returns:
       {"found": True, "n": int|None, "phase": str|None, "blocked_by": [int], "reason": str|None}
     """
-    if not body:
-        return None
-    m = _VERDICT_MARKER_RE.search(body)
-    if not m:
-        return None
-    attrs = m.group(1)
-    reason = None
-    rm = re.search(r"\breason=(.*)$", attrs, re.DOTALL)
-    if rm:
-        reason = rm.group(1).strip() or None
-        attrs = attrs[:rm.start()]        # keep reason from swallowing nothing else
-
-    def _grab(pat):
-        mm = re.search(pat, attrs)
-        return mm.group(1) if mm else None
-
-    n_raw = _grab(r"\bn=(\d+)")
-    bb_raw = _grab(r"\bblocked_by=([0-9,\s]*)")
-    return {"found": True,
-            "n": int(n_raw) if n_raw else None,
-            "phase": _grab(r"\bphase=([A-Za-z][\w-]*)"),
-            "blocked_by": [int(x) for x in re.split(r"[,\s]+", (bb_raw or "").strip()) if x],
-            "reason": reason}
+    record = read_marker(VERDICT_RECORD, body)
+    return None if record is None else {"found": True, **_NO_VERDICT, **record}
 
 
 def latest_verdict(comments):
     """
-    The LATEST afk:verdict across an issue's comments (multiple markers → latest
-    wins). `comments` are [{"body", "url"}...], oldest first (the gh default).
-    Returns:
+    The worker's verdict on an issue, from its comments ([{"body", "url"}...],
+    oldest first, the gh default) — `latest_record`'s. Returns:
       {"found": bool, "phase": str|None, "blocked_by": [int], "reason": str|None,
        "comment_url": str|None}
     """
-    result = {"found": False, "phase": None, "blocked_by": [],
-              "reason": None, "comment_url": None}
-    for c in comments or []:
-        parsed = parse_verdict_marker(c.get("body"))
-        if parsed:
-            result = {"found": True, "phase": parsed["phase"],
-                      "blocked_by": parsed["blocked_by"], "reason": parsed["reason"],
-                      "comment_url": c.get("url")}
-    return result
+    record, comment = latest_record(VERDICT_RECORD, comments)
+    said = {**_NO_VERDICT, **(record or {})}
+    return {"found": record is not None, "phase": said["phase"], "blocked_by": said["blocked_by"],
+            "reason": said["reason"], "comment_url": comment.get("url") if comment else None}
 
 
 # Where one issue a `blocked` verdict names stands (ADR-0022):
@@ -1301,9 +1381,9 @@ def stall_reason(reason, tail):
 #
 # A marker is never written from loose fields: it is REWRITTEN from the record
 # it was read as (`latest_turn`) plus what changed (`next_turn`), and rendered
-# by `turn_comment` — so a field no rewrite names survives it.
-
-_TURN_MARKER_RE = re.compile(r"<!--\s*afk:turn\b(.*?)-->", re.DOTALL)
+# by `turn_comment` — so a field no rewrite names survives it. The fields, their
+# order and their types are `TURN_RECORD`'s, declared under the vocabularies it
+# is made of.
 
 # Every `outcome` `afk land` can stop with — the vocabulary the worker's prompt
 # routes on (a test holds the prompt and the docs to it).
@@ -1336,6 +1416,27 @@ BATCH_OUTCOMES = ("landed", "gate_red", "target_moved", "too_small")
 UNBATCHED = ("left_out", "abandoned", "dissolved")
 
 
+def _batch_members(raw):
+    """`1:10,2:20` → [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}]; anything
+    else in the list is dropped."""
+    pairs = [tok.split(":") for tok in (raw or "").split(",")]
+    return [{"issue": int(p[0]), "pr": int(p[1])} for p in pairs
+            if len(p) == 2 and p[0].isdigit() and p[1].isdigit()]
+
+
+# The PRs a merge batch holds, in stack order, each with the issue it closes.
+_MEMBERS = FieldType(lambda members: ",".join(f"{m['issue']}:{m['pr']}" for m in members),
+                     lambda raw: _batch_members(raw) or None)
+
+# The landing turn, as the marker of one comment on a PR. A marker that names no
+# instance is not a record — nobody could hold it.
+TURN_RECORD = RecordKind("afk:turn", {
+    "instance": str, "at": int, "verified": str, "allow_no_checks": FLAG,
+    "stopped": one_of(LAND_OUTCOMES), "head": str,
+    "batch": str, "members": _MEMBERS, "phase": one_of(BATCH_PHASES),
+    "unbatched": one_of(UNBATCHED), "of": str, "released": FLAG}, ("instance",))
+
+
 def land_outcome(outcome):
     """`outcome`, refused unless it is one of LAND_OUTCOMES: `afk land` cannot
     stop with a word the worker was never told how to act on."""
@@ -1364,6 +1465,14 @@ def batch_outcome(outcome):
 _NO_TURN = {"instance": None, "at": None, "verified": None, "allow_no_checks": False,
             "stopped": None, "head": None, "batch": None, "members": [], "phase": None,
             "unbatched": None, "of": None, "released": False, "comment_id": None}
+
+
+def _whole_turn(fields):
+    """A turn's fields with the ones that say nothing alone taken out: `head` is
+    where a landing `stopped`, `members` and `phase` are a `batch`'s."""
+    return {**fields,
+            **({} if fields.get("stopped") else {"head": None}),
+            **({} if fields.get("batch") else {"members": [], "phase": None})}
 
 
 def next_turn(prev, **changed):
@@ -1433,49 +1542,31 @@ def turn_comment(turn):
         raise ValueError(f"not a batch phase: {turn['phase']!r}")
     if turn["released"] and turn["unbatched"] not in UNBATCHED:
         raise ValueError(f"not a reason a PR leaves a batch: {turn['unbatched']!r}")
-    listed = ",".join(f"{m['issue']}:{m['pr']}" for m in turn["members"])
-    parts = [f"instance={instance}", f"at={int(turn['at'])}",
-             *([f"verified={turn['verified']}"] if turn["verified"] else []),
-             *(["allow_no_checks=1"] if turn["allow_no_checks"] else []),
-             *([f"stopped={stopped}", f"head={turn['head']}"] if stopped else []),
-             *([f"batch={batch}", f"members={listed}", f"phase={turn['phase']}"] if batch else []),
-             *([f"unbatched={turn['unbatched']}"] if turn["unbatched"] else []),
-             *([f"of={turn['of']}"] if turn["of"] else []),
-             *(["released=1"] if turn["released"] else [])]
-    marker = f"<!--afk:turn {' '.join(parts)}-->\n"
     if turn["released"]:
         said = {"left_out": "it conflicted with the PRs stacked before it, and was left out",
                 "abandoned": "the batch was abandoned, and nothing landed",
                 "dissolved": "fewer than two PRs were left in the batch, so it was dissolved"
                 }[turn["unbatched"]]
-        return (f"{marker}"
-                f"**afk-fleet: this PR was in merge batch `{turn['of']}`** — {said}. It now "
+        text = (f"**afk-fleet: this PR was in merge batch `{turn['of']}`** — {said}. It now "
                 f"waits for a landing turn of its own, on which its worker lands it, and it is "
                 f"not batched again.")
-    if batch:
+    elif batch:
         prs = ", ".join(f"#{m['pr']}" for m in turn["members"])
-        return (f"{marker}"
-                f"**afk-fleet: this PR is in a merge batch** (`{batch}`) of fleet instance "
+        text = (f"**afk-fleet: this PR is in a merge batch** (`{batch}`) of fleet instance "
                 f"`{instance}`: {prs} are stacked on the target as one squash commit each, gated "
                 f"once as a stack, and landed together by the batch's own worker "
                 f"(`afk land --batch`). This PR's branch is not touched. It will be closed, not "
                 f"merged, with a comment naming the commit that landed it. Phase: "
                 f"`{turn['phase']}`.")
-    state = (f"Its last `afk land` stopped with `{stopped}` on `{(turn['head'] or '')[:12]}`."
-             if stopped else "The worker has been told to land it.")
-    return (f"{marker}"
-            f"**afk-fleet: this PR holds the landing turn** of fleet instance `{instance}`. "
-            f"The worker that wrote the branch lands it with `afk land` — sync with the target, "
-            f"gate, merge — and the next PR's turn comes when this one has landed or failed. "
-            f"{state}")
-
-
-def _batch_members(raw):
-    """`1:10,2:20` → [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}]; anything
-    else in the list is dropped."""
-    pairs = [tok.split(":") for tok in (raw or "").split(",")]
-    return [{"issue": int(p[0]), "pr": int(p[1])} for p in pairs
-            if len(p) == 2 and p[0].isdigit() and p[1].isdigit()]
+    else:
+        state = (f"Its last `afk land` stopped with `{stopped}` on `{(turn['head'] or '')[:12]}`."
+                 if stopped else "The worker has been told to land it.")
+        text = (f"**afk-fleet: this PR holds the landing turn** of fleet instance `{instance}`. "
+                f"The worker that wrote the branch lands it with `afk land` — sync with the target, "
+                f"gate, merge — and the next PR's turn comes when this one has landed or failed. "
+                f"{state}")
+    fields = _whole_turn({name: turn[name] for name in TURN_RECORD.fields})
+    return record_comment(TURN_RECORD, fields, text)
 
 
 def latest_turn(comments):
@@ -1483,37 +1574,16 @@ def latest_turn(comments):
     The landing turn recorded on a PR, from its comments ([{"id", "body"}...],
     oldest first) → {"instance", "at", "verified", "allow_no_checks", "stopped",
     "head", "batch", "members", "phase", "unbatched", "of", "released",
-    "comment_id"}, or None when the PR was never granted one. The latest
-    marker wins; one that names no instance is not a record — nobody could hold it.
+    "comment_id"}, or None when the PR was never granted one — `latest_record`'s.
     `batch` / `members` / `phase` are a merge batch's turn (None / [] / None on a
     single one); `unbatched` is the UNBATCHED word of a PR that left a batch and
     `of` the batch it left; `released` says the marker holds no turn at all.
     `turn_comment` renders the record back: the two are a round trip.
     """
-    found = None
-    for c in comments or []:
-        m = _TURN_MARKER_RE.search(c.get("body") or "")
-        if not m:
-            continue
-        attrs = dict(tok.split("=", 1) for tok in m.group(1).split() if "=" in tok)
-        if not attrs.get("instance"):
-            continue
-        at = attrs.get("at", "")
-        stopped = attrs.get("stopped")
-        found = {"instance": attrs["instance"], "at": int(at) if at.isdigit() else None,
-                 "verified": attrs.get("verified"),
-                 "allow_no_checks": attrs.get("allow_no_checks") == "1",
-                 "stopped": stopped if stopped in LAND_OUTCOMES else None,
-                 "head": attrs.get("head") if stopped in LAND_OUTCOMES else None,
-                 "batch": attrs.get("batch"),
-                 "members": _batch_members(attrs.get("members")) if attrs.get("batch") else [],
-                 "phase": attrs.get("phase") if attrs.get("phase") in BATCH_PHASES else None,
-                 "unbatched": attrs.get("unbatched") if attrs.get("unbatched") in UNBATCHED
-                 else None,
-                 "of": attrs.get("of"),
-                 "released": attrs.get("released") == "1",
-                 "comment_id": c.get("id")}
-    return found
+    record, comment = latest_record(TURN_RECORD, comments)
+    if record is None:
+        return None
+    return {**_whole_turn({**_NO_TURN, **record}), "comment_id": comment.get("id")}
 
 
 def held_turn(turn, owner):
@@ -2224,7 +2294,10 @@ def render_landing(template, fields, landing):
 # lifecycle state renders identical text; the effectful layer then writes only
 # when the text actually changed, and re-entrant/disposable ticks never spam.
 
-STATUS_MARKER = "<!--afk:status-->"
+# The board is a record with no fields: its marker only says which comment is
+# the board, and everything it tells is the text under it.
+STATUS_RECORD = RecordKind("afk:status", {}, ())
+STATUS_MARKER = record_marker(STATUS_RECORD, {})
 
 # Happy-path milestones, in order — these are the task-list checkboxes.
 _STATUS_STEPS = (
@@ -2300,7 +2373,7 @@ def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attem
         return i <= reached
 
     header = "**afk-fleet 进度**" + (f" · 认领方 `{instance}`" if instance else "")
-    lines = [STATUS_MARKER, header, ""]
+    lines = [header, ""]
     for i, (key, label) in enumerate(_STATUS_STEPS):
         label = label.format(pr=f" (#{pr})" if pr else "", gate=gate)
         lines.append(f"- [{'x' if done(i, key) else ' '}] {label}")
@@ -2310,7 +2383,7 @@ def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attem
                                      doing=_BATCH_DOING[batch["phase"]])
     lines.append(current.format(gate=gate, attempt=attempt, retry_max=retry_max,
                                 blockers="、".join(f"#{n}" for n in blocked_by)))
-    return "\n".join(lines)
+    return record_comment(STATUS_RECORD, {}, "\n".join(lines))
 
 
 def board_key(body):

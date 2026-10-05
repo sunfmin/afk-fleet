@@ -494,6 +494,138 @@ def test_gate_verdict():
     assert r["status"] == "red" and r["timed_out"] is True
 
 
+def test_records_kept_in_comments_share_the_encoding_of_records_on_refs():
+    """ADR-0032. The landing turn, a worker's verdict and the status board each
+    declare a word and their fields; the pair that writes and reads a record on a
+    ref writes and reads them, with a comment's marker as the carrier."""
+    members = [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}]
+    kinds = [
+        (d.TURN_RECORD, [
+            ({"instance": "fl-1", "at": 100}, "<!--afk:turn instance=fl-1 at=100-->"),
+            ({"instance": "fl-1", "at": 150, "verified": "v" * 40, "allow_no_checks": True,
+              "stopped": "needs_verify", "head": "h" * 40},
+             f"<!--afk:turn instance=fl-1 at=150 verified={'v' * 40} allow_no_checks=1 "
+             f"stopped=needs_verify head={'h' * 40}-->"),
+            ({"instance": "fl-1", "at": 200, "batch": "fl-1-200", "members": members,
+              "phase": "gating"},
+             "<!--afk:turn instance=fl-1 at=200 batch=fl-1-200 members=1:10,2:20 phase=gating-->"),
+            ({"instance": "fl-1", "at": 300, "unbatched": "left_out", "of": "fl-1-200",
+              "released": True},
+             "<!--afk:turn instance=fl-1 at=300 unbatched=left_out of=fl-1-200 released=1-->")]),
+        (d.VERDICT_RECORD, [
+            ({"n": 7, "phase": "already-satisfied"}, "<!--afk:verdict n=7 phase=already-satisfied-->"),
+            ({"n": 12, "phase": "blocked", "blocked_by": [3, 4], "reason": "needs pages from #3"},
+             "<!--afk:verdict n=12 phase=blocked blocked_by=3,4 reason=needs pages from #3-->"),
+            ({"n": 9, "phase": "giving-up", "reason": "the gate is red: k=v, 100% of runs"},
+             "<!--afk:verdict n=9 phase=giving-up reason=the gate is red: k=v, 100% of runs-->")]),
+        (d.STATUS_RECORD, [({}, "<!--afk:status-->")]),
+    ]
+    for kind, cases in kinds:
+        for record, marker in cases:
+            # a literal of each marker in use today is what is written, and reads back
+            assert d.record_marker(kind, record) == marker
+            body = d.record_comment(kind, record, "**worded for a human**\n\nmore")
+            assert body == f"{marker}\n**worded for a human**\n\nmore"
+            assert d.read_marker(kind, body) == record, marker
+            # the comment a record is read from is the one its rewrite replaces
+            comments = [{"id": 1, "body": "a human note"}, {"id": 2, "body": body, "url": "u2"}]
+            assert d.latest_record(kind, comments) == (record, comments[1]), marker
+        assert d.read_marker(kind, "a human note") is None and d.read_marker(kind, None) is None
+        assert d.latest_record(kind, []) == d.latest_record(kind, None) == (None, None)
+
+    # the latest marker wins, for every kind: stated once, in `latest_record`
+    for kind, cases in kinds:
+        old, new = cases[0][0], cases[-1][0]
+        comments = [{"id": 1, "body": d.record_comment(kind, old, "then")},
+                    {"id": 2, "body": "chatter"},
+                    {"id": 3, "body": d.record_comment(kind, new, "now")}]
+        assert d.latest_record(kind, comments) == (new, comments[2])
+    # …and a marker that is not a record is passed over, not read as the latest: a
+    # turn that names no instance is nobody's (`TURN_RECORD` requires it)
+    held = {"id": 1, "body": "<!--afk:turn instance=fl-1 at=1-->"}
+    assert d.latest_record(d.TURN_RECORD, [held, {"id": 2, "body": "<!--afk:turn at=3-->"}]) == \
+        ({"instance": "fl-1", "at": 1}, held)
+    assert d.TURN_RECORD.required == ("instance",)
+    # a verdict is written by hand and requires nothing: one with no phase is still one
+    assert d.read_marker(d.VERDICT_RECORD, "<!--afk:verdict n=9-->") == {"n": 9}
+
+    # read like a commit's subject: an unknown field is read past, a value not of
+    # its type is a field that is missing, and spacing is free
+    assert d.read_marker(d.TURN_RECORD, "<!--  afk:turn instance=x at=soon pid=7 stopped=bogus "
+                                        "phase=bisecting released=yes\n members=zz,3:30 -->") == \
+        {"instance": "x", "members": [{"issue": 3, "pr": 30}]}
+    assert d.read_marker(d.VERDICT_RECORD, "<!--afk:verdict blocked_by=3, x, 4 n=5 reason= -->") == \
+        {"n": 5, "blocked_by": [3, 4]}
+    # the first marker of a body is the one read, and another kind's is not this kind's
+    both = "<!--afk:verdict n=1 phase=blocked-->\n<!--afk:verdict n=1 phase=giving-up-->"
+    assert d.read_marker(d.VERDICT_RECORD, both)["phase"] == "blocked"
+    assert d.read_marker(d.TURN_RECORD, both) is None and d.read_marker(d.STATUS_RECORD, both) is None
+    # a word outside a closed vocabulary is a defect in the writer
+    for bad in ({"instance": "x", "stopped": "bogus"}, {"instance": "x", "pid": 7}, {"at": 1}):
+        try:
+            d.record_marker(d.TURN_RECORD, bad)
+            raise AssertionError(bad)
+        except ValueError:
+            pass
+    # the two carriers are one line: a marker is the commit message between `<!--` and `-->`
+    assert d.record_marker(d.CLAIM_RECORD, {"instance": "a", "ts": 1}) == "<!--afk-claim instance=a ts=1-->"
+    assert d.read_record(d.TURN_RECORD, "afk:turn instance=a at=1 released=1") == \
+        {"instance": "a", "at": 1, "released": True}
+
+
+def test_each_record_in_a_comment_round_trips_through_its_own_reader():
+    """What the fleet's own writers put in a comment — a turn in each of its
+    shapes, a verdict, a status board — is found again by the kind it was
+    written as, and a literal of each marker already on a PR or an issue reads
+    as the record it always did."""
+    for shape, turn in _turn_shapes().items():
+        body = d.turn_comment(turn)
+        record, comment = d.latest_record(d.TURN_RECORD, [{"id": 7, "body": body}])
+        assert comment["id"] == 7 and d.record_marker(d.TURN_RECORD, record) == body.split("\n")[0], shape
+    board = d.render_status_board("pr_open", "local", 2, instance="fl-1", pr=9)
+    assert board.split("\n")[:2] == ["<!--afk:status-->", "**afk-fleet 进度** · 认领方 `fl-1`"]
+    assert d.latest_record(d.STATUS_RECORD, [{"id": 1, "body": "x"}, {"id": 2, "body": board}]) == \
+        ({}, {"id": 2, "body": board})
+    posted = d.verdict_marker(12, "blocked", [3, 4], "needs #3") + "\nBlocked on #3 and #4."
+    assert d.latest_verdict([{"body": posted, "url": "u"}]) == {
+        "found": True, "phase": "blocked", "blocked_by": [3, 4], "reason": "needs #3",
+        "comment_url": "u"}
+
+    no_turn = {"verified": None, "allow_no_checks": False, "stopped": None, "head": None,
+               "batch": None, "members": [], "phase": None, "unbatched": None, "of": None,
+               "released": False, "comment_id": 5}
+    literals = {
+        "<!--afk:turn instance=fl-7fbd5e at=1759676212-->\n**afk-fleet: this PR holds the landing turn**":
+            {"instance": "fl-7fbd5e", "at": 1759676212},
+        "<!--afk:turn instance=fl-7fbd5e at=1759676300 verified=0af4df0 allow_no_checks=1 "
+        "stopped=awaiting_ci head=8ca0ee2-->\n…":
+            {"instance": "fl-7fbd5e", "at": 1759676300, "verified": "0af4df0",
+             "allow_no_checks": True, "stopped": "awaiting_ci", "head": "8ca0ee2"},
+        "<!--afk:turn instance=fl-7fbd5e at=1759676400 batch=fl-7fbd5e-1759676400 "
+        "members=59:66,60:67 phase=stacking-->\n…":
+            {"instance": "fl-7fbd5e", "at": 1759676400, "batch": "fl-7fbd5e-1759676400",
+             "members": [{"issue": 59, "pr": 66}, {"issue": 60, "pr": 67}], "phase": "stacking"},
+        "<!--afk:turn instance=fl-7fbd5e at=1759676500 unbatched=dissolved "
+        "of=fl-7fbd5e-1759676400 released=1-->\n…":
+            {"instance": "fl-7fbd5e", "at": 1759676500, "unbatched": "dissolved",
+             "of": "fl-7fbd5e-1759676400", "released": True},
+    }
+    for body, said in literals.items():
+        assert d.latest_turn([{"id": 5, "body": body}]) == {**no_turn, **said}, body
+    verdicts = {
+        "<!--afk:verdict n=72 phase=already-satisfied-->\nEmpty diff.": ("already-satisfied", [], None),
+        "<!--afk:verdict n=72 phase=blocked blocked_by=71,55-->\nNeeds both.": ("blocked", [71, 55], None),
+        "<!--afk:verdict n=72 phase=giving-up reason=the gate stays red on master-->\n…":
+            ("giving-up", [], "the gate stays red on master"),
+        "<!--afk:verdict n=72 phase=blocked blocked_by=71 reason=no record mechanism yet-->":
+            ("blocked", [71], "no record mechanism yet"),
+    }
+    for body, (phase, blocked_by, reason) in verdicts.items():
+        assert d.parse_verdict_marker(body) == {"found": True, "n": 72, "phase": phase,
+                                                "blocked_by": blocked_by, "reason": reason}, body
+    assert d.STATUS_MARKER == "<!--afk:status-->"
+
+
 def test_records_kept_on_refs_share_one_encoding():
     """ADR-0031. A claim, a heartbeat and a recorded gate run each declare a word
     and their fields; one pair of functions writes and reads them all, with one
