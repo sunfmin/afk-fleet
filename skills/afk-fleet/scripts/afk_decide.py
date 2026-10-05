@@ -52,7 +52,6 @@ CONFIG_DEFAULTS = {
     "gate": {
         "ci": "required",
         "local_command": "",
-        "trust_recorded_run": True,
         "adversarial_verify": False,
         "adversarial_verify_prompt": "",
     },
@@ -112,9 +111,19 @@ CONFIG_RENAMED = {
         "resolved inside them. Rename the key; its meaning and default (true) are unchanged."),
 }
 
+# Keys that were removed, and why — refused as loudly as a renamed one.
+CONFIG_REMOVED = {
+    "gate.trust_recorded_run": (
+        "a recorded gate run is always trusted now (ADR-0030): the landing skips its own run "
+        "whenever a green run of the configured command is on record for the tree that lands. "
+        "Delete the key."),
+}
+
 
 def _renamed(dotted):
-    """The migration error text for a renamed key, or None if it isn't one."""
+    """The migration error text for a renamed or removed key, or None if it is neither."""
+    if dotted in CONFIG_REMOVED:
+        return f"config: {dotted!r} was removed — {CONFIG_REMOVED[dotted]}"
     hit = CONFIG_RENAMED.get(dotted)
     if not hit:
         return None
@@ -488,9 +497,10 @@ def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, landing=False):
 # the worker runs it after its pre-PR sync, and `afk land` runs it again on the
 # landing turn, after the landing's sync, in the same worktree. The invariant
 # both runs serve: *what lands on the target branch was tested in the form it
-# lands.* With `gate.trust_recorded_run` (the default) the second run is skipped when — and
-# only when — a green run is on record for the exact head that lands
-# (`gate_record_void`, ADR-0026). A red run comes back as a bounded excerpt,
+# lands.* A green run is put on record on the remote, under the TREE it tested and
+# the command that ran, so any run — the landing's, a batch's — is skipped when,
+# and only when, that tree was already tested green by that command, wherever it
+# ran (`gate_record_void`, ADR-0030). A red run comes back as a bounded excerpt,
 # never a raw log.
 
 GATE_EXCERPT_LINES = 40
@@ -515,47 +525,63 @@ def gate_verdict(exit_code, output, max_lines=GATE_EXCERPT_LINES, timed_out=Fals
             "omitted_lines": max(0, len(lines) - len(tail))}
 
 
-def gate_record(head, command, clean, at):
-    """
-    What `afk gate` (and a green run of `afk land`) writes down after a GREEN run
-    of the local gate — never after a red or timed-out one, so no record can be
-    read as a pass that did not happen:
+# Where recorded gate runs live on the remote, one ref per record, and how long
+# one is believed: a green that depends on something outside the tree (a
+# toolchain, a service, the date) is trusted for a day, on any machine.
+GATE_RECORD_NAMESPACE = "refs/afk/gate"
+GATE_RECORD_TTL = 24 * 3600
 
-      head:    the commit the worktree was at, before and after the run
+
+def gate_record_ref(tree, command):
+    """The remote ref a recorded gate run of `command` on `tree` lives at. The
+    name IS the key — the tree tested and the command that tested it — so asking
+    "was this tested green?" is asking for one ref, and two runs never contend."""
+    return (f"{GATE_RECORD_NAMESPACE}/{tree}-"
+            f"{hashlib.sha256(command.encode('utf-8')).hexdigest()[:16]}")
+
+
+def gate_record(tree, command, at):
+    """
+    What a GREEN run of the local gate on a committed tree puts on record — by
+    `afk gate`, `afk land` and a batch's landing alike; never after a red or
+    timed-out run, and never for a run over uncommitted or untracked files, which
+    tested a tree no commit holds:
+
+      tree:    the tree that was tested — the content, whatever commit holds it
       command: the `gate.local_command` that ran, verbatim
-      clean:   the worktree had nothing uncommitted and nothing untracked when the
-               run started — what was tested is exactly `head`
       at:      when the run finished (epoch seconds)
     """
-    return {"head": head, "command": command, "clean": bool(clean), "at": int(at)}
+    return {"tree": tree, "command": command, "at": int(at)}
 
 
-def gate_record_void(record, head, command):
+def gate_record_void(record, tree, command, now):
     """
-    Why a recorded gate run does NOT stand in for the landing's own run — or
-    None when it does, which is the only case `afk land` skips its own (ADR-0026).
+    Why a recorded gate run does NOT stand in for a run of the gate — or None
+    when it does, which is the only case a landing skips its own (ADR-0030).
 
-      record:  the worktree's `gate_record`, None when it has none (never gated
-               through `afk gate`, a red run since, a worktree recreated here)
-      head:    the head that would land, after the landing's sync
+      record:  the `gate_record` the remote holds for this tree and command, None
+               when it holds none (never gated through `afk`, a red run since,
+               a record that could not be written or read)
+      tree:    the tree that would land, after the landing's sync
       command: the `gate.local_command` configured now
+      now:     epoch seconds
 
-    The record proves the gate passed on one commit, with one command. Anything
-    that makes the tree that lands a different tree — the landing's sync brought
-    the target in, the worker committed afterwards — or the test a different test
-    voids it, and so does a run over uncommitted or untracked files, which tested
-    something no commit holds. Void is the safe side: the landing runs the gate.
+    The record proves one command passed on one tree. A sync that brought the
+    target in or a later commit makes what lands another tree, and that tree has
+    its own record or none; a record older than `GATE_RECORD_TTL` is no longer
+    believed. Void is the safe side: the landing runs the gate.
     """
-    if not isinstance(record, dict) or not record.get("head"):
-        return "no green run of the gate is on record in this worktree"
+    if not isinstance(record, dict) or not record.get("tree"):
+        return "no green run of the gate is on record for the tree that would land"
     if record.get("command") != command:
         return (f"the recorded run was of a different command ({record.get('command')!r}) "
                 f"than the gate.local_command configured now")
-    if not record.get("clean"):
-        return "the recorded run was on a tree with uncommitted or untracked files"
-    if record["head"] != head:
-        return (f"the recorded run was on {record['head']}, not on the head that would land "
-                f"({head}) — a sync or a later commit moved it")
+    if record["tree"] != tree:
+        return f"the recorded run was on tree {record['tree']}, not on the tree that would land ({tree})"
+    age = int(now) - int(record.get("at") or 0)
+    if age > GATE_RECORD_TTL:
+        return (f"the recorded run is {age}s old — a record is trusted for "
+                f"{GATE_RECORD_TTL}s")
     return None
 
 

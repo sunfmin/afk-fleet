@@ -2111,10 +2111,6 @@ def test_dispatch_continues_from_whatever_progress_survived():
 # act: the landing turn (`afk turn`) and the landing (`afk land`) — ADR-0027   #
 # --------------------------------------------------------------------------- #
 
-TRUST = ("--set", "gate.trust_recorded_run=true")      # the default, spelled out
-RERUN = ("--set", "gate.trust_recorded_run=false")     # the landing always gates itself
-
-
 def _turn(n, *extra, now=T0, instance="me"):
     """The argv of one `afk turn` — the tick's half of a landing."""
     return ("turn", "--issue", str(n), "--instance", instance, "--worker-command", WORKER,
@@ -2238,12 +2234,13 @@ def test_a_worker_lands_its_own_pr_on_the_turn_the_fleet_grants():
         # that line lands the PR as written
         [line] = [ln.strip() for ln in brief.splitlines() if " land --issue " in ln]
         assert line.startswith(f"{AFK} land --issue 3 --repo {REPO} --config ")
-        p = subprocess.run(line, shell=True, cwd=wt, capture_output=True, text=True, env=w.env)
+        p = subprocess.run(f"{line} --now {T0}", shell=True, cwd=wt, capture_output=True,
+                           text=True, env=w.env)
         r = json.loads(p.stdout)
         assert p.returncode == 0 and (r["outcome"], r["pr"], r["synced"], r["head"]) == \
             ("merged", 30, False, synced), r
         # the landing gh refused had gated this very head, green: that run is on
-        # record, so this one does not gate it again (ADR-0026)
+        # record, so this one does not gate it again (ADR-0030)
         assert r["gate"] == {"status": "green", "source": "recorded", "head": synced,
                              "command": "test -f feature3.txt && test -f landed-meanwhile.txt",
                              "recorded_at": r["gate"]["recorded_at"]}
@@ -2568,13 +2565,19 @@ def test_the_adversarial_verify_is_settled_before_the_turn_and_pinned_to_the_hea
 
 
 # --------------------------------------------------------------------------- #
-# the worker's own gate run, and the landing that trusts it (ADR-0026)         #
+# the worker's own gate run, and the landing that trusts it (ADR-0030)         #
 # --------------------------------------------------------------------------- #
+
+def _gate_refs(w):
+    return {ref for ref in w.sb.all_refs() if ref.startswith("refs/afk/gate/")}
+
 
 def test_a_recorded_worker_gate_run_is_not_repeated_by_the_landing():
     """#36. The worker gates through the line its brief gives it, the target does
     not move, and `afk land` lands the PR on that record: the gate command ran
-    ONCE across the PR and its landing — not twice on the same commit."""
+    ONCE across the PR and its landing — not twice on the same tree. The record
+    is on the remote, under the tree: it is found from any commit holding that
+    tree, with nothing kept in the worktree."""
     with world(issues=[issue(3, "ready-for-agent"), issue(4, "ready-for-agent")]) as w:
         runs = os.path.join(w.sb.root, "gate-runs")
         command = f"echo gate-log; echo run >> {runs}"
@@ -2597,40 +2600,48 @@ def test_a_recorded_worker_gate_run_is_not_repeated_by_the_landing():
         assert ran == {"status": "green", "exit_code": 0, "timed_out": False, "command": command,
                        "head": head, "recorded": True, "detail": ran["detail"]}, ran
         assert count() == 1 and git(wt, "status", "--porcelain") == ""
+        # the record is ONE ref on the remote, named for the tree and the command
+        assert _gate_refs(w) == {afk_decide.gate_record_ref(git(wt, "rev-parse", "HEAD^{tree}"),
+                                                            command)}
 
-        # the record survives the landing brief replacing the worker's first one
-        w.afk(*_turn(3, *gate, *TRUST))
-        r = _land(w, 3, wt, *gate, *TRUST)
+        w.afk(*_turn(3, *gate))
+        r = _land(w, 3, wt, *gate)
         assert (r["outcome"], r["synced"], r["head"]) == ("merged", False, head), r
-        # the outcome says the gate was trusted, not run, and names the recorded head
+        # the outcome says the gate was trusted, not run, and names the head that landed
         assert r["gate"] == {"status": "green", "source": "recorded", "head": head,
                              "command": command, "recorded_at": r["gate"]["recorded_at"]}
         assert count() == 1 and w.pr(30)["merged"]["head"] == head
 
-        # turned off: the same record, and the landing gates for itself anyway
+        # the record is of a TREE: another commit holding the same content — here
+        # the worker reworded its commit — is as tested as the one that was gated
         d, _ = with_pr(w, 4, 40, gate=gate)
-        git(d["worktree"], "pull", "-q", "--no-edit", "origin", w.sb.base)   # the worker's own sync
-        head = git(d["worktree"], "rev-parse", "HEAD")
-        git(d["worktree"], "push", "-q", "origin", "HEAD")
-        assert _gate(w, d["worktree"], command)["recorded"] is True and count() == 2
-        w.afk(*_turn(4, *gate, *RERUN))
-        r = _land(w, 4, d["worktree"], *gate, *RERUN)
-        assert (r["outcome"], r["gate"]) == \
-            ("merged", {"status": "green", "source": "run", "head": head, "command": command})
-        assert count() == 3
+        wt = d["worktree"]
+        git(wt, "pull", "-q", "--no-edit", "origin", w.sb.base)   # the worker's own sync
+        git(wt, "push", "-q", "origin", "HEAD")
+        assert _gate(w, wt, command)["recorded"] is True and count() == 2
+        gated = git(wt, "rev-parse", "HEAD")
+        git(wt, "commit", "-q", "--amend", "-m", "reworded")
+        head = git(wt, "rev-parse", "HEAD")
+        git(wt, "push", "-q", "--force", "origin", "HEAD")
+        assert head != gated
+        w.afk(*_turn(4, *gate))
+        r = _land(w, 4, wt, *gate)
+        assert (r["outcome"], r["gate"]["source"], r["gate"]["head"]) == ("merged", "recorded", head), r
+        assert count() == 2
 
 
-def test_a_recorded_gate_run_is_void_unless_it_is_of_the_head_that_lands():
-    """With `gate.trust_recorded_run` on, the landing still runs the gate whenever
-    the record does not prove THIS command passed on THIS commit: no record, a red
-    or timed-out run, a dirty tree, another command, a later commit, a sync that
-    moved the head. (The turn here was granted on a verify of some older head, so
-    `needs_verify` holds the PR open between probes: the verify check still comes
-    after the machine gate, pinned to the head.)"""
+def test_a_recorded_gate_run_is_void_unless_it_is_of_the_tree_that_lands():
+    """The landing still runs the gate whenever no record proves THIS command
+    passed on THIS tree: no record, a red or timed-out run, a dirty tree, another
+    command, a later commit, a sync that moved the head. (The turn here was
+    granted on a verify of some older head, so `needs_verify` holds the PR open
+    between probes: the verify check still comes after the machine gate, pinned
+    to the head.)"""
     with world(issues=[issue(7, "ready-for-agent")]) as w:
         runs = os.path.join(w.sb.root, "gate-runs")
-        command = f"echo run >> {runs}; test ! -f broken.txt"
-        on = (*local_gate(command), *TRUST, "--set", "gate.adversarial_verify=true")
+        flaky = os.path.join(w.sb.root, "flaky")
+        command = f"echo run >> {runs}; test ! -f broken.txt && test ! -f {flaky}"
+        on = (*local_gate(command), "--set", "gate.adversarial_verify=true")
         d, head = with_pr(w, 7, 70)
         wt = d["worktree"]
         w.set(comments={"70": [{"id": 2001, "html_url": "u", "body":
@@ -2642,60 +2653,67 @@ def test_a_recorded_gate_run_is_void_unless_it_is_of_the_head_that_lands():
             with open(runs) as f:
                 return len(f.read().split())
 
-        def probe(why, *extra, outcome="needs_verify"):
-            """One `afk land`: it must RUN the gate, and say why the record was void."""
+        def probe(outcome="needs_verify"):
+            """One `afk land`: it must RUN the gate, and say that no record stood in."""
             before = count()
-            r = _land(w, 7, wt, *on, *extra)
+            r = _land(w, 7, wt, *on)
             assert (r["outcome"], r["gate"]["source"]) == (outcome, "run"), r
-            assert why in r["gate"]["not_trusted"], r["gate"]
+            assert "no green run" in r["gate"]["not_trusted"], r["gate"]
             assert count() == before + 1
             return r
 
         # no record: the worker typed the bare command, or never gated
-        probe("no green run")
+        probe()
         # …and a landing's own green run IS a record: the next one need not repeat it
         before = count()
         r = _land(w, 7, wt, *on)
         assert (r["outcome"], r["gate"]["source"], count()) == ("needs_verify", "recorded", before)
 
-        # a red run leaves nothing — not even the green record that was there before it
+        # the same tree, run again and RED — something outside it changed: the
+        # latest run is the one believed, and the green record is gone
+        open(flaky, "w").close()
+        g = _gate(w, wt, command)
+        assert (g["status"], g["recorded"]) == ("red", False) and _gate_refs(w) == set(), g
+        os.remove(flaky)
+        probe()
+
+        # a red run leaves nothing
         w.work(wt, "broken.txt")
         g = _gate(w, wt, command)
         assert (g["status"], g["exit_code"], g["recorded"]) == ("red", 1, False), g
-        probe("no green run", outcome="gate_red")
-        git(wt, "rm", "-q", "broken.txt")
+        probe(outcome="gate_red")
+        git(wt, "mv", "broken.txt", "fixed.txt")   # a new tree: removing it would be the old one
         git(wt, "commit", "-qm", "fix")
         git(wt, "push", "-q", "origin", "HEAD")
         # …nor does one that timed out
-        assert _gate(w, wt, command)["recorded"] is True
         g = _gate(w, wt, "sleep 30", "--gate-timeout", "1")
         assert (g["status"], g["timed_out"], g["recorded"]) == ("red", True, False), g
-        probe("no green run")
 
         # green over an untracked file: it tested a tree no commit holds
         with open(os.path.join(wt, "not-added.txt"), "w") as f:
             f.write("the test only passes with this\n")
         g = _gate(w, wt, command)
         assert (g["status"], g["recorded"], g["uncommitted"]) == ("green", False, ["?? not-added.txt"])
-        probe("uncommitted or untracked")
         os.remove(os.path.join(wt, "not-added.txt"))
+        assert afk_decide.gate_record_ref(git(wt, "rev-parse", "HEAD^{tree}"), command) \
+            not in _gate_refs(w)
 
         # green, clean — of ANOTHER command than the one configured now
         assert _gate(w, wt, "true")["recorded"] is True
-        probe("different command")
+        probe()
 
-        # the worker committed after the recorded run
-        g = _gate(w, wt, command)
+        # the worker committed after the recorded run: another tree
+        _gate(w, wt, command)
         w.work(wt, "afterthought.txt")
-        assert g["head"] in probe("a later commit moved it")["gate"]["not_trusted"]
+        probe()
 
         # the landing's sync moved the head: what lands is not what the worker gated
         g = _gate(w, wt, command)
         w.advance_base("landed-meanwhile.txt")
-        r = probe("not on the head that would land")
+        r = probe()
         assert r["synced"] is True and r["head"] != g["head"]
 
-        # a record of exactly the head that lands: trusted — and still verified first
+        # a record of exactly the tree that lands: trusted — and still verified first
         g = _gate(w, wt, command)
         before = count()
         r = _land(w, 7, wt, *on)
@@ -2704,6 +2722,22 @@ def test_a_recorded_gate_run_is_void_unless_it_is_of_the_head_that_lands():
         r = _land(w, 7, wt, *on)
         assert (r["outcome"], r["gate"]["source"], r["gate"]["head"]) == ("merged", "recorded", g["head"])
         assert count() == before and w.pr(70)["merged"]["head"] == g["head"]
+
+
+def test_a_gate_run_the_remote_will_not_record_is_still_green_and_the_landing_gates():
+    """A record is an optimisation, never a precondition: a remote that refuses
+    the ref leaves the worker's run green and unrecorded, and the landing runs
+    the gate itself."""
+    with world(issues=[issue(5, "ready-for-agent")]) as w:
+        gate = local_gate("true")
+        d, head = with_pr(w, 5, 50, gate=gate)
+        w.sb.forbid("refs/afk/gate/")
+        g = _gate(w, d["worktree"], "true")
+        assert (g["status"], g["recorded"]) == ("green", False), g
+        assert "remote rejected" in g["not_recorded"] and "landing runs the gate" in g["detail"]
+        w.afk(*_turn(5, *gate))
+        r = _land(w, 5, d["worktree"], *gate)
+        assert (r["outcome"], r["gate"]["source"]) == ("merged", "run"), r
 
 
 # --------------------------------------------------------------------------- #

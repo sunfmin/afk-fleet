@@ -40,7 +40,7 @@ config), `{branch}`, `{worktree_path}` (the **actual** values orca returned — 
 `<user>/…`, never assumed from `branch_pattern`), `{wake_command}` — the line that **wakes** the
 launcher, built from the handle of the terminal the launcher runs in, or a no-op when it runs in
 none (ADR-0020) — `{gate_command}` — the line the worker runs the **local gate** with: `afk gate`
-carrying `gate.local_command`, so a green run is on record for the landing (ADR-0026), or a no-op when
+carrying `gate.local_command`, so a green run is on record for the landing (ADR-0030), or a no-op when
 no local gate is configured — `{land_command}` — the line the worker **lands** its PR with: `afk land`
 carrying the run's whole config — and `{verdict_marker}`, the `<!--afk:verdict …-->` line a worker that opens no PR
 must post, written by the same code that parses it back. A field or slot the code cannot fill is an error: no

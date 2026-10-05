@@ -57,8 +57,8 @@ force_tick_after_skips: 6
 - **The local gate is the gate.** This repo has no GitHub Actions and requires no status check on
   `master`, so `gate.ci: local` (ADR-0012): `gate.local_command` is run by the worker before its PR
   and by its landing on the head that lands — no `no_checks` judgment per PR, and nothing lands
-  ungated. `gate.trust_recorded_run` is left at its default (on), so a landing whose sync moved
-  nothing does not run the gate a second time (ADR-0026).
+  ungated. A landing whose sync moved nothing does not run the gate a second time: the worker's
+  green run is on record for that tree (ADR-0030).
 - **Local gate.** `gate.local_command` runs the skill's tests via `uv`, per the repo's uv-only Python
   rule, in parallel (`pytest-xdist`, `-n auto`): 52 s against 188 s serial, measured on 14 cores
   with 125 tests. It is a real gate for the code-touching issues and a no-op pass for

@@ -33,24 +33,25 @@ A PR may land only when **all** configured gates are green. Which **machine gate
   the repo's claim that its command is CI-equivalent, and it is expected to scope remote CI away from
   worker branches; bootstrap **hard-errors** when `merge.target` requires status checks (see
   [Bootstrap](../SKILL.md#bootstrap-once-with-the-human-present) step 2).
-- **`gate.trust_recorded_run` — the two runs become one when nothing moved**
-  ([ADR-0026](../../../docs/adr/0026-a-recorded-gate-run-stands-in-for-the-merge-time-run.md); `local`
-  only; on by default). When the landing's sync is a no-op, the landing's run tests the very commit the
-  worker's pre-PR run did. The worker runs the gate **through `afk gate`** — its prompt hands it that line —
-  which runs `gate.local_command` in the worker's worktree and, on green, records the head it ran on
-  and the command it ran in the worktree's git dir (a green run by `afk land` itself is recorded the
-  same way). Unless the option is turned off, `afk land` skips its own run
-  when — and only when — that record proves the gate passed on **the exact head that would land**:
-  the recorded head is that head, the recorded command is the one configured now, and the tree it ran
-  on had nothing uncommitted or untracked. Anything else voids the record — the sync moved the head,
-  the worker committed afterwards, the command changed, the worker typed the bare command (no record),
-  a red or timed-out run came after (it drops the record), the worktree was recreated on this machine
-  — and the landing runs the gate exactly as above. The outcome says which happened:
-  `gate.source: recorded` with the `head` it was recorded on and `recorded_at`, or `gate.source: run`
-  with `not_trusted: <why the record was not enough>`. The record is `afk`'s own, made from an exit
-  code it observed; a worker reporting "the gate is green" proves nothing and leaves none. What is
-  given up is the second run's independence on an unchanged commit — a flaky test that passed once
-  is not asked again — so the default is off.
+- **A recorded gate run — a tree is gated once**
+  ([ADR-0030](../../../docs/adr/0030-a-gate-run-is-recorded-on-the-remote-under-the-tree-it-tested.md); `local` only). When the landing's sync is a no-op, the
+  landing's run would test the very content the worker's pre-PR run did. The worker runs the gate
+  **through `afk gate`** — its prompt hands it that line — which runs `gate.local_command` in the
+  worker's worktree and, on green on a committed tree, puts the run on record **on the remote**: one
+  ref, `refs/afk/gate/<tree>-<hash of the command>`, named for the tree it tested and the command
+  that ran (a green run by `afk land` itself is recorded the same way). `afk land` skips its own
+  run when — and only when — a record stands for **the tree that would land** and the command
+  configured now, no more than a day old. It is found from anywhere that content is about to land:
+  a worktree recreated from the pushed branch, another machine, another commit holding the same
+  files. Anything else and the landing runs the gate exactly as above: the sync moved the head, the
+  worker committed afterwards, the command changed, the worker typed the bare command (no record),
+  the run was over uncommitted or untracked files (no record), the same tree was run red or timed
+  out since (that deletes the record), the remote refused the ref. The outcome says which happened:
+  `gate.source: recorded` with `recorded_at`, or `gate.source: run` with `not_trusted: <why>`. The
+  record is `afk`'s own, made from an exit code it observed; a worker reporting "the gate is
+  green" proves nothing and leaves none. There is no switch. What is given up is a second,
+  independent sample on unchanged content — a flaky test that passed once, or a gate that depends
+  on the machine, is not asked again for a day.
 - **`merge.batch` — one landing run for several PRs**
   ([ADR-0029](../../../docs/adr/0029-a-merge-batch-lands-n-prs-behind-one-gate-run.md); `local`
   only, opt-in). The landing's run is the fleet's landing throughput: N finished PRs are N runs.
@@ -60,8 +61,9 @@ A PR may land only when **all** configured gates are green. Which **machine gate
   `gate.local_command` **once, on the stack**, then pushes the stack to the target as a
   fast-forward. The invariant is kept literally — the commit the target is moved to is the commit
   the gate passed on — but what the gate proves is the **stack**, not each PR alone: the
-  intermediate commits were never gated by themselves. A recorded run is never trusted here
-  (`gate.trust_recorded_run` does not apply: no record is of a stack). A red run lands nothing and
+  intermediate commits were never gated by themselves. The stack's tree is recorded and looked up
+  like any other (ADR-0030): a stack already gated green — a landing cut short after its gate — is
+  not gated again. A red run lands nothing and
   is the batch worker's `outcome: gate_red`: it fixes the stack with one more commit on top and runs
   the command again — nobody bisects for the PR at fault. The push is the only lock: a target that
   moved while the gate ran refuses it (`target_moved`), nothing lands, and the same command
