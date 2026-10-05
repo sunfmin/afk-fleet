@@ -277,7 +277,7 @@ instead of acting — same rebuild, zero side effects.
      next: *awaiting_merge* → `afk merge`, in the order `merge_order` lists them (see
      [Merge](#merge-serialized)); *queued* → **leave it**: its PR waits its turn behind PR `behind`
      in the [merge queue](#the-merge-queue--conflicting-prs-land-one-at-a-time), never `afk merge`
-     it and never hand it back — it still holds its slot and counts in `in_flight`; *awaiting_ci* → leave;
+     it and never hand it back — it still holds its slot and counts in `in_flight`; *awaiting_ci* → leave (its checks are still running — a PR with **no checks at all** is never *awaiting_ci*: it arrives as *awaiting_merge*, and `afk merge` answers `no_checks`);
      *failure* → `afk fail` (see [Failure handling](#failure-handling--bounded-retry--escalate-never-silently-drop));
      *closed* → the issue is already closed but its claim outlived it (a merge or close that died
      before releasing): `afk release <n> --instance <id>`, nothing else — count it in `cleared`; *handed_back* → a sync conflict on its PR is
@@ -472,7 +472,7 @@ from another machine). It stops, with an `outcome`, wherever the next move is yo
 | `worker_busy` | The worker is **still working** in the PR's worktree — typically it pushed its answer to a hand-back and is now running the gate on it. Nothing was touched. | Leave it; a later tick merges once the worker has stopped. Count it in `in_flight`. |
 | `gate_red` | `local`: the merge-time gate was red, and its `gate.excerpt` is now a PR comment. `required`: the PR's checks are red. | `afk fail --issue <n> --reason "<the failure>"`. |
 | `awaiting_ci` | `required`: checks are pending — or the sync just pushed a new head, so CI must speak about *that* head first. | Leave it; a later tick merges. |
-| `no_checks` | `required`, and the PR has no checks at all — the progressive gate. | If you judge the issue's acceptance criteria met, re-run with `--allow-no-checks`; else `afk fail`. |
+| `no_checks` | `required`, and the PR has no checks at all — the progressive gate. Such a PR reaches you as *awaiting_merge*, so this is the answer every one of them gets first. | If you judge the issue's acceptance criteria met, re-run with `--allow-no-checks`; else `afk fail`. |
 | `needs_verify` | `gate.adversarial_verify` is on, the machine gate is green, and `--verified` does not name `head`. | Run the [adversarial verify](references/completion-gate.md) against `head`. Passed → re-run with `--verified <head>`; refuted → `afk fail`. |
 
 The invariant every path keeps: **what lands on the target was gated in the form it lands.** A sync

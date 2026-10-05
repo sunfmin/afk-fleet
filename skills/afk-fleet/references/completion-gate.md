@@ -13,7 +13,7 @@ A PR may merge only when **all** configured gates are green. Which **machine gat
   checks describe a tree that will not merge, so it returns `awaiting_ci` and a later tick merges.
   On red, read the failing-log excerpt for the `afk fail` reason in an **ephemeral sub-read** that
   returns only `{status: red, reason}`; raw logs never enter the tick. Progressive: before CI exists a
-  PR has no checks at all — `afk merge` returns `no_checks`, the gate is then the issue's acceptance
+  PR has no checks at all — `rebuild` reports it `awaiting_merge` (there is nothing to wait for), `afk merge` returns `no_checks`, the gate is then the issue's acceptance
   criteria + whatever local build/test exists, and `--allow-no-checks` is how you say it passed.
 - **`local` — `gate.local_command` *is* the completion gate.** GitHub checks are **never read** in this
   mode (`rebuild` reports every open PR as `awaiting_merge`: gating is an **action taken at merge
