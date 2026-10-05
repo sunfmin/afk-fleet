@@ -33,8 +33,8 @@ each one runs is shown so the mechanism is legible, but the tick calls the tool.
   working set arrives already partitioned into `mine` / `peer_live` / `stale` / `stale_closed`
   (in-flight = `mine`).
   (`afk scan` / `afk classify-claims` remain as standalone debug surfaces over the same core.)
-- **Heartbeat (the lease) → `afk heartbeat --instance <id>`** in a tick, and inside `afk cycle` on a
-  cycle that spawns none. One ref `afk-heartbeat/<id>`
+- **Heartbeat (the lease) → `afk heartbeat --instance <id>`**, run inside `afk cycle` — by the pass
+  on a tick, and by the gate on a cycle that skips. One ref `afk-heartbeat/<id>`
   carries a timestamp; the tool refreshes it **only if due** (`now - ts > ttl/3`) by force-pushing a
   new marker (it reads the old ts itself, so this stays stateless). **Per instance, not per claim**
   (claim refs never churn); a fleet holding no claims never beats.

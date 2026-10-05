@@ -35,8 +35,8 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    ready, and delivers the worker prompt, filled with the branch and path orca returned, as a brief
    file plus one submitted line pointing at it.
    `skills/afk-fleet/scripts/afk.py:_start_terminal`
-6. It upserts the issue's **status board** to "claimed"; the tick refreshes its **heartbeat**,
-   returns its summary and dies, without waiting for the worker.
+6. It upserts the issue's **status board** to "claimed"; the tick refreshes its **heartbeat**
+   and ends, without waiting for the worker.
    `skills/afk-fleet/scripts/afk.py:_upsert_board`
 7. The worker implements the issue's acceptance criteria, committing and pushing its own branch
    after every completed step so a hard stop loses at most the step in flight.
@@ -121,15 +121,16 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    a custom provider uses the command passed with the invocation, or has the human pick one, and the
    answer is checked to resolve.
    `skills/afk-fleet/scripts/afk.py:cmd_worker_command`
-4. Each cycle, the launcher opens with one call that digests what a rebuild would observe and gets
-   back skip or tick, plus an opaque cycle state to hand back; the raw state never enters its context.
+4. Each cycle, the launcher spawns a fresh tick, handing it only the repo, the config and the cycle
+   state; the tick makes one call, which digests what a rebuild would observe and decides skip or
+   tick — the raw state never enters a context.
    `skills/afk-fleet/scripts/afk.py:cmd_cycle`
-5. When the digest moved, the launcher spawns a fresh tick, handing it only the repo, the config and
-   the two launcher-held facts (instance id, worker launch command).
-   `skills/afk-fleet/SKILL.md:instance_id`
-6. The tick does one reconciliation pass (the mainline above) and returns one compact summary, which
-   the launcher hands back to the same call; it folds the summary into the cycle state and counts
-   whether the cycle was empty.
+5. When the digest moved, that same call runs the reconciliation pass (the mainline above) in code,
+   and returns what it could not decide as judgments, each with the transition for either answer;
+   the tick runs the one it chooses and opens the next cycle at once.
+   `skills/afk-fleet/scripts/afk.py:_tick`
+6. The call folds what the pass did into the cycle state — which also carries the two
+   launcher-held facts (instance id, worker launch command) — and counts whether the cycle was empty.
    `skills/afk-fleet/scripts/afk_decide.py:cycle_ticked`
 7. The launcher sleeps the interval that call returned — busy, or idle after enough consecutive
    empty cycles, never longer than half the lease while the fleet holds a claim — then repeats from
@@ -140,7 +141,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
     `skills/afk-fleet/scripts/afk.py:cmd_release`
 
 **Where it forks.**
-- The digest is unchanged: no tick is spawned, the same call refreshes the heartbeat if the fleet
+- The digest is unchanged: no pass is run, the same call refreshes the heartbeat if the fleet
   holds claims and returns the sleep, and a full tick is forced every `force_tick_after_skips`
   cycles: `skills/afk-fleet/scripts/afk_decide.py:cycle_wake`, ADR-0007.
 - A worker's **wake** arrives during the sleep of step 9: the launcher goes to step 6 at once, and

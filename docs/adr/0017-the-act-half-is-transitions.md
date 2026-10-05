@@ -1,6 +1,6 @@
 # The Act half is transitions, not recipes: one call per change of a claim's state
 
-**Status:** accepted; its `merge` transition is **superseded by [ADR-0027](0027-a-worker-lands-its-own-pr-on-a-landing-turn.md)** — the tick grants a landing turn (`afk turn`) and the worker lands the PR (`afk land`); every other transition stands — extends [ADR-0004](0004-deterministic-mechanics-as-tools.md) from the
+**Status:** accepted; its `merge` transition is **superseded by [ADR-0027](0027-a-worker-lands-its-own-pr-on-a-landing-turn.md)** — the tick grants a landing turn (`afk turn`) and the worker lands the PR (`afk land`); its `afk cycle` row is **amended** (see [Amendment](#amendment-afk-cycle-runs-the-tick-in-code)) — the tick itself now runs inside it; every other transition stands — extends [ADR-0004](0004-deterministic-mechanics-as-tools.md) from the
 Observe half of a tick to the Act half, and [ADR-0008](0008-rebuild-as-one-observation-tool.md)'s
 "one call, one answer" from `rebuild` to everything a tick *does*. Supersedes the parts of
 [ADR-0016](0016-the-seam-enforces-its-own-rules.md) that named `afk next-attempt`, `afk pace` and
@@ -24,7 +24,7 @@ exactly where the next move is judgment:
 | `afk fail` | require my claim → read the attempt → **retry**: swap the attempt label, discard the failed attempt (PR, branch, worktree), start a fresh worker with the reason; or **escalate** | `--reason` |
 | `afk escalate` | require my claim → status board → relabel → comment → **release last** | `--reason` |
 | `afk close` | require my claim → status board → close the issue → release → cleanup | (the empty-diff check before calling it) |
-| `afk cycle` | launcher: digest → tick-or-skip (+ the skipped cycle's heartbeat and sleep); after a tick: fold its summary → sleep | — |
+| `afk cycle` | *(amended)* one call, the whole cycle: digest → tick-or-skip (+ the skipped cycle's heartbeat and sleep); on a tick, the pass itself — rebuild → `no-pr` → at most one `turn` → `nudge` / `fail` / `park` / `escalate` where the reason is on record → `release` → `reclaim` → `dispatch` → `heartbeat` → `status` — then fold what it did → sleep and a progress line | the `judgments` it returns: `empty_diff`, `no_checks`, `adversarial_verify`, `reason` |
 
 Removed: `afk fingerprint`, `afk pace` (→ `afk cycle`), `afk next-attempt` (→ `afk fail`),
 `afk gate-run` (→ `afk merge`). `afk claim` stays as the low-level step `dispatch` performs; `afk
@@ -34,9 +34,9 @@ status` stays for the non-terminal phases; `afk recovery` stays as the read-only
 The supporting decisions:
 
 1. **The launcher holds one opaque value.** `afk cycle` returns a `state` (`fingerprint`, `skips`,
-   `empty_streak`, `in_flight`, `frontier_remaining`) the launcher hands back verbatim. It keeps no
-   counter and does no arithmetic. A mangled state or a summary without integer `in_flight` /
-   `frontier_remaining` is an error, never a fleet paced on zeros.
+   `empty_streak`, `in_flight`, `frontier_remaining` — and, since the amendment, `unsettled`, the
+   instance id and the worker launch command) the launcher hands back verbatim. It keeps no
+   counter and does no arithmetic. A mangled state is an error, never a fleet paced on zeros.
 2. **A skipped cycle counts toward idleness.** A skip with nothing in flight and nothing left on the
    frontier extends the empty streak exactly like an empty tick. Holding a claim, or frontier the
    last tick could not take, resets it.
@@ -129,9 +129,49 @@ whether recovered state is worth continuing.
   the tick types it, or in which order.
 - **One `afk tick` that does everything.** The judgment points are real; a single call would either
   have to embed an LLM or return a state machine the tick drives blindly. Transitions put the seam
-  where the judgment is.
+  where the judgment is. *(Revisited by the amendment below: once the transitions existed, the
+  single call needs neither — it returns the judgments as data.)*
 - **Inject fakes into `afk.py` for the new effects.** Rejected again, for ADR-0016's reason: the
   seam under test is the process boundary, and the outside world is faked as executables on `PATH`.
 - **Have `merge` resolve conflicts by re-dispatching a worker automatically.** A conflict the tick
   can read and resolve in one edit should not cost a retry; the tick decides, and `afk fail` is one
   call away.
+
+## Amendment: `afk cycle` runs the tick in code
+
+After this ADR, ADR-0021 and ADR-0022, almost everything a tick did was routing: `rebuild` gave each
+claim a `status`, `afk no-pr` an `action`, and the next `afk` call was fixed by a table — a table
+that lived in ~300 lines of SKILL.md a fresh LLM context re-read every tick. `afk cycle` now **runs
+that table**: one call opens the cycle, decides tick-or-skip, and on a tick performs the rebuild and
+every transition whose next step is a lookup, then folds its own account of what it did into the
+state and returns the pace. `--summary` and `summary_schema` are gone: nothing carries a summary
+between two calls.
+
+- **What code cannot decide is returned, not decided** — as `judgments: [{issue, kind, question,
+  context, if_yes, if_no}]`, each answer one runnable `afk` transition. There is no "resume with
+  answers" interface: every answer is a transition, so the next cycle rebuilds from GitHub and does
+  not ask again. A cycle with open judgments returns `sleep_seconds: 0`, and leaves the state
+  `unsettled`, so the next cycle ticks even when the answer moved nothing the digest hashes. For a
+  `reason` judgment the transition is already fixed and both answers are the same command: what is
+  asked for is its `--reason` text.
+- **A reason on record is not a judgment.** The pass fails, parks or escalates by itself wherever
+  the reason is already written down — the worker's own `reason=`, the standing of the blockers it
+  named, a silence that outlasted its nudge — and asks only where it must be re-read (a CI log, a
+  verdict that gave none).
+- **Two judgments are retired for unattended runs**, each to its safe default: an orphaned claim is
+  always continued, never released back to the frontier; recovered state is always continued
+  (`--start fresh` stays a flag for a human).
+- **The two launcher-held facts ride in the state.** The instance id and the worker launch command
+  are passed on the first cycle and carried in `state` from then on; a state without them is exit 3.
+  The procedure being code and the facts being in the one value handed back is what lets a later
+  change run the cycle from a session whose context may be compacted.
+- **A failed transition settles nothing.** It is reported in the cycle's `errors`, its claim stays
+  held, the rest of the pass goes on — except that a failure to *start* a worker ends the starting
+  for that pass, so a fleet whose orca is down does not take claims it cannot staff — and the state
+  is `unsettled`.
+- **Judgments owed together are asked together.** `afk turn` records nothing until every judgment
+  about a PR is in, so a PR with no checks under `gate.adversarial_verify` is asked one
+  `adversarial_verify` whose yes carries both flags; a `no_checks` whose yes changed nothing would be
+  asked forever.
+
+The tick is still an Agent subagent: its instructions are "run `afk cycle`, answer the judgments".

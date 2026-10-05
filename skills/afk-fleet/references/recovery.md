@@ -3,8 +3,9 @@
 Disclosed reference for [`afk-fleet`](../SKILL.md), reached only on a **dead claim** — an orphaned
 claim of mine, a stale claim reclaimed from a dead peer, or one inherited through a takeover — and
 only when you doubt what would be continued. Recovery itself is not a procedure you run: `afk dispatch
---issue <n>` selects the tier and acts on it. This file is the tier table it follows, and the one
-judgment it leaves to you.
+--issue <n>` selects the tier and acts on it, and the pass inside `afk cycle` calls it for every dead
+claim without asking. This file is the tier table it follows, and the one override it leaves to a
+human.
 
 A claim whose worker died is recovered *from its durable progress*, never re-dispatched from base
 while progress exists. Workers push after every completed step (see
@@ -33,8 +34,9 @@ the `afk-attempt/<n>` counter is neither read nor incremented: continuation answ
 Because progress accumulates across continuations, a claim recovered repeatedly *converges* instead of
 looping.
 
-**Judgment stays with the tick.** The tier selection is mechanics; whether the recovered state is sane
-to build on is your read, exactly like orphan-vs-alive. To look before acting, ask without acting:
+**An unattended run always continues.** The tier selection is mechanics, and a tick acts on it with
+no judgment asked: an orphaned claim is never released back to the frontier, and recovered state is
+never discarded. Whether that state is sane to build on is a human's read. To look, ask without acting:
 
 ```bash
 <skill>/scripts/afk.py recovery --issue <n> --repo <repo> --config '<config json>'

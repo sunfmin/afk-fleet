@@ -2,18 +2,18 @@
 
 An unattended fleet that works a GitHub-issue backlog on its own, for days, without any session's
 context growing without bound: a thin **launcher** spawns a fresh disposable **tick** each cycle;
-each tick dispatches worktree-isolated **workers** per ready issue and gives each finished PR its
+each tick — one reconciliation pass, run in code — dispatches worktree-isolated **workers** per ready issue and gives each finished PR its
 **landing turn**, on which its worker gates it and lands it on the target branch — one PR at a time.
 
 ## Language
 
 **Launcher**:
 The interactive session `/afk-fleet` is invoked in. Invoking it is the launch: it asks for no
-confirmation, mints a **fleet-instance** id, then loops: spawn a **tick**, ingest its one-line summary, pace, repeat. It does no coordination
+confirmation, mints a **fleet-instance** id, then loops: spawn a **tick**, keep the **cycle state** it returns, pace, repeat. It does no coordination
 itself: it never computes the **frontier**, never reads tick-only files (the `afk.py`/`afk_decide.py`
 source, `worker-prompt.md`). It is
-thin *by construction* from its first action — it only ever spawns subagents and ingests their compact
-summaries — so its context stays flat over a multi-day run. Several launchers — on several machines,
+thin *by construction* from its first action — it only ever spawns subagents and keeps the state and
+progress line each returns — so its context stays flat over a multi-day run. Several launchers — on several machines,
 even under one GitHub account — may run against the same repo at once; they cooperate only through
 **claims**, never a central coordinator.
 _Avoid_: coordinator (there is no single long-lived coordinator; a tick coordinates one pass),
@@ -21,19 +21,19 @@ orchestrator, manager, main agent
 
 **Fleet instance**:
 One launcher run and everything it owns — the ticks it spawns, the workers they dispatch, and the
-**claims** it holds — identified by an id minted at bootstrap and injected into every tick. That id
+**claims** it holds — identified by an id minted at bootstrap. That id
 and the **worker launch command** are the run's two launcher-held facts:
-settled once at bootstrap, carried in every tick's spawn prompt, never written to a file,
-and gone when the launcher stops. Its liveness is published as a **heartbeat**; when it stops or dies
+settled once at bootstrap, passed to the first cycle and carried in the **cycle state** from then on,
+never written to a file, and gone when the launcher stops. Its liveness is published as a **heartbeat**; when it stops or dies
 its claims are released or reclaimed. Distinct instances (even on one GitHub account) are the unit of
 cooperative concurrency across machines.
 _Avoid_: node, worker (that is the per-issue coding agent), coordinator
 
 **Tick**:
-One fresh-context, disposable reconciliation pass, run as an Agent subagent. It rebuilds the working
-set from fleet state, acts once (give a finished PR its **landing turn**, escalate exhausted, dispatch to free slots — each a
-single **transition**), returns
-a compact summary, and dies — without waiting for the workers it dispatched. Runtime is bounded
+One disposable reconciliation pass. The pass itself is code, inside one call (`afk cycle`): it rebuilds the working
+set from fleet state and acts once (give a finished PR its **landing turn**, escalate exhausted, dispatch to free slots — each a
+single **transition**), without waiting for the workers it dispatched. It is run by a fresh-context Agent subagent,
+which answers the **judgments** the call returns, hands the launcher the **cycle state**, and dies. Runtime is bounded
 because ticks are disposable, not because one session stays disciplined.
 _Avoid_: batch (implies draining a whole wave), poll (a tick acts, not just observes), coordinator
 
@@ -135,10 +135,21 @@ not a difference of opinion — selecting the **frontier**, claiming/reclaiming/
 mine/live-peer/stale partition, lease arithmetic, retry accounting, pacing, reading a worker's
 **worker state**. They are extracted into tested **tools**. **Judgment** is everything that must read
 context and can be reasonably contested — whether an implementation is correct (the gate), whether a
-refutation holds, whether an empty diff really is empty, how to word an escalation. It stays with the **tick** (an LLM). "Extract mechanics to code, keep judgment in the
+refutation holds, whether an empty diff really is empty, how to word an escalation. It stays with the **tick** (an LLM): the pass returns it as a **judgment** instead of deciding it. "Extract mechanics to code, keep judgment in the
 LLM" is the fleet's core build rule.
 _Avoid_: automation vs decision, deterministic vs heuristic (near, but this is specifically the
 code/LLM ownership split), script vs agent (the tick is not a script)
+
+**Judgment** (as returned by a cycle):
+One question a **tick**'s pass could not decide, handed back by `afk cycle` instead of decided: is
+an empty diff really empty, may a PR with no checks land, does a head survive the adversarial
+verify, how is a failure or an escalation worded. It carries the one **transition** to run for
+either answer, ready to run, so answering it *is* a transition and the next cycle does not ask
+again; there is nothing to resume. One whose answer takes reading something long (a diff under
+review, a CI log) is marked for an ephemeral subagent. A step whose reason is already on record is
+not a judgment — the pass performs it (ADR-0017).
+_Avoid_: question, prompt, decision point, outcome (an **outcome** is where one transition stopped;
+a judgment is what a whole pass returns)
 
 **Transition**:
 One change of a **claim**'s state, performed as a single `afk` call that runs its whole ordered
@@ -155,10 +166,11 @@ _Avoid_: recipe, procedure, step list (those were the prose a tick used to re-de
 
 **Cycle state**:
 The one value the **launcher** carries between cycles: an opaque object `afk cycle` returns and takes
-back verbatim, holding the last fingerprint, the skip streak, the empty streak and what the last
-**tick** left in flight. The launcher never reads into it or does arithmetic on it; pacing, the
+back verbatim, holding the last fingerprint, the skip streak, the empty streak, what the last
+**tick** left in flight and whether it left anything unsettled — and the **fleet instance**'s two facts, its id and the
+**worker launch command**, from the first cycle on. The launcher never reads into it or does arithmetic on it; pacing, the
 skipped cycle's heartbeat and the forced tick are all decided from it in code (ADR-0017).
-_Avoid_: launcher memory, last summary (the summary is folded in and discarded)
+_Avoid_: launcher memory, last summary (a tick's account of what it did is folded in by the same call, and never travels)
 
 **Fleet state**:
 The authoritative record of the fleet's progress — what is claimed, in-flight, gated, merged,
@@ -215,7 +227,8 @@ _Avoid_: refresh, resync, reload
 One of **my own** claims (an `afk-claim/<n>` owned by this instance) with no PR and no live worker — a
 claim whose worker crashed or never started. Reconciled *locally* on every rebuild by **continuation**
 — recovered from its durable progress (the local worktree if still present, else the pushed branch)
-and only re-dispatched fresh when nothing survives, or released — never assumed still-running.
+and only re-dispatched fresh when nothing survives — never assumed still-running, and never released
+back to the frontier by an unattended run.
 Contrast **Stale claim**, which is a peer's.
 _Avoid_: stuck issue, dead worker, zombie
 
