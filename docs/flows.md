@@ -89,7 +89,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   attempt spent, `skills/afk-fleet/scripts/afk_decide.py:land_outcome`.
 - The landing's gate is red: the worker fixes the code, commits and lands again; the excerpt is
   also a PR comment, `skills/afk-fleet/scripts/afk_decide.py:gate_comment`.
-- The repo set `gate.trust_recorded_run`, and a recorded run is of the command configured
+- `gate.trust_recorded_run` is on (the default), and a recorded run is of the command configured
   now, on a committed tree, at the exact head that would land: step 13 does not run the local gate
   again, `skills/afk-fleet/scripts/afk_decide.py:gate_record_void` (ADR-0026). Any sync that moved
   the head, any later commit, or no record, and it runs as written.

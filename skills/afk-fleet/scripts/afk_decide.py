@@ -52,7 +52,7 @@ CONFIG_DEFAULTS = {
     "gate": {
         "ci": "required",
         "local_command": "",
-        "trust_recorded_run": False,
+        "trust_recorded_run": True,
         "adversarial_verify": False,
         "adversarial_verify_prompt": "",
     },
@@ -142,10 +142,6 @@ def validate_config(cfg):
         raise ValueError("config gate.ci: 'local' requires a non-empty gate.local_command — in "
                          "local mode that command IS the completion gate (ADR-0012), so an empty "
                          "one would merge every PR unverified")
-    if gate.get("trust_recorded_run") and ci != "local":
-        raise ValueError("config gate.trust_recorded_run: only gate.ci: 'local' has a landing "
-                         "run of gate.local_command to skip (ADR-0026) — set gate.ci to 'local' "
-                         "or leave this false")
     strategy = (cfg.get("merge") or {}).get("strategy")
     if strategy not in MERGE_STRATEGIES:
         raise ValueError(f"config merge.strategy: expected one of "
@@ -493,7 +489,7 @@ def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, landing=False):
 # the worker runs it after its pre-PR sync, and `afk land` runs it again on the
 # landing turn, after the landing's sync, in the same worktree. The invariant
 # both runs serve: *what lands on the target branch was tested in the form it
-# lands.* With `gate.trust_recorded_run` the second run is skipped when — and
+# lands.* With `gate.trust_recorded_run` (the default) the second run is skipped when — and
 # only when — a green run is on record for the exact head that lands
 # (`gate_record_void`, ADR-0026). A red run comes back as a bounded excerpt,
 # never a raw log.

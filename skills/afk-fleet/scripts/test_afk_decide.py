@@ -329,16 +329,13 @@ def test_a_recorded_gate_run_counts_only_for_the_commit_and_command_it_ran():
     void = d.gate_record_void(rec, "def456", "make test")
     assert "abc123" in void and "def456" in void
 
-    # only local mode has a landing run to skip: on `required` the key would be
-    # one a human sets to no effect
-    on = {"local_command": "make test", "trust_recorded_run": True}
-    d.validate_config(d.resolve_config({"gate": {**on, "ci": "local"}}))
-    assert d.CONFIG_DEFAULTS["gate"]["trust_recorded_run"] is False     # opt-in
-    try:
-        d.validate_config(d.resolve_config({"gate": on}))
-        assert False, "expected ValueError"
-    except ValueError as e:
-        assert "trust_recorded_run" in str(e)
+    # on unless a repo turns it off — and so never an error in `required` mode,
+    # which has no landing run of the command to skip: the key is inert there
+    assert d.CONFIG_DEFAULTS["gate"]["trust_recorded_run"] is True
+    for ci in d.GATE_CI_MODES:
+        for trust in (True, False):
+            d.validate_config(d.resolve_config(
+                {"gate": {"ci": ci, "local_command": "make test", "trust_recorded_run": trust}}))
 
     # the line a worker gates with: the tool, carrying the command — quoted for a shell
     assert d.gate_command("/s/afk.py", " make test ") == \
