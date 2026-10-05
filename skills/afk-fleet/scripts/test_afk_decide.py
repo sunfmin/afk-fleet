@@ -303,6 +303,12 @@ def test_a_batch_is_known_by_its_id_wherever_orca_puts_its_branch():
     heads = ["main", "felix/afk-batch-fl-1-170", "afk-batch-fl-1-170-2", "felix/afk-batch-fl-1-1700",
              "felix/afk-batch-fl-2-170", "felix/issue-3-x", "felix/afk-batch-fl-1-170-x"]
     assert d.batch_branches(heads, "fl-1-170") == ["afk-batch-fl-1-170-2", "felix/afk-batch-fl-1-170"]
+    # a batch's id says which instance formed it — and only that one
+    assert d.batch_formed_by(batch, "fl-1/x") and not d.batch_formed_by(batch, "fl-1")
+    assert not d.batch_formed_by(batch, "") and not d.batch_formed_by(None, "fl-1/x")
+    # the PR a squash commit's subject names
+    assert d.squashed_pr(d.squash_message("a title", 12, 3).splitlines()[0]) == 12
+    assert d.squashed_pr("work: fix.txt") is None and d.squashed_pr(None) is None
     assert d.batch_branches(heads, "fl-9-1") == [] and d.batch_branches(None, "fl-1-170") == []
 
     def wt(branch, at=1, **more):

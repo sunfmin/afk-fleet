@@ -363,7 +363,8 @@ merge-time gate run (the gate run is the landing's)
 One **landing turn** held by several finished PRs of a **fleet instance** at once, so that they land
 behind ONE run of the **local gate** instead of one each (ADR-0029; opt-in with `merge.batch`,
 `gate.ci: local` only). Its whole record is the turn marker on every member PR, naming the batch,
-its members and its phase — `stacking`, `gating` or `fixing`. A **batch worker** stacks the members
+its members and its phase — `stacking`, `gating` or `fixing` — and it is the only place the members
+are kept: the batch's worktree holds no list of them. A **batch worker** stacks the members
 on the target's tip as one squash commit per PR, in **merge queue** order, gates the stack once, and
 pushes it to the target as a fast-forward: that push is the only lock, and a target that moved
 refuses it. Each PR then reads *closed* on GitHub, with a comment naming the commit that landed it

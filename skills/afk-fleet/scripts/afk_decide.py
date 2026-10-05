@@ -1661,6 +1661,12 @@ def batch_id(instance, now):
     return f"{_BATCH_ID_UNSAFE.sub('-', instance)}-{int(now)}"
 
 
+def batch_formed_by(batch, instance):
+    """Is `batch` an id `batch_id` gives a batch of `instance`?"""
+    return bool(instance) and bool(
+        re.fullmatch(rf"{re.escape(_BATCH_ID_UNSAFE.sub('-', instance))}-\d+", batch or ""))
+
+
 def batch_name(batch):
     """The name a batch's worktree is created under — and so, behind orca's
     `<user>/` prefix, its branch (`batch_branch_regex`)."""
@@ -1736,6 +1742,13 @@ def squash_message(title, pr, issue):
     return f"{(title or '').strip() or f'PR {pr}'} (#{pr})\n\nCloses #{issue}\n"
 
 
+def squashed_pr(subject):
+    """The PR a commit subject names the way `squash_message` writes it — its
+    trailing ` (#<pr>)` — or None."""
+    m = re.search(r" \(#(\d+)\)$", subject or "")
+    return int(m.group(1)) if m else None
+
+
 def read_stack(commits, prs):
     """
     A batch worktree's commits above the target, read back → (stacked, fixes):
@@ -1750,9 +1763,9 @@ def read_stack(commits, prs):
     """
     stacked, fixes = {}, []
     for sha, subject in commits:
-        m = re.search(r" \(#(\d+)\)$", subject or "")
-        if m and int(m.group(1)) in prs and int(m.group(1)) not in stacked:
-            stacked[int(m.group(1))] = sha
+        pr = squashed_pr(subject)
+        if pr in prs and pr not in stacked:
+            stacked[pr] = sha
         else:
             fixes.append(sha)
     return stacked, fixes

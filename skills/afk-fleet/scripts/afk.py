@@ -2418,25 +2418,29 @@ def cmd_land(a):
 # A batch is one landing turn, held by several PRs at once and landed by a
 # worker of the batch's own, in a worktree of the batch's own. Its record is the
 # turn marker on every member PR; its stack is that worktree's branch — read
-# back from git every time, never from a file. The one thing the worktree's git
-# dir remembers (`_BATCH_STATE`) is which PRs to look at, and what to report.
-
-_BATCH_STATE = "afk-batch.json"
-
-
-def _batch_state(path):
-    """What a batch's worktree remembers of its batch → {"id", "members",
-    "gate_runs", "left_out"}, or None in a worktree that is not a batch's."""
-    try:
-        with open(_worker_file(path, _BATCH_STATE)) as f:
-            return json.load(f)
-    except (OSError, ValueError, RuntimeError):
-        return None
+# back from git every time, never from a file. The worktree keeps nothing of its
+# batch: which batch it is the worktree of is its branch's name, and which PRs
+# the batch holds is read off the markers (`_batch_members`).
 
 
-def _save_batch_state(path, state):
-    with open(_worker_file(path, _BATCH_STATE), "w") as f:
-        json.dump(state, f)
+def _batch_members(run, batch, landed_pr=lambda issue: None):
+    """The PRs merge batch `batch` holds, in stack order → [{"issue", "pr"}...],
+    read from the turn marker they carry — the one home of a batch's membership
+    (ADR-0029); [] when no PR carries it. Any member's marker names them all, so
+    one is looked for among the PRs of the claims: a claim's open PR, or — for a
+    claim whose PR the batch already closed — the one `landed_pr(issue)` names.
+    The claims of the instance that formed the batch are asked first: one
+    comments read per PR asked, and usually the first is a member."""
+    claims = sorted(_scan(run.rem, run.cfg["claim_namespace"])[0],
+                    key=lambda c: not afk_decide.batch_formed_by(batch, c["instance"]))
+    prs = _open_prs(run.repo)
+    for c in claims:
+        pr = afk_decide.closing_pr(prs, c["number"])
+        number = pr["number"] if pr else landed_pr(c["number"])
+        turn = _turn(run.repo, number) if number else None
+        if turn and turn["batch"] == batch:
+            return turn["members"]
+    return []
 
 
 def _require_my_batch(run, instance, batch):
@@ -2568,8 +2572,6 @@ def _start_batch_worker(run, instance, agent, batch, members, phase, again):
         wt = _Worktree.cut(run, pushed[-1] if pushed else target, batch=batch)
         branch = wt.branch
     path = wt.path
-    _save_batch_state(path, {"gate_runs": 0, "left_out": [], **(_batch_state(path) or {}),
-                             "id": batch, "members": members})
     titles = {p["number"]: p["title"] for p in _open_prs(run.repo)}
     with open(_WORKER_PROMPT) as f:
         prompt = afk_decide.render_batch_brief(f.read(), {
@@ -2628,7 +2630,7 @@ def _batch_worker(run, batch, worker):
     if not seen:
         now, grace = worker.now, worker.grace
         told = [(_turn(run.repo, m["pr"]) or {}).get("at")
-                for m in (_batch_state(path) or {}).get("members") or []]
+                for m in _batch_members(run, batch)]
         turn_at = max((t for t in told if t), default=None)
         progress = _worktree_progress(path, run.rem, cfg["merge"]["target"])
         # a batch's worker declares no verdict and names no blocker
@@ -2637,6 +2639,15 @@ def _batch_worker(run, batch, worker):
                                            turn={"at": turn_at})
     return {"batch": batch, **seen, "worktree": path, "progress": progress,
             "nudged_at": nudged_at, "turn_at": turn_at, "worker_state": worker.reading["state"]}
+
+
+def _landed_pr(path, tip, issue):
+    """The PR whose squash commit on the target (`tip`, already fetched into
+    `path`) closes `issue` — `afk_decide.squash_message`'s `Closes #<issue>`
+    under a subject ending ` (#<pr>)` — or None."""
+    subject = _git(["-C", path, "log", "-1", "--format=%s", "-E",
+                    f"--grep=^Closes #{issue}$", tip]).stdout.strip()
+    return afk_decide.squashed_pr(subject)
 
 
 def _landed_commit(path, tip, pr_number):
@@ -2747,8 +2758,8 @@ def _land_batch(run, batch, gate_timeout, excerpt_lines):
     red gate (a fix commit on top) and a run after the target moved are the same
     run. It stops with an `outcome`:
 
-      landed        the stack is on the target (`landed`, `left_out`,
-                    `gate_runs`, `fix_commits`). Send the wake and stop.
+      landed        the stack is on the target (`landed`, `left_out` — the
+                    PRs this run left out — `fix_commits`). Send the wake and stop.
       gate_red      the gate was red on the stack; nothing landed (`gate.excerpt`).
                     Fix the stack — one more commit on top — and run this again.
       target_moved  the fast-forward was refused; nothing landed. Run this again.
@@ -2758,27 +2769,37 @@ def _land_batch(run, batch, gate_timeout, excerpt_lines):
     The invariant every path keeps: the target is only ever moved to a commit
     the gate passed on, and what the gate proved is the stack in the form it
     lands. No claim is released and no worktree removed here — the next cycle
-    settles each member from its closed issue, and removes the batch's worktree."""
+    settles each member from its closed issue, and removes the batch's worktree.
+
+    Which PRs the batch holds is read from their turn markers on every run
+    (`_batch_members`): the worktree keeps no list, so one recreated from the
+    batch's pushed branch lands the same members."""
     cfg, rem = run.cfg, run.rem
     now, target = run.now(), cfg["merge"]["target"]
     path = _git(["rev-parse", "--show-toplevel"]).stdout.strip()
-    state = _batch_state(path)
-    if not state or state.get("id") != batch:
+    branch = _git(["-C", path, "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+    if not afk_decide.batch_branches([branch], batch):
         raise RuntimeError(f"this worktree is not merge batch {batch}'s; nothing was changed")
     tip = _fetch_tip(rem, target, cwd=path)
+    listed = _batch_members(run, batch, lambda issue: _landed_pr(path, tip, issue))
+    if not listed:
+        raise RuntimeError(f"no PR carries the turn marker of merge batch {batch}: it does not "
+                           f"hold the landing turn; nothing was changed. Do not land anything "
+                           f"any other way — send your wake and stop")
+    left_out = []
 
     def result(outcome, members, **more):
         return {"outcome": afk_decide.batch_outcome(outcome), "batch": batch,
                 "issues": [m["issue"] for m in members], "prs": [m["pr"] for m in members],
-                "left_out": state["left_out"], "gate_runs": state["gate_runs"], **more}
+                "left_out": left_out, **more}
 
     # --- a landing whose finishing was cut short: the target already holds the stack ---
-    landed = [{**m, "commit": c} for m in state["members"]
+    landed = [{**m, "commit": c} for m in listed
               for c in [_landed_commit(path, tip, m["pr"])] if c]
     if landed:
-        return _finish_batch(run, state, landed, result)
+        return _finish_batch(run, batch, landed, result)
 
-    members, instance = _batch_turns(run, batch, state["members"])
+    members, instance = _batch_turns(run, batch, listed)
     dirty = _git(["-C", path, "status", "--porcelain", "--untracked-files=no"]).stdout.strip()
     if dirty:
         raise RuntimeError(f"the batch worktree {path} has uncommitted changes to tracked "
@@ -2793,7 +2814,7 @@ def _land_batch(run, batch, gate_timeout, excerpt_lines):
     # --- stack: every member on the target's tip, then the fixes carried so far ---
     log = _git(["-C", path, "log", "--reverse", "--format=%H%x09%s", f"{tip}..HEAD"]).stdout
     _, fixes = afk_decide.read_stack([tuple(ln.split("\t", 1)) for ln in log.splitlines()],
-                                     {m["pr"] for m in state["members"]})
+                                     {m["pr"] for m in listed})
     _git(["-C", path, "reset", "-q", "--hard", tip])
     stacked = []
     for m in members:
@@ -2802,8 +2823,7 @@ def _land_batch(run, batch, gate_timeout, excerpt_lines):
             stacked.append({**m, "commit": commit})
             continue
         _unbatch(run.repo, cfg, instance, now, batch, m, "left_out")
-        state["left_out"].append({**m, "reason": why, "files": files})
-        _save_batch_state(path, state)
+        left_out.append({**m, "reason": why, "files": files})
     if len(stacked) < 2:
         for m in stacked:
             _unbatch(run.repo, cfg, instance, now, batch, m, "dissolved")
@@ -2821,7 +2841,6 @@ def _land_batch(run, batch, gate_timeout, excerpt_lines):
             _git(["-C", path, "cherry-pick", "--abort"], check=False)
             _git(["-C", path, "reset", "-q", "--hard", "HEAD"])
     head = _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip()
-    branch = _git(["-C", path, "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
     _push_branch(run.repo, rem, path, head, branch, force=True)
     _delete_batch_branches(rem, batch, keep=branch)
     more = {"head": head, "target": target, "fix_commits": len(kept)}
@@ -2830,9 +2849,6 @@ def _land_batch(run, batch, gate_timeout, excerpt_lines):
     _record_batch(run.repo, cfg, instance, now, batch, stacked, "gating")
     gate = _gated(cfg, rem, path, gate_timeout, excerpt_lines, run.now())
     gone = not os.path.isdir(path)       # a gate run is long: an abandon removes the worktree
-    if gate["source"] == "run" and not gone:   # a stack found on record is not a run
-        state["gate_runs"] += 1
-        _save_batch_state(path, state)
     if gate["status"] != "green":
         _record_batch(run.repo, cfg, instance, run.now(), batch, stacked, "fixing")
         verdict = {k: v for k, v in gate.items() if k not in ("source", "head", "not_trusted")}
@@ -2857,17 +2873,16 @@ def _land_batch(run, batch, gate_timeout, excerpt_lines):
                       detail=f"{target} moved while the batch was gating: the fast-forward was "
                              f"refused and nothing landed — run this again; the batch is "
                              f"re-stacked on the new tip and gated again")
-    return _finish_batch(run, state, stacked, result, **more)
+    return _finish_batch(run, batch, stacked, result, **more)
 
 
-def _finish_batch(run, state, landed, result, **more):
+def _finish_batch(run, batch, landed, result, **more):
     """Finish every PR a batch landed — what GitHub does not do for a commit
     that was pushed rather than merged. Each step is skipped when already done,
     so a finishing that was cut short is finished by the next run. Issues first:
     a member whose issue is closed is settled by the next cycle whatever happens
     here, and a PR left open behind one is closed by that cycle's release."""
     cfg, rem = run.cfg, run.rem
-    batch = state["id"]
     instance = (_turn(run.repo, landed[0]["pr"]) or {}).get("instance")
     for m in landed:
         if cfg["progress_comment"]:
