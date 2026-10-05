@@ -136,6 +136,8 @@ def known_labels():
 
 if " ".join(argv[:2]) in st.get("fail", []):
     finish(code=1, err="fake gh: injected failure\n")
+if any(part in " ".join(argv) for part in st.get("garble", [])):
+    finish(out="null")                  # an answer of a shape nothing expects
 
 if argv[0] in ("issue", "pr", "label") and opt("--repo") != st["repo"]:
     finish(code=1, err="fake gh: unknown repo %%s\n" %% opt("--repo"))
@@ -1706,6 +1708,20 @@ def test_a_failed_transition_is_reported_and_leaves_its_claim_held():
         nxt = cycle(w, r["state"], now=t)
         assert (nxt["action"], nxt["reason"]) == ("tick", "unsettled") and "errors" not in nxt
         assert nxt["progress"] == "escalated #1; retried #2; 1 in flight, 0 left on the frontier"
+
+    # whatever a transition raises: an answer from GitHub of a shape nothing
+    # expects is no `{"error": …}` of afk's own, and the tick still goes on
+    with world(issues=[issue(n, "ready-for-agent") for n in (2, 3, 12)]) as w:
+        t = int(time.time()) + 5000
+        w.afk(*dispatch(2))
+        verdict(w, 2, "blocked", 12)                               # → park
+        w.set(garble=["issues/2/dependencies"])                    # its recorded edges: `null`
+
+        r = cycle(w, None, now=t)
+        assert [(e["step"], e["issue"]) for e in r["errors"]] == [("park", 2)]
+        assert r["errors"][0]["error"].startswith("TypeError: ")
+        assert r["progress"] == "dispatched #3, #12; 1 error; 3 in flight, 0 left on the frontier"
+        assert w.claimed_by(2) == "me" and r["state"]["unsettled"] is True
 
     # a worker whose agent never comes up is an error of ITS start: the claim it
     # took is held, and the next tick finds it with no worker… which here is one
