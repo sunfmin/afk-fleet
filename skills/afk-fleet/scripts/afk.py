@@ -378,10 +378,10 @@ def _blocked_by(repo, number):
     return [json.loads(ln) for ln in p.stdout.splitlines() if ln.strip()]
 
 
-def _turn(repo, pr):
-    """The landing turn recorded on a PR (`afk_decide.latest_turn`), whoever
-    granted it; None when it has none. One comments read."""
-    return afk_decide.latest_turn(_issue_comments(repo, pr["number"]))
+def _turn(repo, pr_number):
+    """The landing turn recorded on PR `pr_number` (`afk_decide.latest_turn`),
+    whoever granted it; None when it has none. One comments read."""
+    return afk_decide.latest_turn(_issue_comments(repo, pr_number))
 
 
 def _claim_turns(repo, prs, claims, instance):
@@ -393,17 +393,19 @@ def _claim_turns(repo, prs, claims, instance):
     turns = {}
     for c in claims:
         pr = afk_decide.closing_pr(prs, c["number"]) if c["instance"] == instance else None
-        turn = _turn(repo, pr) if pr else None
+        turn = _turn(repo, pr["number"]) if pr else None
         if turn:
             turns[c["number"]] = turn
     return turns
 
 
-def _record_turn(repo, pr, body, prev):
-    """Write a PR's ONE landing-turn comment → its id: `prev` (`_turn` of the PR)
-    is rewritten when there is one, whoever wrote it, so a PR never carries two
+def _record_turn(repo, pr_number, turn):
+    """Write PR `pr_number`'s ONE landing-turn comment from its record → its id.
+    `turn` is the record read from the PR (`_turn`) plus what changed
+    (`afk_decide.next_turn` and its kin): the comment it was read from is
+    rewritten when there was one, whoever wrote it, so a PR never carries two
     turns to tell apart."""
-    return _comment(repo, pr["number"], body, prev["comment_id"] if prev else None)
+    return _comment(repo, pr_number, afk_decide.turn_comment(turn), turn["comment_id"])
 
 
 def _orca_worktree_rows():
@@ -1359,7 +1361,7 @@ def _worker_outcome(a, cfg, number, path, reading, now, grace):
     prs = _open_prs(a.repo)
     blockers = _blocker_standings(a, cfg, number, declared["blocked_by"], prs)
     pr = afk_decide.closing_pr(prs, number)
-    turn = (_turn(a.repo, pr) if pr else None) or {}
+    turn = (_turn(a.repo, pr["number"]) if pr else None) or {}
     return {**afk_decide.classify_stopped(progress, reading["terminal_idle_seconds"], declared,
                                           {b["number"]: b["standing"] for b in blockers},
                                           now, grace, nudged_at=nudged_at,
@@ -1747,7 +1749,7 @@ def _begin_worker(a, cfg, rem, issue, start, reason=None):
         rec = _recovery(cfg, rem, a.repo, number)
         plan = {k: rec[k] for k in ("tier", "action", "prompt", "reason")}
         pr = afk_decide.closing_pr(_open_prs(a.repo), number)
-        turn = afk_decide.held_turn(_turn(a.repo, pr), a.instance) if pr else None
+        turn = afk_decide.held_turn(_turn(a.repo, pr["number"]), a.instance) if pr else None
         if turn and turn["batch"]:       # a merge batch's turn is its batch worker's
             turn = None
 
@@ -2138,7 +2140,7 @@ def cmd_turn(a):
         return stop("waiting", holder=others[0],
                     detail=f"issue #{others[0]}'s PR holds this fleet's landing turn; nothing was "
                            f"touched — this PR's turn comes when that one has landed or failed")
-    prev = _turn(a.repo, pr)
+    prev = _turn(a.repo, pr["number"])
     mine = held.get(a.number)
     if mine and mine["stopped"] not in afk_decide.LAND_WAITS:
         return stop("landing",
@@ -2160,10 +2162,8 @@ def cmd_turn(a):
         with open(_WORKER_PROMPT) as f:
             brief = _write_brief(path, afk_decide.render_landing(
                 f.read(), _prompt_fields(a, cfg, issue, path, branch), _landing_fields(cfg, pr)))
-    out["comment_id"] = _record_turn(
-        a.repo, pr, afk_decide.turn_comment(a.instance, _now(a), verified=verified,
-                                            allow_no_checks=allow,
-                                            unbatched=(prev or {}).get("unbatched")), prev)
+    out["comment_id"] = _record_turn(a.repo, pr["number"], afk_decide.single_turn(
+        prev, a.instance, _now(a), verified=verified, allow_no_checks=allow))
     out["again"] = bool(mine)
     if not handle:          # the worker is gone: its continuation is started on the turn
         worker = _start_worker(a, cfg, rem, issue, "auto")
@@ -2253,7 +2253,7 @@ def cmd_land(a):
         raise RuntimeError(f"no open PR closes issue #{a.number} — there is nothing to land (if "
                            f"it has already merged, send your wake and stop)")
     owner = _claim_owner(rem, cfg, a.number)
-    turn = afk_decide.held_turn(_turn(a.repo, pr), owner)
+    turn = afk_decide.held_turn(_turn(a.repo, pr["number"]), owner)
     if turn is None or turn["batch"]:
         raise RuntimeError(f"PR #{pr['number']} does not hold the landing turn of the fleet "
                            f"instance that holds issue #{a.number}'s claim; nothing was changed. "
@@ -2264,9 +2264,8 @@ def cmd_land(a):
     def stop(outcome, **more):
         """Stop short of merging, and say so on the PR's turn comment."""
         at = _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip()
-        _record_turn(a.repo, pr, afk_decide.turn_comment(
-            owner, _now(a), verified=turn["verified"], allow_no_checks=turn["allow_no_checks"],
-            stopped=afk_decide.land_outcome(outcome), head=at, unbatched=turn["unbatched"]), turn)
+        _record_turn(a.repo, pr["number"], afk_decide.next_turn(
+            turn, at=_now(a), stopped=afk_decide.land_outcome(outcome), head=at))
         return {**out, "outcome": outcome, **more}
 
     # --- the PR's head, as this worktree has it: commits the worker made since
@@ -2371,10 +2370,6 @@ def _batch_worktree(repo, batch, rows=None):
     return None
 
 
-def _pr_turn(repo, pr_number):
-    return _turn(repo, {"number": pr_number})
-
-
 def _require_my_batch(a, cfg, rem, batch):
     """The turn marker of a batch one of MY claims' PRs is in → that marker.
     Raises when no PR of mine carries it: a batch is only ever moved by the
@@ -2391,10 +2386,10 @@ def _require_my_batch(a, cfg, rem, batch):
 def _record_batch(repo, cfg, instance, now, batch, members, phase):
     """Write the batch's turn on every member PR — ONE marker each, rewritten in
     place — and say so on each member's status board."""
-    body = afk_decide.batch_turn_comment(instance, now, batch, members, phase)
     board = {"prs": [m["pr"] for m in members], "phase": phase}
     for m in members:
-        _record_turn(repo, {"number": m["pr"]}, body, _pr_turn(repo, m["pr"]))
+        _record_turn(repo, m["pr"], afk_decide.batch_turn(
+            _turn(repo, m["pr"]), instance, now, batch, members, phase))
         if cfg["progress_comment"]:
             _upsert_board(repo, m["issue"], cfg, "landing", instance=instance, pr=m["pr"],
                           batch=board)
@@ -2403,9 +2398,8 @@ def _record_batch(repo, cfg, instance, now, batch, members, phase):
 def _unbatch(repo, cfg, instance, now, batch, member, why, board=True):
     """Replace a member PR's batch marker by the one that says it left the batch:
     it holds no turn, waits for a single one, and is never batched again."""
-    _record_turn(repo, {"number": member["pr"]},
-                 afk_decide.unbatched_comment(instance, now, batch, why),
-                 _pr_turn(repo, member["pr"]))
+    _record_turn(repo, member["pr"], afk_decide.unbatched_turn(
+        _turn(repo, member["pr"]), instance, now, batch, why))
     if board and cfg["progress_comment"]:
         _upsert_board(repo, member["issue"], cfg, "awaiting_turn", instance=instance,
                       pr=member["pr"])
@@ -2474,7 +2468,7 @@ def _turn_batch(a, cfg, rem):
                                "there; nothing was touched — `afk no-pr --batch` watches it")
         # only the PRs that still carry the batch's marker: one left out since is not put back
         members = [m for m in mine["members"]
-                   if ((_pr_turn(a.repo, m["pr"]) or {}).get("batch") == mine["id"])]
+                   if ((_turn(a.repo, m["pr"]) or {}).get("batch") == mine["id"])]
         return _start_batch_worker(a, cfg, rem, mine["id"], members,
                                    mine["phase"] or afk_decide.BATCH_PHASES[0], again=True)
     dead = next((b for b in ws["batches"] if b["instance"] != a.instance), None)
@@ -2555,7 +2549,7 @@ def _abandon_batch(a, cfg, rem):
     still_open = {p["number"] for p in _open_prs(a.repo)}
     left = []
     for m in found["members"]:
-        turn = _pr_turn(a.repo, m["pr"]) if m["pr"] in still_open else None
+        turn = _turn(a.repo, m["pr"]) if m["pr"] in still_open else None
         if not turn or turn["batch"] != batch or turn["released"]:
             continue
         _unbatch(a.repo, cfg, a.instance, now, batch, m, "abandoned", board=m["issue"] in mine)
@@ -2583,7 +2577,7 @@ def _batch_worker(a, cfg, batch):
     turn_at, progress = None, {}
     seen = afk_decide.settled_by_worker_state(reading, now, grace, nudged_at)
     if not seen:
-        told = [(_pr_turn(a.repo, m["pr"]) or {}).get("at")
+        told = [(_turn(a.repo, m["pr"]) or {}).get("at")
                 for m in (_batch_state(path) or {}).get("members") or []]
         turn_at = max((t for t in told if t), default=None)
         progress = _worktree_progress(path, _remote(a), cfg["merge"]["target"])
@@ -2610,7 +2604,7 @@ def _close_landed_pr(a, cfg, rem, number):
     nothing of the kind. The target itself is asked: a PR whose squash commit is
     not on it is left alone."""
     pr = afk_decide.closing_pr(_open_prs(a.repo), number)
-    turn = _turn(a.repo, pr) if pr else None
+    turn = _turn(a.repo, pr["number"]) if pr else None
     if not turn or not turn["batch"] or turn["released"]:
         return None
     target = cfg["merge"]["target"]
@@ -2665,7 +2659,7 @@ def _batch_turns(a, cfg, rem, batch, listed):
     batch does not hold the turn, and raises: nothing may land on it."""
     members, instance = [], None
     for m in listed:
-        turn = _pr_turn(a.repo, m["pr"])
+        turn = _turn(a.repo, m["pr"])
         if turn and turn["released"]:
             continue
         owner = _claim_owner(rem, cfg, m["issue"])
@@ -2821,7 +2815,7 @@ def _finish_batch(a, cfg, rem, state, landed, result, **more):
     a member whose issue is closed is settled by the next cycle whatever happens
     here, and a PR left open behind one is closed by that cycle's release."""
     batch = state["id"]
-    instance = (_pr_turn(a.repo, landed[0]["pr"]) or {}).get("instance")
+    instance = (_turn(a.repo, landed[0]["pr"]) or {}).get("instance")
     for m in landed:
         if cfg["progress_comment"]:
             _upsert_board(a.repo, m["issue"], cfg, "merged", instance=instance, pr=m["pr"])
