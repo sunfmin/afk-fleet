@@ -433,6 +433,8 @@ if cmd == ["terminal", "send"]:
     term = terminal()
     if term is None:
         finish(error="terminal_handle_stale")
+    if fake.get("send_refused"):
+        finish({"send": {"accepted": False}})
     term["sent"].append({"text": opt("--text"), "enter": "--enter" in argv})
     finish({"send": {"accepted": True}})
 
@@ -450,7 +452,8 @@ if cmd == ["worktree", "ps"]:
 if cmd == ["terminal", "list"]:
     row = worktree()
     finish({"terminals": [{"handle": t["handle"], "worktreePath": t["worktreePath"],
-                           "connected": True, "writable": True, "lastOutputAt": i}
+                           "connected": t.get("connected", True), "writable": True,
+                           "lastOutputAt": i}
                           for i, t in enumerate(fake["terminals"])
                           if t["open"] and row and t["worktreePath"] == row["path"]]})
 
@@ -618,7 +621,8 @@ class World:
     # --- orca -------------------------------------------------------------
     def orca(self, worktrees=None, **knobs):
         """Set orca's worktree rows and/or the fake's knobs (`never_ready`,
-        `stale_base`, `rm_fails`, `repos`), keeping everything else it remembers."""
+        `stale_base`, `rm_fails`, `send_refused`, `repos`), keeping everything else it
+        remembers."""
         if os.path.exists(self.orca_file):
             try:
                 with open(self.orca_file) as f:
@@ -1397,14 +1401,21 @@ def test_only_the_read_and_write_helpers_know_the_read_cache():
     assert writes == _WRITES, writes
 
 
-def test_the_steps_of_a_tick_share_one_tick_and_a_start_names_its_outcome():
-    """The landing-turn step is handed the tick's books as one argument, and no
-    code tells how a start began by whether a value can be called."""
+def test_the_tick_carries_out_a_plan_and_holds_no_rule_of_its_own():
+    """What a tick runs, and in what order, is `afk_decide.tick_plan`'s: `_tick`
+    asks the decision core for nothing else, branches on nothing, and its table
+    performs exactly the steps a plan can name. No code tells how a start began
+    by whether a value can be called."""
     import ast
     with open(AFK) as f:
         tree = ast.parse(f.read())
-    turn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_tick_turn")
-    assert [a.arg for a in turn.args.args] == ["run", "instance", "agent", "tick"]
+    tick = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_tick")
+    asked = {n.attr for n in ast.walk(tick) if isinstance(n, ast.Attribute)
+             and isinstance(n.value, ast.Name) and n.value.id == "afk_decide"}
+    assert asked == {"tick_plan", "follow"}, asked
+    assert not [n.lineno for n in ast.walk(tick) if isinstance(n, (ast.If, ast.While))]
+    tables = [{k.value for k in n.keys} for n in ast.walk(tick) if isinstance(n, ast.Dict)]
+    assert set(afk_decide.TICK_STEPS) in tables, tables
     assert not [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id == "callable"]
 
 
@@ -1543,12 +1554,12 @@ def test_workers_are_started_at_once_and_never_past_concurrency():
         assert [w.claimed_by(n) for n in (1, 2, 3)] == ["me"] * 3
 
 
-def test_a_claim_a_peer_won_mid_tick_is_off_the_frontier_and_takes_no_slot(monkeypatch):
+def test_a_claim_a_peer_won_mid_tick_is_answered_as_lost_not_as_a_failure(monkeypatch):
     """Beginning a dispatch can lose the claim to a peer that took the issue
-    after the rebuild. That is neither a start nor a failure: the issue is off
-    the frontier, the slot it would have filled goes to the next one, and the
-    starting goes on."""
-    with world(issues=[issue(n, "ready-for-agent") for n in range(1, 6)]) as w:
+    after the rebuild. The tick answers its plan `lost` — neither a start nor an
+    error — so the starting goes on (what the plan does with a lost claim is
+    `afk_decide.tick_plan`'s, under its own fixtures)."""
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
         for name, value in w.env.items():          # orca is run on the process's own environment
             monkeypatch.setenv(name, value)
         with inside(w) as rem:
@@ -1557,10 +1568,10 @@ def test_a_claim_a_peer_won_mid_tick_is_off_the_frontier_and_takes_no_slot(monke
             w.afk("claim", "1", "--instance", "peer", *NOW, *R)
             did, judgments, errors = afk._tick(run, "me", "host", afk._Agent(WORKER, 30), ws)
         assert (judgments, errors) == ([], [])
-        assert did == {**{k: [] for k in afk_decide.TICK_DID}, "dispatched": [2, 3, 4],
-                       "in_flight": 3, "frontier_remaining": 1}
-        assert [w.claimed_by(n) for n in range(1, 6)] == ["peer", "me", "me", "me", None]
-        assert len(w.terminals()) == 3 and all(_told(t) for t in w.terminals())
+        assert did == {**{k: [] for k in afk_decide.TICK_DID}, "dispatched": [2],
+                       "in_flight": 1, "frontier_remaining": 0}
+        assert [w.claimed_by(n) for n in (1, 2)] == ["peer", "me"]
+        assert len(w.terminals()) == 1 and _told(w.terminals()[0])
 
 
 def test_what_changed_while_a_tick_ran_still_gets_a_tick():
@@ -1660,57 +1671,75 @@ def _judged(r):
     return {j["issue"]: j for j in r["judgments"]}
 
 
-def test_a_tick_returns_each_judgment_with_a_command_for_either_answer():
+_VERIFY = ("--set", "gate.adversarial_verify=true")
+
+
+def _each_judgment_comes_with_a_command_for_either_answer(pick, verify=()):
     """What code cannot decide comes back as a judgment: a question, and the one
     `afk` transition for each answer — runnable as handed over. Every answer is a
-    transition, so whichever is run, the next cycle does not ask again."""
-    for pick in ("if_yes", "if_no"):
-        for verify in ((), ("--set", "gate.adversarial_verify=true")):
-            issues = [issue(n, "ready-for-agent") for n in (1, 2, 3)]
-            with world(issues=issues) as w:
-                w.afk(*dispatch(1))
-                verdict(w, 1, "already-satisfied")                  # idle, nothing on its branch
-                with_pr(w, 2, 20, conclusion="FAILURE")             # its checks are red
-                _, head = with_pr(w, 3, 30, conclusion=None)        # no checks at all
-                t = int(time.time()) + 5000
+    transition, so whichever is run, the next cycle does not ask again. (One
+    world per answer and per gate, each its own test: they run side by side.)"""
+    issues = [issue(n, "ready-for-agent") for n in (1, 2, 3)]
+    with world(issues=issues) as w:
+        w.afk(*dispatch(1))
+        verdict(w, 1, "already-satisfied")                  # idle, nothing on its branch
+        with_pr(w, 2, 20, conclusion="FAILURE")             # its checks are red
+        _, head = with_pr(w, 3, 30, conclusion=None)        # no checks at all
+        t = int(time.time()) + 5000
 
-                r = cycle(w, None, *verify, now=t)
-                asked = _judged(r)
-                assert {n: j["kind"] for n, j in asked.items()} == {
-                    1: "empty_diff", 2: "reason", 3: "adversarial_verify" if verify else "no_checks"}
-                # judgments open: answer them and come straight back
-                assert r["sleep_seconds"] == 0 and "3 judgments open" in r["progress"]
-                for j in asked.values():
-                    assert set(j) - {"bulky"} == {"issue", "kind", "question", "context",
-                                                  "if_yes", "if_no"}
-                # the two whose answer means reading something long say so
-                assert sorted(n for n, j in asked.items() if j.get("bulky")) == ([2, 3] if verify else [2])
-                assert asked[1]["context"]["worktree"] == w.worktrees()[0]["path"]
-                assert asked[3]["context"]["head"] == head
-                # nothing was decided for the caller: every claim is as it was
-                assert w.issue(1)["state"] == "open" and "state" not in w.pr(20)
-                assert _turns(w, 30) == [] and all(w.claimed_by(n) == "me" for n in (1, 2, 3))
-                # a `reason` judgment's transition is fixed; the answer is its wording
-                assert asked[2]["if_yes"] == asked[2]["if_no"]
+        r = cycle(w, None, *verify, now=t)
+        asked = _judged(r)
+        assert {n: j["kind"] for n, j in asked.items()} == {
+            1: "empty_diff", 2: "reason", 3: "adversarial_verify" if verify else "no_checks"}
+        # judgments open: answer them and come straight back
+        assert r["sleep_seconds"] == 0 and "3 judgments open" in r["progress"]
+        for j in asked.values():
+            assert set(j) - {"bulky"} == {"issue", "kind", "question", "context",
+                                          "if_yes", "if_no"}
+        # the two whose answer means reading something long say so
+        assert sorted(n for n, j in asked.items() if j.get("bulky")) == ([2, 3] if verify else [2])
+        assert asked[1]["context"]["worktree"] == w.worktrees()[0]["path"]
+        assert asked[3]["context"]["head"] == head
+        # nothing was decided for the caller: every claim is as it was
+        assert w.issue(1)["state"] == "open" and "state" not in w.pr(20)
+        assert _turns(w, 30) == [] and all(w.claimed_by(n) == "me" for n in (1, 2, 3))
+        # a `reason` judgment's transition is fixed; the answer is its wording
+        assert asked[2]["if_yes"] == asked[2]["if_no"]
 
-                # the caller that never answered is asked again, digest unmoved or not
-                again = cycle(w, r["state"], *verify, now=t)
-                assert (again["reason"], _judged(again).keys()) == ("unsettled", asked.keys())
+        # the caller that never answered is asked again, digest unmoved or not
+        again = cycle(w, r["state"], *verify, now=t)
+        assert (again["reason"], _judged(again).keys()) == ("unsettled", asked.keys())
 
-                done = {n: answer(w, j[pick]) for n, j in asked.items()}
-                assert done[2]["action"] == "retry" and w.pr(20)["state"] == "closed"
-                if pick == "if_yes":
-                    assert done[1]["action"] == "closed" and w.issue(1)["state"] == "closed"
-                    assert done[3]["outcome"] == "granted" and len(_turns(w, 30)) == 1
-                    turn = afk_decide.latest_turn([{"body": b} for b in _turns(w, 30)])
-                    assert turn["allow_no_checks"] and turn["verified"] == (head if verify else None)
-                else:
-                    assert done[1]["action"] == done[3]["action"] == "retry"
-                    assert w.pr(30)["state"] == "closed" and w.claimed_by(1) == "me"
+        done = {n: answer(w, j[pick]) for n, j in asked.items()}
+        assert done[2]["action"] == "retry" and w.pr(20)["state"] == "closed"
+        if pick == "if_yes":
+            assert done[1]["action"] == "closed" and w.issue(1)["state"] == "closed"
+            assert done[3]["outcome"] == "granted" and len(_turns(w, 30)) == 1
+            turn = afk_decide.latest_turn([{"body": b} for b in _turns(w, 30)])
+            assert turn["allow_no_checks"] and turn["verified"] == (head if verify else None)
+        else:
+            assert done[1]["action"] == done[3]["action"] == "retry"
+            assert w.pr(30)["state"] == "closed" and w.claimed_by(1) == "me"
 
-                after = cycle(w, again["state"], *verify, now=int(time.time()))
-                assert after["action"] == "tick" and after["judgments"] == [], after
-                assert after["sleep_seconds"] == 90 and after["state"]["unsettled"] is False
+        after = cycle(w, again["state"], *verify, now=int(time.time()))
+        assert after["action"] == "tick" and after["judgments"] == [], after
+        assert after["sleep_seconds"] == 90 and after["state"]["unsettled"] is False
+
+
+def test_a_judgment_answered_yes_is_a_transition_that_runs():
+    _each_judgment_comes_with_a_command_for_either_answer("if_yes")
+
+
+def test_a_judgment_answered_no_is_a_transition_that_runs():
+    _each_judgment_comes_with_a_command_for_either_answer("if_no")
+
+
+def test_a_verify_judgment_answered_yes_is_a_transition_that_runs():
+    _each_judgment_comes_with_a_command_for_either_answer("if_yes", _VERIFY)
+
+
+def test_a_verify_judgment_answered_no_is_a_transition_that_runs():
+    _each_judgment_comes_with_a_command_for_either_answer("if_no", _VERIFY)
 
 
 def test_a_failed_transition_is_reported_and_leaves_its_claim_held():
@@ -3877,6 +3906,88 @@ def test_an_orca_that_cannot_be_asked_is_an_error_for_every_observation_of_a_wor
         w.orca(ps_truncated=True)
         assert "truncated" in w.error("no-pr", "--batch", batch, *R, *gate, *NOW)
         assert "truncated" in w.error("no-pr", "--issue", "1", *R, *gate)
+
+
+def test_a_terminal_that_does_not_take_what_a_worker_is_told_is_one_error():
+    """A nudge, a landing turn and a worker's prompt are each one line said to a
+    worker's terminal. A terminal that does not accept the line is one error,
+    raised in one place — and what was not said is not on record as said."""
+    gate = local_gate("true")
+    with world(issues=[issue(5, "ready-for-agent"), issue(6, "ready-for-agent")]) as w:
+        d, _ = with_pr(w, 5, 50)
+        nudge = ("nudge", "--issue", "5", *ME, *R, *gate)
+        w.orca(send_refused=True)
+        term = d["terminal"]
+        assert w.error(*nudge) == f"terminal {term} did not accept the nudge"
+        assert w.error(*_turn(5, *gate)) == f"terminal {term} did not accept the landing turn"
+        assert "did not accept the worker prompt" in w.error(*dispatch(6))
+        assert len(w.terminals()[0]["sent"]) == 1                    # only its first prompt
+        # the nudge that was not taken was not recorded: the worker is nudged, once
+        w.orca(send_refused=False)
+        assert w.afk(*nudge)["action"] == "nudged"
+    with open(AFK) as f:
+        src = f.read()
+    assert src.count("raise WorkerNotTold(") == 1 and src.count('.get("accepted")') == 1
+
+
+def test_a_worker_put_where_an_agent_already_is_closes_that_agent_first():
+    """Two agents in one worktree would fight. Whatever is in a worktree a worker
+    is put into — an issue's or a merge batch's — is closed first, in one place."""
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
+        gate = (*local_gate("true"), *BATCH)
+        d = {n: with_pr(w, n, n * 10, gate=gate)[0] for n in (1, 2)}
+
+        def agents(path):
+            return [t["open"] for t in w.terminals() if t["worktreePath"] == path]
+
+        # a merge batch's worktree: its worker hung — still there, no longer reachable
+        assert w.afk(*_turn_batch(*gate))["outcome"] == "granted"
+        bwt = _the_batch(w, gate)["worktree"]
+        terms = w.terminals()
+        terms[-1]["connected"] = False
+        w.orca(terminals=terms)
+        w.orca_calls()
+        r = w.afk(*_turn_batch(*gate, now=T0 + 90))
+        assert (r["outcome"], r["delivery"], r["worktree"]) == ("granted", "worktree", bwt), r
+        assert w.orca_calls() == ["terminal list", "terminal close", "terminal create",
+                                  "terminal wait", "terminal send"]
+        assert agents(bwt) == [False, True]
+
+        # an issue's worktree: its worker stopped, and is continued where it stood
+        r = w.afk(*dispatch(1, *gate, "--now", str(T0 + 90)))
+        assert (r["action"], r["worktree"]) == ("reuse_worktree", d[1]["worktree"]), r
+        assert w.orca_calls() == ["terminal close", "terminal create", "terminal wait",
+                                  "terminal send"]
+        assert agents(d[1]["worktree"]) == [False, True]
+        # a worktree just cut has no agent to close
+        assert agents(d[2]["worktree"]) == [True]
+    with open(AFK) as f:
+        assert f.read().count('"terminal", "close"') == 1
+
+
+# What the worker module replaced: none of these is a name any more.
+_REPLACED_BY_THE_WORKER_MODULE = {
+    "_orca_worktree_rows", "_issue_worktree", "_live_worktree", "_batch_worktree",
+    "_batch_worktrees", "_create_worktree", "_cut_worktree", "_remove_worktree", "_live_terminal",
+    "_tui_idle", "_terminal_tail", "_open_terminal", "_submit_prompt", "_write_brief", "_nudge"}
+
+
+def test_only_the_worker_module_types_an_orca_command():
+    """No transition types an orca command: `_orca` is called only by the worker
+    module's two classes, orca is run in one place, and the helpers the module
+    replaced are gone."""
+    import ast
+    with open(AFK) as f:
+        src = f.read()
+    tree = ast.parse(src)
+    callers = {top.name for top in tree.body for node in ast.walk(top)
+               if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+               and node.func.id == "_orca"}
+    assert callers == {"_Worktree", "_Workers"}, callers
+    assert src.count('["orca",') == 1
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    names |= {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    assert not names & _REPLACED_BY_THE_WORKER_MODULE, names & _REPLACED_BY_THE_WORKER_MODULE
 
 
 def test_bootstrap_refuses_a_merge_batch_the_target_would_not_take():

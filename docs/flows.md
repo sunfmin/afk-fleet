@@ -31,12 +31,12 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    `skills/afk-fleet/scripts/afk.py:cmd_dispatch`
 4. The dispatch fetches the base's tip from the remote and has orca create the worktree and branch
    at that sha, then asserts the worktree contains it.
-   `skills/afk-fleet/scripts/afk.py:_create_worktree`
+   `skills/afk-fleet/scripts/afk.py:cut`
 5. It starts a **worker** there with the run's **worker launch command**, waits until the agent is
    ready, and delivers the worker prompt, filled with the branch and path orca returned, as a brief
    file plus one submitted line pointing at it. A tick filling several slots begins every start
    first and then waits for all the agents together.
-   `skills/afk-fleet/scripts/afk.py:_submit_prompt`
+   `skills/afk-fleet/scripts/afk.py:put`
 6. It upserts the issue's **status board** to "claimed"; the tick refreshes its **heartbeat**
    and ends, without waiting for the worker.
    `skills/afk-fleet/scripts/afk.py:_upsert_board`
@@ -136,10 +136,12 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    cycle state; the call digests what a rebuild would observe and decides skip or tick — the raw
    state never enters a context.
    `skills/afk-fleet/scripts/afk.py:cmd_cycle`
-5. When the digest moved, that same call runs the reconciliation pass (the mainline above) in code,
-   and returns what it could not decide as judgments, each with the transition for either answer;
-   the launcher runs the one it chooses and opens the next cycle at once.
-   `skills/afk-fleet/scripts/afk.py:_tick`
+5. When the digest moved, that same call runs the reconciliation pass (the mainline above) in code:
+   the decision core says which transition comes next, one step at a time, and the call carries
+   each one out and reports how it ended. What it could not decide comes back as judgments, each
+   with the transition for either answer; the launcher runs the one it chooses and opens the next
+   cycle at once.
+   `skills/afk-fleet/scripts/afk_decide.py:tick_plan`
 6. The call folds what the pass did into the cycle state — which also carries the two
    launcher-held facts (instance id, worker launch command) — with the digest of the fleet as the
    pass left it, so its own writes do not cause the next tick, and counts whether the cycle was empty.
