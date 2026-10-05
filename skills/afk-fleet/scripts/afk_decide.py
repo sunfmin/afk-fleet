@@ -1506,8 +1506,8 @@ def select_recovery(worktree, branch):
 # is handed over. The `landing` block is a brief of its own — `render_landing` —
 # pointed at when the worker is given its landing turn: the one command a worker
 # lands its PR with and what each of its outcomes asks for (ADR-0027). It is the
-# only place either is spelled; the body says no more than that the PR lands
-# later, on its turn. Everything else in braces is a
+# only place either is spelled; the body says no more than that the worker does
+# not merge its PR and is told when to land it. Everything else in braces is a
 # field — four of them derived: {wake_command}, the line a worker runs to wake
 # the launcher once its outcome is on GitHub, built from the `launcher_terminal`
 # field (ADR-0020), {gate_command}, the line a worker runs the local gate with —
