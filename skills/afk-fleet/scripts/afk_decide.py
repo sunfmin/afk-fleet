@@ -416,10 +416,11 @@ def classify_claims(claims, heartbeats, me, now, ttl):
 
 # Every `status` a `mine` row can carry — what `subclassify_pr` returns, and the
 # vocabulary the tick's instructions route on (a test holds the docs to it).
-CLAIM_STATUSES = ("awaiting_merge", "awaiting_ci", "failure", "handed_back", "no_pr", "closed")
+CLAIM_STATUSES = ("awaiting_merge", "queued", "awaiting_ci", "failure", "handed_back", "no_pr",
+                  "closed")
 
 
-def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=False):
+def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=False, queued=False):
     """
     Classify one of MY in-flight claims from its PR + checks → `(status,
     board_phase)`: what the tick does next, and what the status board shows a human
@@ -433,6 +434,9 @@ def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=Fals
       handed_back:  a sync conflict on the PR was handed back to its worker and the
                     PR head does not yet contain the target tip it named
                     (`handback_open`)
+      queued:       the PR waits behind a handed-back PR ahead of it in the merge
+                    queue (`waits_behind`). Only a claim that would otherwise be
+                    `awaiting_merge` is ever `queued`: it is the merge that waits
 
       status           the tick…                                board_phase
       closed           releases the leftover claim               None (not re-rendered)
@@ -444,6 +448,8 @@ def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=Fals
       awaiting_merge   runs `afk merge`                          awaiting_merge
                        (`local`: an open PR, whatever its        (`local`: pr_open)
                        remote checks say)
+      queued           leaves it: its turn comes when the PR     queued
+                       it is behind has merged
 
     In `local` mode (ADR-0012) there are no checks to wait on: gating is an
     **action the tick takes at merge time** (sync → re-run the local gate → merge),
@@ -462,10 +468,10 @@ def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=Fals
         # whatever the checks say: re-running the merge against the same head would
         # hit the same conflict and hand it back again, every cycle
         return "handed_back", "handed_back"
-    if ci_mode == "local":
-        return "awaiting_merge", "pr_open"
-    if checks_state == "green":
-        return "awaiting_merge", "awaiting_merge"
+    if ci_mode == "local" or checks_state == "green":
+        if queued:
+            return "queued", "queued"
+        return "awaiting_merge", "pr_open" if ci_mode == "local" else "awaiting_merge"
     if checks_state == "red":
         return "failure", "ci_failed"
     return "awaiting_ci", "pr_open"
@@ -550,7 +556,7 @@ def protection_verdict(ci_mode, protection, unavailable=None):
 
 # Every `outcome` `afk merge` can stop with — the vocabulary the tick's
 # instructions route on (a test holds the docs to it).
-MERGE_OUTCOMES = ("merged", "conflict", "handed_back", "worker_busy", "gate_red", "awaiting_ci",
+MERGE_OUTCOMES = ("merged", "conflict", "handed_back", "queued", "worker_busy", "gate_red", "awaiting_ci",
                   "no_checks", "needs_verify")
 
 
@@ -1049,14 +1055,14 @@ def handback_comment(target, tip, head, files, at):
             f"spent; this PR merges once its head contains that `{target}` tip.")
 
 
-def latest_handback(comments):
+def handback_records(comments):
     """
-    The LATEST hand-back recorded on a PR, from its comments ([{"id", "body"}...],
-    oldest first) → {"target", "tip", "head", "at", "files", "comment_id"}, or None
-    when the PR was never handed back. A marker missing `tip` or `head` is not a
+    Every hand-back recorded on a PR, from its comments ([{"id", "body"}...],
+    oldest first) → [{"target", "tip", "head", "at", "files", "comment_id"}...],
+    one per round, oldest first. A marker missing `tip` or `head` is not a
     record: nothing could ever be compared against it.
     """
-    found = None
+    found = []
     for c in comments or []:
         body = c.get("body") or ""
         m = _HANDBACK_MARKER_RE.search(body)
@@ -1066,11 +1072,18 @@ def latest_handback(comments):
         if not attrs.get("tip") or not attrs.get("head"):
             continue
         at = attrs.get("at", "")
-        found = {"target": attrs.get("target"), "tip": attrs["tip"], "head": attrs["head"],
-                 "at": int(at) if at.isdigit() else None,
-                 "files": _HANDBACK_FILE_RE.findall(body[m.end():]),
-                 "comment_id": c.get("id")}
+        found.append({"target": attrs.get("target"), "tip": attrs["tip"], "head": attrs["head"],
+                      "at": int(at) if at.isdigit() else None,
+                      "files": _HANDBACK_FILE_RE.findall(body[m.end():]),
+                      "comment_id": c.get("id")})
     return found
+
+
+def latest_handback(comments):
+    """The LATEST hand-back recorded on a PR (`handback_records`), or None when the
+    PR was never handed back."""
+    records = handback_records(comments)
+    return records[-1] if records else None
 
 
 def handback_open(handback, pr_head, contains_tip):
@@ -1089,6 +1102,70 @@ def handback_open(handback, pr_head, contains_tip):
     if not handback:
         return False
     return pr_head == handback["head"] or not contains_tip
+
+
+# --------------------------------------------------------------------------- #
+# The merge queue — conflicting PRs land one at a time                         #
+# --------------------------------------------------------------------------- #
+#
+# PRs that conflict with each other must each resolve against a target that
+# already holds everything landing before them, or every merge re-opens the
+# conflicts the others just resolved (ADR-0025). So the fleet's open PRs are
+# ORDERED, and a PR waits behind a handed-back one ahead of it whose conflict it
+# would re-open. A queue entry is one claim's open PR:
+#
+#   {"issue", "pr", "handbacks": <rounds recorded on the PR>,
+#    "handback": <its latest record, None when never handed back>,
+#    "open": <that record is still unanswered>}
+
+def queue_rank(entry):
+    """
+    The sort key of a queue entry — the ONE merge order, smallest first:
+
+      1. a PR that was handed back, before one that never was: its worker already
+         paid for a resolution, and anything landing ahead of it can void that;
+      2. among those, the most rounds first — the one that has waited longest;
+      3. then the one whose latest hand-back is oldest;
+      4. then the lower PR number — which is also the whole order among PRs
+         never handed back.
+    """
+    at = (entry["handback"] or {}).get("at") if entry["handbacks"] else None
+    return (-entry["handbacks"], at or 0, entry["pr"])
+
+
+def queue_order(entries):
+    """The issue numbers of the queue's entries, in merge order (`queue_rank`)."""
+    return [e["issue"] for e in sorted(entries, key=queue_rank)]
+
+
+def queue_ahead(entry, entries):
+    """The entries `entry` could have to wait behind: the handed-back PRs ahead of
+    it in the merge order — answered or not, for an answered one still has to
+    LAND before a PR behind it can resolve against what it brings. Empty for the
+    usual case (nothing was handed back), which is what lets a caller skip
+    reading the PR's changed files."""
+    mine = queue_rank(entry)
+    return sorted((e for e in entries if e["handbacks"] and e["pr"] != entry["pr"]
+                   and queue_rank(e) < mine), key=queue_rank)
+
+
+def waits_behind(changed_files, ahead):
+    """
+    The PR number a PR waits behind, or None when it is free to merge.
+
+      changed_files: the paths the PR changes
+      ahead:         `queue_ahead` of its entry
+
+    It waits behind the first PR ahead whose latest hand-back conflicted in a
+    file this PR also changes: landing first would move the target under a
+    resolution in progress, and syncing now would resolve against a tip that PR
+    is about to move. A PR that touches none of those files waits for nobody.
+    """
+    changed = set(changed_files or [])
+    for e in ahead:
+        if changed & set(e["handback"]["files"]):
+            return e["pr"]
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -1527,8 +1604,9 @@ _STATUS_STEPS = (
 # The closed set of lifecycle phases the board renders, each with everything the
 # board says about it: how far along the happy path it has reached (the index of
 # the last DONE step) and its single ▸/✅/⚠️ 'where are we now' line. Happy path
-# plus five off-ramps that reuse the same checkboxes + an annotation: ci_failed,
-# handed_back (a sync conflict returned to the worker — `afk hand-back`), escalated
+# plus six off-ramps that reuse the same checkboxes + an annotation: ci_failed,
+# handed_back (a sync conflict returned to the worker — `afk hand-back`), queued
+# (waiting its turn in the merge queue behind a handed-back PR), escalated
 # (a terminal give-up, ticked specially in `render_status_board`), closed (the
 # worker found the issue already satisfied — `afk close`), and parked (the worker
 # found an open dependency; the claim is released until it closes — `afk park`).
@@ -1538,6 +1616,7 @@ _PHASES = {
     "pr_open":        (1, "▸ 当前:等 {gate}"),
     "ci_failed":      (1, "▸ 当前:{gate} 失败,修复重试中({attempt}/{retry_max}) —— 见下方 {gate} 与评论"),
     "handed_back":    (1, "▸ 当前:与目标分支同步冲突,已交还 worker 解决 —— 见 PR 评论"),
+    "queued":         (1, "▸ 当前:排队等合并 —— 等 PR #{behind} 先合并(改动与它的同步冲突文件重叠),轮到后自动继续"),
     "awaiting_merge": (2, "▸ 当前:门已绿,待合并"),
     "merged":         (3, "✅ 已合并,完成"),
     "escalated":      (1, "⚠️ 已升级给人处理 —— 见下方评论"),
@@ -1548,7 +1627,7 @@ STATUS_PHASES = tuple(_PHASES)
 
 
 def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attempt=0,
-                        blocked_by=()):
+                        blocked_by=(), behind=None):
     """
     Render the human-facing progress *status board* comment body. Pure: a function
     of the discrete lifecycle state the tick already derived from fleet state; no
@@ -1563,11 +1642,14 @@ def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attem
       pr:        the PR number, once one is open
       attempt:   the claim's current attempt (`current_attempt`)
       blocked_by: the open blockers the issue waits on, for parked only
+      behind:    the PR number this one waits behind, for queued only
 
     Returns the full markdown body, led by STATUS_MARKER (the find-or-create anchor).
     """
     if phase not in STATUS_PHASES:
         raise ValueError(f"unknown status phase: {phase!r}")
+    if phase == "queued" and not behind:
+        raise ValueError("a queued status board names the PR it waits behind")
     gate = GATE_CI_MODES[gate_ci]
     reached, current = _PHASES[phase]
     escalated = phase == "escalated"
@@ -1583,7 +1665,7 @@ def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attem
         label = label.format(pr=f" (#{pr})" if pr else "", gate=gate)
         lines.append(f"- [{'x' if done(i, key) else ' '}] {label}")
     lines.append("")
-    lines.append(current.format(gate=gate, attempt=attempt, retry_max=retry_max,
+    lines.append(current.format(gate=gate, attempt=attempt, retry_max=retry_max, behind=behind,
                                 blockers="、".join(f"#{n}" for n in blocked_by)))
     return "\n".join(lines)
 
@@ -2070,7 +2152,7 @@ def superseded_prs(prs, number, branch_pattern):
 
 
 def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, config,
-                         closed=(), handed_back=()):
+                         closed=(), handed_back=(), queued=None, merge_queue=()):
     """
     The tick's whole working set from the raw observables. Pure — afk.py's
     `rebuild` gathers, this assembles, and a fixture pins the join.
@@ -2093,11 +2175,16 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
       handed_back: the numbers of MY claims whose PR carries an open hand-back
                    (`handback_open` — `afk rebuild` asks about each of mine that
                    has a PR)
+      queued:      {number: the PR number it waits behind} for MY claims whose PR
+                   waits its turn in the merge queue (`waits_behind`)
+      merge_queue: the issue numbers of every claim's open PR in merge order
+                   (`queue_order`); a claim missing from it keeps `mine`'s order
 
     Returns:
       {"frontier": {"dispatch": [{"number","title"}...], "excluded": [...]},
        "mine": [{"number","title","status","board_phase","pr","checks",
-                 "attempt"}...],
+                 "attempt","behind"}...],
+       "merge_order": [number...],   # the `awaiting_merge` rows, in the order to merge
        "peer_live": [{"number","instance"}...],
        "stale": [{"number","instance","sha"}...],   # sha feeds reclaim --expect-sha
        "stale_closed": [{"number","instance","sha"}...],  # sha feeds release --expect-sha
@@ -2106,7 +2193,8 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
        "now": now}
 
     `status` and `board_phase` are `subclassify_pr`'s pair; `attempt` is
-    `current_attempt` — the number `afk status` takes.
+    `current_attempt` — the number `afk status` takes; `behind` is the PR a
+    `queued` row waits behind, None on every other row.
 
     `stale` holds only work to continue: a stale claim on an OPEN issue. One whose
     issue is already closed — its fleet merged or closed it and died before
@@ -2130,6 +2218,7 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
         return [{"number": n, "instance": by_claim.get(n, {}).get("instance"),
                  "sha": by_claim.get(n, {}).get("sha")} for n in numbers]
 
+    queued = queued or {}
     mine = []
     for n in part["mine"]:
         pr = pr_for.get(n)
@@ -2137,14 +2226,19 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
         issue = by_num.get(n, {})
         status, board_phase = subclassify_pr(pr is not None, checks, ci_mode,
                                              closed=n in closed,
-                                             handed_back=n in set(handed_back))
+                                             handed_back=n in set(handed_back),
+                                             queued=n in queued)
         mine.append({"number": n, "title": issue.get("title"),
                      "status": status, "board_phase": board_phase,
                      "pr": pr.get("number") if pr else None, "checks": checks,
-                     "attempt": current_attempt(issue.get("labels"))})
+                     "attempt": current_attempt(issue.get("labels")),
+                     "behind": queued[n] if status == "queued" else None})
 
+    place = {n: i for i, n in enumerate(merge_queue)}
+    ready = [m["number"] for m in mine if m["status"] == "awaiting_merge"]
     return {"frontier": frontier,
             "mine": mine,
+            "merge_order": sorted(ready, key=lambda n: (place.get(n, len(place)), ready.index(n))),
             "peer_live": [{"number": n, "instance": by_claim.get(n, {}).get("instance")}
                           for n in part["peer_live"]],
             "stale": stale_rows(n for n in part["stale"] if n not in closed),
