@@ -17,7 +17,7 @@ dependencies: native
 base_branch: master
 branch_pattern: "issue-{number}-{slug}"
 worker: orca
-concurrency: 3
+concurrency: 10
 worktree_cleanup: true
 worker_idle_grace_seconds: 300
 
