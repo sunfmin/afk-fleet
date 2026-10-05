@@ -26,15 +26,33 @@ A PR may merge only when **all** configured gates are green. Which **machine gat
   deliberately the same compact shape as the CI sub-read, so a raw log never enters the tick. A run
   that outlives `--gate-timeout` is red, never green by default. The `excerpt` has already been
   **posted as a PR comment** by then, so the next attempt re-reads the failure from where it lives
-  rather than from a dead tick's context. Adopting this mode is
+  rather than from a dead tick's context. A green merge carries `gate: {status, source, head, …}`:
+  `source: run` — the gate ran here, on `head`. Adopting this mode is
   the repo's claim that its command is CI-equivalent, and it is expected to scope remote CI away from
   worker branches; bootstrap **hard-errors** when `merge.target` requires status checks (see
   [Bootstrap](../SKILL.md#bootstrap-once-with-the-human-present) step 2).
+- **`gate.trust_recorded_run` — the two runs become one when nothing moved**
+  ([ADR-0026](../../../docs/adr/0026-a-recorded-gate-run-stands-in-for-the-merge-time-run.md); `local`
+  only, opt-in). When the merge-time sync is a no-op, the merge-time run tests the very commit the
+  worker's run did. The worker runs the gate **through `afk gate`** — its prompt hands it that line —
+  which runs `gate.local_command` in the worker's worktree and, on green, records the head it ran on
+  and the command it ran in the worktree's git dir. With the option on, `afk merge` skips its own run
+  when — and only when — that record proves the gate passed on **the exact head that would land**:
+  the recorded head is that head, the recorded command is the one configured now, and the tree it ran
+  on had nothing uncommitted or untracked. Anything else voids the record — the sync moved the head,
+  the worker committed afterwards, the command changed, the worker typed the bare command (no record),
+  a red or timed-out run came after (it drops the record), the worktree was recreated on this machine
+  — and the merge runs the gate exactly as above. The outcome says which happened:
+  `gate.source: recorded` with the `head` it was recorded on and `recorded_at`, or `gate.source: run`
+  with `not_trusted: <why the record was not enough>`. The record is `afk`'s own, made from an exit
+  code it observed; a worker reporting "the gate is green" proves nothing and leaves none. What is
+  given up is the second run's independence on an unchanged commit — a flaky test that passed once
+  is not asked again — so the default is off.
 - **Independent adversarial verification** (if `gate.adversarial_verify`) — a *separate* agent (not
   the author, doesn't see its reasoning) re-derives the result and tries to **refute** it (e.g.
   re-solve and assert `final == official answer:`, audit the derivation). Refute-first: any
   refutation blocks the merge, is **posted as a PR review comment** (durable, re-readable on retry),
-  and feeds back as a retry reason (`afk fail --reason`). It runs **after** the machine gate, on the
-  exact head that would land: `afk merge` returns `needs_verify` with that `head`; verify it, then
+  and feeds back as a retry reason (`afk fail --reason`). It runs **after** the machine gate — run
+  or trusted from the record, it makes no difference — on the exact head that would land: `afk merge` returns `needs_verify` with that `head`; verify it, then
   re-run `afk merge --verified <head>`. A verification of any other head does not count — a sync that
   moved the branch asks again.

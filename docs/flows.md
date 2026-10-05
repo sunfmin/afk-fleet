@@ -42,8 +42,9 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    after every completed step so a hard stop loses at most the step in flight.
    `skills/afk-fleet/references/worker-prompt.md:Publish`
 8. The worker **syncs** (merges the base into its branch, never rebases), pushes, and runs the
-   **local gate** until it is green on the combined tree.
-   `skills/afk-fleet/references/worker-prompt.md:local_command`
+   **local gate** until it is green on the combined tree — through `afk gate`, which puts a green
+   run on record with the head it ran on.
+   `skills/afk-fleet/scripts/afk.py:cmd_gate`
 9. The worker opens a PR whose body says `Closes #n`, **wakes** the launcher with one line that
    carries nothing, and stops; it never merges.
    `skills/afk-fleet/scripts/afk_decide.py:wake_command`
@@ -57,8 +58,9 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
     PR's checks, which count only if the sync did not move the head.
     `skills/afk-fleet/scripts/afk_decide.py:checks_gate`
 13. It merges the PR, pinned to the gated head, which closes the issue; upserts the status board to
-    "merged"; releases the claim; and has orca remove the worktree, freeing the slot.
-    `skills/afk-fleet/scripts/afk.py:cmd_merge`
+    "merged"; releases the claim; and has orca remove the worktree, freeing the slot. Its outcome
+    names the claims that were queued behind that PR and are now free, and the tick merges those
+    next. `skills/afk-fleet/scripts/afk.py:cmd_merge`
 
 **Where it forks.**
 - The worker opens no PR and leaves an `afk:verdict` marker instead (already-satisfied, blocked,
@@ -81,6 +83,10 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   claim is `queued` — not merged, not synced, not handed back — until that PR has merged, so each
   worker of a conflicting group resolves once, `skills/afk-fleet/scripts/afk_decide.py:waits_behind`
   (ADR-0025).
+- The repo set `gate.trust_recorded_run`, and the worker's recorded run is of the command configured
+  now, on a committed tree, at the exact head that would land: step 12 does not run the local gate
+  again, `skills/afk-fleet/scripts/afk_decide.py:gate_record_void` (ADR-0026). Any sync that moved
+  the head, any later commit, or no record, and it runs as written.
 - The PR is awaiting merge but its worker is still working in the worktree — it pushed its answer
   to a hand-back and is gating it: the merge stops with `worker_busy`, nothing touched, and a later
   tick lands it, `skills/afk-fleet/scripts/afk.py:cmd_merge` (ADR-0024).
@@ -237,7 +243,10 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 - A branch catches up with its base by merging, never rebasing, and what lands on the target was
   gated in the form it lands; only exit 0 is green, and a timeout is red. (ADR-0012, ADR-0017;
   `test_merge_gates_the_tree_that_lands_then_settles_the_claim`,
-  `test_merge_in_required_mode_trusts_checks_only_on_the_head_that_lands`)
+  `test_merge_in_required_mode_trusts_checks_only_on_the_head_that_lands`) The local gate is not run
+  twice on one commit only where the repo opted in, and only on a record `afk` itself made of that
+  commit. (ADR-0026; `test_a_recorded_worker_gate_run_is_not_repeated_by_the_merge`,
+  `test_a_recorded_gate_run_is_void_unless_it_is_of_the_head_that_lands`)
 - A worker starts from the commit the remote has, never a stale local branch, and is told the branch
   orca actually created. (ADR-0017;
   `test_dispatch_starts_a_worker_on_the_remote_base_tip_and_submits_its_prompt`)
@@ -258,7 +267,9 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   enters the retry ladder. PRs land in one order — handed-back ones first — and a PR waits, unsynced,
   behind a handed-back PR ahead of it whose conflicted files it changes, so mutually conflicting PRs
   are each resolved once (ADR-0025;
-  `test_mutually_conflicting_prs_merge_one_at_a_time_each_resolving_once`). And no merge runs into a worktree whose worker is busy, whatever the
+  `test_mutually_conflicting_prs_merge_one_at_a_time_each_resolving_once`). The merge that lands the
+  PR ahead names the claims it freed, so a queued PR is merged in that same tick (ADR-0026;
+  `test_a_landed_pr_names_the_claims_of_mine_it_freed_and_no_others`). And no merge runs into a worktree whose worker is busy, whatever the
   claim's status. (ADR-0019, ADR-0024;
   `test_merge_stays_out_of_a_worktree_whose_worker_is_still_working`;
   `test_hand_back_returns_a_sync_conflict_to_the_worker_that_wrote_the_branch`,

@@ -276,8 +276,10 @@ instead of acting — same rebuild, zero side effects.
    - **In-flight** — each of **`mine`** arrives subclassified, and its `status` names what you do
      next: *awaiting_merge* → `afk merge`, in the order `merge_order` lists them (see
      [Merge](#merge-serialized)); *queued* → **leave it**: its PR waits its turn behind PR `behind`
-     in the [merge queue](#the-merge-queue--conflicting-prs-land-one-at-a-time), never `afk merge`
-     it and never hand it back — it still holds its slot and counts in `in_flight`; *awaiting_ci* → leave;
+     in the [merge queue](#the-merge-queue--conflicting-prs-land-one-at-a-time). Do not `afk merge`
+     a *queued* row and never hand it back — it holds its slot and counts in `in_flight`. Its turn
+     comes one way only: the `afk merge` that lands PR `behind` lists it in `unblocked`, and you
+     merge it then; *awaiting_ci* → leave;
      *failure* → `afk fail` (see [Failure handling](#failure-handling--bounded-retry--escalate-never-silently-drop));
      *closed* → the issue is already closed but its claim outlived it (a merge or close that died
      before releasing): `afk release <n> --instance <id>`, nothing else — count it in `cleared`; *handed_back* → a sync conflict on its PR is
@@ -442,10 +444,13 @@ A PR may merge only when **all** configured gates are green. Which **machine gat
 `gate.ci` ([ADR-0012](../../docs/adr/0012-local-completion-gate.md)): `required` (default) waits for
 the PR's GitHub checks; `local` makes `gate.local_command` the gate, re-run at merge time, and never
 reads checks. `afk merge` applies whichever is configured ([Merge](#merge-serialized)); the invariants
-behind them — the local gate's two-run rule, the ephemeral CI sub-read, and the adversarial-verify
-procedure when `gate.adversarial_verify` is on — are disclosed in
-[references/completion-gate.md](references/completion-gate.md). Read it before running an adversarial
-verify or switching a repo to `gate.ci: local`.
+behind them — the local gate's two-run rule, the one case `gate.trust_recorded_run` lets the merge
+skip its own run (the worker's `afk gate` run is on record for the exact head that lands;
+[ADR-0026](../../docs/adr/0026-a-recorded-gate-run-stands-in-for-the-merge-time-run.md)), the
+ephemeral CI sub-read, and the adversarial-verify procedure when `gate.adversarial_verify` is on — are
+disclosed in [references/completion-gate.md](references/completion-gate.md). Read it before running an
+adversarial verify or switching a repo to `gate.ci: local`. `afk gate` is the **worker's** subcommand:
+you never run it.
 
 ## Merge (serialized)
 
@@ -465,10 +470,10 @@ from another machine). It stops, with an `outcome`, wherever the next move is yo
 
 | `outcome` | What happened | What you do |
 |---|---|---|
-| `merged` | Landed; board upserted, claim released, worktree removed. | Count it in `merged`; the slot is free. |
+| `merged` | Landed; board upserted, claim released, worktree removed. `unblocked` lists the claims of yours that were *queued* behind this PR and are free now, in merge order. In `local`, `gate.source` says whether the gate was `run` here or trusted from the worker's `recorded` run of `gate.head`. | Count it in `merged`; the slot is free. Then `afk merge` each issue in `unblocked`, in that order, **before** going on down `merge_order` — and act on each outcome like any other. |
 | `conflict` | The sync conflicted. The merge is **left in progress** in `worktree`, `files` unmerged; nothing was pushed. | **Hand it back to its worker**: `afk hand-back --issue <n>` (see [Hand-back](#hand-back--a-sync-conflict-goes-back-to-its-worker)). Not `afk fail` — the work is not failing. |
 | `handed_back` | An earlier conflict on this PR is still with its worker. Nothing was touched. | Leave it — a *handed_back* row is never merged. |
-| `queued` | A handed-back PR ahead of this one in the merge queue (`behind`) conflicted in a file this PR also changes. Nothing was touched, nothing is handed back, and the status board already says it waits. | Leave it — it holds its slot; count it in `in_flight`. Once PR `behind` has **merged in this tick**, call `afk merge` on it again; otherwise a later tick does. |
+| `queued` | A handed-back PR ahead of this one in the merge queue (`behind`) conflicted in a file this PR also changes. Nothing was touched, nothing is handed back, and the status board already says it waits. | Leave it — it holds its slot; count it in `in_flight`. The merge that lands PR `behind` names it in `unblocked`. |
 | `worker_busy` | The worker is **still working** in the PR's worktree — typically it pushed its answer to a hand-back and is now running the gate on it. Nothing was touched. | Leave it; a later tick merges once the worker has stopped. Count it in `in_flight`. |
 | `gate_red` | `local`: the merge-time gate was red, and its `gate.excerpt` is now a PR comment. `required`: the PR's checks are red. | `afk fail --issue <n> --reason "<the failure>"`. |
 | `awaiting_ci` | `required`: checks are pending — or the sync just pushed a new head, so CI must speak about *that* head first. | Leave it; a later tick merges. |
@@ -504,6 +509,11 @@ of your own**:
 - **Waiting is bounded by what already exists.** A hand-back its worker never answers is nudged, then
   failed (below): its PR closes and whatever waited behind it is free again. A *queued* claim is never
   nudged, never failed and spends no attempt for waiting — do not ask `afk no-pr` about it.
+- **A landing names what it freed.** `afk rebuild` read the queue at the top of your pass, so a row it
+  called *queued* stays *queued* in your working set even after the PR ahead of it merges. You keep no
+  note of who waited behind whom: the `merged` outcome carries `unblocked` — your claims that waited
+  behind that PR and now wait behind nothing, in merge order — and you `afk merge` those next, in this
+  same pass. A claim that also waits behind another handed-back PR is not listed; it stays *queued*.
 
 ## Hand-back — a sync conflict goes back to its worker
 
@@ -519,7 +529,8 @@ the context it takes to resolve it, and `afk fail` would throw the whole attempt
 
 One call, right after the `conflict`. It aborts the merge (the worktree is clean again), tells the
 worker — the target and its tip, the conflicted files, *fetch → **merge**, never rebase → resolve →
-`gate.local_command` until green → push to the same PR* — records the hand-back as a marker comment on
+`gate.local_command` until green, run through `afk gate` so the run is on record → push to the same
+PR* — records the hand-back as a marker comment on
 the PR, and upserts the status board. **The claim, the PR, the branch and the worktree are kept, and
 `afk-attempt/<n>` is neither read nor written.** `delivery` says how the worker was reached:
 
