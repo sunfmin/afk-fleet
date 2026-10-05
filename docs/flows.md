@@ -73,7 +73,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 
 **Where it forks.**
 - The worker opens no PR and leaves an `afk:verdict` marker instead (already-satisfied, blocked,
-  giving-up), or goes quiet: `skills/afk-fleet/scripts/afk_decide.py:classify_no_pr`.
+  giving-up), or goes quiet: `skills/afk-fleet/scripts/afk_decide.py:classify_stopped`.
 - While the worker is still at it, the tick's question costs no GitHub read: the worker state its
   runtime reported to orca settles it, `skills/afk-fleet/scripts/afk_decide.py:read_worker_state`
   (ADR-0021).
@@ -114,7 +114,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   the same worktree — or one recreated at the PR's head — briefed only to land the PR,
   `skills/afk-fleet/scripts/afk_decide.py:render_landing`.
 - The worker goes silent on its turn: it is nudged once and then failed like any other silence,
-  which closes its PR and frees the turn, `skills/afk-fleet/scripts/afk_decide.py:classify_no_pr`.
+  which closes its PR and frees the turn, `skills/afk-fleet/scripts/afk_decide.py:classify_stopped`.
 - A peer wins the claim race, or the claim push fails outright (an error, never a lost race):
   ADR-0015.
 - `--plan` stops after step 2 and returns the dispatch plan: ADR-0002.
@@ -196,7 +196,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 - A human who knows the fleet is dead does not wait for the lease: **takeover**,
   `skills/afk-fleet/scripts/afk_decide.py:plan_takeover`, ADR-0011.
 - The dead worker is one of this fleet's own (an **orphaned claim**): no reclaim, straight to step 4,
-  reached from `skills/afk-fleet/scripts/afk_decide.py:classify_no_pr`.
+  reached from `skills/afk-fleet/scripts/afk_decide.py:settled_by_worker_state`.
 - The tick judges the surviving state not worth continuing: a fresh start discards it instead,
   `skills/afk-fleet/scripts/afk.py:_discard_attempt`.
 - The peer's heartbeat is fresh: the claim is left strictly alone, ADR-0003.
@@ -234,7 +234,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   not resolve, a gate (`skills/afk-fleet/scripts/afk_decide.py:gate_verdict`) it did not make
   green — an adversarial refute (`skills/afk-fleet/references/completion-gate.md:adversarial_verify`),
   or a worker idle past grace with a `giving-up` verdict or none at all
-  (`skills/afk-fleet/scripts/afk_decide.py:classify_no_pr`).
+  (`skills/afk-fleet/scripts/afk_decide.py:classify_stopped`).
 - A worker that declares itself blocked is not a failure and never counts as an attempt. Where each
   blocker it names stands decides (`skills/afk-fleet/scripts/afk_decide.py:blocker_standings`):
   all closed, it is re-dispatched; still open but workable backlog, it is **parked** — the
@@ -283,7 +283,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   `test_dispatch_starts_a_worker_on_the_remote_base_tip_and_submits_its_prompt`)
 - Commits ahead and a dirty tree are standing facts, never signs of life: only a busy worker or
   activity within the grace period keeps a PR-less claim "coding". (ADR-0013;
-  `test_classify_no_pr_coding_needs_a_live_signal`)
+  `test_classification_coding_needs_a_live_signal`)
 - A worker is busy only while its runtime reports it working **and** its terminal still produces
   output; an orca that cannot be read is an error, never a gone worker. (ADR-0021;
   `test_read_worker_state_takes_the_runtimes_own_report`,

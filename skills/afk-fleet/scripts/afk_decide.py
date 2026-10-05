@@ -705,7 +705,11 @@ def gate_comment(verdict, command):
 #      dependency gap, see blocked_by) or `giving-up` (a failure it could not fix);
 #      for `blocked`, also the STANDING of each issue it names (`blocker_standings`);
 #   3. the terminal's busy / idle / none state from the orca probe.
-# `classify_no_pr` is the pure join. Two words are kept apart throughout: the
+# The join is two pure decisions, asked in this order: `settled_by_worker_state`
+# — does signal 3 alone settle it (busy, gone)? — and, only when it does not,
+# `classify_stopped` over all three. Each answers with a CAUSE, one of
+# `WORKER_CAUSES`: the one thing decided here, and the one thing the tick routes
+# on (`worker_step`, `batch_step`). Two words are kept apart throughout: the
 # VERDICT is what the worker declared in its marker (an input); the OUTCOME is
 # what this code concludes from all three signals. Whether to TRUST the marker
 # stays the tick's call.
@@ -713,20 +717,40 @@ def gate_comment(verdict, command):
 _VERDICT_MARKER_RE = re.compile(r"<!--\s*afk:verdict\b(.*?)-->", re.DOTALL)
 
 # The phases a worker may declare in its marker (worker-prompt.md asks for exactly
-# these; anything else `classify_no_pr` treats as a failure).
+# these; anything else `classify_stopped` treats as a failure).
 VERDICT_PHASES = ("already-satisfied", "blocked", "giving-up")
 _SATISFIED, _BLOCKED, _GIVING_UP = VERDICT_PHASES
 
 # What the orca liveness probe can say about a worker's terminal.
 TERMINAL_STATES = ("busy", "idle", "none")
 
-# Every (outcome, action) `classify_no_pr` can return — the vocabulary the tick's
-# instructions route on (a test holds the docs to it).
-NO_PR_ROUTES = (("coding", "leave"), ("idle_done", "close_release"),
-                ("idle_blocked", "redispatch"), ("idle_blocked", "park"),
-                ("idle_blocked", "escalate"),
-                ("idle_stalled", "nudge"), ("idle_failed", "next_attempt"),
-                ("dead", "orphan"))
+# Why a claim waiting on its worker is where it is → the (outcome, action)
+# `afk no-pr` prints for it. The cause is what the classification decides and
+# what the tick routes on; the pair is only how a row reads to a human.
+WORKER_CAUSES = {
+    # settled by the worker state alone (`settled_by_worker_state`)
+    "working":            ("coding", "leave"),            # its runtime says so
+    "just_stopped":       ("coding", "leave"),            # stopped, or nudged, within grace
+    "gone":               ("dead", "orphan"),             # no live terminal
+    # a stopped worker (`classify_stopped`)
+    "within_grace":       ("coding", "leave"),            # a sign of life within grace
+    "awaiting_tick":      ("coding", "leave"),            # its landing stopped for the tick
+    "satisfied":          ("idle_done", "close_release"),
+    "satisfied_refuted":  ("idle_failed", "next_attempt"),   # …by work on the branch
+    "blockers_closed":    ("idle_blocked", "redispatch"),
+    "blockers_waiting":   ("idle_blocked", "park"),
+    "blocker_unmet":      ("idle_blocked", "escalate"),
+    "no_blocker_named":   ("idle_blocked", "escalate"),
+    "silent":             ("idle_stalled", "nudge"),
+    "gave_up":            ("idle_failed", "next_attempt"),
+    "unknown_phase":      ("idle_failed", "next_attempt"),
+    "silent_after_nudge": ("idle_failed", "next_attempt"),
+    "silent_unnudgeable": ("idle_failed", "next_attempt"),   # no worktree here to nudge it in
+}
+
+# Every (outcome, action) a `afk no-pr` row can carry — the vocabulary the
+# reference lists for a human reading one (a test holds the docs to it).
+NO_PR_ROUTES = tuple(dict.fromkeys(WORKER_CAUSES.values()))
 
 
 def _verdict_text(n, phase, blocked_by, reason, optional=str):
@@ -760,7 +784,7 @@ def parse_verdict_marker(body):
 
     LENIENT — a marker with a missing/unknown field still parses
     ({"found": True, "phase": None|<raw>}); what an unrecognised phase means is
-    `classify_no_pr`'s call. `reason` (if present) must be the last field — it captures to the end
+    `classify_stopped`'s call. `reason` (if present) must be the last field — it captures to the end
     of the marker so a short human phrase with spaces survives. Returns:
       {"found": True, "n": int|None, "phase": str|None, "blocked_by": [int], "reason": str|None}
     """
@@ -933,7 +957,7 @@ def park_refusal(verdict, standings):
 def read_worker_state(row, now, grace_seconds, tui_idle=None):
     """
     A worker's state, read from its worktree's row of `orca worktree ps --json` —
-    the `terminal` / `terminal_idle_seconds` reading `classify_no_pr` takes,
+    the reading `settled_by_worker_state` takes,
     made in code instead of by a tick looking at a screen (ADR-0021).
 
       row: {liveTerminalCount, lastOutputAt, agents: [{state, stateStartedAt,
@@ -984,19 +1008,61 @@ def read_worker_state(row, now, grace_seconds, tui_idle=None):
     return out("busy" if tui_idle is False else "idle", None)
 
 
-def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, blocker_states,
-                   now, grace_seconds, nudged_at=None, can_nudge=True, turn_at=None,
-                   turn_stopped=None):
+def _seen(cause, idle_seconds, pending_blockers=()):
+    """One worker's classification: its cause, and the row words it comes to."""
+    outcome, action = WORKER_CAUSES[cause]
+    return {"cause": cause, "outcome": outcome, "action": action, "idle_seconds": idle_seconds,
+            "pending_blockers": list(pending_blockers)}
+
+
+def _idle_seconds(now, terminal_idle_seconds, *signs):
+    """Seconds since the MOST RECENT sign of life: the terminal's own clock, and
+    each epoch-second `signs` that is known. None when none is known — which is
+    never "within grace"."""
+    seen = [int(t) for t in signs if t is not None]
+    if terminal_idle_seconds is not None:
+        seen.append(int(now) - int(terminal_idle_seconds))
+    return max(0, int(now) - max(seen)) if seen else None
+
+
+def settled_by_worker_state(reading, now, grace_seconds, nudged_at=None):
     """
-    The outcome for one of MY claims that is waiting on its WORKER — a `no_pr`
-    claim, or a `landing` one — from the raw signals.
+    Does a worker's state alone settle what the tick does about it? Asked before
+    anything else is gathered — a worker it settles costs no git and no GitHub read
+    (ADR-0021).
+
+      reading:   `read_worker_state`'s.
+      nudged_at: epoch seconds this worker was nudged (`afk nudge`), None if never.
+
+    Returns the classification (`classify_stopped`'s shape), or None for a worker
+    that stopped and whose reasons must be gathered:
+      gone          dead / orphan   — no live terminal: it cannot be at work,
+                                      whatever it left behind → continuation.
+      working       coding / leave  — its runtime says it is busy.
+      just_stopped  coding / leave  — it stopped, or was nudged, within grace: more
+                                      signs of life could only say the same.
+    """
+    idle_seconds = _idle_seconds(now, reading["terminal_idle_seconds"], nudged_at)
+    if reading["terminal"] == "none":
+        return _seen("gone", idle_seconds)
+    if reading["terminal"] == "busy":
+        return _seen("working", idle_seconds)
+    if idle_seconds is not None and idle_seconds < grace_seconds:
+        return _seen("just_stopped", idle_seconds)
+    return None
+
+
+def classify_stopped(progress, terminal_idle_seconds, worker_verdict, blocker_states,
+                     now, grace_seconds, nudged_at=None, can_nudge=True, turn=None):
+    """
+    The classification of one of MY claims that is waiting on a worker which has
+    STOPPED — a `no_pr` claim, or a `landing` one, that `settled_by_worker_state`
+    did not settle — from everything gathered about it.
 
       progress:        the worktree's git progress {"commits_ahead", "dirty",
                        "last_commit_ts", "worktree_mtime_ts"}; {} / None if unreadable.
-      terminal:        the orca probe — "busy" | "idle" (connected, not working) |
-                       "none" (no live worker/terminal at all).
-      terminal_idle_seconds: seconds since the terminal last showed activity;
-                       None if the probe could not say.
+      terminal_idle_seconds: seconds since the terminal last showed activity
+                       (the reading's); None if the probe could not say.
       worker_verdict:  the `latest_verdict` dict (or None) — what the worker declared.
       blocker_states:  {issue number: one of BLOCKER_STANDINGS} for the verdict's
                        blocked_by (`blocker_standings`). Anything else is `unmet`.
@@ -1005,91 +1071,88 @@ def classify_no_pr(progress, terminal, terminal_idle_seconds, worker_verdict, bl
                        it never was. A nudge is spent once: the second silence fails.
       can_nudge:       False when there is nowhere to record a nudge (no worktree
                        on this machine) — the silence then fails at once.
-      turn_at:         epoch seconds this worker was last told to land its PR
-                       (`afk turn`), or its `afk land` last stopped; None when its
-                       PR holds no turn. A sign of life like the nudge: the worker
-                       gets a whole grace period to start on it, and after that
-                       its silence takes the same nudge → failure path as any other.
-      turn_stopped:    the LAND_OUTCOMES word this worker's `afk land` last stopped
-                       with, None when it has not stopped (or holds no turn). One of
-                       LAND_WAITS means the worker is idle because the next move is
-                       the tick's — its quiet is not a silence, and is never nudged
-                       or failed here (`afk turn` is what moves it).
+      turn:            the landing turn its PR carries (`latest_turn`), None when it
+                       has none. `at` — when the worker was last told to land
+                       (`afk turn`), or its `afk land` last stopped — is a sign of
+                       life like the nudge: a whole grace period to start on it, and
+                       after that the same nudge → failure path as any other
+                       silence. `stopped` is the LAND_OUTCOMES word its `afk land`
+                       last stopped with: one of LAND_WAITS means the worker is idle
+                       because the next move is the tick's — its quiet is not a
+                       silence, and is never nudged or failed here (`afk turn` is
+                       what moves it).
 
-    Returns {"outcome", "action", "idle_seconds", "pending_blockers"} — `action` is
-    what the tick does, `outcome` the reason it is grouped under:
-      coding       leave         — busy, OR last activity within grace, OR its
-                                   landing stopped for the tick (`turn_stopped`).
-      idle_done    close_release — idle past grace + `already-satisfied` + NO changes
-                                   on the branch: the tick verifies the empty diff,
-                                   closes + releases.
-      idle_blocked redispatch    — …+ `blocked`, and every blocked_by is now closed.
-      idle_blocked park          — …+ `blocked`, and every blocked_by still open is
-                                   one the backlog will resolve: `afk park` records
-                                   the dependency and waits for it (ADR-0022).
-      idle_blocked escalate      — …+ `blocked`, and a blocked_by is one nothing will
-                                   resolve (or the verdict names none, so nothing
-                                   can ever clear).
-      idle_stalled nudge         — …+ NO verdict at all, never nudged: the worker
-                                   stopped without an outcome — typically waiting on
-                                   a question nobody will answer. `afk nudge` tells
-                                   it to carry on; no attempt is spent (ADR-0018).
-      idle_failed  next_attempt  — …+ `giving-up`, an unknown phase, an
-                                   `already-satisfied` refuted by work on the branch,
-                                   or no verdict even after a nudge → failure
-                                   handling (`afk fail`).
-      dead         orphan        — no live worker/terminal → recovery by continuation.
+    Returns {"cause", "outcome", "action", "idle_seconds", "pending_blockers"}.
+    `cause` — one of WORKER_CAUSES — is the decision, and what the tick routes on;
+    `outcome` / `action` are how `afk no-pr` prints it:
+      within_grace       coding       leave         — a sign of life within grace.
+      awaiting_tick      coding       leave         — no verdict, and its landing
+                                                      stopped for the tick.
+      satisfied          idle_done    close_release — `already-satisfied` + NO changes
+                                                      on the branch: the tick verifies
+                                                      the empty diff, closes + releases.
+      satisfied_refuted  idle_failed  next_attempt  — `already-satisfied`, refuted by
+                                                      work on the branch.
+      blockers_closed    idle_blocked redispatch    — `blocked`, and every blocked_by
+                                                      is now closed.
+      blockers_waiting   idle_blocked park          — `blocked`, and every blocked_by
+                                                      still open is one the backlog
+                                                      will resolve: `afk park` records
+                                                      the dependency and waits for it
+                                                      (ADR-0022).
+      blocker_unmet      idle_blocked escalate      — `blocked`, and a blocked_by is
+                                                      one nothing will resolve.
+      no_blocker_named   idle_blocked escalate      — `blocked`, naming none, so
+                                                      nothing can ever clear.
+      silent             idle_stalled nudge         — NO verdict at all, never nudged:
+                                                      the worker stopped without an
+                                                      outcome — typically waiting on a
+                                                      question nobody will answer.
+                                                      `afk nudge` tells it to carry on;
+                                                      no attempt is spent (ADR-0018).
+      gave_up            idle_failed  next_attempt  — `giving-up`.
+      unknown_phase      idle_failed  next_attempt  — a verdict naming no phase the
+                                                      fleet knows.
+      silent_after_nudge idle_failed  next_attempt  — no verdict even after a nudge.
+      silent_unnudgeable idle_failed  next_attempt  — no verdict, and nowhere to
+                                                      record a nudge.
+    Every `next_attempt` is failure handling (`afk fail`).
 
     `idle_seconds` is the time since the MOST RECENT sign of life (last commit,
     newest file mtime, terminal activity, the nudge, the landing turn — a nudged
-    worker, or one just given its turn, gets a whole grace period to answer); None when none is
-    known, which is never
-    "within grace". `pending_blockers` is `blocked_route`'s: the blocked_by not yet
+    worker, or one just given its turn, gets a whole grace period to answer); None
+    when none is known, which is never "within grace". Commits ahead / a dirty tree
+    are standing facts — true until the branch merges — never signs of life
+    (ADR-0013). `pending_blockers` is `blocked_route`'s: the blocked_by not yet
     done, [] for any other verdict.
     """
-    progress = progress or {}
-    seen = [t for t in (progress.get("last_commit_ts"), progress.get("worktree_mtime_ts"))
-            if t is not None]
-    if terminal_idle_seconds is not None:
-        seen.append(int(now) - int(terminal_idle_seconds))
-    for told_at in (nudged_at, turn_at):
-        if told_at is not None:
-            seen.append(int(told_at))
-    idle_seconds = max(0, int(now) - int(max(seen))) if seen else None
+    progress, turn = progress or {}, turn or {}
+    idle_seconds = _idle_seconds(now, terminal_idle_seconds, progress.get("last_commit_ts"),
+                                 progress.get("worktree_mtime_ts"), nudged_at, turn.get("at"))
+    if idle_seconds is not None and idle_seconds < grace_seconds:
+        return _seen("within_grace", idle_seconds)
 
-    def out(outcome, action, pending_blockers=()):
-        assert (outcome, action) in NO_PR_ROUTES, (outcome, action)
-        return {"outcome": outcome, "action": action, "idle_seconds": idle_seconds,
-                "pending_blockers": list(pending_blockers)}
-
-    # dead first: no worker means it cannot be "coding", whatever it left behind.
-    if terminal == "none":
-        return out("dead", "orphan")
-
-    # coding: only LIVE signals count. Commits ahead / a dirty tree are standing
-    # facts — true until the branch merges — never signs of life (ADR-0013).
-    if terminal == "busy" or (idle_seconds is not None and idle_seconds < grace_seconds):
-        return out("coding", "leave")
-
-    # idle past grace: route on the declared reason.
+    # idle past grace: the cause is what it declared…
     verdict = worker_verdict or {}
-    phase = verdict.get("phase") if verdict.get("found") else None
-    # …unless it declared none and its landing stopped for the tick: that quiet
-    # is the tick's to end (`afk turn`), not a silence.
-    if not verdict.get("found") and turn_stopped in LAND_WAITS:
-        return out("coding", "leave")
+    if not verdict.get("found"):
+        # …or, having declared nothing, why it is quiet
+        if turn.get("stopped") in LAND_WAITS:
+            return _seen("awaiting_tick", idle_seconds)
+        if nudged_at is not None:
+            return _seen("silent_after_nudge", idle_seconds)
+        return _seen("silent" if can_nudge else "silent_unnudgeable", idle_seconds)
+    phase = verdict.get("phase")
     if phase == _SATISFIED:
         # "nothing needed doing" is refuted by work sitting on the branch.
         has_changes = int(progress.get("commits_ahead") or 0) > 0 or bool(progress.get("dirty"))
-        if has_changes:
-            return out("idle_failed", "next_attempt")
-        return out("idle_done", "close_release")
+        return _seen("satisfied_refuted" if has_changes else "satisfied", idle_seconds)
     if phase == _BLOCKED:
-        route = blocked_route(verdict.get("blocked_by") or [], blocker_states)
-        return out("idle_blocked", route["action"], route["pending_blockers"])
-    if not verdict.get("found") and nudged_at is None and can_nudge:
-        return out("idle_stalled", "nudge")
-    return out("idle_failed", "next_attempt")
+        named = verdict.get("blocked_by") or []
+        route = blocked_route(named, blocker_states)
+        cause = {"redispatch": "blockers_closed", "park": "blockers_waiting",
+                 "escalate": "blocker_unmet" if named else "no_blocker_named"}[route["action"]]
+        return _seen(cause, idle_seconds, route["pending_blockers"])
+    return _seen("gave_up" if phase == _GIVING_UP else "unknown_phase", idle_seconds)
 
 
 # How much of a stalled worker's screen is carried into a failure reason.
@@ -1553,14 +1616,23 @@ def batch_landed_comment(commit, target, batch, prs):
             f"through GitHub; nothing was lost.")
 
 
+# What a tick does about the batch that holds the turn, for each cause its
+# worker's row can carry — it holds no claim and declares no verdict.
+_BATCH_STEPS = {"working": "leave", "just_stopped": "leave", "within_grace": "leave",
+                "awaiting_tick": "leave", "gone": "continue", "silent": "nudge",
+                "silent_after_nudge": "abandon", "silent_unnudgeable": "abandon"}
+
+
 def batch_step(worker):
-    """What a tick does about the batch that holds the turn, from its worker's
-    `afk no-pr --batch` row → "leave" (it is at it) | "continue" (no terminal:
+    """What a tick does about the batch that holds the turn, from the cause its
+    worker was classified with → "leave" (it is at it) | "continue" (no terminal:
     a new batch worker is started in its worktree, else from its pushed branch)
     | "nudge" (silent past grace, once) | "abandon" (still silent a grace period
-    later: nothing landed, its PRs take single turns)."""
-    return {"leave": "leave", "orphan": "continue", "nudge": "nudge"}.get(worker["action"],
-                                                                         "abandon")
+    later: nothing landed, its PRs take single turns). A cause with no step here
+    is an error."""
+    if worker["cause"] not in _BATCH_STEPS:
+        raise ValueError(f"no step for a batch worker classified {worker['cause']!r}")
+    return _BATCH_STEPS[worker["cause"]]
 
 
 # --------------------------------------------------------------------------- #
@@ -2555,31 +2627,39 @@ def turn_step(call, result, config):
 
 def worker_step(call, row, worker, config):
     """
-    What a tick does about one claim `afk no-pr` was asked about → (do, detail):
+    What a tick does about one claim it asked after, from the cause its worker
+    was classified with (WORKER_CAUSES) → (do, detail):
 
-      ("leave", None)       the worker is at it
-      ("dispatch", None)    `redispatch` (its blockers closed) or `orphan` (no
-                            worker left): `afk dispatch` — an orphaned claim is
-                            ALWAYS continued, never released back
-      ("park", None)        `afk park`
-      ("nudge", None)       `afk nudge`
+      ("leave", None)       working, just_stopped, within_grace, awaiting_tick:
+                            the worker is at it, or the next move is not its
+      ("dispatch", None)    blockers_closed, or gone (no worker left):
+                            `afk dispatch` — an orphaned claim is ALWAYS continued,
+                            never released back
+      ("park", None)        blockers_waiting: `afk park`
+      ("nudge", None)       silent: `afk nudge`
       ("escalate", reason)  `afk escalate`: the reason is on record
       ("fail", reason)      `afk fail`: the reason is on record
-      ("judge", {...})      `close_release` → `empty_diff`; a failure or an
-                            escalation whose reason is NOT on record → `reason`
+      ("judge", {...})      satisfied → `empty_diff`; a failure or an escalation
+                            whose reason is NOT on record → `reason`
 
-      row:    the claim's `mine` row      worker: its `afk no-pr` row
+      row:    the claim's `mine` row      worker: its classification plus what
+                                          `afk no-pr` gathered for it
+
+    The cause is mapped, never re-derived: what the verdict declared is read here
+    only for the words a reason quotes. A cause with no route is an error.
     """
-    number, action = row["number"], worker["action"]
+    number, cause = row["number"], worker["cause"]
     verdict = worker.get("worker_verdict") or {}
     said = {"verdict": verdict.get("comment_url")}
-    if action == "leave":
+    if cause in ("working", "just_stopped", "within_grace", "awaiting_tick"):
         return "leave", None
-    if action in ("redispatch", "orphan"):
+    if cause in ("blockers_closed", "gone"):
         return "dispatch", None
-    if action in ("park", "nudge"):
-        return action, None
-    if action == "close_release":
+    if cause == "blockers_waiting":
+        return "park", None
+    if cause == "silent":
+        return "nudge", None
+    if cause == "satisfied":
         base = config["base_branch"]
         return "judge", judgment(
             "empty_diff", number,
@@ -2590,33 +2670,34 @@ def worker_step(call, row, worker, config):
             afk_command(call, "fail", number, "--reason",
                         f"its worker declared `already-satisfied`, but the branch's diff "
                         f"against {base} is not empty"))
-    if action == "escalate":
+    if cause == "blocker_unmet":
         unmet = [f"#{b['number']} {b['reason']}" for b in worker.get("blockers") or []
                  if b["standing"] == "unmet"]
-        if unmet:
-            return "escalate", f"blocked by a dependency nothing will resolve: {'; '.join(unmet)}"
+        return "escalate", f"blocked by a dependency nothing will resolve: {'; '.join(unmet)}"
+    if cause == "no_blocker_named":
         if verdict.get("reason"):
             return "escalate", f"its worker reported blocked, naming no blocker: {verdict['reason']}"
         return "judge", reason_judgment(
             call, number, "escalate", "its worker reported blocked without naming a blocker",
             "its worker's verdict comment", said)
-    assert action == "next_attempt", action
-    phase = verdict.get("phase") if verdict.get("found") else None
-    if phase == _SATISFIED:
+    if cause == "satisfied_refuted":
         return "fail", "its worker declared `already-satisfied`, but the branch holds changes"
-    if phase == _GIVING_UP:
+    if cause == "gave_up":
         if verdict.get("reason"):
             return "fail", f"its worker gave up: {verdict['reason']}"
         return "judge", reason_judgment(call, number, "fail", "its worker gave up",
                                         "its worker's verdict comment", said)
-    if phase is not None or verdict.get("found"):
-        return "fail", f"its worker's verdict names no phase the fleet knows ({phase!r})"
-    if row["status"] == "landing":
-        return "fail", (f"given the landing turn and never landed: "
-                        f"{row.get('stopped') or 'no `afk land` outcome'}")
-    if worker.get("nudged_at") is not None:
-        return "fail", "idle with no PR and no verdict a grace period after its nudge"
-    return "fail", "idle with no PR and no verdict, and no worktree here to nudge it in"
+    if cause == "unknown_phase":
+        return "fail", (f"its worker's verdict names no phase the fleet knows "
+                        f"({verdict.get('phase')!r})")
+    if cause in ("silent_after_nudge", "silent_unnudgeable"):
+        if row["status"] == "landing":
+            return "fail", (f"given the landing turn and never landed: "
+                            f"{row.get('stopped') or 'no `afk land` outcome'}")
+        if cause == "silent_after_nudge":
+            return "fail", "idle with no PR and no verdict a grace period after its nudge"
+        return "fail", "idle with no PR and no verdict, and no worktree here to nudge it in"
+    raise ValueError(f"issue #{number}: no route for a worker classified {cause!r}")
 
 
 # --------------------------------------------------------------------------- #
