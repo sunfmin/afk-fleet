@@ -142,6 +142,23 @@ if any(part in " ".join(argv) for part in st.get("garble", [])):
 if argv[0] in ("issue", "pr", "label") and opt("--repo") != st["repo"]:
     finish(code=1, err="fake gh: unknown repo %%s\n" %% opt("--repo"))
 
+# GitHub marks a PR merged by itself once a push puts its head on the base: the
+# PR's own commits reached it, whoever pushed them. (`pushes_never_merge` holds
+# that back — GitHub can be slow, or the head moved after it was stacked.)
+if not st.get("pushes_never_merge"):
+    for row in st["prs"]:
+        ref = "refs/heads/" + row["headRefName"]
+        if row.get("state", "open") != "open" or not bare("rev-parse", "-q", "--verify", ref):
+            continue
+        p = subprocess.run(["git", "--git-dir", st["bare"], "merge-base", "--is-ancestor",
+                            ref, "refs/heads/" + st["base"]])
+        if p.returncode == 0:
+            row.update(state="merged", merged={"pushed": True, "head": head_of(row)})
+            for ref_issue in row["closingIssuesReferences"]:
+                for i in st["issues"]:
+                    if i["number"] == ref_issue["number"]:
+                        i["state"] = "closed"
+
 if argv[:2] == ["pr", "list"]:
     assert opt("--state") == "open", argv
     rows = [r for r in st["prs"] if r.get("state", "open") == "open"]
@@ -201,14 +218,13 @@ if argv[0] == "pr" and argv[1] in ("merge", "close", "comment"):
         if "--delete-branch" in argv:
             bare("update-ref", "-d", ref)
         finish()
-    strategy = [x[2:] for x in argv if x in ("--squash", "--merge", "--rebase")]
-    assert len(strategy) == 1, argv
+    assert "--merge" in argv and not {"--squash", "--rebase"} & set(argv), argv
     if opt("--match-head-commit") != head_of(row):
         finish(code=1, err="GraphQL: Head branch was modified. Review and try the merge again.\n")
     # the head already contains the target (the sync merged it in), so landing it
     # is a fast-forward of the target — the same tree a real squash would produce
     bare("update-ref", "refs/heads/" + st["base"], head_of(row))
-    row.update(state="merged", merged={"strategy": strategy[0], "head": head_of(row),
+    row.update(state="merged", merged={"head": head_of(row),
                                        "delete_branch": "--delete-branch" in argv})
     if "--delete-branch" in argv:
         bare("update-ref", "-d", ref)
@@ -1253,7 +1269,7 @@ def test_a_merged_pr_and_the_issue_it_closed_are_gone_from_the_reads_after_it():
         with inside(w) as rem:
             issues, one, state, prs, heads, _ = _read_everything(rem, 1, 10)
             assert (len(issues), one["state"], state) == (2, "open", "open")
-            afk._merge_pr(REPO, rem, prs[0], head, "squash", delete_branch=True)
+            afk._merge_pr(REPO, rem, prs[0], head, delete_branch=True)
             assert afk._open_prs(REPO) == [] and d["branch"] not in afk._remote_heads(rem)
             assert afk._issue_state(REPO, 1) == "closed" and afk._issue(REPO, 1)["state"] == "closed"
             assert [i["number"] for i in afk._open_issues(REPO)] == [2]
@@ -2632,8 +2648,8 @@ def test_a_worker_lands_its_own_pr_on_the_turn_the_fleet_grants():
         assert r["gate"] == {"status": "green", "source": "recorded", "head": synced,
                              "command": "test -f feature3.txt && test -f landed-meanwhile.txt",
                              "recorded_at": r["gate"]["recorded_at"]}
-        # gh was pinned to the gated head, with the configured strategy
-        assert w.pr(30)["merged"] == {"strategy": "squash", "head": synced, "delete_branch": True}
+        # gh was pinned to the gated head, and asked for a merge commit
+        assert w.pr(30)["merged"] == {"head": synced, "delete_branch": True}
         # what landed contains both sides, by MERGE (the base tip is an ancestor)
         assert w.sb.remote_ref(f"refs/heads/{w.sb.base}") == synced
         assert {"feature3.txt", "landed-meanwhile.txt"} <= w.remote_files(w.sb.base)
@@ -2708,10 +2724,9 @@ def test_a_red_gate_on_the_turn_is_the_workers_to_fix_and_spends_nothing():
 
         # the worker fixes the code, commits, and lands again — its commit is pushed
         fixed = w.work(wt, "fixed.txt", push=False)
-        r = _land(w, 4, wt, *red, "--set", "merge.strategy=rebase",
-                  "--set", "merge.delete_branch=false")
+        r = _land(w, 4, wt, *red, "--set", "merge.delete_branch=false")
         assert (r["outcome"], r["synced"], r["head"]) == ("merged", True, fixed), r
-        assert w.pr(40)["merged"] == {"strategy": "rebase", "head": fixed, "delete_branch": False}
+        assert w.pr(40)["merged"] == {"head": fixed, "delete_branch": False}
         assert w.sb.remote_ref(f"refs/heads/{branch}") == fixed       # config decides what stays
 
 
@@ -3287,12 +3302,12 @@ def test_a_turn_with_no_terminal_is_delivered_by_continuation_never_from_base():
 # act: the merge batch (ADR-0029)                                              #
 # --------------------------------------------------------------------------- #
 
-BATCH = ("--set", "merge.batch=true")
+BATCH = ()        # nothing to set: batches form wherever the gate is local
 
 
 def _counted(w, command="true"):
     """A local gate that counts its own runs — in a file outside every worktree —
-    with `merge.batch` on."""
+    in the gate mode merge batches form in."""
     return (*local_gate(f"echo run >> {w.sb.root}/gate-runs && {command}"), *BATCH)
 
 
@@ -3325,8 +3340,10 @@ def _target(w):
 
 
 def _history(w, since):
-    """What landed on the target after `since`, oldest first → [(sha, subject, body)]."""
-    p = subprocess.run(["git", "--git-dir", w.sb.bare, "log", "--reverse",
+    """What landed on the target after `since`, oldest first → [(sha, subject, body)]
+    — the target's own line: a PR is the merge commit it landed with, not the
+    commits it brought."""
+    p = subprocess.run(["git", "--git-dir", w.sb.bare, "log", "--reverse", "--first-parent",
                         "--format=%H%x09%s%x09%b%x00", f"{since}..refs/heads/{w.sb.base}"],
                        capture_output=True, text=True, env=ENV)
     return [tuple(x.strip() for x in row.split("\t")) for row in p.stdout.split("\0") if row.strip()]
@@ -3341,9 +3358,9 @@ def _batch_rows(w, gate, instance="me"):
 def test_a_merge_batch_lands_three_prs_behind_one_gate_run():
     """The whole of a batch: three finished PRs that do not conflict take ONE
     landing turn together. A batch worker — in a worktree of the batch's own —
-    stacks them on the target as one squash commit each, runs the gate once on
-    the stack, and pushes the stack to the target as a fast-forward. Each PR
-    then reads closed, with a comment naming its commit; the next cycle settles
+    stacks them on the target with one merge commit each, runs the gate once on
+    the stack, and pushes the stack to the target as a fast-forward. Each PR's
+    own head is then on the target, so GitHub shows it merged; the next cycle settles
     the claims and removes every worktree, the batch's included."""
     with world(issues=[issue(n, "ready-for-agent") for n in (1, 2, 3, 4)]) as w:
         # green ONLY on the three together: what is gated is the stack, not a PR
@@ -3407,27 +3424,28 @@ def test_a_merge_batch_lands_three_prs_behind_one_gate_run():
         r = json.loads(p.stdout)
         tip = _target(w)
         landed = _history(w, base0)
-        # the target's history: one squash commit per PR, in merge order, each
-        # naming its PR and closing its issue
+        # the target's history: one merge commit per PR, in merge order, each
+        # naming its PR and closing its issue — and bringing the PR's own head
         assert [(s, body) for _, s, body in landed] == [
             (f"feature {n} (#{n * 10})", f"Closes #{n}") for n in (1, 2, 3)]
         assert landed[-1][0] == tip == r["head"]
         assert git(w.cwd, "fetch", "-q", "origin", w.sb.base) == "" and \
-            git(w.cwd, "rev-list", "--count", "--merges", f"{base0}..{tip}") == "0"
+            [git(w.cwd, "rev-parse", f"{sha}^2") for sha, _, _ in landed] == \
+            [d[n][1] for n in (1, 2, 3)]
         assert {"feature1.txt", "feature2.txt", "feature3.txt"} <= w.remote_files(w.sb.base)
         # ONE gate run for three PRs, and the outcome says exactly what happened
         assert _gate_runs(w) == 1
         assert r == {"outcome": "landed", "batch": batch, "issues": [1, 2, 3],
                      "prs": [10, 20, 30], "left_out": [], "gate_runs": 1, "fix_commits": 0,
-                     "head": tip, "target": w.sb.base, "detail": r["detail"],
+                     "head": tip, "target": w.sb.base, "detail": r["detail"], "unmerged": [],
                      "landed": [{"issue": n, "pr": n * 10, "commit": landed[i][0]}
                                 for i, n in enumerate((1, 2, 3))]}, r
-        # every PR reads closed, with a comment naming the commit that landed it;
-        # every issue is closed; its branch is gone
-        for i, n in enumerate((1, 2, 3)):
-            assert w.pr(n * 10)["state"] == "closed"
-            [said] = w.state()["pr_comments"][str(n * 10)]
-            assert landed[i][0] in said and f"`{batch}`" in said and "#10, #20, #30" in said
+        # every PR reads MERGED — by GitHub itself, since its head is on the target:
+        # nobody closed it and nobody commented; every issue is closed; its branch is gone
+        for n in (1, 2, 3):
+            assert w.pr(n * 10)["state"] == "merged"
+            assert w.pr(n * 10)["merged"] == {"pushed": True, "head": d[n][1]}
+            assert str(n * 10) not in w.state().get("pr_comments", {})
             assert w.issue(n)["state"] == "closed"
             assert not w.sb.remote_ref(f"refs/heads/{d[n][0]['branch']}")
             assert "已合并,完成" in w.board(n)
@@ -3451,6 +3469,38 @@ def test_a_merge_batch_lands_three_prs_behind_one_gate_run():
         assert [x["linkedIssue"] for x in w.worktrees()] == [4] and not os.path.isdir(bwt)
         assert not [ref for ref in w.sb.all_refs() if "afk-batch" in ref]
         assert w.afk("rebuild", *ME, *R, *NOW, *gate)["mine"] == []
+
+
+def test_a_batched_pr_github_does_not_show_merged_keeps_its_branch_and_is_closed_by_the_next_cycle():
+    """GitHub marks a batched PR merged a moment after the push, by itself. The
+    landing waits for that before it deletes the PR's branch — deleted first, the
+    PR would read closed. One GitHub still shows open when the wait runs out is
+    left as it is, and the next cycle's release closes it, naming its commit."""
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
+        gate = _counted(w)
+        d = {n: with_pr(w, n, n * 10, gate=gate) for n in (1, 2)}
+        base0 = _target(w)
+        b = w.afk(*_turn_batch(*gate))
+        w.set(pushes_never_merge=True)
+        r = _land_batch(w, b, *gate, "--merged-timeout", "0")
+        assert (r["outcome"], r["prs"], r["unmerged"]) == ("landed", [10, 20], [10, 20]), r
+        landed = _history(w, base0)
+        assert [s for _, s, _ in landed] == ["feature 1 (#10)", "feature 2 (#20)"]
+        # the stack is on the target and the issues are closed — the PRs and their
+        # branches are untouched
+        for n in (1, 2):
+            assert w.issue(n)["state"] == "closed"
+            assert w.pr(n * 10).get("state", "open") == "open"
+            assert w.sb.remote_ref(f"refs/heads/{d[n][0]['branch']}") == d[n][1]
+        # still open a cycle later: the release closes each, with its commit
+        c = cycle(w, None, *gate)
+        assert c["progress"] == "cleared #1, #2; 0 in flight, 0 left on the frontier" and \
+            "errors" not in c, c
+        for i, n in enumerate((1, 2)):
+            assert w.pr(n * 10)["state"] == "closed"
+            [said] = w.state()["pr_comments"][str(n * 10)]
+            assert landed[i][0] in said and f"`{b['batch']}`" in said and "#10, #20" in said
+            assert not w.sb.remote_ref(f"refs/heads/{d[n][0]['branch']}")
 
 
 def _the_batch(w, gate):
@@ -3562,10 +3612,10 @@ def test_a_red_batch_lands_nothing_and_is_repaired_with_a_fix_commit_on_top():
         assert _target(w) == base0
         assert [w.pr(p).get("state", "open") for p in (10, 20)] == ["open", "open"]
         assert [w.issue(n)["state"] for n in (1, 2)] == ["open", "open"]
-        # the stack is durable on the batch's own branch: one squash commit per PR
+        # the stack is durable on the batch's own branch: one merge commit per PR
         [ref] = [x for x in w.sb.all_refs() if "afk-batch" in x]
         assert w.sb.remote_ref(ref) == r["head"] == git(bwt, "rev-parse", "HEAD")
-        assert git(bwt, "log", "--format=%s", f"{base0}..HEAD").splitlines() == \
+        assert git(bwt, "log", "--first-parent", "--format=%s", f"{base0}..HEAD").splitlines() == \
             ["feature 2 (#20)", "feature 1 (#10)"]
         # WHILE the gate ran, each PR's marker and each issue's board said so
         with open(during) as f:
@@ -3599,7 +3649,7 @@ def test_a_red_batch_lands_nothing_and_is_repaired_with_a_fix_commit_on_top():
         assert landed[-1][0] == _target(w) == r["head"] and fix != r["head"]
         assert [m["commit"] for m in r["landed"]] == [landed[0][0], landed[1][0]]
         assert _gate_runs(w) == 2 and "fix.txt" in w.remote_files(w.sb.base)
-        assert [w.pr(p)["state"] for p in (10, 20)] == ["closed", "closed"]
+        assert [w.pr(p)["state"] for p in (10, 20)] == ["merged", "merged"]
         assert not [x for x in w.sb.all_refs() if "afk-batch" in x]
 
 
@@ -3859,7 +3909,7 @@ def test_a_batch_is_formed_only_from_prs_that_are_free_to_land_together():
     """Who is batched. Never with the option off, in `required` mode, or while
     every PR owes an adversarial verify of its own; never a PR whose own worker
     is still working; never while one PR holds the turn. With one eligible PR
-    the turn goes to it exactly as without the option."""
+    the turn goes to it alone (ADR-0027)."""
     with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
         off = local_gate("true")
         gate = (*off, *BATCH)
@@ -3871,10 +3921,12 @@ def test_a_batch_is_formed_only_from_prs_that_are_free_to_land_together():
             assert r["outcome"] == "too_few" and _turns(w, 10) == _turns(w, 20) == [], r
             return r
 
-        too_few(*off)                                               # the option is off
+        too_few()                                                   # `required`: each PR's checks gate it
         too_few(*gate, "--set", "gate.adversarial_verify=true")     # each owes its own verify
-        assert "merge.batch" in w.error(*_turn_batch(*BATCH))       # `required`: a config error
-        assert "merge.batch" in w.error("config", *BATCH)
+        # there is no switch: the key that used to be one is refused, with the reason
+        for value in ("true", "false"):
+            assert "'merge.batch' was removed" in \
+                w.error(*_turn_batch(*gate, "--set", f"merge.batch={value}"))
         # #2's own worker is still working: its PR may yet move, so one is eligible
         w.worker(output=T0, state="working", since=T0, n=1)
         assert too_few(*gate)["busy"] == [2]
@@ -4035,9 +4087,10 @@ def test_bootstrap_refuses_a_merge_batch_the_target_would_not_take():
                            ({"restrictions": {"users": [], "teams": []}}, "restrict"),
                            ({"lock_branch": {"enabled": True}}, "lock")):
             r = verdict(prot, *gate)
-            assert r["verdict"] == "error" and "merge.batch" in r["detail"] and \
+            assert r["verdict"] == "error" and "merge batch" in r["detail"] and \
                 word in r["detail"].lower(), r
-            assert verdict(prot, *local_gate("true"))["verdict"] == "ok"   # only with the option
+            # only where batches form: with a verify owed per PR, none ever does
+            assert verdict(prot, *gate, "--set", "gate.adversarial_verify=true")["verdict"] == "ok"
         assert verdict({"lock_branch": {"enabled": False}, "enforce_admins": {"enabled": True}},
                        *gate)["verdict"] == "ok"
 
@@ -4564,7 +4617,7 @@ def test_the_tools_table_is_the_one_the_parser_generates():
          "[--ready-timeout <s>] [--start <auto\\|fresh>]")
     assert gen_tools_doc.usage("land", subs["land"]) == \
         ("afk land [--issue <n>] [--batch <batch>] [--gate-timeout <s>] [--excerpt-lines <k>] "
-         "[--checks-timeout <s>] [--checks-poll <s>]")
+         "[--merged-timeout <s>] [--checks-timeout <s>] [--checks-poll <s>]")
 
 
 def test_the_docs_restate_config_only_as_the_schema_has_it():

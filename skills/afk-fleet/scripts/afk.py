@@ -382,10 +382,11 @@ def _close_pr(repo, rem, number, comment, delete_branch):
             *([("heads", rem)] if delete_branch else []))
 
 
-def _merge_pr(repo, rem, pr, head, strategy, delete_branch):
-    """Merge an open PR, only while its head is still `head`. The issues it
-    closes are closed by GitHub with it."""
-    _gh(["pr", "merge", str(pr["number"]), "--repo", repo, f"--{strategy}",
+def _merge_pr(repo, rem, pr, head, delete_branch):
+    """Merge an open PR — a merge commit, never a squash or a rebase — only
+    while its head is still `head`. The issues it closes are closed by GitHub
+    with it."""
+    _gh(["pr", "merge", str(pr["number"]), "--repo", repo, "--merge",
          "--match-head-commit", head, *(["--delete-branch"] if delete_branch else [])])
     _forget(("prs", repo), ("heads", rem))
     for ref in pr.get("closingIssuesReferences") or []:
@@ -722,7 +723,7 @@ def cmd_release(a):
           can neither release the claim nor remove the worktree it runs in — has
           its worktree removed too (`cleanup`, when `worktree_cleanup`). An open
           issue's worktree is never touched: it may hold work. A PR a merge
-          batch landed and its worker did not get to close is closed here
+          batch landed that GitHub still does not show merged is closed here
           (`closed_pr`).
       afk release <n> --instance <id> --expect-sha <sha>
           a `stale_closed` row of rebuild — a dead peer's claim on an issue that
@@ -866,8 +867,8 @@ def cmd_probe(a):
     2. **Branch protection** (only when `gate.ci: local`, ADR-0012) — does the merge
        target REQUIRE status checks? Then `gh pr merge` is rejected however green the
        local gate is, so that combination is a hard `error` at bootstrap; an
-       inconclusive read is a `warn`. With `merge.batch`, so is a target that
-       refuses a direct push — a merge batch lands by pushing (ADR-0029).
+       inconclusive read is a `warn`. Where merge batches form, so is a target
+       that refuses a direct push — a merge batch lands by pushing (ADR-0029).
     3. **Gate records** (only when `gate.ci: local`, ADR-0030) — can a green gate
        run be put on record on the remote? A `warn` if not: every landing then
        runs the gate itself. Records past their day are swept here."""
@@ -889,7 +890,7 @@ def cmd_probe(a):
             prot, unavailable = _branch_protection(run.repo, target)
             result["protection"] = {"branch": target,
                                     **afk_decide.protection_verdict(ci_mode, prot, unavailable,
-                                                                    batch=cfg["merge"]["batch"])}
+                                                                    batch=afk_decide.batches_form(cfg))}
         result["gate_records"] = _probe_gate_records(run.rem, run.now())
     return result
 
@@ -2323,7 +2324,7 @@ def cmd_land(a):
     if (a.number is None) == (a.batch_id is None):
         raise ValueError("afk land takes exactly one of --issue <n>, --batch <batch>")
     if a.batch_id:
-        return _land_batch(run, a.batch_id, a.gate_timeout, a.excerpt_lines)
+        return _land_batch(run, a.batch_id, a.gate_timeout, a.excerpt_lines, a.merged_timeout)
     path = _git(["rev-parse", "--show-toplevel"]).stdout.strip()
     pr = afk_decide.closing_pr(_open_prs(run.repo), a.number)
     if pr is None:
@@ -2402,7 +2403,7 @@ def cmd_land(a):
                            "your wake and stop; you are told to run this again once it is")
 
     # --- land it. The claim and this worktree are the next cycle's to settle ---
-    _merge_pr(run.repo, rem, pr, head, cfg["merge"]["strategy"], cfg["merge"]["delete_branch"])
+    _merge_pr(run.repo, rem, pr, head, cfg["merge"]["delete_branch"])
     if cfg["progress_comment"]:
         _upsert_board(run.repo, a.number, cfg, "merged", instance=owner, pr=pr["number"])
     return {**out, "outcome": afk_decide.land_outcome("merged"),
@@ -2639,18 +2640,19 @@ def _batch_worker(run, batch, worker):
 
 def _landed_commit(path, tip, pr_number):
     """The commit on the target (`tip`, already fetched into `path`) that landed
-    a batched PR — the one whose subject ends ` (#<pr>)` — or None."""
-    out = _git(["-C", path, "log", "-1", "--format=%H%x09%s", "--fixed-strings",
+    a batched PR — the one on the target's own line whose subject ends
+    ` (#<pr>)` — or None."""
+    out = _git(["-C", path, "log", "-1", "--first-parent", "--format=%H%x09%s", "--fixed-strings",
                 f"--grep= (#{pr_number})", tip]).stdout.strip()
     sha, _, subject = out.partition("\t")
     return sha if sha and subject.endswith(f" (#{pr_number})") else None
 
 
 def _close_landed_pr(run, number):
-    """Close the open PR of a CLOSED issue when a merge batch landed it and the
-    batch's worker did not get to close it → the PR number, None when there is
-    nothing of the kind. The target itself is asked: a PR whose squash commit is
-    not on it is left alone."""
+    """Close the open PR of a CLOSED issue when a merge batch landed it and
+    GitHub does not show it merged → the PR number, None when there is nothing
+    of the kind. The target itself is asked: a PR whose merge commit is not on
+    it is left alone."""
     pr = afk_decide.closing_pr(_open_prs(run.repo), number)
     turn = _turn(run.repo, pr["number"]) if pr else None
     if not turn or not turn["batch"] or turn["released"]:
@@ -2671,28 +2673,30 @@ def _close_batched_pr(run, pr, commit, batch, prs):
               cfg["merge"]["delete_branch"])
 
 
-def _squash(rem, path, pr, issue):
-    """Stack one PR onto the batch worktree's HEAD as ONE squash commit →
-    (commit, None, []), or (None, why, files) when it is left out: it conflicts
-    with the stack so far (`conflict`, with the files), or changes nothing
-    against it (`no_changes`). A PR left out leaves the worktree as it found
-    it. The commit carries the PR's last author and is committed under the
-    caller's own git identity."""
+def _stack_pr(rem, path, pr, issue):
+    """Stack one PR onto the batch worktree's HEAD with ONE merge commit, whose
+    second parent is the PR's own head → (commit, None, []), or (None, why,
+    files) when it is left out: it conflicts with the stack so far (`conflict`,
+    with the files), or changes nothing against it (`no_changes`). A PR left
+    out leaves the worktree as it found it. The PR's head is on the stack
+    unchanged, which is what makes GitHub show the PR merged once the stack is
+    on the target; the merge commit is the caller's own."""
     head = _fetch_tip(rem, pr["headRefName"], cwd=path)
-    p = subprocess.run(["git", "-C", path, "merge", "--squash", head],
+    p = subprocess.run(["git", "-C", path, "merge", "--no-ff", "--no-commit", head],
                        capture_output=True, text=True)
     files = _unmerged(path)
     if p.returncode != 0 or files:
+        _git(["-C", path, "merge", "--abort"], check=False)
         _git(["-C", path, "reset", "-q", "--hard", "HEAD"])
         if not files:
-            raise RuntimeError(f"git merge --squash of PR #{pr['number']} into {path} failed: "
+            raise RuntimeError(f"git merge of PR #{pr['number']} into {path} failed: "
                                f"{(p.stderr or p.stdout).strip()}")
         return None, "conflict", files
     if not _git(["-C", path, "status", "--porcelain", "--untracked-files=no"]).stdout.strip():
+        _git(["-C", path, "merge", "--abort"], check=False)    # none is open when it was up to date
         return None, "no_changes", []
-    author = _git(["-C", path, "log", "-1", "--format=%an <%ae>", head]).stdout.strip()
-    p = subprocess.run(["git", "-C", path, "commit", "-q", "--no-verify", "--author", author,
-                        "-m", afk_decide.squash_message(pr["title"], pr["number"], issue)],
+    p = subprocess.run(["git", "-C", path, "commit", "-q", "--no-verify",
+                        "-m", afk_decide.stack_message(pr["title"], pr["number"], issue)],
                        capture_output=True, text=True)
     if p.returncode != 0:
         raise RuntimeError(f"could not commit PR #{pr['number']} onto the stack: "
@@ -2722,14 +2726,14 @@ def _batch_turns(run, batch, listed):
     return members, instance
 
 
-def _land_batch(run, batch, gate_timeout, excerpt_lines):
+def _land_batch(run, batch, gate_timeout, excerpt_lines, merged_timeout):
     """`afk land --batch <batch>` — a BATCH WORKER stacks, gates and lands its
     merge batch, in the batch's worktree (ADR-0029). Refused (exit 3, nothing
     changed) unless every member PR carries the batch's turn marker, naming the
     fleet instance that holds its issue's claim. Then, in order:
 
       stack   reset to the target's tip and put each member on it in merge
-              order, ONE squash commit per PR; a PR that conflicts with the
+              order, ONE merge commit per PR; a PR that conflicts with the
               stack so far is left out — its marker says so, it takes a single
               turn later and is not batched again. The fix commits this worktree
               already carried are put back on top.
@@ -2738,15 +2742,16 @@ def _land_batch(run, batch, gate_timeout, excerpt_lines):
               green run is already on record for the stack's tree (ADR-0030)
       land    push the stack to the target as a FAST-FORWARD — the only lock
               there is: a target that moved refuses it
-      finish  each member: status board, close the issue, close the PR with a
-              comment naming the commit that landed it
+      finish  each member: status board, close the issue; GitHub shows the PR
+              merged, and its branch is deleted once it does
 
     The stack is rebuilt from the target's tip on every run, so a run after a
     red gate (a fix commit on top) and a run after the target moved are the same
     run. It stops with an `outcome`:
 
       landed        the stack is on the target (`landed`, `left_out`,
-                    `gate_runs`, `fix_commits`). Send the wake and stop.
+                    `gate_runs`, `fix_commits`; `unmerged`: the PRs GitHub did
+                    not yet show merged). Send the wake and stop.
       gate_red      the gate was red on the stack; nothing landed (`gate.excerpt`).
                     Fix the stack — one more commit on top — and run this again.
       target_moved  the fast-forward was refused; nothing landed. Run this again.
@@ -2774,7 +2779,7 @@ def _land_batch(run, batch, gate_timeout, excerpt_lines):
     landed = [{**m, "commit": c} for m in state["members"]
               for c in [_landed_commit(path, tip, m["pr"])] if c]
     if landed:
-        return _finish_batch(run, state, landed, result)
+        return _finish_batch(run, state, landed, result, merged_timeout)
 
     members, instance = _batch_turns(run, batch, state["members"])
     dirty = _git(["-C", path, "status", "--porcelain", "--untracked-files=no"]).stdout.strip()
@@ -2789,13 +2794,16 @@ def _land_batch(run, batch, gate_timeout, excerpt_lines):
                            f"was changed — send your wake and stop")
 
     # --- stack: every member on the target's tip, then the fixes carried so far ---
-    log = _git(["-C", path, "log", "--reverse", "--format=%H%x09%s", f"{tip}..HEAD"]).stdout
+    log = _git(["-C", path, "log", "--first-parent", "--reverse", "--format=%H%x09%s",
+                f"{tip}..HEAD"]).stdout
     _, fixes = afk_decide.read_stack([tuple(ln.split("\t", 1)) for ln in log.splitlines()],
                                      {m["pr"] for m in state["members"]})
     _git(["-C", path, "reset", "-q", "--hard", tip])
+    state["branches"] = {str(m["pr"]): prs[m["pr"]]["headRefName"] for m in members}
+    _save_batch_state(path, state)
     stacked = []
     for m in members:
-        commit, why, files = _squash(rem, path, prs[m["pr"]], m["issue"])
+        commit, why, files = _stack_pr(rem, path, prs[m["pr"]], m["issue"])
         if commit:
             stacked.append({**m, "commit": commit})
             continue
@@ -2855,15 +2863,31 @@ def _land_batch(run, batch, gate_timeout, excerpt_lines):
                       detail=f"{target} moved while the batch was gating: the fast-forward was "
                              f"refused and nothing landed — run this again; the batch is "
                              f"re-stacked on the new tip and gated again")
-    return _finish_batch(run, state, stacked, result, **more)
+    return _finish_batch(run, state, stacked, result, merged_timeout, **more)
 
 
-def _finish_batch(run, state, landed, result, **more):
-    """Finish every PR a batch landed — what GitHub does not do for a commit
-    that was pushed rather than merged. Each step is skipped when already done,
+def _await_merged(repo, numbers, timeout, poll=2):
+    """Wait for GitHub to show the PRs `numbers` merged — it does so by itself,
+    a moment after a push puts their heads on the target → the ones still open
+    when `timeout` seconds ran out. Each look is one fresh read of the open PRs."""
+    deadline = time.monotonic() + timeout
+    while True:
+        still_open = {p["number"] for p in _open_prs(repo, fresh=True)} & set(numbers)
+        left = deadline - time.monotonic()
+        if not still_open or left <= 0:
+            return still_open
+        time.sleep(min(poll, left))
+
+
+def _finish_batch(run, state, landed, result, merged_timeout, **more):
+    """Finish every PR a batch landed. Each step is skipped when already done,
     so a finishing that was cut short is finished by the next run. Issues first:
     a member whose issue is closed is settled by the next cycle whatever happens
-    here, and a PR left open behind one is closed by that cycle's release."""
+    here. The PRs are GitHub's to finish: each one's head is on the target, so
+    it shows the PR merged, and the PR's branch is deleted once it does —
+    deleted sooner, the PR would read closed instead. One still open after
+    `merged_timeout` seconds is left as it is, branch and all: the next cycle's
+    release closes it if it is open even then (`_close_landed_pr`)."""
     cfg, rem = run.cfg, run.rem
     batch = state["id"]
     instance = (_turn(run.repo, landed[0]["pr"]) or {}).get("instance")
@@ -2873,12 +2897,14 @@ def _finish_batch(run, state, landed, result, **more):
         if _issue_state(run.repo, m["issue"]) == "open":
             _close_issue(run.repo, m["issue"])
     _delete_batch_branches(rem, batch)
-    still_open = {p["number"]: p for p in _open_prs(run.repo)}
-    for m in landed:
-        if m["pr"] in still_open:
-            _close_batched_pr(run, still_open[m["pr"]], m["commit"], batch,
-                              [x["pr"] for x in landed])
-    return result("landed", landed, **more,
+    still_open = _await_merged(run.repo, [m["pr"] for m in landed], merged_timeout)
+    if cfg["merge"]["delete_branch"]:
+        heads = _remote_heads(rem)
+        for m in landed:
+            branch = (state.get("branches") or {}).get(str(m["pr"]))
+            if m["pr"] not in still_open and branch in heads:
+                _delete_branch(rem, branch, check=False)
+    return result("landed", landed, **more, unmerged=sorted(still_open),
                   landed=[{k: m[k] for k in ("issue", "pr", "commit")} for m in landed],
                   detail="landed — send your wake and stop")
 
@@ -3151,6 +3177,9 @@ def build_parser():
                    help="seconds before the local gate is called red (default %(default)s)")
     p.add_argument("--excerpt-lines", type=int, default=afk_decide.GATE_EXCERPT_LINES, metavar="k",
                    help="how many trailing log lines a red gate's excerpt keeps")
+    p.add_argument("--merged-timeout", type=int, default=60, metavar="s",
+                   help="--batch: seconds to wait for GitHub to show the landed PRs merged "
+                        "before leaving their branches in place (default %(default)s)")
     p.add_argument("--checks-timeout", type=int, default=1800, metavar="s",
                    help="gate.ci required: seconds to wait for the checks on the head that "
                         "would land before stopping with awaiting_ci (default %(default)s)")

@@ -1,5 +1,9 @@
 # ADR-0029 — A merge batch lands N ready PRs behind one gate run
 
+**Amended by [ADR-0033](0033-every-pr-lands-as-a-merge-commit-and-batches-need-no-switch.md):** a
+batch is no longer opt-in (`merge.batch` is removed), its stack is one **merge** commit per PR, and
+a batched PR reads *merged* on GitHub, not *closed*. Read "squash commit", "with the option on"
+and "closed with a comment" below as they were decided then.
 **Status:** accepted — opt-in (`merge.batch`, default off, `gate.ci: local` only). Relaxes, per
 batch, the reading of [ADR-0012](0012-local-completion-gate.md)'s invariant that the gate proves
 *a PR*: with the option on it proves *a stack*. Extends

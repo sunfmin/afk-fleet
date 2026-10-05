@@ -30,7 +30,6 @@ gate:
 
 # --- merge ---
 merge:
-  strategy: squash
   target: master
   sync_before_merge: true
   delete_branch: true

@@ -107,7 +107,7 @@ asks only the one thing code cannot derive (step 3, and only when it was not pas
      `merge.target` **requires status checks**, so `gh pr merge` would be rejected however green the
      local gate is: **stop here** — drop the required checks on that branch or
      switch to `gate.ci: required`. (`gh pr merge --admin` is not an option: it bypasses human review
-     too.) With `merge.batch` it is also an `"error"` when the target would refuse a direct push
+     too.) Unless `gate.adversarial_verify` is on, it is also an `"error"` when the target would refuse a direct push
      (required pull request reviews, push restrictions, a locked branch) — a merge batch lands by
      pushing; **stop here** too. A `"warn"` verdict (the read was inconclusive — no admin rights) is reported and continues.
    - **Gate records** (only when `gate.ci: local`) — `gate_records.verdict == "warn"` means the
@@ -307,7 +307,7 @@ In this order, each step the same `afk` transition you could type yourself
    landing one whose worker has not stopped for the tick. A worker's state is what its runtime
    reported to orca, never its screen (ADR-0021).
 3. **The landing turn** (`afk turn`) — at most one a cycle: to the head of the merge queue, or,
-   with `merge.batch`, to a merge batch of the PRs that may land together. See
+   when two or more may land together, to a merge batch of them. See
    [Landing](#landing--the-worker-lands-its-own-pr-on-its-turn).
 4. **Settle what a stopped worker left** where the reason is on record: a worker idle with no
    outcome is nudged once (`afk nudge`, ADR-0018); a `giving-up` verdict, a refuted
@@ -439,13 +439,15 @@ that moved the head invalidates checks and verifications of the old one, and gh 
 the branch moved after the gate. No landing outcome spends an attempt or closes the PR; only
 `afk fail` does.
 
-**A merge batch — several PRs on one turn** (`merge.batch`, `gate.ci: local`; off by default;
-[ADR-0029](../../docs/adr/0029-a-merge-batch-lands-n-prs-behind-one-gate-run.md)). When two or more
+**A merge batch — several PRs on one turn** (`gate.ci: local` with `gate.adversarial_verify` off;
+there is no switch —
+[ADR-0029](../../docs/adr/0029-a-merge-batch-lands-n-prs-behind-one-gate-run.md),
+[ADR-0033](../../docs/adr/0033-every-pr-lands-as-a-merge-commit-and-batches-need-no-switch.md)). When two or more
 finished PRs may land together, the pass gives the turn to all of them at once — `afk turn --batch`
 — instead of to the first: it records one marker on every member PR and starts a **batch worker**
 in a worktree of the batch's own. That worker runs `afk land --batch`, which stacks the PRs on the
-target as one squash commit each, runs the gate **once** on the stack, and pushes the stack to the
-target; each PR then reads **closed** (not merged) with a comment naming its commit, and its issue
+target with one merge commit each, runs the gate **once** on the stack, and pushes the stack to the
+target; each PR's own head is then on the target, so GitHub shows it **merged**, and its issue
 is closed. Which PRs are batched, and whether any are, is decided in code — you never choose. The
 members' own workers are told nothing, and a batch worker holds no claim and no slot. The pass
 watches the batch worker as it watches any worker on a turn: gone, it is continued; silent, it is
