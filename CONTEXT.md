@@ -1,48 +1,53 @@
 # afk-fleet
 
-An unattended fleet that works a GitHub-issue backlog on its own, for days, without any session's
-context growing without bound: a thin **launcher** spawns a fresh disposable **tick** each cycle;
-each tick — one reconciliation pass, run in code — dispatches worktree-isolated **workers** per ready issue and gives each finished PR its
+An unattended fleet that works a GitHub-issue backlog on its own, for days, in one session that can
+be compacted at any point and lose nothing: a **launcher** runs one cycle after another, and each
+cycle's **tick** — one reconciliation pass, run in code — dispatches worktree-isolated **workers** per ready issue and gives each finished PR its
 **landing turn**, on which its worker gates it and lands it on the target branch — one PR at a time.
 
 ## Language
 
 **Launcher**:
 The interactive session `/afk-fleet` is invoked in. Invoking it is the launch: it asks for no
-confirmation, mints a **fleet-instance** id, then loops: spawn a **tick**, keep the **cycle state** it returns, pace, repeat. It does no coordination
-itself: it never computes the **frontier**, never reads tick-only files (the `afk.py`/`afk_decide.py`
-source, `worker-prompt.md`). It is
-thin *by construction* from its first action — it only ever spawns subagents and keeps the state and
-progress line each returns — so its context stays flat over a multi-day run. Several launchers — on several machines,
+confirmation, mints a **fleet-instance** id, then loops: run one cycle (`afk cycle`, whose **tick** runs in code),
+answer the **judgments** it returns, keep the **cycle state**, sleep, repeat. It is the one session that
+runs each tick, and the one LLM a judgment reaches. Its context is bounded by ordinary
+auto-compaction, which is safe by construction: after any compaction it needs only the repo, the
+config and the last cycle state, and no rule of the pass is its to remember (ADR-0028). It still
+never computes the **frontier** in its own context and never reads a worker. Several launchers — on several machines,
 even under one GitHub account — may run against the same repo at once; they cooperate only through
 **claims**, never a central coordinator.
-_Avoid_: coordinator (there is no single long-lived coordinator; a tick coordinates one pass),
+_Avoid_: coordinator (**fleet state** is all in GitHub: no session holds it, and a launcher that
+forgot everything but its cycle state carries on),
 orchestrator, manager, main agent
 
 **Fleet instance**:
-One launcher run and everything it owns — the ticks it spawns, the workers they dispatch, and the
+One launcher run and everything it owns — the ticks it runs, the workers they dispatch, and the
 **claims** it holds — identified by an id minted at bootstrap. That id
 and the **worker launch command** are the run's two launcher-held facts:
-settled once at bootstrap, passed to the first cycle and carried in the **cycle state** from then on,
+settled once at bootstrap, passed to the first cycle and riding in the **cycle state** from then on —
+not in the launcher's own memory, which a compaction may cut —
 never written to a file, and gone when the launcher stops. Its liveness is published as a **heartbeat**; when it stops or dies
 its claims are released or reclaimed. Distinct instances (even on one GitHub account) are the unit of
 cooperative concurrency across machines.
 _Avoid_: node, worker (that is the per-issue coding agent), coordinator
 
 **Tick**:
-One disposable reconciliation pass. The pass itself is code, inside one call (`afk cycle`): it rebuilds the working
+One reconciliation pass. It is code, inside one call (`afk cycle`): it rebuilds the working
 set from fleet state and acts once (give a finished PR its **landing turn**, escalate exhausted, dispatch to free slots — each a
-single **transition**), without waiting for the workers it dispatched. It is run by a fresh-context Agent subagent,
-which answers the **judgments** the call returns, hands the launcher the **cycle state**, and dies. Runtime is bounded
-because ticks are disposable, not because one session stays disciplined.
-_Avoid_: batch (implies draining a whole wave), poll (a tick acts, not just observes), coordinator
+single **transition**), without waiting for the workers it dispatched, and returns what it could not
+decide as **judgments**. It is a pass, not a context: the **launcher** makes the call, and nothing
+of a tick outlives it but the **cycle state**. A run lasts because every tick starts from GitHub and
+the procedure is code, not because one session stays disciplined (ADR-0028).
+_Avoid_: batch (implies draining a whole wave), poll (a tick acts, not just observes), coordinator,
+subagent (a tick was one, per cycle, until ADR-0028)
 
 **Plan tick**:
 A **tick** run in dry-run mode (`--plan`): it does the full **rebuild** (recompute the **frontier**,
 classify claims into mine/peer-live/stale) and then **stops before the Act phase**, returning the
 dispatch plan instead of granting/dispatching/reclaiming. It is the *same* procedure as an acting tick,
 short-circuited — so the plan a human reads cannot drift from what a live tick will actually do. It
-is how to look before launching: `/afk-fleet --plan`. A launch itself spawns none (ADR-0023).
+is how to look before launching: `/afk-fleet --plan`. A launch itself runs none (ADR-0023).
 _Avoid_: dry run (that is its mode, not its name), preview pass
 
 **Worker**:
@@ -84,8 +89,8 @@ _Avoid_: provider (that is the API backend, e.g. Anthropic), CLI (too generic), 
 (implementation-level)
 
 **Worker launch command**:
-The one shell string that starts every **worker** of a run — held by the **fleet instance**, injected
-into each **tick**, and handed to orca verbatim. It is **opaque**: the fleet never parses it, composes
+The one shell string that starts every **worker** of a run — held by the **fleet instance**, carried
+in the **cycle state**, and handed to orca verbatim. It is **opaque**: the fleet never parses it, composes
 it, or appends to it, so it can be a provider alias (`ckimi`), a wrapper (`direnv exec . claude`), or
 a script, and no credential ever enters the fleet. It exists because a launcher's provider lives only
 in its environment — the wrapper's name is gone by the time the process exists, and its argv is
@@ -114,7 +119,7 @@ commit, a changed command, or no record at all voids it, and the landing runs th
 expected to scope remote CI away from worker branches, and a target branch whose protection requires
 checks is rejected at bootstrap. A red run at landing is the worker's to fix in place; its log
 excerpt is also posted as a PR comment, so a failure that does reach the retry ladder is re-read
-from where it lives, never from a dead tick's context.
+from where it lives, never from anyone's context.
 _Avoid_: local CI (it substitutes for CI; it is not CI), pre-push check, local build
 
 **Sync**:
@@ -135,10 +140,10 @@ not a difference of opinion — selecting the **frontier**, claiming/reclaiming/
 mine/live-peer/stale partition, lease arithmetic, retry accounting, pacing, reading a worker's
 **worker state**. They are extracted into tested **tools**. **Judgment** is everything that must read
 context and can be reasonably contested — whether an implementation is correct (the gate), whether a
-refutation holds, whether an empty diff really is empty, how to word an escalation. It stays with the **tick** (an LLM): the pass returns it as a **judgment** instead of deciding it. "Extract mechanics to code, keep judgment in the
+refutation holds, whether an empty diff really is empty, how to word an escalation. It stays with the **launcher** (an LLM): the tick returns it as a **judgment** instead of deciding it. "Extract mechanics to code, keep judgment in the
 LLM" is the fleet's core build rule.
 _Avoid_: automation vs decision, deterministic vs heuristic (near, but this is specifically the
-code/LLM ownership split), script vs agent (the tick is not a script)
+code/LLM ownership split), script vs agent
 
 **Judgment** (as returned by a cycle):
 One question a **tick**'s pass could not decide, handed back by `afk cycle` instead of decided: is
@@ -146,7 +151,7 @@ an empty diff really empty, may a PR with no checks land, does a head survive th
 verify, how is a failure or an escalation worded. It carries the one **transition** to run for
 either answer, ready to run, so answering it *is* a transition and the next cycle does not ask
 again; there is nothing to resume. One whose answer takes reading something long (a diff under
-review, a CI log) is marked for an ephemeral subagent. A step whose reason is already on record is
+review, a CI log) is marked for an ephemeral subagent — the launcher's only use of one. A step whose reason is already on record is
 not a judgment — the pass performs it (ADR-0017).
 _Avoid_: question, prompt, decision point, outcome (an **outcome** is where one transition stopped;
 a judgment is what a whole pass returns)
@@ -179,8 +184,8 @@ state, branches). It is the single source of truth; no tick holds it in memory.
 _Avoid_: progress, run state, memory
 
 **Working set**:
-A tick's disposable, in-context view of the fleet at one moment. It is derived from fleet state and
-is dropped when the tick returns.
+A tick's view of the fleet at one moment. It is derived from fleet state inside the `afk cycle`
+call and dropped when that call returns: it never enters a context.
 _Avoid_: coordinator memory, session state
 
 **Frontier**:
@@ -215,7 +220,7 @@ The bounded pass, run at the top of every tick, that re-derives the whole workin
 state: recompute the frontier, and reconstruct the in-flight set (the `afk-claim/<n>` refs owned by
 this instance, sub-classified from each issue's PR + checks). Any tick — a fresh one or a later one — produces the
 same working set from the same GitHub; this equivalence is the re-entrancy invariant that makes
-disposable ticks safe. Its deterministic half is one read-only tool call — `afk rebuild`, which
+a killed tick, and a launcher that forgot the last one, safe. Its deterministic half is one read-only tool call — `afk rebuild`, which
 gathers and assembles the working set (plus its fingerprint digest) in code. Why a `no_pr` claim has
 no PR is a second, machine-dependent call — `afk no-pr`, which reads the worktree, the worker's
 verdict marker and its blockers and returns the **outcome** (what the tick does about it — distinct

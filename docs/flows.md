@@ -6,8 +6,9 @@ one or several machines.
 The nouns are in [`CONTEXT.md`](../CONTEXT.md), the reasons in [`docs/adr/`](adr/). This file is the
 verbs: what happens, in what order, and what it leaves behind.
 
-**Reading the anchors.** The fleet is a doc-driven skill (ADR-0004): the **launcher** and the
-**tick** are LLM sessions executing the prose of `skills/afk-fleet/SKILL.md`, the **worker** executes
+**Reading the anchors.** The fleet is a doc-driven skill (ADR-0004): the **launcher** is an LLM
+session executing the prose of `skills/afk-fleet/SKILL.md`, the **tick** it runs each cycle is code
+(ADR-0028), the **worker** executes
 `skills/afk-fleet/references/worker-prompt.md`, and every deterministic step is a subcommand of
 `skills/afk-fleet/scripts/afk.py` deciding through a pure function in
 `skills/afk-fleet/scripts/afk_decide.py`. Each thing a tick *does* to a claim — start a worker, land
@@ -121,30 +122,31 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    a custom provider uses the command passed with the invocation, or has the human pick one, and the
    answer is checked to resolve.
    `skills/afk-fleet/scripts/afk.py:cmd_worker_command`
-4. Each cycle, the launcher spawns a fresh tick, handing it only the repo, the config and the cycle
-   state; the tick makes one call, which digests what a rebuild would observe and decides skip or
-   tick — the raw state never enters a context.
+4. Each cycle, the launcher itself makes one call, handing it only the repo, the config and the
+   cycle state; the call digests what a rebuild would observe and decides skip or tick — the raw
+   state never enters a context.
    `skills/afk-fleet/scripts/afk.py:cmd_cycle`
 5. When the digest moved, that same call runs the reconciliation pass (the mainline above) in code,
    and returns what it could not decide as judgments, each with the transition for either answer;
-   the tick runs the one it chooses and opens the next cycle at once.
+   the launcher runs the one it chooses and opens the next cycle at once.
    `skills/afk-fleet/scripts/afk.py:_tick`
 6. The call folds what the pass did into the cycle state — which also carries the two
    launcher-held facts (instance id, worker launch command) — and counts whether the cycle was empty.
    `skills/afk-fleet/scripts/afk_decide.py:cycle_ticked`
 7. The launcher sleeps the interval that call returned — busy, or idle after enough consecutive
    empty cycles, never longer than half the lease while the fleet holds a claim — then repeats from
-   step 4, keeping nothing but the cycle state.
+   step 4. Its context may be compacted at any point: the repo, the config and the cycle state are
+   all the next cycle needs (ADR-0028).
    `skills/afk-fleet/scripts/afk_decide.py:pace`
-8. On the human's word, one final drain tick releases the claims that have no PR, keeps the ones
-   that do, and the launcher spawns no more ticks.
-    `skills/afk-fleet/scripts/afk.py:cmd_release`
+8. On the human's word, one last cycle — the drain — releases the claims that have no PR and keeps
+   the ones that do, and the launcher runs no more cycles.
+    `skills/afk-fleet/scripts/afk.py:_drain`
 
 **Where it forks.**
 - The digest is unchanged: no pass is run, the same call refreshes the heartbeat if the fleet
   holds claims and returns the sleep, and a full tick is forced every `force_tick_after_skips`
   cycles: `skills/afk-fleet/scripts/afk_decide.py:cycle_wake`, ADR-0007.
-- A worker's **wake** arrives during the sleep of step 9: the launcher goes to step 6 at once, and
+- A worker's **wake** arrives during the sleep of step 7: the launcher goes to step 4 at once, and
   acts on nothing the line says, `skills/afk-fleet/SKILL.md:wake`, ADR-0020.
 - The org forbids `refs/afk/*`, so claims fall back to ordinary branches:
   `skills/afk-fleet/scripts/afk.py:_usable_namespace`.

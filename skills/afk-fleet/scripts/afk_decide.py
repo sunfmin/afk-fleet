@@ -1981,6 +1981,29 @@ def cycle_ticked(state, did, config, judgments=0, errors=0):
             "progress": "; ".join([*parts, _standing(new)])}
 
 
+def cycle_drained(state, released, kept, errors=0):
+    """
+    The bottom of the LAST cycle of a run — `afk cycle --drain`, the launcher's
+    stop: fold what the drain released and kept into the cycle state.
+
+      released: issue numbers whose claim was released — it had no PR yet, or
+                had outlived its issue
+      kept:     issue numbers whose claim is still held: an open PR closes the
+                issue, and a peer (or a later run) lands it once the lease lapses
+      errors:   how many releases failed — those claims are still held too
+
+    Returns {"state", "sleep_seconds", "progress"}. `sleep_seconds` is None:
+    nothing follows a drain. One that met an error is `unsettled`, so a caller
+    that does run it again is not told it has nothing to do.
+    """
+    new = {**state, "in_flight": len(kept), "unsettled": bool(errors)}
+    parts = [f"{word} {', '.join(f'#{n}' for n in numbers)}"
+             for word, numbers in (("released", released), ("kept", kept)) if numbers]
+    parts += [f"{errors} error{'' if errors == 1 else 's'}"] if errors else []
+    return {"state": new, "sleep_seconds": None,
+            "progress": "; ".join(["drained", *parts])}
+
+
 def _standing(state):
     return (f"{state['in_flight']} in flight, "
             f"{state['frontier_remaining']} left on the frontier")
@@ -2310,9 +2333,9 @@ def resolve_worker_command(base_url, supplied=None, resolved=None, runtime="clau
 # Fingerprint gate — skip ticks code can prove are no-ops (ADR-0007)           #
 # --------------------------------------------------------------------------- #
 #
-# A tick is a fresh LLM context; spawning one just to conclude "still waiting"
-# is the fleet's main steady-state token spend. The gate collapses everything a
-# tick's Rebuild observes into a short digest; the launcher spawns a tick only
+# A tick is a rebuild and a pass of transitions: dozens of gh calls, just to
+# conclude "still waiting", most cycles of a run. The gate collapses everything a
+# tick's Rebuild observes into a short digest; `afk cycle` runs a tick only
 # when the digest moved (or a forced full pass is due). A false "changed" costs
 # one tick; a missed change waits at most `force_after`
 # cycles. Correctness never depends on the gate.

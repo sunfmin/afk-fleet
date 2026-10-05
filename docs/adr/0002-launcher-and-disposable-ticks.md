@@ -4,6 +4,12 @@
 [ADR-0001](0001-disposable-coordinator-context.md); keeps its *fleet-state-in-GitHub* foundation.
 Amended by [ADR-0023](0023-invoking-the-skill-is-the-launch.md) (no bootstrap preview, no run
 authorization: the invocation is the go-ahead).
+**Superseded in part by [ADR-0028](0028-the-launcher-runs-each-cycle-itself.md):** *a tick is an
+Agent subagent*, *the launcher is thin by construction* and *compaction is not the mechanism* no
+longer hold — the launcher runs each cycle itself and is bounded by auto-compaction, made safe by
+construction. What stands: no long-lived coordinator holds fleet state, a tick is one reconciliation
+pass that never waits for its workers, pacing is adaptive, and `--plan` is the tick short-circuited
+before it acts.
 
 ## Decision
 
