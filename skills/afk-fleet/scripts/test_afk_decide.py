@@ -1688,6 +1688,11 @@ def test_cycle_ticked_folds_what_the_tick_did_and_counts_empty_ticks():
     assert asked["state"]["empty_streak"] == 0 and "2 judgments open" in asked["progress"]
     failed = d.cycle_ticked(r["state"], _did(), cfg, errors=1)
     assert (failed["sleep_seconds"], failed["state"]["unsettled"]) == (90, True)
+    # a PR that opened while the tick ran is in the digest it keeps, unseen: the
+    # next cycle is opened at once, and ticks
+    missed = d.cycle_ticked(r["state"], _did(in_flight=2), cfg, unseen=1)
+    assert (missed["sleep_seconds"], missed["state"]["unsettled"]) == (0, True)
+    assert missed["progress"] == "1 PR opened meanwhile; 2 in flight, 0 left on the frontier"
     assert "1 error;" in failed["progress"]
     assert ticked(asked["state"])["state"]["unsettled"] is False     # a clean tick settles it
 
@@ -2572,6 +2577,11 @@ def test_fingerprint():
     assert fp != d.fingerprint(issues, prs, [{"number": 1, "instance": "peer", "sha": "s2"}])  # reclaimed
     edged = [{**issues[0], "blocked_by": 1}, issues[1]]
     assert fp != d.fingerprint(edged, prs, claims)                            # a blocker recorded
+    # a PR becomes an issue's only through what it closes, and GitHub may list
+    # that after the PR itself
+    linked = [{**prs[0], "closingIssuesReferences": [{"number": 1}]}]
+    assert fp != d.fingerprint(issues, linked, claims)                        # the PR closes #1
+    assert fp == d.fingerprint(issues, [{**prs[0], "closingIssuesReferences": []}], claims)
 
     # a PR's checks enter as the one word a tick acts on. Still running — queued, in
     # progress, the first of several done green — the claim is `awaiting_ci`
@@ -2591,6 +2601,21 @@ def test_fingerprint():
     assert fp != d.fingerprint(issues, checks(), claims)                      # no checks at all
     # heartbeats are not an input at all — the launcher's own skip-cycle refresh
     # can't move the digest (that is what keeps the gate from defeating itself).
+
+
+def test_unseen_prs_are_the_claims_whose_pr_is_not_the_one_the_tick_worked_from():
+    mine = [{"number": 1, "pr": None}, {"number": 2, "pr": 20}, {"number": 3, "pr": 30},
+            {"number": 4, "pr": None}]
+
+    def closing(pr_number, issue):
+        return {"number": pr_number, "closingIssuesReferences": [{"number": issue}]}
+
+    assert d.unseen_prs(mine, [closing(20, 2), closing(30, 3)]) == []
+    # opened while the tick ran; replaced by a later attempt; a PR of nobody's claim
+    assert d.unseen_prs(mine, [closing(10, 1), closing(20, 2), closing(31, 3), closing(90, 9)]) \
+        == [1, 3]
+    # a PR the tick closed, or one that landed, leaves nothing to act on
+    assert d.unseen_prs(mine, []) == []
 
 
 def test_fingerprint_gate():

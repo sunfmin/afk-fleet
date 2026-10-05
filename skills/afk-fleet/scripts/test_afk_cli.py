@@ -246,6 +246,7 @@ if parts[0] == "issues" and parts[2:] == ["comments"]:
         new = 1 + max([c["id"] for rs in comments.values() for c in rs], default=1000)
         rows.append({"id": new, "body": body, "html_url": "https://gh/c/%%d" %% new})
         st["issues"] += st.pop("arrives_mid_tick", [])     # someone files one meanwhile
+        st["prs"] += st.pop("prs_open_mid_tick", [])       # a worker opens its PR meanwhile
         finish(json.dumps({"id": new, "html_url": "https://gh/c/%%d" %% new}))
     assert jq == ".[] | {id, body, url: .html_url}", "fake gh: unsupported jq %%r" %% jq
     finish("\n".join(json.dumps({"id": c["id"], "body": c["body"], "url": c["html_url"]})
@@ -1610,6 +1611,33 @@ def test_what_changed_while_a_tick_ran_still_gets_a_tick():
         assert (idle["reason"], idle["progress"]) == \
             ("wake", "4 in flight, 0 left on the frontier")
         assert cycle(w, idle["state"], *forced)["action"] == "skip"
+
+
+def test_a_pr_that_opens_while_a_tick_runs_gets_its_turn_from_the_next_cycle_at_once():
+    """A worker opens its PR while the tick is busy elsewhere. The digest the tick
+    keeps holds that PR, so nothing would ever read as changed — the cycle says so
+    instead: it sleeps 0, and the next one ticks and gives the PR its landing turn."""
+    with world(issues=[issue(1, "ready-for-agent")]) as w:
+        d = w.afk(*dispatch(1))
+        w.work(d["worktree"], "feature1.txt")
+        w.worker(output=T0 - 1, state="working", since=T0 - 60)
+        first = cycle(w, None, "--set", "concurrency=5")
+        assert first["progress"] == "1 in flight, 0 left on the frontier"
+
+        # #1's PR opens while the tick that dispatches #2 is writing #2's board
+        w.set(issues=w.state()["issues"] + [issue(2, "ready-for-agent")],
+              prs_open_mid_tick=[pr(10, closes=1, headRefName=d["branch"])])
+        busy = cycle(w, first["state"], "--set", "concurrency=5")
+        assert busy["progress"] == ("dispatched #2; 1 PR opened meanwhile; "
+                                    "2 in flight, 0 left on the frontier")
+        assert (busy["sleep_seconds"], busy["state"]["unsettled"]) == (0, True)
+        assert _mine(w, (), 1)[0] == "awaiting_turn"
+
+        nxt = cycle(w, busy["state"], "--set", "concurrency=5")
+        assert (nxt["action"], nxt["reason"]) == ("tick", "unsettled")
+        assert nxt["progress"] == "landing turn to #1; 2 in flight, 0 left on the frontier"
+        assert (nxt["sleep_seconds"], nxt["state"]["unsettled"]) == (90, False)
+        assert cycle(w, nxt["state"], "--set", "concurrency=5")["action"] == "skip"
 
 
 def test_a_tick_in_code_carries_out_every_no_pr_action_whose_reason_is_on_record():

@@ -184,7 +184,7 @@ _Avoid_: recipe, procedure, step list (those were the prose a tick used to re-de
 **Cycle state**:
 The one value the **launcher** carries between cycles: an opaque object `afk cycle` returns and takes
 back verbatim, holding the fingerprint of the fleet as the last **tick** left it, the skip streak, the empty streak, what that
-tick left in flight, whether it left anything unsettled and which **status board** each claim already shows — and the **fleet instance**'s two facts, its id and the
+tick left in flight, whether it left anything unsettled (a judgment, an error, a PR that opened while it ran) and which **status board** each claim already shows — and the **fleet instance**'s two facts, its id and the
 **worker launch command**, from the first cycle on. The launcher never reads into it or does arithmetic on it; pacing, the
 skipped cycle's heartbeat and the forced tick are all decided from it in code (ADR-0017).
 _Avoid_: launcher memory, last summary (a tick's account of what it did is folded in by the same call, and never travels)

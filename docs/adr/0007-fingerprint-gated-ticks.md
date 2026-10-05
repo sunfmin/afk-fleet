@@ -28,6 +28,23 @@ its two invariants did not.
   ticks whatever the digest says (`reason: wake`), and the forced tick remains the backstop for a
   change nobody announced.
 
+**Note — a PR that opens behind a tick's back.** The closing digest swallowed more than that note
+allowed for. A worker opens its PR and wakes the launcher within seconds; the tick that wake
+starts reads GitHub once, at its top, and GitHub may not yet list the PR — or lists it before it
+lists the issue the PR closes, which is the only thing that makes it a claim's PR. The tick saw a
+claim with no PR and did nothing; its closing digest held the PR; the next cycle read `unchanged`
+and skipped. No wake was pending (the one that came had been spent on the tick that looked too
+early), so the PR waited for the forced tick or for some unrelated change — measured on a live
+fleet, 2 min 23 s and 4 min 42 s with the landing turn free the whole time. Two changes:
+
+- **The issues a PR closes are in its row of the digest.** The link arriving after the PR now
+  reads as a change.
+- **A tick says which PRs it did not act on.** The closing gather is compared with the working set
+  the tick worked from (`unseen_prs`): a claim whose closing PR is not the one its row named leaves
+  the cycle state `unsettled`, and the cycle returns `sleep_seconds: 0`. The launcher opens the
+  next cycle at once; it ticks (`reason: unsettled`) and grants the turn. It costs no read — the
+  closing gather is the one the digest is taken from.
+
 ## Context
 
 ADR-0001/0002 bound the fleet's context growth — tokens *per call* — but every launcher wake-up

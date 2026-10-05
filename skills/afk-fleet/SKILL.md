@@ -198,7 +198,9 @@ from the first cycle on.
    handed you ([Judgments](#judgments)). Judgments answered → **step 1 at once**, with the `state`
    this cycle returned.
 3. **Otherwise show `progress`** — the cycle's one human line — **and sleep `sleep_seconds`**
-   (`ScheduleWakeup`). The number already encodes the pacing rules — you
+   (`ScheduleWakeup`). `sleep_seconds` 0 with no judgments is not a sleep: a PR opened while the
+   tick ran, and it gets its landing turn from the next cycle — **step 1 at once**, with no
+   `ScheduleWakeup` in between (it cannot wait less than a minute). The number already encodes the pacing rules — you
    apply none yourself: `busy_interval_seconds` (default 90) while the last tick did anything or anything is in
    flight, so finished PRs land promptly; `idle_interval_seconds` (default 1500) once `idle_ticks_before_sleep`
    consecutive cycles were **empty** (a tick that did nothing, or a skip, with nothing in flight and
