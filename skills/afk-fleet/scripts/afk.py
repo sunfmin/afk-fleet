@@ -738,11 +738,20 @@ def cmd_cycle(a):
     tick could not decide comes back as `judgments`, each with the `afk` command
     for either answer; the caller runs one and opens the next cycle at once
     (`sleep_seconds` is then 0). Only that ever reaches a context — the raw
-    issue/PR/ref JSON lives and dies here."""
+    issue/PR/ref JSON lives and dies here.
+
+    `--drain` is the last cycle of a run, the launcher's stop: no gate and no
+    tick — `_drain` releases my claims that no open PR stands behind and keeps
+    the rest → `"action": "drain"`, `sleep_seconds` null."""
     cfg = _cfg(a)
     state = afk_decide.cycle_state(json.loads(a.state) if a.state else None,
                                    a.instance, a.worker_command)
     a.instance, a.worker_command = state["instance"], state["worker_command"]
+    if a.drain:
+        released, kept, errors = _drain(a, _rebuild(a, cfg))
+        return {"action": "drain", "reason": "stop",
+                **afk_decide.cycle_drained(state, released, kept, len(errors)),
+                "judgments": [], **({"errors": errors} if errors else {})}
     gathered = _gather(a, cfg) if cfg["fingerprint_gate"] else None
     fp = afk_decide.fingerprint(*gathered[:3]) if gathered else None  # heartbeats: see fingerprint
     woke = afk_decide.cycle_wake(state, fp, cfg)
@@ -755,6 +764,29 @@ def cmd_cycle(a):
     return {"action": "tick", "reason": woke["reason"],
             **afk_decide.cycle_ticked(woke["state"], did, cfg, len(judgments), len(errors)),
             "judgments": judgments, **({"errors": errors} if errors else {})}
+
+
+def _drain(a, ws):
+    """The stop: release every claim of mine that no open PR stands behind — a
+    worker still coding, an orphan, a claim that outlived its issue — and keep
+    the rest → (released, kept, errors). A kept claim's PR is landed by a peer,
+    or a later run, once this instance's lease lapses; a release that failed is
+    recorded in `errors` and its claim counted as kept, which it is. Nothing
+    is dispatched, granted or failed, and no worker is touched: the ones in
+    flight finish on their own."""
+    released, kept, errors = [], [], []
+    for row in ws["mine"]:
+        if row["pr"] and row["status"] != "closed":
+            kept.append(row["number"])
+            continue
+        try:
+            cmd_release(argparse.Namespace(**{**vars(a), "number": row["number"],
+                                              "expect_sha": None}))
+            released.append(row["number"])
+        except (OSError, ValueError, RuntimeError) as e:
+            errors.append({"step": "release", "issue": row["number"], "error": str(e)})
+            kept.append(row["number"])
+    return released, kept, errors
 
 
 def _tick(a, cfg, ws):
@@ -2070,6 +2102,9 @@ def build_parser():
                         "cycle only; then --state carries it")
     p.add_argument("--ready-timeout", type=int, default=120, metavar="s",
                    help="seconds to wait for a started agent to accept a prompt")
+    p.add_argument("--drain", action="store_true",
+                   help="the last cycle of a run: release my claims with no open PR, keep "
+                        "the rest, and do nothing else")
 
     # --- claim refs ---
     command("scan", cmd_scan, "debug: read all claim + heartbeat refs", remote="refs")

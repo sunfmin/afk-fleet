@@ -37,6 +37,7 @@ owner/name` reaches it through a `url.<bare>.insteadOf` rewrite in the clone.
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -932,6 +933,96 @@ def test_the_cycle_state_carries_the_instance_and_the_worker_launch_command():
         assert "fl-9" in w.error("cycle", *R, "--state", json.dumps(state), *ME)
         assert "--worker-command" in w.error("cycle", *R, "--state", json.dumps(state),
                                              "--worker-command", "claude")
+
+
+def test_a_compacted_launcher_carries_on_from_the_repo_the_config_and_the_last_state():
+    """The launcher runs each cycle itself, in a context auto-compaction may cut
+    at any point. What it must still hold afterwards is three values — the repo,
+    the config and the last `state` — and nothing else: no instance id, no worker
+    launch command, no rule. From those alone the next cycle is the same fleet
+    instance's: it claims as that instance, starts workers with the same command,
+    hands back judgments whose commands carry both, and drains its own claims."""
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2, 3)]) as w:
+        config = json.dumps({"concurrency": 2})
+        first = w.afk("cycle", *R, *NOW, "--config", config, "--instance", "fl-7",
+                      "--worker-command", WORKER)
+        assert first["progress"] == "dispatched #1, #2; 2 in flight, 1 left on the frontier"
+        # the compaction: all that survives is this one line of text
+        note = json.dumps({"repo": REPO, "config": config, "state": first["state"]})
+        del first, config
+
+        def launcher(note, *extra, now=T0):
+            """One cycle by a launcher that kept only `note` → (its result, the next note)."""
+            kept = json.loads(note)
+            assert set(kept) == {"repo", "config", "state"}
+            r = w.afk("cycle", "--repo", kept["repo"], "--config", kept["config"],
+                      "--state", json.dumps(kept["state"]), "--now", str(now), *extra)
+            return r, json.dumps({**kept, "state": r["state"]})
+
+        # #1 landed, and #2's worker says there was nothing to do: the pass settles
+        # the first, fills the slot it freed, and asks about the second
+        w.set(issues=[issue(1, "ready-for-agent", state="closed"),
+                      issue(2, "ready-for-agent"), issue(3, "ready-for-agent")])
+        verdict(w, 2, "already-satisfied")
+        r, note = launcher(note, now=int(time.time()) + 5000)
+        assert r["progress"] == ("dispatched #3; cleared #1; 1 judgment open; "
+                                 "2 in flight, 0 left on the frontier")
+        assert w.claimed_by(3) == "fl-7" and w.claimed_by(1) is None
+        assert [t["command"] for t in w.terminals()] == [WORKER] * 3
+        # the judgment is answered with what it carries, not with what was remembered
+        (j,) = r["judgments"]
+        assert (j["issue"], j["kind"], r["sleep_seconds"]) == (2, "empty_diff", 0)
+        assert "--instance fl-7 " in j["if_yes"] and "--instance fl-7 " in j["if_no"]
+        assert shlex.quote(WORKER) in j["if_no"]                     # a retry starts a worker
+        assert answer(w, j["if_yes"])["action"] == "closed" and w.claimed_by(2) is None
+
+        # answered → the next cycle at once, and it does not ask again
+        r, note = launcher(note, now=int(time.time()))
+        assert r["judgments"] == [] and r["state"]["instance"] == "fl-7"
+        assert r["state"]["worker_command"] == WORKER
+
+        # the stop, from the same three values
+        r, note = launcher(note, "--drain")
+        assert (r["action"], r["progress"]) == ("drain", "drained; released #3")
+        assert w.claimed_by(3) is None
+
+
+def test_the_drain_releases_claims_with_no_pr_and_keeps_those_with_one():
+    """`afk cycle --drain` is the launcher's stop, in code: a claim no open PR
+    stands behind is released — its worker still coding, or its issue already
+    closed — and one with an open PR is kept, for a peer or a later run to land
+    once the lease lapses. Nothing else happens: no turn, no dispatch, no worker
+    told anything, no peer's claim touched."""
+    issues = [issue(n, "ready-for-agent") for n in (1, 2, 3, 4)]
+    issues += [issue(5, "ready-for-agent", state="closed")]
+    with world(issues=issues) as w:
+        with_pr(w, 1, 10, conclusion="PENDING")                      # finished, checks running
+        w.afk(*dispatch(2))                                          # still coding
+        w.afk("claim", "4", "--instance", "peer-live", *NOW, *R)
+        w.afk("heartbeat", "--instance", "peer-live", "--now", str(T0 - 60), *R)
+        r = cycle(w, None, "--set", "concurrency=2")
+        assert r["progress"] == "2 in flight, 1 left on the frontier"
+        w.afk("claim", "5", *ME, *NOW, *R)                           # mine, outlived its issue
+        sent = [len(t["sent"]) for t in w.terminals()]
+
+        done = cycle(w, r["state"], "--drain", "--set", "concurrency=2")
+        assert set(done) == {"action", "reason", "state", "sleep_seconds", "progress", "judgments"}
+        assert (done["action"], done["reason"]) == ("drain", "stop")
+        assert done["progress"] == "drained; released #2, #5; kept #1"
+        # nothing follows a drain: no sleep, nothing to answer
+        assert done["sleep_seconds"] is None and done["judgments"] == []
+        assert done["state"]["in_flight"] == 1 and done["state"]["instance"] == "me"
+        assert w.claimed_by(2) is None and w.claimed_by(5) is None
+        assert w.claimed_by(1) == "me" and "state" not in w.pr(10)   # the PR is left open
+        # the frontier was not worked, the peer not touched, no worker told anything
+        assert w.claimed_by(3) is None and w.claimed_by(4) == "peer-live"
+        assert [len(t["sent"]) for t in w.terminals()] == sent
+        # an open issue's worktree may hold work: the drain removes none
+        assert {wt["linkedIssue"] for wt in w.worktrees()} == {1, 2}
+
+        # draining twice is harmless, and so is a drain that was never preceded by a cycle
+        assert cycle(w, done["state"], "--drain")["progress"] == "drained; kept #1"
+        assert cycle(w, None, "--drain")["progress"] == "drained; kept #1"
 
 
 def test_a_tick_in_code_settles_every_row_the_rebuild_routes():

@@ -1198,6 +1198,20 @@ def test_cycle_ticked_folds_what_the_tick_did_and_counts_empty_ticks():
     assert ticked(asked["state"])["state"]["unsettled"] is False     # a clean tick settles it
 
 
+def test_cycle_drained_folds_the_stop_and_schedules_nothing():
+    st = d.cycle_ticked(d.cycle_state(None, **FACTS), _did(in_flight=3), PACE_CFG)["state"]
+    r = d.cycle_drained(st, [1, 2], [7])
+    assert r["progress"] == "drained; released #1, #2; kept #7"
+    assert r["sleep_seconds"] is None                          # no cycle follows a drain
+    assert (r["state"]["in_flight"], r["state"]["unsettled"]) == (1, False)
+    assert d.cycle_state(r["state"]) == r["state"]             # still a state the code takes back
+    assert d.cycle_drained(st, [], [])["progress"] == "drained"
+    # a release that failed left its claim held: said, and never read as settled
+    failed = d.cycle_drained(st, [1], [2, 7], errors=1)
+    assert failed["progress"] == "drained; released #1; kept #2, #7; 1 error"
+    assert failed["state"]["unsettled"] is True
+
+
 def test_cycle_wake_gates_beats_and_paces_a_skipped_cycle():
     cfg, st = PACE_CFG, d.cycle_state(None, **FACTS)
     first = d.cycle_wake(st, "aaa", cfg)
