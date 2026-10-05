@@ -11,7 +11,7 @@ A PR may land only when **all** configured gates are green. Which **machine gate
 - **`required` (default) — the CI machine gate.** Wait for the PR's GitHub checks. `afk turn` grants
   the landing turn only when they are green, and `afk land` lands the PR only when they are green
   **on the head that lands**: if its sync moved the head, the old checks describe a tree that will
-  not merge, so it returns `awaiting_ci`, the worker stops, and your next `afk turn` tells it to land
+  not merge, so it returns `awaiting_ci`, the worker stops, and the next pass's `afk turn` tells it to land
   again once CI has spoken about that head. On red, read the failing-log excerpt for the `afk fail` reason in an **ephemeral sub-read** that
   returns only `{status: red, reason}`; raw logs never enter the tick. Progressive: before CI exists a
   PR has no checks at all — `rebuild` reports it `awaiting_turn` (there is nothing to wait for), `afk turn` returns `no_checks`, the gate is then the issue's acceptance
@@ -56,7 +56,8 @@ A PR may land only when **all** configured gates are green. Which **machine gate
   refutation blocks the landing, is **posted as a PR review comment** (durable, re-readable on retry),
   and feeds back as a retry reason (`afk fail --reason`). A worker never verifies itself, so it is
   settled **before** the turn, on the PR's exact head: `afk turn` returns `needs_verify` with that
-  `head`; verify it, then re-run `afk turn --verified <head>`. The verified head travels with the
+  `head`, which the pass hands back as an `adversarial_verify` judgment; verify it, then run its
+  `if_yes` — `afk turn --verified <head>`. The verified head travels with the
   turn, and `afk land` checks it after its machine gate — run or trusted from the record, it makes no
   difference: a verification of any other head does not count, so a landing whose sync moved the
-  branch stops with `needs_verify`, and your next `afk turn` asks again with the new `head`.
+  branch stops with `needs_verify`, and the next pass's `afk turn` asks again with the new `head`.
