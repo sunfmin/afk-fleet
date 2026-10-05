@@ -22,4 +22,4 @@ Every PR opened in this repo is landed and installed in the same breath — no w
 
 1. **Merge + delete the branch**: `gh pr merge <n> --squash --delete-branch`. Checks red or a merge conflict -> fix it first; never merge red.
 2. **Sync local**: `git checkout master && git pull --ff-only`.
-3. **Install the skill**: `npx skills update afk-fleet -g -y`, so `~/.agents/skills/afk-fleet/` runs what just merged. Confirm `updatedAt` moved in `~/.agents/.skill-lock.json`.
+3. **Install the skill**: `npx skills update afk-fleet -g -y`, so `~/.agents/skills/afk-fleet/` runs what just merged. Confirm `updatedAt` moved in `~/.agents/.skill-lock.json` — unless the PR left `skills/afk-fleet/` untouched, where "All global skills are up to date" is the expected answer.
