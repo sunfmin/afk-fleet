@@ -433,6 +433,8 @@ if cmd == ["terminal", "send"]:
     term = terminal()
     if term is None:
         finish(error="terminal_handle_stale")
+    if fake.get("send_refused"):
+        finish({"send": {"accepted": False}})
     term["sent"].append({"text": opt("--text"), "enter": "--enter" in argv})
     finish({"send": {"accepted": True}})
 
@@ -450,7 +452,8 @@ if cmd == ["worktree", "ps"]:
 if cmd == ["terminal", "list"]:
     row = worktree()
     finish({"terminals": [{"handle": t["handle"], "worktreePath": t["worktreePath"],
-                           "connected": True, "writable": True, "lastOutputAt": i}
+                           "connected": t.get("connected", True), "writable": True,
+                           "lastOutputAt": i}
                           for i, t in enumerate(fake["terminals"])
                           if t["open"] and row and t["worktreePath"] == row["path"]]})
 
@@ -618,7 +621,8 @@ class World:
     # --- orca -------------------------------------------------------------
     def orca(self, worktrees=None, **knobs):
         """Set orca's worktree rows and/or the fake's knobs (`never_ready`,
-        `stale_base`, `rm_fails`, `repos`), keeping everything else it remembers."""
+        `stale_base`, `rm_fails`, `send_refused`, `repos`), keeping everything else it
+        remembers."""
         if os.path.exists(self.orca_file):
             try:
                 with open(self.orca_file) as f:
@@ -3873,6 +3877,88 @@ def test_an_orca_that_cannot_be_asked_is_an_error_for_every_observation_of_a_wor
         w.orca(ps_truncated=True)
         assert "truncated" in w.error("no-pr", "--batch", batch, *R, *gate, *NOW)
         assert "truncated" in w.error("no-pr", "--issue", "1", *R, *gate)
+
+
+def test_a_terminal_that_does_not_take_what_a_worker_is_told_is_one_error():
+    """A nudge, a landing turn and a worker's prompt are each one line said to a
+    worker's terminal. A terminal that does not accept the line is one error,
+    raised in one place — and what was not said is not on record as said."""
+    gate = local_gate("true")
+    with world(issues=[issue(5, "ready-for-agent"), issue(6, "ready-for-agent")]) as w:
+        d, _ = with_pr(w, 5, 50)
+        nudge = ("nudge", "--issue", "5", *ME, *R, *gate)
+        w.orca(send_refused=True)
+        term = d["terminal"]
+        assert w.error(*nudge) == f"terminal {term} did not accept the nudge"
+        assert w.error(*_turn(5, *gate)) == f"terminal {term} did not accept the landing turn"
+        assert "did not accept the worker prompt" in w.error(*dispatch(6))
+        assert len(w.terminals()[0]["sent"]) == 1                    # only its first prompt
+        # the nudge that was not taken was not recorded: the worker is nudged, once
+        w.orca(send_refused=False)
+        assert w.afk(*nudge)["action"] == "nudged"
+    with open(AFK) as f:
+        src = f.read()
+    assert src.count("raise WorkerNotTold(") == 1 and src.count('.get("accepted")') == 1
+
+
+def test_a_worker_put_where_an_agent_already_is_closes_that_agent_first():
+    """Two agents in one worktree would fight. Whatever is in a worktree a worker
+    is put into — an issue's or a merge batch's — is closed first, in one place."""
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
+        gate = (*local_gate("true"), *BATCH)
+        d = {n: with_pr(w, n, n * 10, gate=gate)[0] for n in (1, 2)}
+
+        def agents(path):
+            return [t["open"] for t in w.terminals() if t["worktreePath"] == path]
+
+        # a merge batch's worktree: its worker hung — still there, no longer reachable
+        assert w.afk(*_turn_batch(*gate))["outcome"] == "granted"
+        bwt = _the_batch(w, gate)["worktree"]
+        terms = w.terminals()
+        terms[-1]["connected"] = False
+        w.orca(terminals=terms)
+        w.orca_calls()
+        r = w.afk(*_turn_batch(*gate, now=T0 + 90))
+        assert (r["outcome"], r["delivery"], r["worktree"]) == ("granted", "worktree", bwt), r
+        assert w.orca_calls() == ["terminal list", "terminal close", "terminal create",
+                                  "terminal wait", "terminal send"]
+        assert agents(bwt) == [False, True]
+
+        # an issue's worktree: its worker stopped, and is continued where it stood
+        r = w.afk(*dispatch(1, *gate, "--now", str(T0 + 90)))
+        assert (r["action"], r["worktree"]) == ("reuse_worktree", d[1]["worktree"]), r
+        assert w.orca_calls() == ["terminal close", "terminal create", "terminal wait",
+                                  "terminal send"]
+        assert agents(d[1]["worktree"]) == [False, True]
+        # a worktree just cut has no agent to close
+        assert agents(d[2]["worktree"]) == [True]
+    with open(AFK) as f:
+        assert f.read().count('"terminal", "close"') == 1
+
+
+# What the worker module replaced: none of these is a name any more.
+_REPLACED_BY_THE_WORKER_MODULE = {
+    "_orca_worktree_rows", "_issue_worktree", "_live_worktree", "_batch_worktree",
+    "_batch_worktrees", "_create_worktree", "_cut_worktree", "_remove_worktree", "_live_terminal",
+    "_tui_idle", "_terminal_tail", "_open_terminal", "_submit_prompt", "_write_brief", "_nudge"}
+
+
+def test_only_the_worker_module_types_an_orca_command():
+    """No transition types an orca command: `_orca` is called only by the worker
+    module's two classes, orca is run in one place, and the helpers the module
+    replaced are gone."""
+    import ast
+    with open(AFK) as f:
+        src = f.read()
+    tree = ast.parse(src)
+    callers = {top.name for top in tree.body for node in ast.walk(top)
+               if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+               and node.func.id == "_orca"}
+    assert callers == {"_Worktree", "_Workers"}, callers
+    assert src.count('["orca",') == 1
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    names |= {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    assert not names & _REPLACED_BY_THE_WORKER_MODULE, names & _REPLACED_BY_THE_WORKER_MODULE
 
 
 def test_bootstrap_refuses_a_merge_batch_the_target_would_not_take():

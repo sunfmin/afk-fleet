@@ -245,8 +245,9 @@ class OrcaError(RuntimeError):
 def _orca(args, timeout=60):
     """One `orca … --json` call → its `result` object. HARD: raises when orca
     cannot be run, exits non-zero, or answers `ok: false` — the Act half cannot
-    start, find or remove a worker's worktree without it (ADR-0005). The one soft
-    read is `_orca_worktree_rows`, which recovery must survive without."""
+    start, find or remove a worker's worktree without it (ADR-0005). Called only
+    by the worker module (`_Workers`, `_Worktree`), which is also where the one
+    soft read is: `_Worktree._rows`, which recovery must survive without."""
     what = f"orca {' '.join(args[:2])}"
     try:
         p = subprocess.run(["orca", *args, "--json"], capture_output=True, text=True,
@@ -447,20 +448,6 @@ def _record_turn(repo, pr_number, turn):
     rewritten when there was one, whoever wrote it, so a PR never carries two
     turns to tell apart."""
     return _comment(repo, pr_number, afk_decide.turn_comment(turn), turn["comment_id"])
-
-
-def _orca_worktree_rows():
-    """The `result.worktrees` rows of `orca worktree list --json`, or [] when orca
-    can't be reached. SOFT by design: the worktree signal is one input to a tiered
-    recovery whose last tier needs no orca at all, so a machine without orca (or a
-    momentarily unhappy one) must degrade to "no local worktree", never abort a
-    recovery."""
-    try:
-        p = subprocess.run(["orca", "worktree", "list", "--json"],
-                           capture_output=True, text=True, timeout=30)
-        return list(json.loads(p.stdout)["result"]["worktrees"]) if p.returncode == 0 else []
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
-        return []
 
 
 def _worktree_progress(wt, rem, base):
@@ -761,9 +748,9 @@ def _release_claim(run, instance, number, expect_sha=None):
         closed_pr = _close_landed_pr(run, number)
         if closed_pr:
             released["closed_pr"] = closed_pr
-        path, _ = _issue_worktree(run.repo, number)
-        if path and cfg["worktree_cleanup"]:
-            released["cleanup"] = _remove_worktree(path)
+        worktree = _Worktree.of_issue(run.repo, number)
+        if worktree.remembered and cfg["worktree_cleanup"]:
+            released["cleanup"] = worktree.remove()
     return released
 
 
@@ -1377,22 +1364,25 @@ def cmd_rebuild(a):
 
 
 # --------------------------------------------------------------------------- #
-# the worker of an issue, or of a merge batch: where it is, what it is doing   #
+# the worker of an issue, or of a merge batch                                  #
 # --------------------------------------------------------------------------- #
 #
-# The one place orca is asked where a worker's worktree is and what its worker
-# is doing, for an issue's worker and a merge batch's alike. How orca is read
-# follows from what the answer is for, so no caller picks:
+# The one place orca is asked about a worker, an issue's and a merge batch's
+# alike: where its worktree is, what it is doing, and everything the fleet does
+# to it. No transition types an orca command. How orca is read follows from what
+# the answer is for, so no caller picks:
 #
 #   what a worker is DOING    `_Workers` — HARD. Its answer may be "the worker is
 #                             gone", and an orca that cannot be asked, read that
 #                             way, starts a second worker beside a live one
 #                             (ADR-0021): it is an error instead.
-#   WHERE a worktree is, to   `_issue_worktree`, `_live_worktree`,
-#   act on it or recover      `_batch_worktree`, `_batch_worktrees` — SOFT. No orca
-#   from it                   is "no worktree here": a recovery has tiers that
-#                             need none (ADR-0011), and whatever then has to
-#                             start or tell a worker asks orca hard itself.
+#   WHERE a worktree is, to   `_Worktree.of_issue`, `.of_batch`, `.of_batches` —
+#   act on it or recover      SOFT. No orca is "no worktree here": a recovery has
+#   from it                   tiers that need none (ADR-0011).
+#   what is DONE to a worker  `_Worktree.cut`, `.put`, `.tell`, `.screen` — HARD:
+#                             a worker cannot be started or told without orca
+#                             (ADR-0005). `.remove` alone reports instead of
+#                             raising: what it cleans up after is already durable.
 
 def _on_disk(path):
     """`path` when it is a directory on this machine's disk, else None — the one
@@ -1401,38 +1391,256 @@ def _on_disk(path):
     return path if path and os.path.isdir(path) else None
 
 
-def _issue_worktree(repo, number):
-    """This machine's orca worktree for an issue → (path, branch), each None when
-    there is none. A path orca remembers but the disk no longer has is returned
-    as-is, for the callers that must still see it: removing it, reporting it. One
-    that will read the worktree asks `_live_worktree` instead."""
-    hit = afk_decide.find_orca_worktree(_orca_worktree_rows(), number, repo)
-    return hit["path"], hit["branch"]
-
-
-def _live_worktree(repo, number):
-    """The path of an issue's worktree that is really on this machine's disk, None
-    when orca knows none or the directory is gone — what every caller that works
-    IN the worktree wants."""
-    return _on_disk(_issue_worktree(repo, number)[0])
-
-
-def _batch_worktrees(repo, instance):
-    """Every worktree orca remembers here for a merge batch of `instance` →
-    [{"batch", "path", "branch"}], whether or not the disk still has it."""
-    return afk_decide.batch_worktrees(_orca_worktree_rows(), repo, instance=instance)
-
-
-def _batch_worktree(repo, batch):
-    """The path of a merge batch's worktree that is really on this machine's
-    disk, None when there is none."""
-    return _batch_path(_orca_worktree_rows(), repo, batch)
-
-
 def _batch_path(rows, repo, batch):
-    """`_batch_worktree`, from orca's worktree `rows` however they were read."""
+    """The path of a merge batch's worktree that is really on this machine's
+    disk, None when there is none — from orca's worktree `rows` however they
+    were read."""
     return next((path for hit in afk_decide.batch_worktrees(rows, repo, batch=batch)
                  for path in [_on_disk(hit["path"])] if path), None)
+
+
+_WORKER_BRIEF = "afk-worker-prompt.md"
+_BRIEF_POINTER = ("Your task brief is the file {brief} — read it now and carry it out end to end. "
+                  "It is my instruction to you; do not ask me to confirm.")
+_NUDGE_MARK = "afk-nudge.json"
+
+# How long orca is given to say a terminal is idle; it answers at once when it is.
+_TUI_IDLE_PROBE_MS = 2000
+
+
+def _worker_file(path, name):
+    """A fleet-private file about the worker in a worktree, kept in the worktree's
+    own git dir: never staged by the worker's `git add -A`, gone when the worktree
+    is."""
+    git_dir = _git(["-C", path, "rev-parse", "--absolute-git-dir"]).stdout.strip()
+    return os.path.join(git_dir, name)
+
+
+class WorkerNotTold(RuntimeError):
+    """The worker's terminal did not accept what it was told."""
+
+
+class _Worktree:
+    """The worktree of one worker on this machine — an issue's or a merge
+    batch's — and everything the fleet does to the worker in it: tell it one
+    line (`tell`), put a new worker in it on a brief (`put`), read where it
+    stopped (`screen`), remove it (`remove`).
+
+    `path` is the worktree on this disk, None when there is none here;
+    `remembered` is the path orca (or whoever named it) gave, kept for the
+    callers that must still see a directory the disk has lost: removing it,
+    reporting it. `branch` is the branch orca named for it, where orca was the
+    one asked; `batch` the merge batch it is the worktree of, if any."""
+
+    def __init__(self, path, branch=None, batch=None, new=False):
+        self.remembered, self.path = path, _on_disk(path)
+        self.branch, self.batch = branch, batch
+        self._new = new             # just cut: no agent can be in it yet
+
+    # --- where it is -------------------------------------------------------
+
+    @staticmethod
+    def _rows():
+        """Orca's worktree rows, or [] when orca cannot be asked. SOFT by design:
+        the worktree signal is one input to a tiered recovery whose last tier
+        needs no orca at all, so a machine without orca (or a momentarily unhappy
+        one) must degrade to "no local worktree", never abort a recovery."""
+        try:
+            return list(_orca(["worktree", "list"], timeout=30).get("worktrees") or [])
+        except (RuntimeError, TypeError, AttributeError):
+            return []
+
+    @classmethod
+    def of_issue(cls, repo, number):
+        """The worktree orca remembers here for issue <number>."""
+        hit = afk_decide.find_orca_worktree(cls._rows(), number, repo)
+        return cls(hit["path"], hit["branch"])
+
+    @classmethod
+    def of_batch(cls, repo, batch):
+        """The worktree of merge batch `batch` that is really on this disk."""
+        return cls(_batch_path(cls._rows(), repo, batch), batch=batch)
+
+    @classmethod
+    def of_batches(cls, repo, instance):
+        """Every worktree orca remembers here for a merge batch of `instance`,
+        whether or not the disk still has it."""
+        return [cls(hit["path"], hit["branch"], batch=hit["batch"])
+                for hit in afk_decide.batch_worktrees(cls._rows(), repo, instance=instance)]
+
+    @classmethod
+    def at(cls, path):
+        """The worktree at a path named by hand, or already known."""
+        return cls(path)
+
+    @classmethod
+    def cut(cls, run, at_branch, issue=None, batch=None):
+        """Have orca create a worktree + branch at the REMOTE's current tip of
+        `at_branch` (ADR-0005: orca owns both, and names the branch) — for
+        `issue`, linked to it, or for merge batch `batch`, linked to none. The
+        tip is fetched into the checkout orca cuts worktrees from and handed over
+        as a sha rather than a branch name — and then ASSERTED: the worktree must
+        contain it, however orca resolved the ref. A worker started on a base
+        that is commits behind builds on files that have already moved."""
+        if issue is not None:
+            name = afk_decide.worktree_name(run.cfg["branch_pattern"], issue["number"],
+                                            issue["title"])
+        else:
+            name = afk_decide.batch_name(batch)
+        orca_repo = afk_decide.find_orca_repo(_orca(["repo", "list"]).get("repos"), run.repo)
+        if not orca_repo:
+            raise RuntimeError(f"orca knows no repo for {run.repo} — add this checkout once with "
+                               f"`orca repo add --path <path>`")
+        sha = _fetch_tip(run.rem, at_branch, cwd=orca_repo["path"])
+        wt = _orca(["worktree", "create", "--repo", f"id:{orca_repo['id']}", "--name", name,
+                    "--no-parent", "--base-branch", sha,
+                    *(["--issue", str(issue["number"])] if issue is not None else [])
+                    ]).get("worktree") or {}
+        path, branch = wt.get("path"), wt.get("branch")
+        if not path or not os.path.isdir(path):
+            raise RuntimeError(f"orca worktree create returned no usable path: {path!r}")
+        if _git(["-C", path, "merge-base", "--is-ancestor", sha, "HEAD"],
+                check=False).returncode != 0:
+            _git(["-C", path, "merge", "--ff-only", sha])
+        return cls(path, afk_decide.short_branch(branch), batch=batch, new=True)
+
+    def checked_out(self):
+        """The branch checked out in it now, whatever orca named it at first."""
+        return _git(["-C", self.path, "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+
+    # --- what the worktree remembers of its worker ---------------------------
+
+    @property
+    def brief(self):
+        """The file the worker here was last briefed with, None when there is none."""
+        brief = _worker_file(self.path, _WORKER_BRIEF)
+        return brief if os.path.exists(brief) else None
+
+    def write_brief(self, prompt):
+        """Write the worker's instructions to the worktree's brief file → its
+        path. A worker under a new brief — a new worker, or one just given its
+        landing turn — has not been nudged, whatever came before."""
+        brief = _worker_file(self.path, _WORKER_BRIEF)
+        with open(brief, "w") as f:
+            f.write(prompt)
+        mark = _worker_file(self.path, _NUDGE_MARK)
+        if os.path.exists(mark):
+            os.remove(mark)
+        return brief
+
+    @property
+    def nudge(self):
+        """The nudge recorded for the worker here → {"at", "tail"}, or None when
+        it was never nudged (or there is no worktree to have recorded one in)."""
+        if not self.path:
+            return None
+        try:
+            with open(_worker_file(self.path, _NUDGE_MARK)) as f:
+                return json.load(f)
+        except (OSError, ValueError, RuntimeError):
+            return None
+
+    def record_nudge(self, at, tail):
+        """Record that the worker here was nudged at `at`, its screen then `tail`."""
+        with open(_worker_file(self.path, _NUDGE_MARK), "w") as f:
+            json.dump({"at": at, "tail": tail}, f)
+
+    # --- the worker in it --------------------------------------------------
+
+    @functools.cached_property
+    def terminal(self):
+        """The handle of the live worker terminal here — the one that spoke last,
+        when a worktree somehow has several — or None: no worker is here."""
+        if not self.path:
+            return None
+        rows = _orca(["terminal", "list", "--worktree", f"path:{self.path}"]).get("terminals") or []
+        live = [t for t in rows if t.get("connected", True) and t.get("writable", True)]
+        return max(live, key=lambda t: t.get("lastOutputAt") or 0)["handle"] if live else None
+
+    def seems_idle(self):
+        """Does orca see the worker terminal here idle? Its own reading of the
+        terminal (title, prompt), for a runtime that reports no state. True when
+        it answers within the probe, False when the probe times out — the worker
+        is at it. No live terminal reads as idle: there is nothing busy to wait
+        for."""
+        if self.terminal is None:
+            return True
+        try:
+            wait = _orca(["terminal", "wait", "--terminal", self.terminal, "--for", "tui-idle",
+                          "--timeout-ms", str(_TUI_IDLE_PROBE_MS)]).get("wait") or {}
+        except OrcaError as e:
+            if e.code == "timeout":
+                return False
+            raise
+        return bool(wait.get("satisfied"))
+
+    def screen(self):
+        """The last lines of the worker's rendered screen, bounded; None when no
+        worker is here. Read for ONE purpose: saying where a silent worker
+        stopped (ADR-0018) — never for its result, which is only ever a PR or a
+        verdict marker."""
+        if self.terminal is None:
+            return None
+        shown = _orca(["terminal", "read", "--terminal", self.terminal, "--screen",
+                       "--limit", str(afk_decide.STALL_TAIL_LINES * 2)]).get("terminal") or {}
+        return afk_decide.stall_tail(shown.get("tail"))
+
+    def tell(self, line, what):
+        """Say one line to the worker here → its terminal's handle. Sent WITH
+        `--enter`: typed but unsubmitted, a worker sits idle forever,
+        indistinguishable from one that finished. `what` names the line in the
+        one error a terminal that did not take it raises."""
+        sent = _orca(["terminal", "send", "--terminal", self.terminal, "--text", line,
+                      "--enter"]).get("send") or {}
+        if not sent.get("accepted"):
+            raise WorkerNotTold(f"terminal {self.terminal} did not accept {what}")
+        return self.terminal
+
+    def put(self, agent, prompt):
+        """Put a new worker in this worktree, on `prompt` → the rest of its start,
+        to call: wait for the agent until its TUI is idle, then submit its prompt
+        → its terminal's handle. A start is split there so that a tick opens
+        every terminal it will, and then waits on them all at once.
+
+        Whatever agent was here first is closed — dead or idle, two in one
+        worktree would fight. The new one is started with the run's OPAQUE worker
+        launch command (never `--agent`, ADR-0010), and the prompt goes to a
+        brief FILE with only a one-line pointer for the agent — a whole prompt
+        sent as text arrives as one paste, which the agent reads as quoted
+        material and asks to have confirmed instead of starting."""
+        if not self._new:
+            try:
+                _orca(["terminal", "close", "--worktree", f"path:{self.path}", "--all"])
+            except RuntimeError:
+                pass
+        brief = self.write_brief(prompt)
+        term = _orca(["terminal", "create", "--worktree", f"path:{self.path}",
+                      "--command", agent.command]).get("terminal") or {}
+        handle = term.get("handle")
+        if not handle:
+            raise RuntimeError("orca terminal create returned no terminal handle")
+        self.terminal, self._new = handle, False
+        ready_timeout = agent.ready_timeout
+
+        def submit():
+            wait = _orca(["terminal", "wait", "--terminal", handle, "--for", "tui-idle",
+                          "--timeout-ms", str(ready_timeout * 1000)],
+                         timeout=ready_timeout + 30).get("wait") or {}
+            if not wait.get("satisfied"):
+                raise RuntimeError(f"the worker in {self.path} was not ready for a prompt within "
+                                   f"{ready_timeout}s (terminal {handle})")
+            return self.tell(_BRIEF_POINTER.format(brief=brief), "the worker prompt")
+        return submit
+
+    def remove(self):
+        """Have orca remove the worktree (and its terminals). Soft: by the time
+        this runs the transition that mattered — a merge, a close — is already
+        durable, so a failed cleanup is reported, never raised."""
+        try:
+            _orca(["worktree", "rm", "--worktree", f"path:{self.remembered}", "--force"])
+            return {"removed": True, "path": self.remembered}
+        except RuntimeError as e:
+            return {"removed": False, "path": self.remembered, "detail": str(e)}
 
 
 # Far above any one machine's worktree count: a page that stops short is an error.
@@ -1455,7 +1663,7 @@ class _Worker:
     @functools.cached_property
     def nudged_at(self):
         """When this worker was nudged, None when it never was."""
-        return (_nudge(self.path) or {}).get("at")
+        return (_Worktree.at(self.path).nudge or {}).get("at")
 
     @property
     def settled(self):
@@ -1505,7 +1713,8 @@ class _Workers:
         reading = afk_decide.read_worker_state(row, self.now, self.grace)
         if reading["terminal"] != "none" and reading["state"] is None:
             # a runtime that reports nothing: ask orca whether its terminal is idle
-            reading = afk_decide.read_worker_state(row, self.now, self.grace, _tui_idle(path))
+            reading = afk_decide.read_worker_state(row, self.now, self.grace,
+                                                    _Worktree.at(path).seems_idle())
         return _Worker(path, reading, self.now, self.grace)
 
 
@@ -1639,29 +1848,24 @@ def _nudge_worker(run, instance, number=None, batch_id=None, worktree=None):
         raise ValueError("afk nudge takes exactly one of --issue <n>, --batch <batch>")
     if batch_id:
         _require_my_batch(run, instance, batch_id)
-        who, path = f"merge batch {batch_id}", worktree or _batch_worktree(run.repo, batch_id)
+        who, found = f"merge batch {batch_id}", _Worktree.of_batch
     else:
         _require_mine(rem, cfg, number, instance)
-        who, path = f"issue #{number}", worktree or _live_worktree(run.repo, number)
-    if not path or not os.path.isdir(path):      # the isdir is for a --worktree given by hand
+        who, found = f"issue #{number}", _Worktree.of_issue
+    wt = _Worktree.at(worktree) if worktree else found(run.repo, batch_id or number)
+    if not wt.path:
         raise RuntimeError(f"{who} has no worktree on this machine — there is no "
                            f"worker here to nudge")
-    if _nudge(path) is not None:
+    if wt.nudge is not None:
         raise RuntimeError(f"the worker on {who} was already nudged — a second "
                            f"silence is a failure (`afk fail`, or for a batch `afk turn "
                            f"--abandon`), not another nudge")
-    handle = _live_terminal(path)
-    if handle is None:
-        raise RuntimeError(f"no live terminal in {path} — the worker is dead, not stalled "
+    if wt.terminal is None:
+        raise RuntimeError(f"no live terminal in {wt.path} — the worker is dead, not stalled "
                            f"(`afk dispatch` continues it)")
-    tail = _terminal_tail(handle)
-    brief = _worker_file(path, _WORKER_BRIEF)
-    sent = _orca(["terminal", "send", "--terminal", handle, "--enter", "--text",
-                  afk_decide.nudge_text(brief if os.path.exists(brief) else None)]).get("send") or {}
-    if not sent.get("accepted"):
-        raise RuntimeError(f"terminal {handle} did not accept the nudge")
-    with open(_worker_file(path, _NUDGE_MARK), "w") as f:
-        json.dump({"at": run.now(), "tail": tail}, f)
+    tail = wt.screen()
+    handle = wt.tell(afk_decide.nudge_text(wt.brief), "the nudge")
+    wt.record_nudge(run.now(), tail)
     return {**({"batch": batch_id} if batch_id else {"issue": number}),
             "action": "nudged", "terminal": handle, "terminal_tail": tail}
 
@@ -1670,13 +1874,12 @@ def _stalled_reason(repo, number, reason):
     """`reason`, plus where the worker stopped when this failure follows a nudge
     it never answered: its screen as it is now, else as it was when nudged. Soft —
     a failure is never blocked on reading a terminal."""
-    path = _live_worktree(repo, number)
-    nudge = _nudge(path)
+    wt = _Worktree.of_issue(repo, number)
+    nudge = wt.nudge
     if nudge is None:
         return reason
     try:
-        handle = _live_terminal(path)
-        tail = _terminal_tail(handle) if handle else None
+        tail = wt.screen()
     except RuntimeError:
         tail = None
     return afk_decide.stall_reason(reason, tail or nudge.get("tail"))
@@ -1699,11 +1902,13 @@ def _recovery(cfg, rem, repo, number, path=None, branch=None, no_worktree=False)
 
     # --- tier-1 signal: a worktree for this issue, still on this machine ---
     if path is None and not no_worktree:
-        path, found_branch = _issue_worktree(repo, number)
-        branch = branch or found_branch
-    present = _on_disk(path) is not None
-    worktree = {"present": present, "path": path,
-                **(_worktree_progress(path, rem, base) if present else {})}
+        wt = _Worktree.of_issue(repo, number)
+        branch = branch or wt.branch
+    else:
+        wt = _Worktree.at(path)
+    present = wt.path is not None
+    worktree = {"present": present, "path": wt.remembered,
+                **(_worktree_progress(wt.path, rem, base) if present else {})}
 
     # --- tier-2 signal: the branch the dead worker pushed ---
     candidates = [] if branch else afk_decide.branch_candidates(
@@ -1731,48 +1936,6 @@ def cmd_recovery(a):
 # act: starting a worker — dispatch                                            #
 # --------------------------------------------------------------------------- #
 
-def _create_worktree(run, issue, at_branch):
-    """Have orca create the worktree + branch for an issue at the REMOTE's current
-    tip of `at_branch` (`_cut_worktree`) → (path, branch, sha)."""
-    name = afk_decide.worktree_name(run.cfg["branch_pattern"], issue["number"], issue["title"])
-    return _cut_worktree(run, name, at_branch, issue["number"])
-
-
-def _cut_worktree(run, name, at_branch, issue=None):
-    """Have orca create a worktree + branch at the REMOTE's current tip of
-    `at_branch` (ADR-0005: orca owns both, and names the branch) → (path, branch,
-    sha) — linked to `issue`, or to none: a merge batch's. The tip is fetched
-    into the checkout orca cuts worktrees from and
-    handed over as a sha rather than a branch name — and then ASSERTED: the
-    worktree must contain it, however orca resolved the ref. A worker started on a
-    base that is commits behind builds on files that have already moved."""
-    orca_repo = afk_decide.find_orca_repo(_orca(["repo", "list"]).get("repos"), run.repo)
-    if not orca_repo:
-        raise RuntimeError(f"orca knows no repo for {run.repo} — add this checkout once with "
-                           f"`orca repo add --path <path>`")
-    sha = _fetch_tip(run.rem, at_branch, cwd=orca_repo["path"])
-    wt = _orca(["worktree", "create", "--repo", f"id:{orca_repo['id']}", "--name", name,
-                "--no-parent", "--base-branch", sha,
-                *(["--issue", str(issue)] if issue is not None else [])]).get("worktree") or {}
-    path, branch = wt.get("path"), wt.get("branch")
-    if not path or not os.path.isdir(path):
-        raise RuntimeError(f"orca worktree create returned no usable path: {path!r}")
-    if _git(["-C", path, "merge-base", "--is-ancestor", sha, "HEAD"], check=False).returncode != 0:
-        _git(["-C", path, "merge", "--ff-only", sha])
-    return path, afk_decide.short_branch(branch), sha
-
-
-def _remove_worktree(path):
-    """Have orca remove a worktree (and its terminals). Soft: by the time this
-    runs the transition that mattered — a merge, a close — is already durable, so a
-    failed cleanup is reported, never raised."""
-    try:
-        _orca(["worktree", "rm", "--worktree", f"path:{path}", "--force"])
-        return {"removed": True, "path": path}
-    except RuntimeError as e:
-        return {"removed": False, "path": path, "detail": str(e)}
-
-
 def _discard_attempt(run, number):
     """Throw the previous attempt away, for a FRESH start: close the PRs the fleet
     opened for the issue, delete its work branches on the remote, remove its
@@ -1793,130 +1956,13 @@ def _discard_attempt(run, number):
     for branch in afk_decide.branch_candidates(_remote_heads(rem), cfg["branch_pattern"], number):
         _delete_branch(rem, branch)
         deleted.append(branch)
-    path, _ = _issue_worktree(run.repo, number)
-    removed = _remove_worktree(path) if path else None
+    wt = _Worktree.of_issue(run.repo, number)
+    path = wt.remembered
+    removed = wt.remove() if path else None
     if removed and not removed["removed"]:
         raise RuntimeError(f"could not remove the previous attempt's worktree {path}: "
                            f"{removed['detail']}")
     return {"closed_prs": closed, "deleted_branches": deleted, "removed_worktree": path}
-
-
-_WORKER_BRIEF = "afk-worker-prompt.md"
-_BRIEF_POINTER = ("Your task brief is the file {brief} — read it now and carry it out end to end. "
-                  "It is my instruction to you; do not ask me to confirm.")
-
-
-_NUDGE_MARK = "afk-nudge.json"
-
-
-def _worker_file(path, name):
-    """A fleet-private file about the worker in a worktree, kept in the worktree's
-    own git dir: never staged by the worker's `git add -A`, gone when the worktree
-    is."""
-    git_dir = _git(["-C", path, "rev-parse", "--absolute-git-dir"]).stdout.strip()
-    return os.path.join(git_dir, name)
-
-
-def _write_brief(path, prompt):
-    """Write a worker's instructions to the worktree's brief file → its path. A
-    worker under a new brief — a new worker, or one just given its landing turn —
-    has not been nudged, whatever came before."""
-    brief = _worker_file(path, _WORKER_BRIEF)
-    with open(brief, "w") as f:
-        f.write(prompt)
-    mark = _worker_file(path, _NUDGE_MARK)
-    if os.path.exists(mark):
-        os.remove(mark)
-    return brief
-
-
-def _nudge(path):
-    """The nudge recorded for the worker in a worktree → {"at", "tail"}, or None
-    when it was never nudged (or there is no worktree to have recorded one in)."""
-    if not path:
-        return None
-    try:
-        with open(_worker_file(path, _NUDGE_MARK)) as f:
-            return json.load(f)
-    except (OSError, ValueError, RuntimeError):
-        return None
-
-
-def _live_terminal(path):
-    """The handle of the live worker terminal in a worktree — the one that spoke
-    last, when a worktree somehow has several — or None."""
-    rows = _orca(["terminal", "list", "--worktree", f"path:{path}"]).get("terminals") or []
-    live = [t for t in rows if t.get("connected", True) and t.get("writable", True)]
-    return max(live, key=lambda t: t.get("lastOutputAt") or 0)["handle"] if live else None
-
-
-# How long orca is given to say a terminal is idle; it answers at once when it is.
-_TUI_IDLE_PROBE_MS = 2000
-
-
-def _tui_idle(path):
-    """Does orca see the worker terminal in a worktree idle? Its own reading of
-    the terminal (title, prompt), for a runtime that reports no state. True when
-    it answers within the probe, False when the probe times out — the worker is
-    at it. No live terminal reads as idle: there is nothing busy to wait for."""
-    handle = _live_terminal(path)
-    if handle is None:
-        return True
-    try:
-        wait = _orca(["terminal", "wait", "--terminal", handle, "--for", "tui-idle",
-                      "--timeout-ms", str(_TUI_IDLE_PROBE_MS)]).get("wait") or {}
-    except OrcaError as e:
-        if e.code == "timeout":
-            return False
-        raise
-    return bool(wait.get("satisfied"))
-
-
-def _terminal_tail(handle):
-    """The last lines of a worker's rendered screen, bounded. Read for ONE purpose:
-    saying where a silent worker stopped (ADR-0018) — never for its result, which
-    is only ever a PR or a verdict marker."""
-    shown = _orca(["terminal", "read", "--terminal", handle, "--screen",
-                   "--limit", str(afk_decide.STALL_TAIL_LINES * 2)]).get("terminal") or {}
-    return afk_decide.stall_tail(shown.get("tail"))
-
-
-# Starting a worker is four steps, each of which has failed silently when a tick
-# typed it. `_open_terminal` takes the two that are quick; `_submit_prompt` the
-# two that wait on the agent — so a tick opens every terminal it will, and then
-# waits on them all at once.
-
-def _open_terminal(path, worker_command, prompt):
-    """Start the worker's agent in a worktree → (its terminal handle, the line to
-    submit to it). The agent is started with the run's OPAQUE worker launch
-    command (never `--agent`, ADR-0010), and the prompt goes to a brief FILE with
-    only a one-line pointer for the agent — a whole prompt sent as text arrives
-    as one paste, which the agent reads as quoted material and asks to have
-    confirmed instead of starting."""
-    brief = _write_brief(path, prompt)
-    term = _orca(["terminal", "create", "--worktree", f"path:{path}",
-                  "--command", worker_command]).get("terminal") or {}
-    handle = term.get("handle")
-    if not handle:
-        raise RuntimeError("orca terminal create returned no terminal handle")
-    return handle, _BRIEF_POINTER.format(brief=brief)
-
-
-def _submit_prompt(path, handle, pointer, ready_timeout):
-    """Wait for the agent in a terminal, then hand it its prompt: it is waited
-    for until its TUI is idle, and the pointer is sent WITH `--enter` — typed but
-    unsubmitted, a worker sits idle forever, indistinguishable from one that
-    finished."""
-    wait = _orca(["terminal", "wait", "--terminal", handle, "--for", "tui-idle",
-                  "--timeout-ms", str(ready_timeout * 1000)],
-                 timeout=ready_timeout + 30).get("wait") or {}
-    if not wait.get("satisfied"):
-        raise RuntimeError(f"the worker in {path} was not ready for a prompt within "
-                           f"{ready_timeout}s (terminal {handle})")
-    sent = _orca(["terminal", "send", "--terminal", handle, "--text", pointer,
-                  "--enter"]).get("send") or {}
-    if not sent.get("accepted"):
-        raise RuntimeError(f"terminal {handle} did not accept the worker prompt")
 
 
 def _landing_fields(cfg, pr):
@@ -1978,22 +2024,20 @@ def _begin_worker(run, instance, agent, issue, start, reason=None):
             turn = None
 
     if plan["action"] == "reuse_worktree":
-        path = rec["worktree"]["path"]
-        branch = _git(["-C", path, "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
-        # whatever agent was here is dead or idle: two in one worktree would fight
-        try:
-            _orca(["terminal", "close", "--worktree", f"path:{path}", "--all"])
-        except RuntimeError:
-            pass
+        wt = _Worktree.at(rec["worktree"]["path"])
+        branch = wt.checked_out()
     elif turn:
         plan = {"tier": 2, "action": "recreate_at_tip", "prompt": "continue",
                 "reason": f"no local worktree; PR #{pr['number']} holds the landing turn — "
                           f"recreate at its head"}
-        path, branch, _ = _create_worktree(run, issue, pr["headRefName"])
+        wt = _Worktree.cut(run, pr["headRefName"], issue=issue)
+        branch = wt.branch
     else:
         tip = rec["branch"]["name"] if plan["action"] == "recreate_at_tip" else cfg["base_branch"]
-        path, branch, _ = _create_worktree(run, issue, tip)
+        wt = _Worktree.cut(run, tip, issue=issue)
+        branch = wt.branch
 
+    path = wt.path
     fields = _prompt_fields(run, issue, path, branch)
     with open(_WORKER_PROMPT) as f:
         if turn:
@@ -2002,10 +2046,10 @@ def _begin_worker(run, instance, agent, issue, start, reason=None):
         else:
             prompt = afk_decide.render_worker_prompt(f.read(), plan["prompt"], fields,
                                                      reason=reason)
-    handle, pointer = _open_terminal(path, agent.command, prompt)
+    submit = wt.put(agent, prompt)
 
     def ready():
-        _submit_prompt(path, handle, pointer, agent.ready_timeout)
+        handle = submit()
         if cfg["progress_comment"]:
             if turn:
                 _upsert_board(run.repo, number, cfg, "landing", instance=instance,
@@ -2408,27 +2452,24 @@ def _grant_turn(run, instance, agent, number, allow_no_checks=False, verified=No
     if ready != "ready":
         return stop(ready, checks=checks)
 
-    path = _live_worktree(run.repo, number)
-    handle = _live_terminal(path) if path else None
-    if handle:
-        branch = _git(["-C", path, "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+    wt = _Worktree.of_issue(run.repo, number)
+    there = wt.terminal is not None
+    if there:
         with open(_WORKER_PROMPT) as f:
-            brief = _write_brief(path, afk_decide.render_landing(
-                f.read(), _prompt_fields(run, issue, path, branch), _landing_fields(cfg, pr)))
+            brief = wt.write_brief(afk_decide.render_landing(
+                f.read(), _prompt_fields(run, issue, wt.path, wt.checked_out()),
+                _landing_fields(cfg, pr)))
     out["comment_id"] = _record_turn(run.repo, pr["number"], afk_decide.single_turn(
         prev, instance, run.now(), verified=verified, allow_no_checks=allow))
     out["again"] = bool(mine)
-    if not handle:          # the worker is gone: its continuation is started on the turn
+    if not there:           # the worker is gone: its continuation is started on the turn
         worker = _start_worker(run, instance, agent, issue, "auto")
         return stop("granted", delivery="continuation", terminal=worker["terminal"],
                     worktree=worker["worktree"])
-    sent = _orca(["terminal", "send", "--terminal", handle, "--enter", "--text",
-                  _TURN_POINTER.format(brief=brief)]).get("send") or {}
-    if not sent.get("accepted"):
-        raise RuntimeError(f"terminal {handle} did not accept the landing turn")
+    handle = wt.tell(_TURN_POINTER.format(brief=brief), "the landing turn")
     if cfg["progress_comment"]:
         _upsert_board(run.repo, number, cfg, "landing", instance=instance, pr=pr["number"])
-    return stop("granted", delivery="terminal", terminal=handle, worktree=path)
+    return stop("granted", delivery="terminal", terminal=handle, worktree=wt.path)
 
 
 def _await_checks(repo, number, head, had_checks, timeout, poll):
@@ -2692,8 +2733,7 @@ def _turn_batch(run, instance, agent, working_set=None):
 
     mine = next((b for b in ws["batches"] if b["instance"] == instance), None)
     if mine:
-        path = _batch_worktree(run.repo, mine["id"])
-        if path and _live_terminal(path):
+        if _Worktree.of_batch(run.repo, mine["id"]).terminal:
             return stop("landing", batch=mine["id"],
                         detail="this batch already holds the landing turn and its worker is "
                                "there; nothing was touched — `afk no-pr --batch` watches it")
@@ -2735,19 +2775,15 @@ def _start_batch_worker(run, instance, agent, batch, members, phase, again):
     cfg, rem = run.cfg, run.rem
     target = cfg["merge"]["target"]
     _record_batch(run.repo, cfg, instance, run.now(), batch, members, phase)
-    path = _batch_worktree(run.repo, batch)
-    if path:
-        delivery = "worktree"
-        branch = _git(["-C", path, "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
-        try:                             # whatever agent was here is dead or idle
-            _orca(["terminal", "close", "--worktree", f"path:{path}", "--all"])
-        except RuntimeError:
-            pass
+    wt = _Worktree.of_batch(run.repo, batch)
+    if wt.path:
+        delivery, branch = "worktree", wt.checked_out()
     else:
         pushed = afk_decide.batch_branches(_remote_heads(rem), batch)
         delivery = "branch" if pushed else "fresh"
-        path, branch, _ = _cut_worktree(run, afk_decide.batch_name(batch),
-                                        pushed[-1] if pushed else target)
+        wt = _Worktree.cut(run, pushed[-1] if pushed else target, batch=batch)
+        branch = wt.branch
+    path = wt.path
     _save_batch_state(path, {"gate_runs": 0, "left_out": [], **(_batch_state(path) or {}),
                              "id": batch, "members": members})
     titles = {p["number"]: p["title"] for p in _open_prs(run.repo)}
@@ -2758,8 +2794,7 @@ def _start_batch_worker(run, instance, agent, batch, members, phase, again):
             "afk_path": os.path.abspath(__file__),
             "config": json.dumps(cfg, ensure_ascii=False), "worktree_path": path,
             "launcher_terminal": os.environ.get("ORCA_TERMINAL_HANDLE", "")})
-    handle, pointer = _open_terminal(path, agent.command, prompt)
-    _submit_prompt(path, handle, pointer, agent.ready_timeout)
+    handle = wt.put(agent, prompt)()
     return {"outcome": afk_decide.turn_outcome("granted"), "batch": batch,
             "issues": [m["issue"] for m in members], "prs": [m["pr"] for m in members],
             "again": again, "delivery": delivery, "terminal": handle, "worktree": path}
@@ -2789,8 +2824,8 @@ def _abandon_batch(run, instance, batch):
         _unbatch(run.repo, cfg, instance, now, batch, m, "abandoned", board=m["issue"] in mine)
         left.append(m)
     deleted = _delete_batch_branches(rem, batch)
-    path = _batch_worktree(run.repo, batch)
-    cleanup = _remove_worktree(path) if path else None
+    wt = _Worktree.of_batch(run.repo, batch)
+    cleanup = wt.remove() if wt.path else None
     return {"outcome": afk_decide.turn_outcome("abandoned"), "batch": batch,
             "issues": [m["issue"] for m in left], "prs": [m["pr"] for m in left],
             "deleted_branches": deleted, **({"cleanup": cleanup} if cleanup else {})}
@@ -3072,14 +3107,14 @@ def _sweep_batches(run, instance, live):
     one whose worker is still busy: it is finishing) and its pushed branch.
     `live` are the ids of the batches that still do."""
     cfg, rem = run.cfg, run.rem
-    stale = [w for w in _batch_worktrees(run.repo, instance)
-             if w["batch"] not in live and w["path"]]
+    stale = [w for w in _Worktree.of_batches(run.repo, instance)
+             if w.batch not in live and w.remembered]
     removed = []
     if stale and cfg["worktree_cleanup"]:
         workers = _Workers(run)
         for w in stale:
-            if not workers.at(w["path"]).busy:
-                removed.append(_remove_worktree(w["path"]))
+            if not workers.at(w.remembered).busy:
+                removed.append(w.remove())
     rx = afk_decide.batch_branch_regex(instance=instance)
     gone = [h for h in _remote_heads(rem) for m in [rx.match(h)] if m and m.group(1) not in live]
     for branch in gone:
@@ -3198,7 +3233,8 @@ def _park_claim(run, instance, number):
     if refusal:
         raise ValueError(f"issue #{number} is not parkable: {refusal}; nothing was changed")
     waiting = [b["number"] for b in standings if b["standing"] == "waiting"]
-    path = _live_worktree(run.repo, number)
+    wt = _Worktree.of_issue(run.repo, number)
+    path = wt.path
     progress = _worktree_progress(path, rem, cfg["base_branch"]) if path else {}
 
     recorded = {e["number"] for e in _blocked_by(run.repo, number)}
@@ -3209,7 +3245,7 @@ def _park_claim(run, instance, number):
         _upsert_board(run.repo, number, cfg, "parked", blocked_by=waiting)
     _release(rem, cfg, number)
     empty = progress.get("commits_ahead") == 0 and not progress.get("dirty")
-    cleanup = _remove_worktree(path) if (path and empty and cfg["worktree_cleanup"]) else None
+    cleanup = wt.remove() if (path and empty and cfg["worktree_cleanup"]) else None
     return {"issue": number, "action": "parked", "blocked_by": waiting, "edges_added": added,
             "released": True, **({"cleanup": cleanup} if cleanup else {})}
 
@@ -3225,8 +3261,8 @@ def cmd_close(a):
         _upsert_board(run.repo, a.number, cfg, "closed", instance=a.instance)
     _close_issue(run.repo, a.number)
     _release(rem, cfg, a.number)
-    path, _ = _issue_worktree(run.repo, a.number)
-    cleanup = _remove_worktree(path) if (path and cfg["worktree_cleanup"]) else None
+    wt = _Worktree.of_issue(run.repo, a.number)
+    cleanup = wt.remove() if (wt.remembered and cfg["worktree_cleanup"]) else None
     return {"issue": a.number, "action": "closed", "released": True,
             **({"cleanup": cleanup} if cleanup else {})}
 
