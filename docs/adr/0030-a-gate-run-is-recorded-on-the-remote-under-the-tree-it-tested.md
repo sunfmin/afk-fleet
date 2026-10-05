@@ -27,7 +27,8 @@ not the one the merge would have used, which is the thing a `local` gate is a cl
    a reworded commit, a rebuilt stack — is as tested as the one that was gated.
 2. **It lives on the remote, one ref per record, and the ref's name is the key:**
    `refs/afk/gate/<tree>-<hash of the command>` (`afk_decide.gate_record_ref`). The ref points at a
-   parentless commit of the tested tree whose message carries `{tree, command, at}`. Asking "was this
+   parentless commit of the tested tree whose message carries `{tree, command, at}` (written as every record kept on a ref is:
+   [ADR-0031](0031-records-kept-on-refs-share-one-encoding.md)). Asking "was this
    tested green?" is one fetch of one ref; writing is one push; two runs never contend for a ref.
    Nothing is kept in the worktree.
 3. **A green run anywhere is believed everywhere.** The gate is a claim about content. Remote CI

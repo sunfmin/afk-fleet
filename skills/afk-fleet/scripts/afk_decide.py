@@ -21,6 +21,8 @@ import hashlib
 import json
 import re
 import shlex
+import urllib.parse
+from typing import NamedTuple
 
 # --------------------------------------------------------------------------- #
 # Config — one home for every key and default (ADR-0009)                       #
@@ -90,6 +92,87 @@ CLAIM_NAMESPACES = {
     "refs/heads": ("refs/heads/afk-claim", "refs/heads/afk-heartbeat"),
 }
 BRANCH_NAMESPACE = "refs/heads"
+
+
+# --------------------------------------------------------------------------- #
+# Records kept on refs — one encoding (ADR-0031)                               #
+# --------------------------------------------------------------------------- #
+#
+# What the fleet keeps on a git ref is a record: a set of named fields, carried
+# as the subject of the small commit the ref points at —
+#
+#     <word> <field>=<value> <field>=<value> …
+#
+# A kind of record declares its word and its fields and nothing else; writing
+# one (`record_message`) and reading one back (`read_record`) are the same code
+# for every kind, and so are the three rules of reading:
+#
+#   - a field the kind does not declare is ignored — a newer fleet may write one
+#     an older fleet reads past;
+#   - a field with no value, or a value that is not of its type, is a field that
+#     is missing; a missing optional field is simply absent from the record;
+#   - a commit whose subject does not open with the kind's word, or that lacks a
+#     required field, is not a record: it reads as None, never as a record with
+#     holes in it.
+#
+# A value is percent-encoded only where it would break a word (whitespace, `%`,
+# anything outside ASCII), so an instance id or a hostname is written as itself.
+
+class RecordKind(NamedTuple):
+    word: str           # the subject's first word: what kind of record this is
+    fields: dict        # field → str | int, in the order they are written
+    required: tuple     # the fields without which a commit is not this record
+
+
+# A claim names the fleet instance that holds an issue (ADR-0003). The ref is the
+# lock; the record says whose it is.
+CLAIM_RECORD = RecordKind("afk-claim", {"instance": str, "host": str, "ts": int}, ("instance",))
+# A heartbeat is the time a fleet instance last said it was alive; whose it is
+# is the ref's name.
+HEARTBEAT_RECORD = RecordKind("afk-heartbeat", {"instance": str, "ts": int}, ("ts",))
+# A recorded gate run: a green run of `command` on `tree`, finished at `at`
+# (`gate_record`, ADR-0030). The ref's name is the key; the time is the record.
+GATE_RUN_RECORD = RecordKind("afk-gate", {"tree": str, "command": str, "at": int}, ("at",))
+# What the bootstrap probe pushes to learn whether a namespace takes a push.
+PROBE_RECORD = RecordKind("afk-probe", {"ts": int}, ("ts",))
+
+_RECORD_SAFE = "!\"#$&'()*+,/:;<=>?@[\\]^`{|}~"
+
+
+def record_message(kind, record):
+    """A record → the commit message that carries it. Fields are written in the
+    kind's order; one that is None or empty is left out. A field the kind does not
+    declare, or a required one left out, is a defect in the caller and raises."""
+    unknown = sorted(set(record) - set(kind.fields))
+    if unknown:
+        raise ValueError(f"{kind.word} record has no field {', '.join(unknown)}")
+    words = [kind.word]
+    for name, type_ in kind.fields.items():
+        value = record.get(name)
+        if value is None or value == "":
+            if name in kind.required:
+                raise ValueError(f"{kind.word} record needs {name}")
+            continue
+        words.append(f"{name}={urllib.parse.quote(str(type_(value)), safe=_RECORD_SAFE)}")
+    return " ".join(words)
+
+
+def read_record(kind, message):
+    """A commit message → the record of `kind` it carries, as {field: value} with
+    every required field present and each optional one present only when the
+    commit states it — or None when the commit is not such a record."""
+    words = (message or "").split("\n", 1)[0].split()
+    if not words or words[0] != kind.word:
+        return None
+    record = {}
+    for word in words[1:]:
+        name, _, raw = word.partition("=")
+        type_ = kind.fields.get(name)
+        if type_ is int and raw.isdigit():
+            record[name] = int(raw)
+        elif type_ is str and raw:
+            record[name] = urllib.parse.unquote(raw)
+    return record if all(name in record for name in kind.required) else None
 
 # The completion gate's two modes (ADR-0012), each with what the status board calls
 # that gate. `required` waits for the PR's GitHub checks; `local` never reads them
