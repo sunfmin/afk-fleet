@@ -983,7 +983,7 @@ def _tick(a, cfg, ws):
 
     # --- observe: the claims waiting on their worker ---
     asked = afk_decide.asks_after(ws["mine"])
-    seen = run("no-pr", cmd_no_pr, numbers=asked, worktree=None, batch=None) if asked else None
+    seen = run("no-pr", _workers_seen, numbers=asked, worktree=None, batch=None) if asked else None
     routes = [(w["issue"], *afk_decide.worker_step(call, mine[w["issue"]], w, cfg))
               for w in (seen or {}).get("workers", [])]
 
@@ -1119,7 +1119,7 @@ def _tick_turn(a, cfg, ws, run, call, did, touched, judgments):
         live |= {b["id"] for b in dead if not abandon(b)}
         return live
     if mine:
-        seen = run("no-pr", cmd_no_pr, numbers=[], batch=mine["id"], worktree=None)
+        seen = run("no-pr", _workers_seen, numbers=[], batch=mine["id"], worktree=None)
         do = afk_decide.batch_step(seen["workers"][0]) if seen else "leave"
         members = [m["issue"] for m in mine["members"]]
         if do == "continue":
@@ -1205,11 +1205,20 @@ def cmd_no_pr(a):
     `turn_at`). For a busy or gone worker `turn_at` is therefore null because it
     was NOT READ — never evidence that its PR holds no turn; the claim's `status`
     in `afk rebuild` is what says that.
-    Returns {"workers": [`afk_decide.classify_no_pr`'s outcome plus those signals
-    and the `worker_state` it was read from, one per --issue, in order]}.
+    Returns {"workers": [the outcome and action the worker's classification
+    comes to (`afk_decide.WORKER_CAUSES`) plus those signals and the
+    `worker_state` it was read from, one per --issue, in order]}.
 
     `--batch <batch>` asks the same of a merge batch's worker (`_batch_worker`):
     one row, with `batch` in place of `issue`."""
+    return {"workers": [{k: v for k, v in w.items() if k != "cause"}
+                        for w in _workers_seen(a)["workers"]]}
+
+
+def _workers_seen(a):
+    """`afk no-pr`'s rows as the tick reads them: each also carries the `cause`
+    its worker was classified with, which is what the tick routes on
+    (`afk_decide.worker_step`, `batch_step`)."""
     cfg = _cfg(a)
     if bool(a.numbers) == bool(a.batch):
         raise ValueError("afk no-pr takes --issue <n> (repeatable), or --batch <batch>")
@@ -1264,13 +1273,12 @@ def _worker_reading(states, path, now, grace):
 
 
 def _worker_outcome(a, cfg, number, path, reading, now, grace):
-    """`classify_no_pr` for one worker, gathering only what its reading leaves
-    open: busy or gone is settled by the reading alone, so it costs no git and
-    no GitHub."""
+    """One worker's classification, gathering only what its reading leaves open:
+    busy or gone is settled by the reading alone
+    (`afk_decide.settled_by_worker_state`), so it costs no git and no GitHub."""
     nudged_at = (_nudge(path) or {}).get("at")
-    settled = afk_decide.classify_no_pr({}, reading["terminal"], reading["terminal_idle_seconds"],
-                                        None, {}, now, grace, nudged_at=nudged_at)
-    if settled["outcome"] in ("coding", "dead"):
+    settled = afk_decide.settled_by_worker_state(reading, now, grace, nudged_at)
+    if settled:
         return {**settled, "worktree": path, "progress": {}, "worker_verdict": None,
                 "blockers": [], "nudged_at": nudged_at, "turn_at": None}
     progress = _worktree_progress(path, _remote(a), cfg["base_branch"]) if path else {}
@@ -1279,13 +1287,10 @@ def _worker_outcome(a, cfg, number, path, reading, now, grace):
     blockers = _blocker_standings(a, cfg, number, declared["blocked_by"], prs)
     pr = afk_decide.closing_pr(prs, number)
     turn = (_turn(a.repo, pr) if pr else None) or {}
-    return {**afk_decide.classify_no_pr(progress, reading["terminal"],
-                                        reading["terminal_idle_seconds"], declared,
-                                        {b["number"]: b["standing"] for b in blockers},
-                                        now, grace,
-                                        nudged_at=nudged_at, can_nudge=path is not None,
-                                        turn_at=turn.get("at"),
-                                        turn_stopped=turn.get("stopped")),
+    return {**afk_decide.classify_stopped(progress, reading["terminal_idle_seconds"], declared,
+                                          {b["number"]: b["standing"] for b in blockers},
+                                          now, grace, nudged_at=nudged_at,
+                                          can_nudge=path is not None, turn=turn),
             "worktree": path, "progress": progress, "worker_verdict": declared,
             "blockers": blockers, "nudged_at": nudged_at, "turn_at": turn.get("at")}
 
@@ -2472,7 +2477,7 @@ def _abandon_batch(a, cfg, rem):
 
 def _batch_worker(a, cfg, batch):
     """`afk no-pr --batch` — is the batch's worker still at it? The same reading
-    and the same ladder as any worker holding a turn (`classify_no_pr`), from the
+    and the same ladder as any worker holding a turn (`classify_stopped`), from the
     batch's worktree: busy, or within grace of its turn or of its last
     `afk land --batch`, it is left; gone (`dead` / `orphan`), it is continued;
     silent past grace it is nudged once, and silent again the batch is
@@ -2483,16 +2488,16 @@ def _batch_worker(a, cfg, batch):
     reading = _worker_reading(_worker_states(), path, now, grace)
     nudged_at = (_nudge(path) or {}).get("at")
     turn_at, progress = None, {}
-    seen = afk_decide.classify_no_pr({}, reading["terminal"], reading["terminal_idle_seconds"],
-                                     None, {}, now, grace, nudged_at=nudged_at)
-    if seen["outcome"] not in ("coding", "dead"):
+    seen = afk_decide.settled_by_worker_state(reading, now, grace, nudged_at)
+    if not seen:
         told = [(_pr_turn(a.repo, m["pr"]) or {}).get("at")
                 for m in (_batch_state(path) or {}).get("members") or []]
         turn_at = max((t for t in told if t), default=None)
         progress = _worktree_progress(path, _remote(a), cfg["merge"]["target"])
-        seen = afk_decide.classify_no_pr(progress, reading["terminal"],
-                                         reading["terminal_idle_seconds"], None, {}, now, grace,
-                                         nudged_at=nudged_at, turn_at=turn_at)
+        # a batch's worker declares no verdict and names no blocker
+        seen = afk_decide.classify_stopped(progress, reading["terminal_idle_seconds"], None, {},
+                                           now, grace, nudged_at=nudged_at,
+                                           turn={"at": turn_at})
     return {"batch": batch, **seen, "worktree": path, "progress": progress,
             "nudged_at": nudged_at, "turn_at": turn_at, "worker_state": reading["state"]}
 

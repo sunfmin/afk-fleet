@@ -300,7 +300,7 @@ def test_the_cycle_forms_a_batch_only_from_two_or_more_eligible_prs():
     assert d.asks_after(mine) == [3, 4]
     assert d.turn_due(mine[:2], [1, 2]) is None
     # its worker's reading routes the batch: left, continued, nudged once, abandoned
-    assert [d.batch_step({"action": a}) for a in ("leave", "orphan", "nudge", "next_attempt")] == \
+    assert [d.batch_step({"cause": c}) for c in ("working", "gone", "silent", "silent_after_nudge")] == \
         ["leave", "continue", "nudge", "abandon"]
 
 
@@ -543,7 +543,7 @@ def test_a_batch_shows_on_the_board_in_the_brief_and_in_the_working_set():
         raise AssertionError("a brief with a field missing was rendered")
 
     # --- what the tick does about the batch's worker ---
-    assert [d.batch_step({"action": a}) for a in ("leave", "orphan", "nudge", "next_attempt")] == \
+    assert [d.batch_step({"cause": c}) for c in ("working", "gone", "silent", "silent_after_nudge")] == \
         ["leave", "continue", "nudge", "abandon"]
 
     # --- the working set: a batch's members are `landing` rows that name it ---
@@ -649,7 +649,7 @@ def test_parse_verdict_marker():
     assert d.parse_verdict_marker(None) is None
 
     # malformed: marker present but no phase → found True, phase None. Parse is
-    # lenient by design; classify_no_pr treats a None/unknown phase as failed, and
+    # lenient by design; classify_stopped treats a None/unknown phase as failed, and
     # whether to trust the marker at all stays the tick's call.
     p = d.parse_verdict_marker("<!--afk:verdict n=9-->")
     assert p["found"] is True and p["phase"] is None and p["blocked_by"] == []
@@ -683,9 +683,17 @@ def _verdict(phase, blocked_by=None):
             "reason": None, "comment_url": "u"}
 
 
+def _classify(progress, terminal, idle, verdict=None, blockers=None, **more):
+    """One worker's classification, the way `afk no-pr` reaches it: is it settled
+    by its worker state alone — and only if not, as a stopped worker."""
+    reading = {"terminal": terminal, "terminal_idle_seconds": idle, "state": None}
+    return d.settled_by_worker_state(reading, NOW, GRACE, more.get("nudged_at")) or \
+        d.classify_stopped(progress, idle, verdict, blockers or {}, NOW, GRACE, **more)
+
+
 def _no_pr(progress, terminal, idle, verdict=None, blockers=None):
-    """classify_no_pr with the terminal as the only recency signal, `idle` s ago."""
-    r = d.classify_no_pr(progress, terminal, idle, verdict, blockers or {}, NOW, GRACE)
+    """`_classify` with the terminal as the only recency signal, `idle` s ago."""
+    r = _classify(progress, terminal, idle, verdict, blockers)
     return r["outcome"], r["action"]
 
 
@@ -737,7 +745,7 @@ def test_read_worker_state_takes_the_runtimes_own_report():
                       {"state": "working", "stateStartedAt": (NOW - 1) * 1000, "parentPaneKey": "p"}]
     assert _reading(row) == ("idle", 60, "done")
 
-    # and the reading is what classify_no_pr takes: busy → coding, a stop within
+    # and the reading is what the classification takes: busy → coding, a stop within
     # grace → coding, a stop past grace → routed on the verdict
     for row, outcome in ((_ps("working", 900, 5), "coding"), (_ps("done", 10, 10), "coding"),
                          (_ps("done", GRACE, 1), "idle_stalled"), (None, "dead")):
@@ -745,7 +753,7 @@ def test_read_worker_state_takes_the_runtimes_own_report():
         assert _no_pr(ZERO, t, idle)[0] == outcome, row
 
 
-def test_classify_no_pr_coding_needs_a_live_signal():
+def test_classification_coding_needs_a_live_signal():
     # terminal busy: left alone even with a giving-up verdict + zero progress
     assert _no_pr(ZERO, "busy", 9999, _verdict("giving-up")) == ("coding", "leave")
     # idle, but activity within the grace window (a worker between steps)
@@ -765,9 +773,9 @@ def test_classify_no_pr_coding_needs_a_live_signal():
     assert _no_pr({**ZERO, "commits_ahead": 4}, "busy", 9999) == ("coding", "leave")
 
 
-def test_classify_no_pr_idle_seconds_is_the_most_recent_sign_of_life():
+def test_classification_idle_seconds_is_the_most_recent_sign_of_life():
     def idle(progress, terminal_idle):
-        return d.classify_no_pr(progress, "idle", terminal_idle, None, {}, NOW, GRACE)
+        return _classify(progress, "idle", terminal_idle)
 
     # three clocks, the freshest wins — whichever one it is
     r = idle({**ZERO, "last_commit_ts": NOW - 5000, "worktree_mtime_ts": NOW - 40}, 9000)
@@ -789,7 +797,7 @@ def test_classify_no_pr_idle_seconds_is_the_most_recent_sign_of_life():
     assert idle({**ZERO, "worktree_mtime_ts": NOW + 30}, None)["idle_seconds"] == 0
 
 
-def test_classify_no_pr_routes_idle_workers_on_their_verdict():
+def test_classification_routes_idle_workers_on_their_verdict():
     # already-satisfied + a truly empty branch → close + release
     assert _no_pr(ZERO, "idle", 600, _verdict("already-satisfied")) == ("idle_done", "close_release")
     # …but work on the branch REFUTES it → failure handling, not a closed issue
@@ -810,13 +818,13 @@ def test_classify_no_pr_routes_idle_workers_on_their_verdict():
         ("dead", "orphan")
 
 
-def test_classify_no_pr_nudges_a_silent_worker_once_before_failing_it():
+def test_classification_nudges_a_silent_worker_once_before_failing_it():
     """A worker idle past grace with NO verdict stopped without an outcome — most
     often it is waiting on a question nobody will answer. Failing it discards its
     work and sends a fresh worker into the same wall, so it is nudged first; a
     nudge is spent once (ADR-0018)."""
     def silent(idle, **nudge):
-        r = d.classify_no_pr(ZERO, "idle", idle, None, {}, NOW, GRACE, **nudge)
+        r = _classify(ZERO, "idle", idle, **nudge)
         return r["outcome"], r["action"], r["idle_seconds"]
 
     assert silent(600) == ("idle_stalled", "nudge", 600)
@@ -830,7 +838,7 @@ def test_classify_no_pr_nudges_a_silent_worker_once_before_failing_it():
 
     # a nudge never overrides what the worker DECLARED, nor a terminal that is gone
     def routed(verdict, terminal="idle", **nudge):
-        r = d.classify_no_pr(ZERO, terminal, 600, verdict, {}, NOW, GRACE, **nudge)
+        r = _classify(ZERO, terminal, 600, verdict, **nudge)
         return r["outcome"], r["action"]
     assert routed(_verdict("giving-up")) == ("idle_failed", "next_attempt")
     assert routed(_verdict("already-satisfied"), nudged_at=NOW - 9000) == ("idle_done", "close_release")
@@ -838,30 +846,30 @@ def test_classify_no_pr_nudges_a_silent_worker_once_before_failing_it():
 
     # a landing turn is the same kind of sign of life (ADR-0027): one grace period
     # to start on it, then the same nudge → failure path — never a parked queue
-    def turn(idle, at, **more):
-        r = d.classify_no_pr({**ZERO, "commits_ahead": 3}, "idle", idle, None, {}, NOW, GRACE,
-                             turn_at=at, **more)
+    def turn(idle, at, stopped=None, **more):
+        r = _classify({**ZERO, "commits_ahead": 3}, "idle", idle,
+                      turn={"at": at, "stopped": stopped}, **more)
         return r["outcome"], r["action"], r["idle_seconds"]
     assert turn(9000, NOW - 10) == ("coding", "leave", 10)
     assert turn(9000, NOW - GRACE) == ("idle_stalled", "nudge", GRACE)
     assert turn(9000, NOW - 2 * GRACE, nudged_at=NOW - GRACE) == \
         ("idle_failed", "next_attempt", GRACE)
-    r = d.classify_no_pr(ZERO, "none", None, None, {}, NOW, GRACE, turn_at=NOW - 10)
+    r = _classify(ZERO, "none", None, turn={"at": NOW - 10})
     assert (r["outcome"], r["action"]) == ("dead", "orphan")      # a gone terminal is still dead
     # a worker whose landing stopped FOR THE TICK (CI, a verify, absent checks) is
     # waiting on the tick, not silent: never nudged, never failed, however long ago
     for stopped in d.LAND_WAITS:
-        assert turn(9000, NOW - 5 * GRACE, turn_stopped=stopped)[:2] == ("coding", "leave"), stopped
-        assert turn(9000, NOW - 5 * GRACE, turn_stopped=stopped, nudged_at=NOW - 3 * GRACE)[:2] == \
+        assert turn(9000, NOW - 5 * GRACE, stopped=stopped)[:2] == ("coding", "leave"), stopped
+        assert turn(9000, NOW - 5 * GRACE, stopped=stopped, nudged_at=NOW - 3 * GRACE)[:2] == \
             ("coding", "leave")
     # …while one that stopped on something that is ITS to fix is silent like any other
     for stopped in ("conflict", "gate_red"):
-        assert turn(9000, NOW - GRACE, turn_stopped=stopped)[:2] == ("idle_stalled", "nudge")
+        assert turn(9000, NOW - GRACE, stopped=stopped)[:2] == ("idle_stalled", "nudge")
     # what the worker declared still wins, and so does a gone terminal
-    r = d.classify_no_pr(ZERO, "idle", 9000, _verdict("giving-up"), {}, NOW, GRACE,
-                         turn_at=NOW - 9000, turn_stopped="awaiting_ci")
+    r = _classify(ZERO, "idle", 9000, _verdict("giving-up"),
+                  turn={"at": NOW - 9000, "stopped": "awaiting_ci"})
     assert (r["outcome"], r["action"]) == ("idle_failed", "next_attempt")
-    r = d.classify_no_pr(ZERO, "none", None, None, {}, NOW, GRACE, turn_stopped="awaiting_ci")
+    r = _classify(ZERO, "none", None, turn={"stopped": "awaiting_ci"})
     assert (r["outcome"], r["action"]) == ("dead", "orphan")
 
 
@@ -880,10 +888,9 @@ def test_stall_reason_carries_where_the_worker_stopped():
     assert "/w/.git/afk-worker-prompt.md" in d.nudge_text("/w/.git/afk-worker-prompt.md")
 
 
-def test_classify_no_pr_blocked_routes_on_the_blockers_real_state():
+def test_classification_blocked_routes_on_the_blockers_real_state():
     def blocked(named, states, progress=ZERO):
-        return d.classify_no_pr(progress, "idle", 600, _verdict("blocked", named), states,
-                                NOW, GRACE)
+        return _classify(progress, "idle", 600, _verdict("blocked", named), states)
 
     # every named blocker closed → the DAG cleared: re-dispatch (keep the claim)
     r = blocked([42, 43], {42: "closed", 43: "closed"})
@@ -912,8 +919,8 @@ def test_classify_no_pr_blocked_routes_on_the_blockers_real_state():
     assert {("idle_blocked", a) for a in ("redispatch", "park", "escalate")} <= set(d.NO_PR_ROUTES)
 
     # pending_blockers is reported only for a blocked verdict
-    assert d.classify_no_pr(ZERO, "idle", 600, _verdict("giving-up", [42]), {42: "open"},
-                            NOW, GRACE)["pending_blockers"] == []
+    assert _classify(ZERO, "idle", 600, _verdict("giving-up", [42]),
+                     {42: "open"})["pending_blockers"] == []
 
 
 def test_blocker_standings_tell_a_dependency_the_backlog_resolves_from_one_nothing_will():
@@ -1597,58 +1604,131 @@ def _declared(phase=None, reason=None, blocked_by=()):
             "reason": reason, "comment_url": "https://gh/c/7" if phase else None}
 
 
-def test_worker_step_routes_every_no_pr_action_or_returns_the_judgment():
+def test_worker_step_routes_every_cause_or_returns_the_judgment():
     cfg = d.resolve_config({})
 
-    def step(action, row=None, **worker):
-        return d.worker_step(CALL, row or _mine(4), {"action": action, **worker}, cfg)
+    def step(cause, row=None, **worker):
+        return d.worker_step(CALL, row or _mine(4), {"cause": cause, **worker}, cfg)
 
-    routed = {"leave", "close_release", "redispatch", "park", "escalate", "nudge",
-              "next_attempt", "orphan"}
-    assert routed == {action for _, action in d.NO_PR_ROUTES}     # a new action needs a route
-
-    assert step("leave") == ("leave", None)
-    assert step("park") == ("park", None) and step("nudge") == ("nudge", None)
+    for cause in ("working", "just_stopped", "within_grace", "awaiting_tick"):
+        assert step(cause) == ("leave", None), cause
+    assert step("blockers_waiting") == ("park", None) and step("silent") == ("nudge", None)
     # a claim with no worker left is CONTINUED, with no judgment asked: an unattended
     # run never releases it back to the frontier
-    assert step("orphan") == step("redispatch") == ("dispatch", None)
+    assert step("gone") == step("blockers_closed") == ("dispatch", None)
 
     # already-satisfied: whether the diff really is empty stays a judgment
-    do, j = step("close_release", worktree="/wt/4", worker_verdict=_declared("already-satisfied"))
+    do, j = step("satisfied", worktree="/wt/4", worker_verdict=_declared("already-satisfied"))
     assert (do, j["kind"], j.get("bulky")) == ("judge", "empty_diff", None)
     assert j["context"] == {"worktree": "/wt/4", "base_branch": "main", "verdict": "https://gh/c/7"}
     sub, argv = _argv(j["if_yes"])
     assert sub == "close" and "--worker-command" not in argv
     assert _argv(j["if_no"])[0] == "fail"
 
-    # an escalation whose reason is on record is carried out; one that is not is asked
-    unmet = [{"number": 9, "standing": "unmet", "reason": "was closed as not planned"},
-             {"number": 8, "standing": "waiting", "reason": None}]
-    assert step("escalate", blockers=unmet, worker_verdict=_declared("blocked", blocked_by=[9, 8])) == \
-        ("escalate", "blocked by a dependency nothing will resolve: #9 was closed as not planned")
-    do, why = step("escalate", blockers=[], worker_verdict=_declared("blocked", reason="no design yet"))
-    assert do == "escalate" and "no design yet" in why
-    do, j = step("escalate", blockers=[], worker_verdict=_declared("blocked"))
+    # an escalation or a failure whose reason is NOT on record is asked for
+    do, j = step("no_blocker_named", blockers=[], worker_verdict=_declared("blocked"))
     assert (do, j["kind"], j.get("bulky")) == ("judge", "reason", None)
     assert j["if_yes"] == j["if_no"] and _argv(j["if_yes"])[0] == "escalate"
     assert j["context"]["verdict"] == "https://gh/c/7"
-
-    # a failure: the same line between a reason on record and one to be worded
-    assert step("next_attempt", worker_verdict=_declared("giving-up", reason="flaky build")) == \
-        ("fail", "its worker gave up: flaky build")
-    do, j = step("next_attempt", worker_verdict=_declared("giving-up"))
+    do, j = step("gave_up", worker_verdict=_declared("giving-up"))
     assert (do, j["kind"]) == ("judge", "reason") and _argv(j["if_yes"])[0] == "fail"
-    do, why = step("next_attempt", worker_verdict=_declared("already-satisfied"))
-    assert do == "fail" and "holds changes" in why
-    do, why = step("next_attempt", worker_verdict=_declared("on-holiday"))
-    assert do == "fail" and "on-holiday" in why
-    do, why = step("next_attempt", worker_verdict=_declared(), nudged_at=NOW)
-    assert do == "fail" and "after its nudge" in why
-    do, why = step("next_attempt", worker_verdict=_declared(), nudged_at=None)
-    assert do == "fail" and "no worktree" in why
-    do, why = step("next_attempt", _mine(4, "landing", pr=30, stopped="conflict"),
-                   worker_verdict=_declared(), nudged_at=NOW)
-    assert (do, why) == ("fail", "given the landing turn and never landed: conflict")
+
+    # every cause the classification can name has a route, and one it cannot is an
+    # error — never a reason worded for some other cause
+    for cause in d.WORKER_CAUSES:
+        assert step(cause, worker_verdict=_declared())[0] in \
+            ("leave", "dispatch", "park", "nudge", "escalate", "fail", "judge"), cause
+    for route in (lambda: step("on-holiday"), lambda: d.batch_step({"cause": "gave_up"})):
+        try:
+            route()
+        except ValueError as e:
+            assert "classified" in str(e)
+        else:
+            raise AssertionError("a cause with no route was routed")
+    assert {c for c in d.WORKER_CAUSES if c not in d._BATCH_STEPS} == {
+        "satisfied", "satisfied_refuted", "blockers_closed", "blockers_waiting", "blocker_unmet",
+        "no_blocker_named", "gave_up", "unknown_phase"}          # a batch worker declares nothing
+
+
+# Every failure and escalation reason a tick words by itself, pinned to the cause
+# it is worded for: (cause, what was gathered, the claim's status → the reason).
+_UNMET = [{"number": 9, "standing": "unmet", "reason": "was closed as not planned"},
+          {"number": 8, "standing": "waiting", "reason": None}]
+_GONE_QUIET = {"progress": ZERO, "idle": 9000}
+REASONS = (
+    ("blocker_unmet", "escalate",
+     {"verdict": _declared("blocked", blocked_by=[9, 8]), "blockers": _UNMET}, "no_pr",
+     "blocked by a dependency nothing will resolve: #9 was closed as not planned"),
+    ("no_blocker_named", "escalate",
+     {"verdict": _declared("blocked", reason="no design yet")}, "no_pr",
+     "its worker reported blocked, naming no blocker: no design yet"),
+    ("satisfied_refuted", "fail",
+     {"verdict": _declared("already-satisfied"), "progress": {**ZERO, "commits_ahead": 2}}, "no_pr",
+     "its worker declared `already-satisfied`, but the branch holds changes"),
+    ("gave_up", "fail", {"verdict": _declared("giving-up", reason="flaky build")}, "no_pr",
+     "its worker gave up: flaky build"),
+    ("unknown_phase", "fail", {"verdict": _declared("on-holiday")}, "no_pr",
+     "its worker's verdict names no phase the fleet knows ('on-holiday')"),
+    ("unknown_phase", "fail", {"verdict": {**_declared("x"), "phase": None}}, "no_pr",
+     "its worker's verdict names no phase the fleet knows (None)"),
+    ("silent_after_nudge", "fail", {"nudged_at": NOW - GRACE}, "no_pr",
+     "idle with no PR and no verdict a grace period after its nudge"),
+    ("silent_unnudgeable", "fail", {"can_nudge": False}, "no_pr",
+     "idle with no PR and no verdict, and no worktree here to nudge it in"),
+    ("silent_after_nudge", "fail", {"nudged_at": NOW - GRACE, "stopped": "conflict"}, "landing",
+     "given the landing turn and never landed: conflict"),
+    ("silent_unnudgeable", "fail", {"can_nudge": False}, "landing",
+     "given the landing turn and never landed: no `afk land` outcome"),
+    # what the worker declared still words the failure of a claim that holds the turn
+    ("gave_up", "fail", {"verdict": _declared("giving-up", reason="flaky build")}, "landing",
+     "its worker gave up: flaky build"),
+)
+
+
+def test_every_reason_a_tick_words_is_pinned_to_the_cause_it_is_worded_for():
+    """The classification names the cause once; `worker_step` maps it to the
+    reason and re-derives nothing — so the text below is reached from the raw
+    signals through the cause in the first column, and through no other."""
+    cfg = d.resolve_config({})
+    for cause, do, got, status, reason in REASONS:
+        verdict, blockers = got.get("verdict", _declared()), got.get("blockers", [])
+        turn = {"at": NOW - 9000, "stopped": got.get("stopped")} if status == "landing" else None
+        seen = d.classify_stopped(got.get("progress", ZERO), 9000, verdict,
+                                  {b["number"]: b["standing"] for b in blockers}, NOW, GRACE,
+                                  nudged_at=got.get("nudged_at"),
+                                  can_nudge=got.get("can_nudge", True), turn=turn)
+        assert seen["cause"] == cause, (seen, reason)
+        row = _mine(4, status, pr=30, stopped=got.get("stopped")) if status == "landing" else _mine(4)
+        worker = {**seen, "worker_verdict": verdict, "blockers": blockers,
+                  "nudged_at": got.get("nudged_at")}
+        assert d.worker_step(CALL, row, worker, cfg) == (do, reason), cause
+        # the cause alone carries the decision: with the row's words for it
+        # scrambled, the reason is the same
+        assert d.worker_step(CALL, row, {**worker, "outcome": "coding", "action": "leave"},
+                             cfg) == (do, reason), cause
+    # every cause that ends in a failure or an escalation is pinned above
+    assert {c for c, (_, action) in d.WORKER_CAUSES.items()
+            if action in ("next_attempt", "escalate")} == {r[0] for r in REASONS}
+
+
+def test_a_worker_state_settles_a_busy_or_gone_worker_and_nothing_else():
+    """ADR-0021: busy, gone, or stopped within grace is decided from the reading
+    alone — the one decision both `afk no-pr` callers ask before gathering."""
+    def settled(row, nudged_at=None):
+        seen = d.settled_by_worker_state(d.read_worker_state(row, NOW, GRACE), NOW, GRACE, nudged_at)
+        return seen and (seen["cause"], seen["outcome"], seen["action"], seen["idle_seconds"])
+
+    assert settled(_ps("working", 900, 5)) == ("working", "coding", "leave", 5)
+    assert settled(None) == ("gone", "dead", "orphan", None)
+    assert settled(_ps("working", 1, 1, terminals=0), NOW - 10) == ("gone", "dead", "orphan", 10)
+    assert settled(_ps("done", 10, 10)) == ("just_stopped", "coding", "leave", 10)
+    assert settled(_ps("done", 9000, 1), NOW - 10) == ("just_stopped", "coding", "leave", 10)
+    # stopped past grace: not settled — its reasons are gathered, then classified
+    assert settled(_ps("done", GRACE, 1)) is None
+    assert settled(_ps("working", 900, GRACE)) is None                # a lost stop report
+    assert settled(_ps("done", 9000, 1), NOW - GRACE) is None
+    # every cause comes to a pair `afk no-pr` may print
+    assert set(d.WORKER_CAUSES.values()) == set(d.NO_PR_ROUTES)
 
 
 def test_checks_gate_and_gate_comment():
