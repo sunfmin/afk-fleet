@@ -1237,7 +1237,7 @@ TURN_OUTCOMES = ("granted", "waiting", "landing", "awaiting_ci", "gate_red", "no
 
 # Every `outcome` `afk turn --batch` and `afk turn --abandon` can stop with: the
 # three a single turn shares, `too_few` (no batch to form: the turn goes to one
-# PR) and `abandoned`. The pass routes them in code (`afk.py:_tick_turn`).
+# PR) and `abandoned`. The pass routes them in code (`_turn_plan`).
 BATCH_TURN_OUTCOMES = ("granted", "waiting", "landing", "too_few", "abandoned")
 
 # What a merge batch's worker is doing with the stack, as its last
