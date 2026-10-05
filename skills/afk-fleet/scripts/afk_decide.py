@@ -20,6 +20,7 @@ pins behaviour deterministically.
 import hashlib
 import json
 import re
+import shlex
 
 # --------------------------------------------------------------------------- #
 # Config — one home for every key and default (ADR-0009)                       #
@@ -51,6 +52,7 @@ CONFIG_DEFAULTS = {
     "gate": {
         "ci": "required",
         "local_command": "",
+        "trust_recorded_run": False,
         "adversarial_verify": False,
         "adversarial_verify_prompt": "",
     },
@@ -140,6 +142,10 @@ def validate_config(cfg):
         raise ValueError("config gate.ci: 'local' requires a non-empty gate.local_command — in "
                          "local mode that command IS the completion gate (ADR-0012), so an empty "
                          "one would merge every PR unverified")
+    if gate.get("trust_recorded_run") and ci != "local":
+        raise ValueError("config gate.trust_recorded_run: only gate.ci: 'local' has a merge-time "
+                         "run of gate.local_command to skip (ADR-0026) — set gate.ci to 'local' "
+                         "or leave this false")
     strategy = (cfg.get("merge") or {}).get("strategy")
     if strategy not in MERGE_STRATEGIES:
         raise ValueError(f"config merge.strategy: expected one of "
@@ -493,8 +499,10 @@ def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=Fals
 # In `gate.ci: local` the repo-local build/test command IS the completion gate:
 # the worker runs it after its pre-PR sync, and the tick re-runs it at merge time,
 # after the merge-time sync, in the branch's worktree. The invariant both runs
-# serve: *what lands on the target branch was tested in the form it lands.* The
-# verdict shape below is deliberately the SAME {status, excerpt} the ephemeral
+# serve: *what lands on the target branch was tested in the form it lands.* With
+# `gate.trust_recorded_run` the second run is skipped when — and only when — the
+# worker's run is on record for the exact head that lands (`gate_record_void`,
+# ADR-0026). The verdict shape below is deliberately the SAME {status, excerpt} the ephemeral
 # CI-log sub-read returns in `required` mode, so the tick has one gate branch, and
 # a raw log never enters its context either way.
 
@@ -518,6 +526,49 @@ def gate_verdict(exit_code, output, max_lines=GATE_EXCERPT_LINES, timed_out=Fals
             "timed_out": bool(timed_out),
             "excerpt": "\n".join(tail).strip(),
             "omitted_lines": max(0, len(lines) - len(tail))}
+
+
+def gate_record(head, command, clean, at):
+    """
+    What `afk gate` writes down after a GREEN run of the local gate — never after a
+    red or timed-out one, so no record can be read as a pass that did not happen:
+
+      head:    the commit the worktree was at, before and after the run
+      command: the `gate.local_command` that ran, verbatim
+      clean:   the worktree had nothing uncommitted and nothing untracked when the
+               run started — what was tested is exactly `head`
+      at:      when the run finished (epoch seconds)
+    """
+    return {"head": head, "command": command, "clean": bool(clean), "at": int(at)}
+
+
+def gate_record_void(record, head, command):
+    """
+    Why a worker's recorded gate run does NOT stand in for the merge-time run — or
+    None when it does, which is the only case `afk merge` skips its own (ADR-0026).
+
+      record:  the worktree's `gate_record`, None when it has none (never gated
+               through `afk gate`, a red run since, a worktree recreated here)
+      head:    the head that would land, after the merge-time sync
+      command: the `gate.local_command` configured now
+
+    The record proves the gate passed on one commit, with one command. Anything
+    that makes the tree that lands a different tree — the merge-time sync brought
+    the target in, the worker committed afterwards — or the test a different test
+    voids it, and so does a run over uncommitted or untracked files, which tested
+    something no commit holds. Void is the safe side: the merge runs the gate.
+    """
+    if not isinstance(record, dict) or not record.get("head"):
+        return "no green run of the gate is on record in this worktree"
+    if record.get("command") != command:
+        return (f"the recorded run was of a different command ({record.get('command')!r}) "
+                f"than the gate.local_command configured now")
+    if not record.get("clean"):
+        return "the recorded run was on a tree with uncommitted or untracked files"
+    if record["head"] != head:
+        return (f"the recorded run was on {record['head']}, not on the head that would land "
+                f"({head}) — a sync or a later commit moved it")
+    return None
 
 
 def protection_verdict(ci_mode, protection, unavailable=None):
@@ -1177,6 +1228,21 @@ def waits_behind(changed_files, ahead):
     return None
 
 
+def freed_by(landed_pr, changed_files, ahead):
+    """
+    Does the landing of PR `landed_pr` free a PR that was queued behind it?
+
+      changed_files: the paths the waiting PR changes
+      ahead:         `queue_ahead` of its entry, read BEFORE the landing
+
+    True only when it waited behind that PR and, with it gone, waits behind
+    nothing: a PR that also overlaps another handed-back PR ahead of it is still
+    queued, and merging it now would resolve against a tip about to move.
+    """
+    rest = [e for e in ahead if e["pr"] != landed_pr]
+    return waits_behind(changed_files, ahead) == landed_pr and waits_behind(changed_files, rest) is None
+
+
 # --------------------------------------------------------------------------- #
 # Takeover — the human-authorized, lease-skipping reclaim (ADR-0011)           #
 # --------------------------------------------------------------------------- #
@@ -1457,19 +1523,21 @@ def select_recovery(worktree, branch):
 # is handed over, and {handback}, filled from the `handback` block only when the
 # worker is started on a sync conflict that was handed back (ADR-0019). That
 # block is also a brief of its own — `render_handback` — for a worker that is
-# still there to be told. Everything else in braces is a field — two of them
+# still there to be told. Everything else in braces is a field — three of them
 # derived: {wake_command}, the line a worker runs to wake the launcher once its
-# outcome is on GitHub, built from the `launcher_terminal` field (ADR-0020), and
-# {verdict_marker}, the marker a worker that opens no PR must post
-# (`verdict_marker_format`).
+# outcome is on GitHub, built from the `launcher_terminal` field (ADR-0020),
+# {gate_command}, the line a worker runs the local gate with — `afk gate`, built
+# from the `afk_path` and `local_command` fields, so a green run is on record for
+# the merge (ADR-0026) — and {verdict_marker}, the marker a worker that opens no
+# PR must post (`verdict_marker_format`).
 
 _BLOCK_RE = re.compile(r"<!--afk:block ([a-z0-9_.]+)-->\n(.*?)\n?<!--/afk:block-->", re.DOTALL)
 PROMPT_VARIANTS = ("fresh", "continue")
-PROMPT_FIELDS = ("n", "title", "repo", "base_branch", "local_command", "branch", "worktree_path",
-                 "launcher_terminal")
+PROMPT_FIELDS = ("n", "title", "repo", "base_branch", "local_command", "afk_path", "branch",
+                 "worktree_path", "launcher_terminal")
 HANDBACK_FIELDS = ("pr", "pr_branch", "target", "target_tip", "files")
 _PROMPT_SLOTS = ("opening", "step1", "retry_reason", "handback")
-_PROMPT_DERIVED = ("wake_command", "verdict_marker")
+_PROMPT_DERIVED = ("wake_command", "gate_command", "verdict_marker")
 _NO_LOCAL_COMMAND = "true   # (no gate.local_command configured: run the repo's own build/test, if any)"
 _NO_WAKE = "true   # (no coordinator terminal to wake: it finds your outcome at its next poll)"
 _TERMINAL_HANDLE_RE = re.compile(r"[A-Za-z0-9_.:-]+")
@@ -1501,6 +1569,25 @@ def wake_command(launcher_terminal, number):
     return f'orca terminal send --terminal {handle} --text "{wake_line(number)}" --enter'
 
 
+def gate_command(afk_path, local_command):
+    """
+    The command a worker runs the local gate with: `afk gate`, carrying the
+    configured `gate.local_command` as its config, so the run is made — and, when
+    green, recorded — by the tool rather than reported by the worker (ADR-0026).
+
+      afk_path:      the afk executable on this machine (the worker runs here)
+      local_command: `gate.local_command`; empty → a no-op with a note
+
+    The command travels inside the line, so a config that changes after the worker
+    was briefed records a command the merge no longer recognises: void, not wrong.
+    """
+    command = (local_command or "").strip()
+    if not command:
+        return _NO_LOCAL_COMMAND
+    config = json.dumps({"gate": {"local_command": command}}, ensure_ascii=False)
+    return f"{shlex.quote(afk_path)} gate --config {shlex.quote(config)}"
+
+
 def _prompt_blocks(template):
     blocks = dict(_BLOCK_RE.findall(template or ""))
 
@@ -1521,6 +1608,7 @@ def _fill_prompt(text, fields, handback, reason=None):
     if missing:
         raise ValueError(f"worker prompt: missing field(s) {', '.join(missing)}")
     values = {k: str(fields[k]) for k in PROMPT_FIELDS}
+    values["gate_command"] = gate_command(values.pop("afk_path"), values["local_command"])
     values["local_command"] = values["local_command"].strip() or _NO_LOCAL_COMMAND
     values["wake_command"] = wake_command(values.pop("launcher_terminal"), fields["n"])
     values["verdict_marker"] = verdict_marker_format(fields["n"])
@@ -1549,8 +1637,9 @@ def render_worker_prompt(template, variant, fields, reason=None, handback=None):
       variant:  "fresh" (a clean checkout of the base) or "continue" (the worktree
                 or branch already carries a dead worker's progress — ADR-0011)
       fields:   {name: value} for every one of PROMPT_FIELDS. An empty
-                `local_command` renders as a no-op with a note, and so does the
-                wake when `launcher_terminal` is empty (`wake_command`).
+                `local_command` renders as a no-op with a note (`gate_command`),
+                and so does the wake when `launcher_terminal` is empty
+                (`wake_command`).
       reason:   why the previous attempt failed, when this is a retry; None otherwise
       handback: {name: value} for every one of HANDBACK_FIELDS when the worker is
                 started on a sync conflict handed back to it (`files` a list of

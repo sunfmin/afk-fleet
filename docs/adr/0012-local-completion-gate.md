@@ -3,6 +3,9 @@
 **Status:** accepted — adds a `local` mode to the completion gate (previously: wait for GitHub
 checks). Composes with [ADR-0011](0011-takeover-and-progress-preservation.md)'s incremental-push
 progress preservation and reuses its continuation tier-2 move for merge-time worktree recreation.
+The merge-time re-run of decision 2 can be skipped, opt-in, when the worker's run is on record for
+the exact head that lands ([ADR-0026](0026-a-recorded-gate-run-stands-in-for-the-merge-time-run.md));
+the invariant is unchanged.
 
 ## Context
 

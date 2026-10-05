@@ -23,6 +23,10 @@ worker, `merge` lands a PR, `hand-back` returns a sync conflict to its worker,
 performs its whole ordered sequence in one process, so an invariant like "relabel
 before release" or "start from the fetched base tip" is code, not a paragraph.
 
+One subcommand is a worker's, not the tick's: `gate` runs the local gate in the
+worker's own worktree and puts a green run on record, which is the only thing
+that lets `merge` skip running it again (ADR-0026).
+
 Every subcommand that reads config REQUIRES the same `--config` (the canonical
 JSON from `afk config`, then `afk probe`) and resolves it one way, in `_cfg`:
 `--set key=value` → `--config` → CONFIG_DEFAULTS for the keys it omits (ADR-0009).
@@ -266,6 +270,12 @@ def _merge_queue(repo, prs, claims):
     return {n: _queue_entry(repo, n, pr) for n, pr in pr_of.items() if pr}
 
 
+def _changed_files(repo, pr_number):
+    """The paths a PR changes."""
+    return _gh(["api", "--paginate", f"repos/{repo}/pulls/{pr_number}/files",
+                "--jq", ".[].filename"]).stdout.splitlines()
+
+
 def _waits_behind(repo, entry, queue):
     """The PR number a queue entry waits behind (`afk_decide.waits_behind`), None
     when it is free. The PR's changed files are read only when a handed-back PR
@@ -273,9 +283,24 @@ def _waits_behind(repo, entry, queue):
     ahead = afk_decide.queue_ahead(entry, queue.values())
     if not ahead:
         return None
-    files = _gh(["api", "--paginate", f"repos/{repo}/pulls/{entry['pr']}/files",
-                 "--jq", ".[].filename"]).stdout.splitlines()
-    return afk_decide.waits_behind(files, ahead)
+    return afk_decide.waits_behind(_changed_files(repo, entry["pr"]), ahead)
+
+
+def _unblocked(repo, landing, queue, mine):
+    """The issues in `mine` whose PRs are queued behind the PR of queue entry
+    `landing` and wait behind nothing else (`afk_decide.freed_by`) — what its
+    landing frees, in merge order. Read from the queue as it stands BEFORE the
+    landing; a PR's changed files are read only when `landing` is ahead of it,
+    so a PR that was never handed back frees nobody and costs nothing."""
+    free = []
+    for number in afk_decide.queue_order(queue.values()):
+        entry = queue[number]
+        ahead = afk_decide.queue_ahead(entry, queue.values())
+        if number not in mine or entry["open"] or landing not in ahead:
+            continue
+        if afk_decide.freed_by(landing["pr"], _changed_files(repo, entry["pr"]), ahead):
+            free.append(number)
+    return free
 
 
 def _orca_worktree_rows():
@@ -1088,6 +1113,7 @@ _BRIEF_POINTER = ("Your task brief is the file {brief} — read it now and carry
 
 
 _NUDGE_MARK = "afk-nudge.json"
+_GATE_RECORD = "afk-gate.json"
 
 
 def _worker_file(path, name):
@@ -1205,7 +1231,7 @@ def _prompt_fields(a, cfg, issue, path, branch):
     this process inherited (ADR-0020)."""
     return {"n": issue["number"], "title": issue["title"], "repo": a.repo,
             "base_branch": cfg["base_branch"], "local_command": cfg["gate"]["local_command"],
-            "branch": branch, "worktree_path": path,
+            "afk_path": os.path.abspath(__file__), "branch": branch, "worktree_path": path,
             "launcher_terminal": os.environ.get("ORCA_TERMINAL_HANDLE", "")}
 
 
@@ -1327,27 +1353,84 @@ def cmd_status(a):
                          instance=a.instance, pr=a.pr, attempt=a.attempt, behind=a.behind)
 
 
-def _run_gate(cfg, worktree, timeout, excerpt_lines):
+def _run_gate(cfg, worktree, timeout, excerpt_lines, live=False):
     """Run the configured local gate in a worktree → `afk_decide.gate_verdict` —
     the completion gate itself in `gate.ci: local` mode, run at MERGE time against
     the exact tree that lands (ADR-0012). *What* to run is config, *where* is the
     branch's worktree, and *whether it passed* is an exit code — no judgment. A run
     that times out is red, never green-by-default; the tick gets a verdict and a
-    bounded excerpt, never a raw log."""
+    bounded excerpt, never a raw log. `live` is a worker's run (`afk gate`): the
+    log goes straight to its terminal — on stderr, the JSON stays alone on stdout —
+    and the excerpt is empty, since the worker has the whole of it."""
     cmd = cfg["gate"]["local_command"]
 
     def _text(s):
         return s.decode("utf-8", "replace") if isinstance(s, bytes) else (s or "")
 
+    pipes = ({"stdout": sys.stderr, "stderr": sys.stderr} if live
+             else {"capture_output": True, "text": True})
     timed_out, rc = False, 0
     try:
-        p = subprocess.run(cmd, shell=True, cwd=worktree, capture_output=True,
-                           text=True, timeout=timeout, env=_GIT_ENV)
+        p = subprocess.run(cmd, shell=True, cwd=worktree, timeout=timeout, env=_GIT_ENV, **pipes)
         out, rc = _text(p.stdout) + _text(p.stderr), p.returncode
     except subprocess.TimeoutExpired as e:
         out = _text(e.stdout) + _text(e.stderr) + f"\n[afk] gate timed out after {timeout}s"
         timed_out, rc = True, 124
+    if live and timed_out:
+        print(out.strip(), file=sys.stderr)
     return {**afk_decide.gate_verdict(rc, out, excerpt_lines, timed_out), "command": cmd}
+
+
+def _gate_record(path):
+    """The `afk_decide.gate_record` in a worktree, None when it has none."""
+    try:
+        with open(_worker_file(path, _GATE_RECORD)) as f:
+            return json.load(f)
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def cmd_gate(a):
+    """A WORKER's run of the local gate, in the worktree it is called from — the
+    one subcommand a worker runs, in place of typing `gate.local_command` itself.
+    The log streams to the worker's terminal; a GREEN run is put on record in the
+    worktree's git dir with the head it ran on, which is what lets `afk merge`
+    skip running the same command on the same commit again
+    (`gate.trust_recorded_run`, ADR-0026). The record is `afk`'s, made from an
+    exit code it saw: a worker saying "the gate is green" leaves none.
+
+      {"status": "green"|"red", "exit_code", "timed_out", "command", "head",
+       "recorded": <this run is on record as a pass of `head`>, "detail"}
+
+    The previous record is dropped before the run starts, so a red or timed-out
+    run leaves nothing that could be read as green. A green run over uncommitted
+    or untracked files is recorded as such and never trusted: it tested a tree no
+    commit holds."""
+    cfg = _cfg(a)
+    if not cfg["gate"]["local_command"].strip():
+        raise ValueError("gate.local_command is empty — there is no local gate to run")
+    path = _git(["rev-parse", "--show-toplevel"]).stdout.strip()
+    mark = _worker_file(path, _GATE_RECORD)
+    if os.path.exists(mark):
+        os.remove(mark)
+    head = _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip()
+    dirty = _git(["-C", path, "status", "--porcelain"]).stdout.splitlines()
+    gate = _run_gate(cfg, path, a.gate_timeout, 0, live=True)
+    out = {k: gate[k] for k in ("status", "exit_code", "timed_out", "command")}
+    if gate["status"] != "green":
+        return {**out, "head": head, "recorded": False,
+                "detail": "the gate is red — nothing is on record; fix it and run this again"}
+    clean = not dirty and _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip() == head
+    with open(mark, "w") as f:
+        json.dump(afk_decide.gate_record(head, gate["command"], clean, _now(a)), f)
+    if not clean:
+        return {**out, "head": head, "recorded": False, "uncommitted": dirty[:20],
+                "detail": "green, but not on a committed tree — the worktree had uncommitted or "
+                          "untracked files, so this run proves nothing about a commit. Commit "
+                          "them (or ignore the gate's own artifacts) and run this again"}
+    return {**out, "head": head, "recorded": True,
+            "detail": f"green on {head} and on record — push it; any further commit needs "
+                      f"another run"}
 
 
 def _unmerged(path):
@@ -1387,7 +1470,9 @@ def cmd_merge(a):
     (ADR-0017), stopping with an `outcome` wherever the tick's judgment is needed:
 
       merged        synced, gate re-confirmed on the tree that lands, merged, status
-                    board upserted, claim released, worktree removed.
+                    board upserted, claim released, worktree removed. `unblocked`
+                    lists my claims that were queued behind this PR and are free
+                    now, in merge order: merge them next.
       conflict      the sync conflicted; the merge is left in progress in `worktree`
                     with `files` unmerged. `afk hand-back` returns it to the worker
                     that wrote the branch (the default); or resolve + commit there
@@ -1414,7 +1499,11 @@ def cmd_merge(a):
                     re-run with `--verified <head>`.
 
     The invariant every path keeps: what lands on the target was gated in the form
-    it lands (ADR-0012) — `gh pr merge` is pinned to the gated head."""
+    it lands (ADR-0012) — `gh pr merge` is pinned to the gated head. In local mode
+    `gate.source` says where that proof came from: "run" — the gate ran here — or,
+    with `gate.trust_recorded_run`, "recorded" — the worker's `afk gate` run is on
+    record for exactly `gate.head`, so it was not run again (ADR-0026);
+    `gate.not_trusted` says why a record was not enough."""
     cfg, rem = _cfg(a), _remote(a)
     _require_mine(rem, cfg, a.number, a.instance)
     prs = _open_prs(a.repo)
@@ -1427,7 +1516,8 @@ def cmd_merge(a):
     def stop(outcome, **more):
         return {**out, "outcome": afk_decide.merge_outcome(outcome), **more}
 
-    queue = _merge_queue(a.repo, prs, _scan(rem, cfg["claim_namespace"])[0])
+    claims = _scan(rem, cfg["claim_namespace"])[0]
+    queue = _merge_queue(a.repo, prs, claims)
     entry = queue[a.number]
     if entry["open"]:                      # before the worktree: the worker is in it
         return stop("handed_back",
@@ -1477,11 +1567,22 @@ def cmd_merge(a):
 
     # --- the machine gate, against exactly `head` ---
     if cfg["gate"]["ci"] == "local":
-        gate = _run_gate(cfg, path, a.gate_timeout, a.excerpt_lines)
-        if gate["status"] != "green":
-            _gh(["pr", "comment", str(pr["number"]), "--repo", a.repo, "--body",
-                 afk_decide.gate_comment(gate, gate["command"])])
-            return stop("gate_red", gate=gate)
+        command, record, void = cfg["gate"]["local_command"], None, None
+        if cfg["gate"]["trust_recorded_run"]:
+            record = _gate_record(path)
+            void = afk_decide.gate_record_void(record, head, command)
+        if cfg["gate"]["trust_recorded_run"] and void is None:
+            out["gate"] = {"status": "green", "source": "recorded", "head": head,
+                           "command": command, "recorded_at": record["at"]}
+        else:
+            gate = {**_run_gate(cfg, path, a.gate_timeout, a.excerpt_lines), "source": "run",
+                    "head": head, **({"not_trusted": void} if void else {})}
+            if gate["status"] != "green":
+                _gh(["pr", "comment", str(pr["number"]), "--repo", a.repo, "--body",
+                     afk_decide.gate_comment(gate, gate["command"])])
+                return stop("gate_red", gate=gate)
+            out["gate"] = {k: gate[k] for k in ("status", "source", "head", "command", "not_trusted")
+                           if k in gate}
     else:
         checks = afk_decide.pr_checks_state(pr.get("statusCheckRollup"))
         verdict = afk_decide.checks_gate(checks, pushed, a.allow_no_checks)
@@ -1493,6 +1594,10 @@ def cmd_merge(a):
                            "--verified <head>")
 
     # --- land it, then settle the claim: board → release → worktree ---
+    # what it frees is read first: a read that fails after the PR landed would
+    # report an error over a merge that happened
+    unblocked = _unblocked(a.repo, entry, queue,
+                           {c["number"] for c in claims if c["instance"] == a.instance})
     _gh(["pr", "merge", str(pr["number"]), "--repo", a.repo, f"--{cfg['merge']['strategy']}",
          "--match-head-commit", head,
          *(["--delete-branch"] if cfg["merge"]["delete_branch"] else [])])
@@ -1500,7 +1605,8 @@ def cmd_merge(a):
         _upsert_board(a.repo, a.number, cfg, "merged", instance=a.instance, pr=pr["number"])
     _release(rem, cfg, a.number)
     cleanup = _remove_worktree(path) if (cfg["worktree_cleanup"] or recreated) else None
-    return stop("merged", released=True, **({"cleanup": cleanup} if cleanup else {}))
+    return stop("merged", released=True, unblocked=unblocked,
+                **({"cleanup": cleanup} if cleanup else {}))
 
 
 _HANDBACK_POINTER = ("The merge of your PR hit a sync conflict, and it is handed back to you. Your "
@@ -1802,6 +1908,14 @@ def build_parser():
     p.add_argument("--check", default=None, metavar="cmd",
                    help="a candidate command: resolve its first word in the login shell "
                         "and report whether it runs (and looks unattended)")
+
+    # --- the worker's own ---
+    p = command("gate", cmd_gate,
+                help="a WORKER's run of the local gate, in the worktree it is called from: "
+                     "the log streams to its terminal, and a green run on a committed tree "
+                     "is put on record for `afk merge`")
+    p.add_argument("--gate-timeout", type=int, default=1800, metavar="s",
+                   help="seconds before the local gate is called red (default %(default)s)")
 
     # --- the launcher's cycle ---
     p = command("cycle", cmd_cycle, remote="gh",

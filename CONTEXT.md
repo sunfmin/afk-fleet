@@ -106,7 +106,12 @@ a PR must pass (ADR-0012). It runs twice in a PR's life: the **worker** runs it 
 **sync**, so it tests "my code + current base"; and the **tick** re-runs it at merge time, after the
 merge-time **sync**, in the branch's worktree (recreated from the branch tip when none survives
 locally — the **continuation** tier-2 move). The invariant both runs serve: *what lands on the target
-branch was tested in the form it lands.* GitHub checks are never read in this mode — the repo is
+branch was tested in the form it lands.* The worker runs it through `afk gate`, which puts a green
+run on record with the head it ran on; a repo that sets `gate.trust_recorded_run` lets the merge
+skip its own run when — and only when — that record is of the command configured now, on a
+committed tree, at the exact head that would land. A merge-time sync that moved the head, a later
+commit, a changed command, or no record at all voids it, and the merge runs the gate as before
+(ADR-0026). GitHub checks are never read in this mode — the repo is
 expected to scope remote CI away from worker branches, and a target branch whose protection requires
 checks is rejected at bootstrap. A red run's log excerpt is posted as a PR comment, so the retry
 ladder re-reads the failure from where it lives, never from a dead tick's context.
@@ -139,7 +144,7 @@ code/LLM ownership split), script vs agent (the tick is not a script)
 One change of a **claim**'s state, performed as a single `afk` call that runs its whole ordered
 sequence in code: **dispatch** (claim → worktree at the right commit → worker started → prompt
 delivered → status board), **merge** (sync → gate → merge pinned to the gated head → status board →
-release → cleanup), **hand-back** (abort the conflicted sync → instruct the worker → record on the PR
+release → cleanup; its `merged` outcome names the claims the landing freed in the **merge queue**), **hand-back** (abort the conflicted sync → instruct the worker → record on the PR
 → status board), **fail** (count the attempt, then a fresh retry or an escalation), **escalate**
 (status board → relabel → comment → release, the release last), **park** (dependency edge → status
 board → release → cleanup), **close** (status board → close → release → cleanup). A transition stops with an **outcome** exactly where the next move is judgment —
@@ -303,6 +308,9 @@ it, answered or not, conflicted in a file it also changes: it is neither merged 
 handed back) until the one ahead has merged, it holds its slot, and its **status board** names the PR
 it waits behind. The queue is every **claim**'s open PR, a peer fleet's included; a PR whose claim was
 released is not in it. Waiting is bounded by the unanswered-hand-back ladder, and spends no **retry**.
+When the PR ahead lands, the **merge** that landed it names the claims it freed (`unblocked`), and the
+**tick** merges them next, in that same pass — a queued PR never waits a cycle for a PR that has
+already merged (ADR-0026).
 _Avoid_: merge train (nothing is batched or speculatively gated), lock (nothing is held: the order
 is recomputed from GitHub every time), priority (it is not configurable)
 

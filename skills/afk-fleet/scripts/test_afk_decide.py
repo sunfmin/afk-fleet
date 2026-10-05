@@ -6,6 +6,7 @@ Run: python3 test_afk_decide.py   (plain asserts, no test-framework dependency)
 These cover the correctness-critical verdicts (esp. classify_claims: the
 mine/peer_live/stale partition whose wrong answer silently corrupts state).
 """
+import json
 import os
 import re
 
@@ -214,6 +215,15 @@ def test_merge_queue_orders_prs_and_holds_one_behind_a_handed_back_pr_it_overlap
     # a hand-back whose sync named no file holds nobody up
     assert d.waits_behind(["a.md"], [entry(9, 90, at=1, rounds=1)]) is None
 
+    # what a landing frees (#36): a PR that waited behind the one that landed and,
+    # with it gone, waits behind nothing
+    assert d.freed_by(50, ["c.md"], everyone) is True
+    assert d.freed_by(50, ["a.md"], everyone) is False       # #30 conflicted in a.md too
+    assert d.freed_by(30, ["a.md"], everyone) is False       # it waits behind #50, not #30
+    assert d.freed_by(40, ["b.md", "x.go"], everyone) is True
+    assert d.freed_by(50, ["x.go"], everyone) is False       # it never waited at all
+    assert d.freed_by(50, ["c.md"], []) is False
+
     # only a claim that would merge is ever `queued`; the board says so
     for ci, checks in (("local", None), ("local", "red"), ("required", "green")):
         assert d.subclassify_pr(True, checks, ci, queued=True) == ("queued", "queued")
@@ -304,6 +314,51 @@ def test_gate_verdict():
     # a timed-out run is RED, never green-by-default, whatever it exited with
     r = d.gate_verdict(0, "hung", timed_out=True)
     assert r["status"] == "red" and r["timed_out"] is True
+
+
+def test_a_recorded_gate_run_counts_only_for_the_commit_and_command_it_ran():
+    """ADR-0026. The merge skips its own run of the local gate on ONE proof: a green
+    run of the command configured now, on a committed tree, at the head that would
+    land. Everything else is void — and void means the merge gates."""
+    rec = d.gate_record("abc123", "make test", True, 1700000000.9)
+    assert rec == {"head": "abc123", "command": "make test", "clean": True, "at": 1700000000}
+    assert d.gate_record_void(rec, "abc123", "make test") is None
+
+    for record, head, command, why in (
+            (None, "abc123", "make test", "no green run"),
+            ({}, "abc123", "make test", "no green run"),
+            ("green", "abc123", "make test", "no green run"),        # not a record at all
+            ({**rec, "head": ""}, "", "make test", "no green run"),
+            (rec, "def456", "make test", "not on the head that would land"),   # synced, or committed
+            (rec, "abc123", "make test -short", "different command"),
+            (rec, "abc123", " make test", "different command"),      # verbatim, not "close enough"
+            ({**rec, "clean": False}, "abc123", "make test", "uncommitted or untracked"),
+            ({k: v for k, v in rec.items() if k != "clean"}, "abc123", "make test", "uncommitted")):
+        assert why in d.gate_record_void(record, head, command), (record, head, command)
+    # the reason names both heads, so a human reading a tick's result can see what moved
+    void = d.gate_record_void(rec, "def456", "make test")
+    assert "abc123" in void and "def456" in void
+
+    # only local mode has a merge-time run to skip: on `required` the key would be
+    # one a human sets to no effect
+    on = {"local_command": "make test", "trust_recorded_run": True}
+    d.validate_config(d.resolve_config({"gate": {**on, "ci": "local"}}))
+    assert d.CONFIG_DEFAULTS["gate"]["trust_recorded_run"] is False     # opt-in
+    try:
+        d.validate_config(d.resolve_config({"gate": on}))
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "trust_recorded_run" in str(e)
+
+    # the line a worker gates with: the tool, carrying the command — quoted for a shell
+    assert d.gate_command("/s/afk.py", " make test ") == \
+        """/s/afk.py gate --config '{"gate": {"local_command": "make test"}}'"""
+    import shlex
+    odd = d.gate_command("/my skills/afk.py", """pnpm test -- --grep 'a "b"'""")
+    argv = shlex.split(odd)
+    assert argv[:3] == ["/my skills/afk.py", "gate", "--config"] and len(argv) == 4
+    assert json.loads(argv[3]) == {"gate": {"local_command": """pnpm test -- --grep 'a "b"'"""}}
+    assert "no gate.local_command configured" in d.gate_command("/s/afk.py", "  ")
 
 
 def test_protection_verdict():
@@ -1223,6 +1278,7 @@ def _prompt_template():
 
 PROMPT_FIELDS = {"n": 31, "title": "Names inspector tab", "repo": "acme/widgets",
                  "base_branch": "main", "local_command": "make test",
+                 "afk_path": "/skills/afk fleet/scripts/afk.py",
                  "branch": "sunfmin/issue-31-names", "worktree_path": "/wt/issue-31",
                  "launcher_terminal": "term_launcher-1"}
 
@@ -1238,6 +1294,9 @@ def test_render_worker_prompt_fills_the_shipped_template():
         assert "`sunfmin/issue-31-names`" in body and "`/wt/issue-31`" in body
         assert "Closes #31" in body and "gh issue view 31 --repo acme/widgets" in body
         assert "make test" in body and "git merge origin/main" in body
+        # the gate is run THROUGH the tool, so a green run is on record (ADR-0026)
+        assert d.gate_command(PROMPT_FIELDS["afk_path"], "make test") in body
+        assert "\n   make test" not in body                    # never the bare command to run
         assert not re.search(r"\{[a-z_0-9.]+\}", body), re.findall(r"\{[a-z_0-9.]+\}", body)
         assert "afk:block" not in body and "Worker prompt template" not in body
         # the single-outcome rule and the checkpoint rule are in both variants
@@ -1260,7 +1319,7 @@ def test_render_worker_prompt_fills_the_shipped_template():
 
     # no local gate configured: a no-op with a note, never an empty command line
     none = d.render_worker_prompt(t, "fresh", {**PROMPT_FIELDS, "local_command": "  "})
-    assert "no gate.local_command configured" in none
+    assert "no gate.local_command configured" in none and " gate --config " not in none
 
 
 def test_a_worker_is_told_how_to_wake_the_launcher_and_nothing_else():
@@ -1294,6 +1353,7 @@ def test_render_handback_is_one_block_alone_or_appended_to_a_continuation():
     alone = d.render_handback(t, PROMPT_FIELDS, HANDBACK)
     # the whole instruction: target + tip, the files, merge-not-rebase, gate, same PR
     assert alone.startswith("## A sync conflict on your PR was handed back to you")
+    assert d.gate_command(PROMPT_FIELDS["afk_path"], "make test") in alone
     for needle in ("PR #77", "`main` moved first", "(`abc123def456`)", "- `a/names.go`",
                    "git fetch origin main", "git merge origin/main", "never rebase", "make test",
                    "git push origin HEAD:sunfmin/issue-31-names", "Do not open another PR",

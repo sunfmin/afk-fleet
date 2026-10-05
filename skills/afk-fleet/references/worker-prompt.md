@@ -27,7 +27,9 @@ The fields are `{n}`, `{title}`, `{repo}`, `{base_branch}`, `{local_command}` (f
 config), `{branch}`, `{worktree_path}` (the **actual** values orca returned — orca names the branch
 `<user>/…`, never assumed from `branch_pattern`), `{wake_command}` — the line that **wakes** the
 launcher, built from the handle of the terminal the launcher runs in, or a no-op when it runs in
-none (ADR-0020) — and `{verdict_marker}`, the `<!--afk:verdict …-->` line a worker that opens no PR
+none (ADR-0020) — `{gate_command}` — the line the worker runs the **local gate** with: `afk gate`
+carrying `gate.local_command`, so a green run is on record for the merge (ADR-0026), or a no-op when
+no local gate is configured — and `{verdict_marker}`, the `<!--afk:verdict …-->` line a worker that opens no PR
 must post, written by the same code that parses it back. A field or slot the code cannot fill is an error: no
 worker is ever started on a prompt with a literal placeholder in it. A test renders both variants.
 
@@ -115,15 +117,23 @@ anyway (ADR-0011).
    git merge origin/{base_branch}      # MERGE — never rebase
    # resolve any conflict HERE, in this session
    git push origin HEAD
-   {local_command}                     # if set: fix until green, committing + pushing each fix
+   {gate_command}
    ```
+   That last line **is** the gate: it runs `{local_command}` here, streams its log to you, and ends
+   with one JSON object. Run it exactly as written — not the bare command. It is green only when that
+   object says `"status": "green"`; on `"red"`, fix, **commit**, and run it again. Finish on a run that
+   says `"recorded": true` — green, on a tree with nothing uncommitted or untracked — and then
+   `git push origin HEAD`. That run is on record for the commit it names, and the coordinator may
+   land that exact commit without running the gate a second time; the bare command leaves no record,
+   and any commit after the recorded run needs another run.
    **Merge, never rebase:** a rebase replays your commits and drops the merge commits, re-igniting
    conflicts whose resolutions lived only inside them; and because the coordinator squash-merges, the
    target branch's history is identical either way (ADR-0012). **Resolve integration conflicts here**
    — you are the author, your context is loaded, and the fix is cheap. A conflict that only shows up
    later, at the coordinator's serialized merge point, comes back to you anyway (see step 6) — after
-   a round trip that blocks the queue. Note the coordinator re-runs this same `{local_command}` at merge time against the tree that
-   actually lands, and in `gate.ci: local` repos that run is the *only* machine gate there is — so
+   a round trip that blocks the queue. Note the coordinator gates the tree that actually lands with this
+   same `{local_command}` — running it again at merge time, or trusting your recorded run when
+   nothing moved since — and in `gate.ci: local` repos that is the *only* machine gate there is — so
    leave it genuinely green, not green-if-you-squint.
 5. **Open the PR:** `gh pr create --base {base_branch} --head {branch} --title "..." --body "Closes #{n}
    ..."`. Body: what you changed, how you verified, any follow-ups.
@@ -212,10 +222,14 @@ any step above that says to implement the issue or to open a PR.** Do exactly th
    HEAD..origin/{target}` and the diffs of the conflicting commits — then fix each file, `git add`
    it, and **commit the merge**. Do not drop the other change to make yours fit, and do not
    re-implement the issue.
-3. **Run the gate until it is green**, committing each fix:
+3. **Run the gate until it is green**, committing each fix — with this line, exactly as written,
+   not the bare `{local_command}`:
    ```bash
-   {local_command}
+   {gate_command}
    ```
+   It streams the log and ends with one JSON object: green only on `"status": "green"`. Finish on a
+   run that says `"recorded": true` (green, nothing uncommitted or untracked) — that run is on record
+   for the merge commit you made, and the coordinator may land it without gating it again.
 4. **Push to the existing PR's branch** — the same PR, never a new one:
    ```bash
    git push origin HEAD:{pr_branch}
