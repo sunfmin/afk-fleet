@@ -1529,7 +1529,7 @@ def test_a_worker_reads_the_one_way_its_pr_lands_when_it_holds_the_turn():
     """ADR-0027. `afk land` is the only way a PR lands, and the landing brief is
     the only place it is spelled: the command, and what to do on each outcome it
     can stop with. A worker with a PR still to open is told only that it lands
-    later, on its turn, and never by hand."""
+    when it is told to, and never by hand."""
     t = _prompt_template()
     # the config travels whole, quoted for the worker's shell — and it is free text
     # to the template: a `{branch}` or an apostrophe inside it arrives verbatim
@@ -1546,14 +1546,15 @@ def test_a_worker_reads_the_one_way_its_pr_lands_when_it_holds_the_turn():
     for outcome in d.LAND_OUTCOMES:
         assert f"| `{outcome}` |" in alone, outcome
     for body in (fresh, cont, alone):
-        assert "landing turn" in body and "gh pr merge" in body          # named only to forbid it
-        assert "afk:block" not in body
-    # a worker with a PR to open is told it does NOT merge until its turn — and is
-    # not handed the command, or its outcomes, before it can run it
+        assert "gh pr merge" in body and "afk:block" not in body         # named only to forbid it
+    assert "landing turn" in alone
+    # a worker with a PR to open is told it does NOT merge it, and that it is told
+    # when to land it — and is not handed the command, or its outcomes, or how the
+    # fleet takes turns, before it can act on any of them
     for body in (fresh, cont):
-        assert "## Landing — later, on your PR's landing turn" in body
-        assert "never merge your PR yourself" in body and "only on its landing turn" in body
+        assert "Do not merge the PR" in body and "you are told\n   here when to land it" in body
         assert " land --issue " not in body and "| `outcome` |" not in body
+        assert "landing turn" not in body
 
     # the landing brief is the whole instruction, alone: which PR, where it lands,
     # the command, the wake — and nothing about implementing or opening a PR

@@ -124,8 +124,8 @@ real boundary would need separate credentials, which the fleet deliberately does
 `afk rebuild`'s `mine` rows report `awaiting_turn` and `landing` (with `stopped`) in place of
 `awaiting_merge`, `queued` and `handed_back`; the status board gains a waiting-for-turn phase and a
 landing step. The **landing brief** names `afk land` as the only way to land and carries its outcome
-table; the worker prompt a worker is started with (fresh, continue) says only that its PR lands
-later, on its landing turn, and never by hand. (As first written every variant carried the command
+table; the worker prompt a worker is started with (fresh, continue) says only that it does not
+merge its PR and is told when to land it. (As first written every variant carried the command
 and the table. The copy in the starting prompt was never acted on — the brief is rewritten with both
 when the turn is granted — so it was cut, with the rest of what a worker read and did not act on.)
 The tick's summary counts `granted` where it counted
