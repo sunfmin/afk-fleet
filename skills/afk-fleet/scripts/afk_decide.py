@@ -2495,8 +2495,9 @@ def pace(did_work, in_flight, empty_streak, config):
 #                       while that was still so
 #   in_flight           claims held as the last tick ended
 #   frontier_remaining  dispatchable issues the last tick left undispatched
-#   unsettled           the last tick left a judgment open or met an error: the
-#                       next cycle ticks whatever the digest says
+#   unsettled           the last tick left a judgment open, met an error or
+#                       ended with a PR it had not seen: the next cycle ticks
+#                       whatever the digest says
 #   boards              {issue number: `board_key`} for the claims held as the
 #                       last tick ended — the status board each one was left
 #                       with, so a tick that would render the same one again
@@ -2572,8 +2573,8 @@ def cycle_wake(state, current_fp, config, woke=False):
     the lease no tick will. On a tick the pass runs and `cycle_ticked` closes it.
 
     A cycle after a tick that left something `unsettled` — an open judgment, an
-    error — ticks whatever the digest says: nothing may have moved, and the
-    judgment is still owed. So does one that `woke`. A skipped cycle extends the empty streak only while
+    error, a PR that opened while it ran — ticks whatever the digest says: nothing
+    may have moved, and the judgment, or the PR's landing turn, is still owed. So does one that `woke`. A skipped cycle extends the empty streak only while
     nothing is in flight and nothing is left on the frontier: unchanged state
     then proves the cycle empty.
     """
@@ -2595,7 +2596,7 @@ def cycle_wake(state, current_fp, config, woke=False):
             "progress": f"nothing moved; {_standing(new)}"}
 
 
-def cycle_ticked(state, did, config, judgments=0, errors=0, left=None, boards=None):
+def cycle_ticked(state, did, config, judgments=0, errors=0, left=None, boards=None, unseen=0):
     """
     The bottom of a cycle that ran a tick: fold what the tick did into the cycle
     state and say how long to sleep.
@@ -2610,14 +2611,18 @@ def cycle_ticked(state, did, config, judgments=0, errors=0, left=None, boards=No
                  cycle (ADR-0007). None keeps the digest the cycle opened with
       boards:    {issue number: `board_key`} for the claims the tick ended
                  holding; None keeps the state's
+      unseen:    how many of my claims' PRs opened while the tick ran
+                 (`unseen_prs`) — inside `left`, and acted on by nobody
 
     Returns {"state", "sleep_seconds", "progress"}. A tick with open judgments
-    sleeps 0: the caller answers them and opens the next cycle at once. One that
-    left a judgment or an error is `unsettled`, and never counts as empty.
+    sleeps 0: the caller answers them and opens the next cycle at once. So does
+    one that left a PR unseen: the next tick is the one that gives it its turn.
+    One that left a judgment, an error or an unseen PR is `unsettled`, and never
+    counts as empty.
     """
     did_work = any(did.get(k) for k in TICK_WORK)
     in_flight, remaining = (int(did[k]) for k in TICK_COUNTS)
-    unsettled = bool(judgments or errors)
+    unsettled = bool(judgments or errors or unseen)
     empty = not did_work and in_flight == 0 and remaining == 0 and not unsettled
     new = {**state, "in_flight": in_flight, "frontier_remaining": remaining,
            "unsettled": unsettled, "empty_streak": state["empty_streak"] + 1 if empty else 0,
@@ -2627,10 +2632,11 @@ def cycle_ticked(state, did, config, judgments=0, errors=0, left=None, boards=No
     parts = [f"{word} {', '.join(f'#{n}' for n in did[k])}"
              for k, word in TICK_DID.items() if did.get(k)]
     parts += [f"{count} {noun}{'' if count == 1 else 's'}{tail}"
-              for count, noun, tail in ((judgments, "judgment", " open"), (errors, "error", ""))
+              for count, noun, tail in ((judgments, "judgment", " open"), (errors, "error", ""),
+                                        (unseen, "PR", " opened meanwhile"))
               if count]
     return {"state": new,
-            "sleep_seconds": 0 if judgments else pace(did_work, in_flight,
+            "sleep_seconds": 0 if judgments or unseen else pace(did_work, in_flight,
                                                       new["empty_streak"], config),
             "progress": "; ".join([*parts, _standing(new)])}
 
@@ -3334,13 +3340,18 @@ def fingerprint(issues, prs, claims):
     Digest the observable fleet inputs — open issues (number + labels +
     updatedAt + open-blocker count, so label churn, closes, fresh blocker
     comments and a dependency edge all move it), open PRs (number + head sha +
-    updatedAt + `pr_checks_state`, so pushes and CI finishing move it), and
-    claim refs (number + sha, so peer claims/releases/reclaims move it).
+    updatedAt + `pr_checks_state` + the issues it closes, so pushes, CI finishing
+    and a PR becoming an issue's all move it), and claim refs (number + sha, so peer claims/releases/reclaims move it).
 
     A PR's checks enter as the ONE word a tick acts on — green / red / pending /
     none — not check by check: a check going queued → in progress, or the first
     of several finishing green, leaves the claim `awaiting_ci` and so leaves the
     digest alone. Only the verdict changing moves it.
+
+    The issues a PR closes are in its row because a claim has a PR only through
+    them (`closing_pr`), and GitHub may list a new PR before it lists what the PR
+    closes: that link arriving must read as a change, or the PR waits for the
+    forced tick.
 
     Heartbeats are deliberately NOT an input: the launcher refreshes its own
     lease on skipped cycles, which would move the digest every cycle and defeat
@@ -3355,7 +3366,8 @@ def fingerprint(issues, prs, claims):
                           int(i.get("blocked_by") or 0)]
                          for i in issues),
         "prs": sorted([p.get("number"), p.get("headRefOid") or "", p.get("updatedAt") or "",
-                       pr_checks_state(p.get("statusCheckRollup")) or "none"]
+                       pr_checks_state(p.get("statusCheckRollup")) or "none",
+                       sorted(ref.get("number") for ref in p.get("closingIssuesReferences") or [])]
                       for p in prs),
         "claims": sorted([c.get("number"), c.get("sha") or ""] for c in claims),
     }
@@ -3435,6 +3447,15 @@ def _closing_pr_map(prs):
 def closing_pr(prs, number):
     """The open PR that closes issue <number> (the latest, when several do), or None."""
     return _closing_pr_map(prs).get(number)
+
+
+def unseen_prs(mine, prs):
+    """The claims whose PR a tick did not act on: the issue numbers of the `mine`
+    rows it worked from whose closing PR, among the open PRs `prs` read as it
+    ended, is not the one the row names — opened, or replaced, while it ran."""
+    now = _closing_pr_map(prs)
+    return sorted(r["number"] for r in mine
+                  if r["number"] in now and now[r["number"]].get("number") != r["pr"])
 
 
 def superseded_prs(prs, number, branch_pattern):

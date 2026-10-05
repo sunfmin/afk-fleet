@@ -998,8 +998,11 @@ def cmd_cycle(a):
     command come from. No `--state` is a first cycle, which always ticks. The
     state a tick hands back holds the digest of the fleet as that tick LEFT it —
     gathered again after its last write — so its own boards, refs and markers do
-    not cause the next tick; what happened meanwhile and is inside that digest
-    unseen is what `--wake` and the forced tick are for (ADR-0007). What the
+    not cause the next tick. A PR of one of my claims that opened meanwhile is
+    inside that digest unseen, and that is said: the state is left unsettled and
+    `sleep_seconds` is 0, so the next cycle ticks at once and gives it its turn.
+    Anything else that happened meanwhile is what `--wake` and the forced tick
+    are for (ADR-0007). What the
     tick could not decide comes back as `judgments`, each with the `afk` command
     for either answer; the caller runs one and opens the next cycle at once
     (`sleep_seconds` is then 0). Only that ever reaches a context — the raw
@@ -1028,17 +1031,19 @@ def cmd_cycle(a):
         return {**woke, "judgments": [],
                 "heartbeat": _beat(run.rem, cfg, instance, run.now())}
     _BOARDS.update({int(n): key for n, key in state["boards"].items()})
-    did, judgments, errors = _tick(run, instance, a.host, agent,
-                                   _rebuild(run, instance, gathered))
-    left = None
+    ws = _rebuild(run, instance, gathered)
+    did, judgments, errors = _tick(run, instance, a.host, agent, ws)
+    left, unseen = None, []
     if gathered:
         try:
-            left = afk_decide.fingerprint(*_gather(run, fresh=True)[:3])
+            after = _gather(run, fresh=True)
+            left = afk_decide.fingerprint(*after[:3])
+            unseen = afk_decide.unseen_prs(ws["mine"], after[1])
         except (OSError, RuntimeError):
             pass        # keep the opening digest: the next cycle reads `changed`, and ticks
     return {"action": "tick", "reason": woke["reason"],
             **afk_decide.cycle_ticked(woke["state"], did, cfg, len(judgments), len(errors),
-                                      left=left, boards=dict(_BOARDS)),
+                                      left=left, boards=dict(_BOARDS), unseen=len(unseen)),
             "judgments": judgments, **({"errors": errors} if errors else {})}
 
 
