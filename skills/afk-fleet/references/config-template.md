@@ -96,7 +96,8 @@ claim_lease_ttl_seconds: 4500          # a claim is live while its owner's heart
                                       #   claim the launcher never sleeps past ttl/2 so the lease can't lapse.
 fingerprint_gate: true                 # each cycle, `afk cycle` (code, zero LLM tokens) runs its
                                       #   reconciliation pass only when the digest of observable
-                                      #   state (issues+labels, PRs+checks, claim refs) moved (ADR-0007)
+                                      #   state (issues+labels+blockers, PRs + whether their checks
+                                      #   are green/red/pending, claim refs) moved (ADR-0007)
 force_tick_after_skips: 6              # safety net: a full tick at least every N skipped cycles — time-
                                       #   driven events (a peer's lease expiring) are invisible to any
                                       #   state hash. 1 disables skipping entirely.

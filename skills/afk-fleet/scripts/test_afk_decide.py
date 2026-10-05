@@ -37,23 +37,21 @@ def test_select_frontier():
     assert len(r["dispatch"]) + len(r["excluded"]) == len(issues)
 
 
-def test_frontier_candidates_are_everything_but_the_blocker_check():
-    # the cheap pre-pass `afk rebuild` runs to decide WHICH issues are worth a
-    # per-issue blocked_by read: every eligibility check except open blockers
+def test_the_frontier_reads_each_issues_own_blocker_count():
+    # the open-blocker count rides on the issue row — the list read carries it —
+    # so the frontier needs no read of its own, and no pre-pass to ration one
     issues = [{"number": n, "labels": ["ready-for-agent"]} for n in (1, 2, 3, 4)]
     issues.append({"number": 5, "labels": ["ready-for-agent", "epic"]})
     prs = [{"number": 30, "closingIssuesReferences": [{"number": 3}]}]
     claims = [{"number": 2, "instance": "peer"}]
-    got = d.frontier_candidates(issues, prs, claims, "ready-for-agent", ["epic"])
-    assert got == [1, 4], got            # 2 claimed, 3 has an open PR, 5 is an epic
-
-    # …and it is the SAME rule the real frontier applies: with every candidate
-    # unblocked the two agree, and a blocked candidate drops out of only the latter
     cfg = d.resolve_config({"epic_labels": ["epic"]})
-    ws = d.assemble_working_set(issues, prs, claims, {}, {}, "me", 0, cfg)
-    assert [i["number"] for i in ws["frontier"]["dispatch"]] == got
-    ws = d.assemble_working_set(issues, prs, claims, {}, {4: 2}, "me", 0, cfg)
+    ws = d.assemble_working_set(issues, prs, claims, {}, "me", 0, cfg)
+    # 2 claimed, 3 has an open PR, 5 is an epic; a row with no count is unblocked
+    assert [i["number"] for i in ws["frontier"]["dispatch"]] == [1, 4]
+    issues[3]["blocked_by"] = 2
+    ws = d.assemble_working_set(issues, prs, claims, {}, "me", 0, cfg)
     assert [i["number"] for i in ws["frontier"]["dispatch"]] == [1]
+    assert {"number": 4, "reason": "2 open blocker(s)"} in ws["frontier"]["excluded"]
 
 
 def test_is_stale_and_due():
@@ -1051,6 +1049,10 @@ def test_render_status_board():
     parked = d.render_status_board("parked", "required", 2, blocked_by=[135, 140])
     assert "- [x]" not in parked and "等待依赖 #135、#140 关闭" in parked
     assert "认领方" not in parked and "无需人工处理" in parked
+    # the key the cycle state keeps for a board is of its body, whitespace aside
+    assert d.board_key(parked) == d.board_key(parked + "\n") != d.board_key(
+        d.render_status_board("parked", "required", 2, blocked_by=[135]))
+    assert len(d.board_key(parked)) == 8
 
     # awaiting_turn: the PR is open and ready; the line says what it waits for
     waiting = d.render_status_board("awaiting_turn", "required", 2, instance="x", pr=9)
@@ -1121,8 +1123,9 @@ def test_cycle_state_is_validated_not_guessed():
     assert d.cycle_state(first) == first                      # …so a later cycle passes neither
     assert d.cycle_state(first, **FACTS) == first             # the same ones again are harmless
     st = {"fingerprint": "abc", "skips": 2, "empty_streak": 1, "in_flight": 0,
-          "frontier_remaining": 4, "unsettled": True, **FACTS}
+          "frontier_remaining": 4, "unsettled": True, "boards": {"7": "0a1b2c3d"}, **FACTS}
     assert d.cycle_state(st) == st
+    assert d.cycle_state(None, **FACTS)["boards"] is not d.CYCLE_START["boards"]   # never shared
     # a caller that mangled the state must hear so — run on zeros, a fleet holding
     # claims would be paced as if it held none; without the facts it could start no worker
     no_facts = {k: v for k, v in st.items() if k not in FACTS}
@@ -1176,6 +1179,14 @@ def test_cycle_ticked_folds_what_the_tick_did_and_counts_empty_ticks():
     assert (held["in_flight"], held["frontier_remaining"]) == (2, 7)
     kept = ticked({**st, "fingerprint": "abc", "skips": 4})["state"]
     assert kept["fingerprint"] == "abc" and {k: kept[k] for k in FACTS} == FACTS
+    # the digest the state keeps is of the fleet as the tick LEFT it, so what the
+    # tick itself wrote is not a change next cycle; with it, the board each claim
+    # still held was left with
+    left = d.cycle_ticked({**st, "fingerprint": "abc", "boards": {"9": "old"}}, _did(in_flight=1),
+                          cfg, left="def", boards={4: "0a1b2c3d"})["state"]
+    assert (left["fingerprint"], left["boards"]) == ("def", {"4": "0a1b2c3d"})
+    assert d.cycle_state(left) == left
+    assert ticked({**st, "boards": {"9": "old"}})["state"]["boards"] == {"9": "old"}
 
     # the progress line: every list the tick filled, then where the fleet stands
     line = ticked(st, cleared=[1], granted=[2], dispatched=[3, 4], retried=[5], nudged=[6],
@@ -1248,6 +1259,12 @@ def test_cycle_wake_gates_beats_and_paces_a_skipped_cycle():
     # the last tick left a judgment open or met an error: unchanged is not a skip
     owed = d.cycle_wake({**idle, "unsettled": True, "skips": 2}, "aaa", cfg)
     assert (owed["action"], owed["reason"], owed["state"]["skips"]) == ("tick", "unsettled", 0)
+
+    # a wake that arrived while the last cycle was running: the digest that cycle
+    # kept may already hold what the wake announced, so unchanged is not a skip
+    woke = d.cycle_wake({**idle, "skips": 2}, "aaa", cfg, woke=True)
+    assert (woke["action"], woke["reason"], woke["state"]["skips"]) == ("tick", "wake", 0)
+    assert d.cycle_wake(idle, "bbb", cfg, woke=True)["reason"] == "changed"
 
     # fingerprint_gate off → always a tick, and nothing was gathered to digest
     off = d.cycle_wake({**idle, "skips": 3}, None, {**cfg, "fingerprint_gate": False})
@@ -1396,17 +1413,26 @@ def test_worker_step_routes_every_no_pr_action_or_returns_the_judgment():
 
 def test_checks_gate_and_gate_comment():
     # required mode: only green on the head that lands merges
-    assert d.checks_gate("green", pushed=False) == "green"
-    assert d.checks_gate("red", pushed=False) == "gate_red"
-    assert d.checks_gate("pending", pushed=False) == "awaiting_ci"
-    # the sync moved the head: those checks describe a tree that will not land
-    for state in ("green", "red", "pending"):
-        assert d.checks_gate(state, pushed=True) == "awaiting_ci"
+    assert d.checks_gate("green") == "green"
+    assert d.checks_gate("red") == "gate_red"
+    assert d.checks_gate("pending") == "awaiting_ci"
     # no checks at all is the tick's judgment, never a default
-    assert d.checks_gate(None, pushed=False) == "no_checks"
-    assert d.checks_gate(None, pushed=True) == "no_checks"
-    assert d.checks_gate(None, pushed=True, allow_no_checks=True) == "green"
-    assert d.checks_gate("red", pushed=False, allow_no_checks=True) == "gate_red"   # not a bypass
+    assert d.checks_gate(None) == "no_checks"
+    assert d.checks_gate(None, allow_no_checks=True) == "green"
+    assert d.checks_gate("red", allow_no_checks=True) == "gate_red"   # not a bypass
+
+    # a landing waits for the checks of the head that would land (ADR-0027): while
+    # GitHub still shows the head before its push, whatever those checks say…
+    for state in ("green", "red", "pending", None):
+        assert d.checks_owed(state, at_head=False, had_checks=True) is True
+    # …while one is running, and while a head just pushed shows none although the
+    # PR had them — they are not registered yet, which is not a repo with no CI
+    assert d.checks_owed("pending", at_head=True, had_checks=True) is True
+    assert d.checks_owed(None, at_head=True, had_checks=True) is True
+    # a verdict ends the wait, and so does a PR that never had a check
+    assert d.checks_owed("green", at_head=True, had_checks=True) is False
+    assert d.checks_owed("red", at_head=True, had_checks=True) is False
+    assert d.checks_owed(None, at_head=True, had_checks=False) is False
 
     red = d.gate_verdict(7, "\n".join(f"line {i}" for i in range(50)), max_lines=3)
     body = d.gate_comment(red, "make test")
@@ -1660,6 +1686,25 @@ def test_fingerprint():
     pushed = [{**prs[0], "headRefOid": "def"}]
     assert fp != d.fingerprint(issues, pushed, claims)                        # worker pushed
     assert fp != d.fingerprint(issues, prs, [{"number": 1, "instance": "peer", "sha": "s2"}])  # reclaimed
+    edged = [{**issues[0], "blocked_by": 1}, issues[1]]
+    assert fp != d.fingerprint(edged, prs, claims)                            # a blocker recorded
+
+    # a PR's checks enter as the one word a tick acts on. Still running — queued, in
+    # progress, the first of several done green — the claim is `awaiting_ci`
+    # throughout, and the digest does not move; the verdict arriving moves it
+    def checks(*rows):
+        return [{**prs[0], "statusCheckRollup": [
+            {"name": f"c{i}", "status": status, "conclusion": conclusion}
+            for i, (status, conclusion) in enumerate(rows)]}]
+
+    queued = d.fingerprint(issues, checks(("QUEUED", None), ("QUEUED", None)), claims)
+    assert queued == d.fingerprint(issues, checks(("IN_PROGRESS", None), ("QUEUED", None)), claims)
+    assert queued == d.fingerprint(
+        issues, checks(("COMPLETED", "SUCCESS"), ("IN_PROGRESS", None)), claims)
+    green = d.fingerprint(issues, checks(("COMPLETED", "SUCCESS"), ("COMPLETED", "SUCCESS")), claims)
+    red = d.fingerprint(issues, checks(("COMPLETED", "SUCCESS"), ("COMPLETED", "FAILURE")), claims)
+    assert len({queued, green, red}) == 3 and green == fp
+    assert fp != d.fingerprint(issues, checks(), claims)                      # no checks at all
     # heartbeats are not an input at all — the launcher's own skip-cycle refresh
     # can't move the digest (that is what keeps the gate from defeating itself).
 
@@ -1696,7 +1741,8 @@ def test_assemble_working_set():
     now = 100_000
     issues = [
         {"number": 1, "title": "ready", "labels": ["ready-for-agent"], "updatedAt": "T1"},
-        {"number": 2, "title": "blocked", "labels": ["ready-for-agent"], "updatedAt": "T2"},
+        {"number": 2, "title": "blocked", "labels": ["ready-for-agent"], "updatedAt": "T2",
+         "blocked_by": 1},
         {"number": 3, "title": "mine green", "labels": ["ready-for-agent"], "updatedAt": "T3"},
         {"number": 4, "title": "mine coding", "labels": ["afk-attempt/1"], "updatedAt": "T4"},
         {"number": 5, "title": "peer live", "labels": ["ready-for-agent"], "updatedAt": "T5"},
@@ -1713,7 +1759,7 @@ def test_assemble_working_set():
     ]
     heartbeats = {"me": now - 10, "peerA": now - 100, "peerB": now - TTL - 999}
     cfg = d.resolve_config({"epic_labels": ["epic", "prd"], "claim_lease_ttl_seconds": TTL})
-    ws = d.assemble_working_set(issues, prs, claims, heartbeats, {2: 1}, "me", now, cfg)
+    ws = d.assemble_working_set(issues, prs, claims, heartbeats, "me", now, cfg)
 
     # frontier: the join (claimed / has_open_pr / blockers) grafted in code, titles ride along
     assert ws["frontier"]["dispatch"] == [{"number": 1, "title": "ready"}]
@@ -1740,7 +1786,8 @@ def test_assemble_working_set():
     assert ws["now"] == now
 
     # missing blocked_by entries default to 0 — safe: only frontier candidates need real counts
-    ws2 = d.assemble_working_set(issues, prs, claims, heartbeats, {}, "me", now, cfg)
+    ws2 = d.assemble_working_set([{**i, "blocked_by": 0} for i in issues], prs, claims,
+                                 heartbeats, "me", now, cfg)
     assert {e["number"] for e in ws2["frontier"]["dispatch"]} == {1, 2}
 
     # gate.ci: local — a PR whose remote checks are RED still awaits its turn,
@@ -1748,8 +1795,8 @@ def test_assemble_working_set():
     # instead (ADR-0012). Everything else about the working set is unchanged.
     red = [{**prs[0], "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "FAILURE"}]}]
     local_cfg = {**cfg, "gate": {**cfg["gate"], "ci": "local", "local_command": "make test"}}
-    strict = d.assemble_working_set(issues, red, claims, heartbeats, {2: 1}, "me", now, cfg)
-    local = d.assemble_working_set(issues, red, claims, heartbeats, {2: 1}, "me", now, local_cfg)
+    strict = d.assemble_working_set(issues, red, claims, heartbeats, "me", now, cfg)
+    local = d.assemble_working_set(issues, red, claims, heartbeats, "me", now, local_cfg)
     assert {m["number"]: m["status"] for m in strict["mine"]} == {3: "failure", 4: "no_pr"}
     assert {m["number"]: m["status"] for m in local["mine"]} == {3: "awaiting_turn", 4: "no_pr"}
     assert {m["number"]: m["board_phase"] for m in strict["mine"]} == {3: "ci_failed", 4: "claimed"}
@@ -1759,12 +1806,12 @@ def test_assemble_working_set():
     # granted — the PR that holds the turn first, then PR number — and a `landing`
     # row carries where its `afk land` last stopped
     more = [*prs, {**prs[0], "number": 20, "closingIssuesReferences": [{"number": 4}]}]
-    ws3 = d.assemble_working_set(issues, more, claims, heartbeats, {}, "me", now, cfg)
+    ws3 = d.assemble_working_set(issues, more, claims, heartbeats, "me", now, cfg)
     assert ws["merge_order"] == [3] and ws3["merge_order"] == [4, 3]
     assert all(m["stopped"] is None for m in ws3["mine"])
     turn = d.latest_turn([{"id": 1, "body": d.turn_comment("me", now, stopped="awaiting_ci",
                                                            head="aaa")}])
-    held = d.assemble_working_set(issues, more, claims, heartbeats, {}, "me", now, cfg,
+    held = d.assemble_working_set(issues, more, claims, heartbeats, "me", now, cfg,
                                   turns={3: turn})
     rows = {m["number"]: (m["status"], m["board_phase"], m["stopped"]) for m in held["mine"]}
     assert rows == {3: ("landing", "landing", "awaiting_ci"), 4: ("awaiting_turn", "awaiting_turn", None)}
@@ -1773,15 +1820,15 @@ def test_assemble_working_set():
     # free_slots: how many more workers this tick may dispatch — the config's
     # concurrency less what I already hold, never negative
     assert ws["free_slots"] == cfg["concurrency"] - 2 == 1
-    assert d.assemble_working_set(issues, prs, claims, heartbeats, {}, "me", now,
+    assert d.assemble_working_set(issues, prs, claims, heartbeats, "me", now,
                                   {**cfg, "concurrency": 1})["free_slots"] == 0
-    assert d.assemble_working_set(issues, prs, [], heartbeats, {}, "me", now, cfg)["free_slots"] == 3
+    assert d.assemble_working_set(issues, prs, [], heartbeats, "me", now, cfg)["free_slots"] == 3
 
     # a claim of mine whose issue is CLOSED (so it is absent from `issues`): status
     # `closed`, no board phase — instead of a title-less `no_pr` a tick would wait
     # on, or re-dispatch a worker for, forever
     gone = claims + [{"number": 9, "instance": "me", "sha": "s9"}]
-    ws3 = d.assemble_working_set(issues, prs, gone, heartbeats, {}, "me", now, cfg, closed=[9])
+    ws3 = d.assemble_working_set(issues, prs, gone, heartbeats, "me", now, cfg, closed=[9])
     row = {m["number"]: m for m in ws3["mine"]}[9]
     assert (row["status"], row["board_phase"], row["title"]) == ("closed", None, None)
     assert {m["number"]: m["status"] for m in ws3["mine"]} == {3: "awaiting_turn", 4: "no_pr", 9: "closed"}
@@ -1790,13 +1837,13 @@ def test_assemble_working_set():
     # a STALE claim whose issue is closed is a phantom lock, not work to take over:
     # it leaves `stale` (reclaim + dispatch) for `stale_closed` (release), sha and all.
     # A live peer's claim on a closed issue is that peer's to release — untouched.
-    ws4 = d.assemble_working_set(issues, prs, claims, heartbeats, {}, "me", now, cfg, closed=[5, 6])
+    ws4 = d.assemble_working_set(issues, prs, claims, heartbeats, "me", now, cfg, closed=[5, 6])
     assert ws4["stale"] == []
     assert ws4["stale_closed"] == [{"number": 6, "instance": "peerB", "sha": "s6"}]
     assert ws4["peer_live"] == ws["peer_live"] and ws4["mine"] == ws["mine"]
 
     # the lease the partition uses is the CONFIG's: shorten it and the live peer goes stale
-    short = d.assemble_working_set(issues, prs, claims, heartbeats, {2: 1}, "me", now,
+    short = d.assemble_working_set(issues, prs, claims, heartbeats, "me", now,
                                    {**cfg, "claim_lease_ttl_seconds": 50})
     assert [s["number"] for s in short["stale"]] == [5, 6] and short["peer_live"] == []
 
@@ -1804,7 +1851,7 @@ def test_assemble_working_set():
     two_prs = prs + [{"number": 31, "headRefOid": "bbb", "updatedAt": "T8",
                       "statusCheckRollup": [{"status": "IN_PROGRESS", "conclusion": None}],
                       "closingIssuesReferences": [{"number": 3}]}]
-    m3 = d.assemble_working_set(issues, two_prs, claims, heartbeats, {}, "me", now, cfg)["mine"][0]
+    m3 = d.assemble_working_set(issues, two_prs, claims, heartbeats, "me", now, cfg)["mine"][0]
     assert (m3["pr"], m3["status"]) == (31, "awaiting_ci")
     assert local["frontier"] == strict["frontier"] and local["stale"] == strict["stale"]
 

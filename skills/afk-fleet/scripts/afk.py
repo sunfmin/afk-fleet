@@ -37,6 +37,7 @@ JSON from `afk config`, then `afk probe`) and resolves it one way, in `_cfg`:
 Invoked as:  <skill>/scripts/afk.py <subcommand> [flags]
 """
 import argparse
+import concurrent.futures
 import json
 import os
 import shlex
@@ -111,6 +112,30 @@ def _gh(args, check=True):
     return p
 
 
+# One process is one tick, or one transition typed by hand: seconds long, and
+# everything in it acts on one view of GitHub. So what a process has read it does
+# not read again — the open PRs, the claim scan, an issue, an issue's comments
+# are each one round trip however many steps ask (`_once`). A write this process
+# makes is carried into what it already read (`_claim_written`, `_comment`) or
+# drops it (`_forget`), so every read after a write sees it. The two reads that
+# must be new each time — the fingerprint a cycle closes on, a landing polling
+# its checks — say so by forgetting first.
+_READS = {}
+
+
+def _once(key, read):
+    """`read()`, made at most once per process for `key`."""
+    if key not in _READS:
+        _READS[key] = read()
+    return _READS[key]
+
+
+def _forget(*keys):
+    """Drop reads a write made stale; with no keys, every read."""
+    for key in keys or list(_READS):
+        _READS.pop(key, None)
+
+
 def _marker_commit(kind, instance, ts, host=None):
     """A parentless commit on the empty tree whose subject is the marker
     `<kind> instance=<id> [host=<host>] ts=<epoch>` (`_parse_marker` reads it
@@ -147,15 +172,21 @@ def _remote_sha(remote, refname):
     return out[0] if out else ""
 
 
+_NO_REMOTE_REF = "couldn't find remote ref"       # git's words for a ref the remote lacks
+
+
 def _fetch_tip(rem, branch, cwd=None):
     """The sha at the tip of `branch` on the remote, with its objects fetched into
     this repo — what a worktree is created at, so a worker starts from what the
-    REMOTE has now, never from a local branch that may be commits behind."""
-    sha = _remote_sha(rem, f"refs/heads/{branch}")
-    if not sha:
-        raise RuntimeError(f"the remote has no branch {branch!r}")
-    _git([*(["-C", cwd] if cwd else []), "fetch", "--quiet", rem, f"refs/heads/{branch}"])
-    return sha
+    REMOTE has now, never from a local branch that may be commits behind. One
+    round trip: the fetch that brings the objects also says where the tip is."""
+    at = ["-C", cwd] if cwd else []
+    p = _git([*at, "fetch", "--quiet", rem, f"refs/heads/{branch}"], check=False)
+    if p.returncode != 0:
+        if _NO_REMOTE_REF in p.stderr:
+            raise RuntimeError(f"the remote has no branch {branch!r}")
+        raise RuntimeError(f"git fetch {rem} refs/heads/{branch} failed: {p.stderr.strip()}")
+    return _git([*at, "rev-parse", "FETCH_HEAD"]).stdout.strip()
 
 
 class OrcaError(RuntimeError):
@@ -191,10 +222,36 @@ def _orca(args, timeout=60):
 
 def _issue(repo, number):
     """One issue as {"number", "title", "state", "labels": [name...]}. Raises when
-    it cannot be read."""
-    p = _gh(["api", f"repos/{repo}/issues/{number}",
-             "--jq", "{title, state, labels: [.labels[].name]}"])
-    return {"number": number, **json.loads(p.stdout)}
+    it cannot be read. An open issue the gather listed is not read again."""
+    def read():
+        p = _gh(["api", f"repos/{repo}/issues/{number}",
+                 "--jq", "{title, state, labels: [.labels[].name]}"])
+        return {"number": number, **json.loads(p.stdout)}
+    return _once(("issue", repo, number), read)
+
+
+# Every open issue with what the frontier and the fingerprint read, one object a
+# line. GitHub's REST issue list carries the open-blocker count on every row, and
+# lists pull requests among the issues — which are left out here.
+_ISSUES_JQ = (".[] | select(.pull_request == null) | {number, title, "
+              "labels: [.labels[].name], updatedAt: .updated_at, "
+              "blocked_by: (.issue_dependencies_summary.blocked_by // 0)}")
+
+
+def _open_issues(repo):
+    """Every open issue — all of them, page after page — as {"number", "title",
+    "labels": [name...], "updatedAt", "blocked_by": <open blocker count>}: the
+    one shape afk_decide reads. Each is also what `_issue` would say of it."""
+    def read():
+        p = _gh(["api", "--paginate", f"repos/{repo}/issues?state=open&per_page=100",
+                 "--jq", _ISSUES_JQ])
+        return [json.loads(ln) for ln in p.stdout.splitlines() if ln.strip()]
+    issues = _once(("issues", repo), read)
+    for i in issues:
+        _READS.setdefault(("issue", repo, i["number"]),
+                          {"number": i["number"], "title": i["title"], "state": "open",
+                           "labels": i["labels"]})
+    return issues
 
 
 _PR_FIELDS = "number,headRefName,headRefOid,updatedAt,statusCheckRollup,closingIssuesReferences"
@@ -203,21 +260,45 @@ _PR_FIELDS = "number,headRefName,headRefOid,updatedAt,statusCheckRollup,closingI
 def _open_prs(repo):
     """Every open PR, with the fields the working set, the merge and a fresh
     start all read."""
-    return json.loads(_gh(["pr", "list", "--repo", repo, "--state", "open",
-                           "--json", _PR_FIELDS]).stdout)
+    return _once(("prs", repo), lambda: json.loads(
+        _gh(["pr", "list", "--repo", repo, "--state", "open", "--json", _PR_FIELDS]).stdout))
 
 
 def _issue_comments(repo, number):
-    """An issue's comments, oldest first, as [{"id", "body", "url"}...]."""
-    p = _gh(["api", "--paginate", f"repos/{repo}/issues/{number}/comments",
-             "--jq", ".[] | {id, body, url: .html_url}"])
-    return [json.loads(ln) for ln in p.stdout.splitlines() if ln.strip()]
+    """An issue's comments, oldest first, as [{"id", "body", "url"}...] — a PR's
+    too: its landing turn is one of them."""
+    def read():
+        p = _gh(["api", "--paginate", f"repos/{repo}/issues/{number}/comments",
+                 "--jq", ".[] | {id, body, url: .html_url}"])
+        return [json.loads(ln) for ln in p.stdout.splitlines() if ln.strip()]
+    return _once(("comments", repo, number), read)
+
+
+def _comment(repo, number, body, comment_id=None):
+    """Write one comment on an issue or a PR → its id: a new one, or `comment_id`
+    rewritten. The comments this process already read of it are kept in step."""
+    read = _READS.get(("comments", repo, number))
+    if comment_id is not None:
+        _gh(["api", "--method", "PATCH", f"repos/{repo}/issues/comments/{comment_id}",
+             "-f", f"body={body}"])
+        for c in read or []:
+            if c["id"] == comment_id:
+                c["body"] = body
+        return comment_id
+    p = _gh(["api", "--method", "POST", f"repos/{repo}/issues/{number}/comments",
+             "-f", f"body={body}"])
+    new = json.loads(p.stdout)
+    if read is not None:
+        read.append({"id": new.get("id"), "body": body, "url": new.get("html_url")})
+    return new.get("id")
 
 
 def _issue_state(repo, number):
     """"open" | "closed", or None if the issue could not be read."""
-    p = _gh(["api", f"repos/{repo}/issues/{number}", "--jq", ".state"], check=False)
-    return p.stdout.strip() or None if p.returncode == 0 else None
+    def read():
+        p = _gh(["api", f"repos/{repo}/issues/{number}", "--jq", ".state"], check=False)
+        return p.stdout.strip() or None if p.returncode == 0 else None
+    return _once(("state", repo, number), read)
 
 
 def _blocker(repo, number):
@@ -262,13 +343,7 @@ def _record_turn(repo, pr, body, prev):
     """Write a PR's ONE landing-turn comment → its id: `prev` (`_turn` of the PR)
     is rewritten when there is one, whoever wrote it, so a PR never carries two
     turns to tell apart."""
-    if prev:
-        _gh(["api", "--method", "PATCH", f"repos/{repo}/issues/comments/{prev['comment_id']}",
-             "-f", f"body={body}"])
-        return prev["comment_id"]
-    p = _gh(["api", "--method", "POST", f"repos/{repo}/issues/{pr['number']}/comments",
-             "-f", f"body={body}"])
-    return json.loads(p.stdout).get("id")
+    return _comment(repo, pr["number"], body, prev["comment_id"] if prev else None)
 
 
 def _orca_worktree_rows():
@@ -307,9 +382,11 @@ def _worktree_progress(wt, rem, base):
 def _remote_heads(remote):
     """Every branch name on the remote (one `ls-remote`). Raises when the remote
     cannot be read — an unreadable remote is not one with no branches."""
-    rows = [ln.split() for ln in _git(["ls-remote", "--heads", remote]).stdout.splitlines()]
-    return [r[1][len("refs/heads/"):] for r in rows
-            if len(r) == 2 and r[1].startswith("refs/heads/")]
+    def read():
+        rows = [ln.split() for ln in _git(["ls-remote", "--heads", remote]).stdout.splitlines()]
+        return [r[1][len("refs/heads/"):] for r in rows
+                if len(r) == 2 and r[1].startswith("refs/heads/")]
+    return _once(("heads", remote), read)
 
 
 def _branch_ahead(remote, branch, base, slot):
@@ -319,12 +396,16 @@ def _branch_ahead(remote, branch, base, slot):
     a GitHub URL or a bare path. `slot` (the issue number) keeps those temp refs
     per-issue, so two recoveries sharing one clone cannot read each other's mirror.
     Raises when the remote cannot be read or has no `base`: "could not look" must
-    never read as "nothing pushed", which is what sends a claim to tier 3."""
-    if not _remote_sha(remote, f"refs/heads/{branch}"):
-        return None
+    never read as "nothing pushed", which is what sends a claim to tier 3. One
+    round trip: the fetch that mirrors the branch is also what says it is absent."""
     ours = f"{_LOCAL_RECOVERY}/{slot}"
-    _git(["fetch", "--force", remote,
-          f"refs/heads/{branch}:{ours}/branch", f"refs/heads/{base}:{ours}/base"])
+    p = _git(["fetch", "--force", remote,
+              f"refs/heads/{branch}:{ours}/branch", f"refs/heads/{base}:{ours}/base"], check=False)
+    if p.returncode != 0:
+        if f"{_NO_REMOTE_REF} refs/heads/{branch}" in p.stderr:
+            return None
+        raise RuntimeError(f"git fetch {remote} of {branch!r} and {base!r} failed: "
+                           f"{p.stderr.strip()}")
     return int(_git(["rev-list", "--count", f"{ours}/base..{ours}/branch"]).stdout.strip())
 
 
@@ -363,16 +444,26 @@ def _scan(remote, ns):
     """Mirror the remote claim+heartbeat refs into a disposable local namespace and
     read every marker. Returns (claims, heartbeats). Raises when the remote cannot
     be read: a fleet whose claims are unreadable must not look like one holding none."""
-    claim_ns, hb_ns = afk_decide.CLAIM_NAMESPACES[ns]
-    _git(["fetch", "--prune", remote,
-          f"+{claim_ns}/*:{_LOCAL_SCAN}/claim/*",
-          f"+{hb_ns}/*:{_LOCAL_SCAN}/heartbeat/*"])
-    claims = [{"number": int(name), "instance": m.get("instance"), "host": m.get("host"),
-               "ts": m.get("ts"), "sha": sha}
-              for name, sha, m in _mirrored_markers(f"{_LOCAL_SCAN}/claim") if name.isdigit()]
-    heartbeats = {name: m["ts"]
-                  for name, _, m in _mirrored_markers(f"{_LOCAL_SCAN}/heartbeat") if "ts" in m}
-    return claims, heartbeats
+    def read():
+        claim_ns, hb_ns = afk_decide.CLAIM_NAMESPACES[ns]
+        _git(["fetch", "--prune", remote,
+              f"+{claim_ns}/*:{_LOCAL_SCAN}/claim/*",
+              f"+{hb_ns}/*:{_LOCAL_SCAN}/heartbeat/*"])
+        claims = [{"number": int(name), "instance": m.get("instance"), "host": m.get("host"),
+                   "ts": m.get("ts"), "sha": sha}
+                  for name, sha, m in _mirrored_markers(f"{_LOCAL_SCAN}/claim") if name.isdigit()]
+        heartbeats = {name: m["ts"] for name, _, m
+                      in _mirrored_markers(f"{_LOCAL_SCAN}/heartbeat") if "ts" in m}
+        return claims, heartbeats
+    return _once(("scan", remote, ns), read)
+
+
+def _claim_written(rem, cfg, number, row=None):
+    """Carry a claim ref this process just wrote into the scan it has made, if it
+    made one: `row` is the claim now on issue <number>, None when it was deleted."""
+    scan = _READS.get(("scan", rem, cfg["claim_namespace"]))
+    if scan:
+        scan[0][:] = [c for c in scan[0] if c["number"] != number] + ([row] if row else [])
 
 
 def cmd_scan(a):
@@ -395,7 +486,10 @@ def _claim(rem, cfg, number, instance, now, host):
     # Create-only: the server rejects a ref that already exists → that is the CAS.
     p = _git(["push", rem, f"{sha}:{ref}"], check=False)
     if p.returncode == 0:
+        _claim_written(rem, cfg, number, {"number": number, "instance": instance, "host": host,
+                                          "ts": int(now), "sha": sha})
         return {"won": True, "issue": number, "ref": ref, "sha": sha, "instance": instance}
+    _forget(("scan", rem, cfg["claim_namespace"]))      # it did not show this claim
     owner = _read_marker(rem, ref)  # who beat us
     if owner is None:
         raise RuntimeError(f"claim push to {ref} failed and no such claim exists on the "
@@ -408,16 +502,20 @@ def cmd_claim(a):
     return _claim(_remote(a), _cfg(a), a.number, a.instance, _now(a), a.host)
 
 
-def _force_take(rem, ref, number, expect_sha, instance, now, host):
+def _force_take(rem, cfg, number, expect_sha, instance, now, host):
     """The atomic re-stamp of ONE existing claim ref to `instance`: rejected unless
     the ref still points at the sha we read. The single mechanism behind both an
     unattended stale reclaim and a human-authorized takeover — they differ only in
     what gates the *choice* of claim (an expired lease vs a present human), never
     in the push, so a takeover is exactly as safe against a live peer."""
+    ref = _claim_ref(cfg, number)
     sha = _marker_commit("afk-claim", instance, now, host=host)
     p = _git(["push", rem, f"--force-with-lease={ref}:{expect_sha}", f"{sha}:{ref}"], check=False)
     if p.returncode == 0:
+        _claim_written(rem, cfg, number, {"number": number, "instance": instance, "host": host,
+                                          "ts": int(now), "sha": sha})
         return {"won": True, "issue": number, "ref": ref, "sha": sha, "instance": instance}
+    _forget(("scan", rem, cfg["claim_namespace"]))      # the claim is not where it showed it
     if _remote_sha(rem, ref) == expect_sha:
         raise RuntimeError(f"reclaim push to {ref} failed although the claim has not moved, "
                            f"so this is not a lost race: {p.stderr.strip()}")
@@ -425,7 +523,7 @@ def _force_take(rem, ref, number, expect_sha, instance, now, host):
 
 
 def cmd_reclaim(a):
-    return _force_take(_remote(a), _claim_ref(_cfg(a), a.number), a.number, a.expect_sha,
+    return _force_take(_remote(a), _cfg(a), a.number, a.expect_sha,
                        a.instance, _now(a), a.host)
 
 
@@ -462,8 +560,7 @@ def cmd_takeover(a):
 
     taken, lost = [], []
     for c in plan["claims"]:
-        r = _force_take(rem, _claim_ref(cfg, c["number"]), c["number"], c["sha"],
-                        a.instance, now, a.host)
+        r = _force_take(rem, cfg, c["number"], c["sha"], a.instance, now, a.host)
         (taken if r["won"] else lost).append(r)
     return {**plan, "action": "taken", "as": a.instance,
             "taken": [t["issue"] for t in taken], "lost": lost,
@@ -481,6 +578,7 @@ def _release(rem, cfg, number):
     if p.returncode != 0 and _remote_sha(rem, ref):
         raise RuntimeError(f"release failed and {ref} is still on the remote: "
                            f"{p.stderr.strip()}")
+    _claim_written(rem, cfg, number)
     return {"released": True, "issue": number, "ref": ref}
 
 
@@ -498,6 +596,7 @@ def _clear(rem, cfg, number, expect_sha):
     if now_at:
         raise RuntimeError(f"{ref} moved since it was read (expected {expect_sha}, now "
                            f"{now_at}): somebody took the claim; nothing was changed")
+    _claim_written(rem, cfg, number)
     return {"released": True, "issue": number, "ref": ref}
 
 
@@ -518,7 +617,7 @@ def cmd_release(a):
     if a.expect_sha:
         return _clear(rem, cfg, a.number, a.expect_sha)
     ref = _claim_ref(cfg, a.number)
-    owner = _claim_owner(rem, ref)
+    owner = _claim_owner(rem, cfg, a.number)
     if owner not in (None, a.instance):
         raise RuntimeError(f"issue #{a.number} is not this fleet's claim ({ref} is held by "
                            f"{owner!r}); nothing was changed. A dead peer's "
@@ -532,20 +631,20 @@ def cmd_release(a):
     return released
 
 
-def _claim_owner(rem, ref):
-    """The instance id a claim ref is stamped with: None when there is no such
-    claim, "" when there is one whose marker names nobody (or cannot be read) —
-    which is never mine."""
-    if not _remote_sha(rem, ref):
-        return None
-    return (_read_marker(rem, ref) or {}).get("instance") or ""
+def _claim_owner(rem, cfg, number):
+    """The instance id issue <number>'s claim is stamped with, as the scan has
+    it: None when there is no such claim, "" when there is one whose marker names
+    nobody — which is never mine."""
+    claim = next((c for c in _scan(rem, cfg["claim_namespace"])[0] if c["number"] == number),
+                 None)
+    return None if claim is None else claim["instance"] or ""
 
 
 def _require_mine(rem, cfg, number, instance):
     """Refuse to settle a claim this fleet does not hold: every transition that
     merges, relabels or releases an issue acts on MY claim only (ADR-0003)."""
     ref = _claim_ref(cfg, number)
-    owner = _claim_owner(rem, ref)
+    owner = _claim_owner(rem, cfg, number)
     if owner != instance:
         held = "not claimed at all" if owner is None else f"held by {owner!r}"
         raise RuntimeError(f"issue #{number} is not this fleet's claim ({ref} is {held}); "
@@ -554,13 +653,15 @@ def _require_mine(rem, cfg, number, instance):
 
 def _beat(rem, cfg, instance, now):
     """Refresh my heartbeat ref if it is due (stateless: the old ts is read from
-    the ref itself)."""
+    the refs, in the scan)."""
     ref = _heartbeat_ref(cfg, instance)
-    last = (_read_marker(rem, ref) or {}).get("ts")
+    heartbeats = _scan(rem, cfg["claim_namespace"])[1]
+    last = heartbeats.get(instance)
     if not afk_decide.heartbeat_due(last, now, cfg["claim_lease_ttl_seconds"]):
         return {"refreshed": False, "reason": "not due", "ts": last, "ref": ref}
     sha = _marker_commit("afk-heartbeat", instance, now)
     _git(["push", rem, "--force", f"{sha}:{ref}"])
+    heartbeats[instance] = now
     return {"refreshed": True, "ts": now, "ref": ref}
 
 
@@ -712,14 +813,14 @@ def cmd_worker_command(a):
 def _gather(a, cfg):
     """The ONE gatherer of the observable fleet inputs (ADR-0008): open issues,
     open PRs, and the claim/heartbeat ref scan. Both `rebuild` and the `cycle`
-    gate read through here, so their views cannot drift. Issues leave here
-    with `labels` as a list of names — the one shape afk_decide reads; the raw
-    JSON lives and dies in this process."""
-    issues = json.loads(_gh(["issue", "list", "--repo", a.repo, "--state", "open",
-                             "--limit", "200", "--json", "number,title,labels,updatedAt"]).stdout)
-    issues = [{**i, "labels": [lb["name"] for lb in i.get("labels") or []]} for i in issues]
-    claims, heartbeats = _scan(_remote(a), cfg["claim_namespace"])
-    return issues, _open_prs(a.repo), claims, heartbeats
+    gate read through here, so their views cannot drift. The three reads do not
+    depend on each other, so they are made at once: a gather costs the slowest
+    of them, not their sum. The raw JSON lives and dies in this process."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        issues = pool.submit(_open_issues, a.repo)
+        prs = pool.submit(_open_prs, a.repo)
+        scan = pool.submit(_scan, _remote(a), cfg["claim_namespace"])
+        return issues.result(), prs.result(), *scan.result()
 
 
 def cmd_cycle(a):
@@ -734,7 +835,11 @@ def cmd_cycle(a):
 
     `state` is opaque to the caller: it hands back the last one verbatim, and
     after the first cycle that is where the instance id and the worker launch
-    command come from. No `--state` is a first cycle, which always ticks. What the
+    command come from. No `--state` is a first cycle, which always ticks. The
+    state a tick hands back holds the digest of the fleet as that tick LEFT it —
+    gathered again after its last write — so its own boards, refs and markers do
+    not cause the next tick; what happened meanwhile and is inside that digest
+    unseen is what `--wake` and the forced tick are for (ADR-0007). What the
     tick could not decide comes back as `judgments`, each with the `afk` command
     for either answer; the caller runs one and opens the next cycle at once
     (`sleep_seconds` is then 0). Only that ever reaches a context — the raw
@@ -754,15 +859,24 @@ def cmd_cycle(a):
                 "judgments": [], **({"errors": errors} if errors else {})}
     gathered = _gather(a, cfg) if cfg["fingerprint_gate"] else None
     fp = afk_decide.fingerprint(*gathered[:3]) if gathered else None  # heartbeats: see fingerprint
-    woke = afk_decide.cycle_wake(state, fp, cfg)
+    woke = afk_decide.cycle_wake(state, fp, cfg, woke=a.wake)
     if woke["action"] == "skip":
         if not woke.pop("heartbeat"):
             return {**woke, "judgments": []}
         return {**woke, "judgments": [],
                 "heartbeat": _beat(_remote(a), cfg, a.instance, _now(a))}
+    _BOARDS.update({int(n): key for n, key in state["boards"].items()})
     did, judgments, errors = _tick(a, cfg, _rebuild(a, cfg, gathered))
+    left = None
+    if gathered:
+        try:
+            _forget()
+            left = afk_decide.fingerprint(*_gather(a, cfg)[:3])
+        except (OSError, RuntimeError):
+            pass        # keep the opening digest: the next cycle reads `changed`, and ticks
     return {"action": "tick", "reason": woke["reason"],
-            **afk_decide.cycle_ticked(woke["state"], did, cfg, len(judgments), len(errors)),
+            **afk_decide.cycle_ticked(woke["state"], did, cfg, len(judgments), len(errors),
+                                      left=left, boards=dict(_BOARDS)),
             "judgments": judgments, **({"errors": errors} if errors else {})}
 
 
@@ -799,11 +913,15 @@ def _tick(a, cfg, ws):
 
     Each transition is the subcommand's own function, so the tick and a human
     typing `afk park` run one code path. One that fails is recorded in `errors`
-    and settles nothing: its claim is still held, and the next cycle ticks. A
-    failure to START a worker also ends the starting for this tick — it is orca
-    or the remote that is unwell, and every further dispatch would take a claim
-    it cannot staff. Re-entrant like any tick: killed at any point, the next
-    one rebuilds from GitHub."""
+    and settles nothing: its claim is still held, and the next cycle ticks.
+
+    Workers are started at once, not one by one: each start is begun in turn —
+    claim, worktree, the agent's terminal — and then every agent is waited for
+    and handed its prompt together, so filling N slots takes about as long as
+    filling one. A start that fails to BEGIN ends the starting for this tick —
+    it is orca or the remote that is unwell, and every further dispatch would
+    take a claim it cannot staff. Re-entrant like any tick: killed at any
+    point, the next one rebuilds from GitHub."""
     call = {"afk_path": os.path.abspath(__file__), "repo": a.repo, "instance": a.instance,
             "worker_command": a.worker_command, "config": json.dumps(cfg, ensure_ascii=False)}
     did = {k: [] for k in afk_decide.TICK_DID}
@@ -869,35 +987,46 @@ def _tick(a, cfg, ws):
 
     # --- start workers: continuations of claims already held, then the frontier ---
     starting, taken = True, 0
+    begun = []                           # (the count it joins, issue, the rest of its start)
 
-    def start(number):
+    def begin(number, counted):
+        """Begin one start → truthy unless it failed; the claim is held from here."""
         nonlocal starting
-        worker = run("dispatch", cmd_dispatch, number, start="auto") if starting else None
-        starting = starting and worker is not None
-        return worker
+        job = run("dispatch", _begin_dispatch, number, start="auto") if starting else None
+        starting = starting and job is not None
+        if callable(job):
+            begun.append((counted, number, job))
+        return job
 
     for number, do, _ in routes:
-        if do == "dispatch" and (start(number) or {}).get("started"):
-            did["dispatched"].append(number)
-            touched.add(number)
+        if do == "dispatch":
+            begin(number, "dispatched")
     for row in ws["stale"]:
         took = run("reclaim", cmd_reclaim, row["number"], expect_sha=row["sha"]) \
             if starting else None
         if took and took["won"]:
             taken += 1
-            if (start(row["number"]) or {}).get("started"):
-                did["reclaimed"].append(row["number"])
+            begin(row["number"], "reclaimed")
     slots = ws["free_slots"] + len(settled) - taken
     left = len(ws["frontier"]["dispatch"])
+    fresh = set()
     for issue in ws["frontier"]["dispatch"]:
         if slots <= 0 or not starting:
             break
-        worker = start(issue["number"])
+        job = begin(issue["number"], "dispatched")
+        if job:
+            left -= 1                    # begun, or a peer won it: off the frontier either way
+        if callable(job):
+            fresh.add(issue["number"])
+            slots -= 1
+    # every agent is waited for and handed its prompt at once
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(begun) or 1) as pool:
+        workers = list(pool.map(lambda b: run("dispatch", lambda _: b[2](), b[1]), begun))
+    for (counted, number, _), worker in zip(begun, workers):
         if worker:
-            left -= 1                    # started, or a peer won it: off the frontier either way
-        if worker and worker["started"]:
-            did["dispatched"].append(issue["number"])
-            taken, slots = taken + 1, slots - 1
+            did[counted].append(number)
+            touched.add(number)
+            taken += number in fresh
 
     did["in_flight"] = len(mine) - len(settled) + taken
     did["frontier_remaining"] = left
@@ -910,6 +1039,9 @@ def _tick(a, cfg, ws):
             if row["board_phase"] and row["number"] not in settled | touched:
                 run("status", cmd_status, row["number"], phase=row["board_phase"],
                     pr=row["pr"], attempt=row["attempt"])
+    held = (set(mine) - settled) | set(did["dispatched"]) | set(did["reclaimed"])
+    for number in set(_BOARDS) - held:
+        del _BOARDS[number]
     return did, judgments, errors
 
 
@@ -919,22 +1051,16 @@ def _tick(a, cfg, ws):
 
 def _rebuild(a, cfg, gathered=None):
     """The working set (`afk_decide.assemble_working_set`), from `gathered` — a
-    `_gather` the caller already made — or a fresh one. The per-issue blocked_by
-    read is paid only by issues that pass every cheaper eligibility check, the
-    per-issue state read only by a claim whose issue is missing from the open
-    list, and the landing-turn read only by a claim of mine that has a PR."""
+    `_gather` the caller already made — or a fresh one. The frontier costs no
+    read of its own: every issue's open-blocker count came with the issue list.
+    A per-issue state read is paid only by a claim whose issue is missing from
+    the open list, and the landing-turn read only by a claim of mine that has a PR."""
     issues, prs, claims, heartbeats = gathered or _gather(a, cfg)
-    blocked = {}
-    for n in afk_decide.frontier_candidates(issues, prs, claims,
-                                            cfg["ready_label"], cfg["epic_labels"]):
-        v = _gh(["api", f"repos/{a.repo}/issues/{n}",
-                 "--jq", ".issue_dependencies_summary.blocked_by"]).stdout.strip()
-        blocked[n] = 0 if v in ("", "null") else int(v)
     listed = {i["number"] for i in issues}
     closed = [c["number"] for c in claims
               if c["number"] not in listed and _issue_state(a.repo, c["number"]) == "closed"]
     return afk_decide.assemble_working_set(
-        issues, prs, claims, heartbeats, blocked, a.instance, _now(a), cfg, closed=closed,
+        issues, prs, claims, heartbeats, a.instance, _now(a), cfg, closed=closed,
         turns=_held_turns(a.repo, prs, claims, a.instance))
 
 
@@ -1238,6 +1364,7 @@ def _discard_attempt(a, cfg, rem, number):
     for branch in afk_decide.branch_candidates(_remote_heads(rem), cfg["branch_pattern"], number):
         _git(["push", rem, "--delete", f"refs/heads/{branch}"])
         deleted.append(branch)
+    _forget(("prs", a.repo), ("heads", rem))
     path, _ = _issue_worktree(a.repo, number)
     removed = _remove_worktree(path) if path else None
     if removed and not removed["removed"]:
@@ -1327,34 +1454,42 @@ def _terminal_tail(handle):
     return afk_decide.stall_tail(shown.get("tail"))
 
 
-def _start_terminal(path, worker_command, prompt, ready_timeout):
-    """Start the worker in a worktree and submit its prompt → the terminal handle.
-    Four steps, each of which has failed silently when a tick typed it: the agent
-    is started with the run's OPAQUE worker launch command (never `--agent`,
-    ADR-0010), it is waited for until its TUI is idle, the prompt goes to a brief
-    FILE with only a one-line pointer typed at the agent — a whole prompt sent as
-    text arrives as one paste, which the agent reads as quoted material and asks
-    to have confirmed instead of starting — and that pointer is sent WITH
-    `--enter` — typed but unsubmitted, a worker sits idle forever, indistinguishable
-    from one that finished."""
+# Starting a worker is four steps, each of which has failed silently when a tick
+# typed it. `_open_terminal` takes the two that are quick; `_submit_prompt` the
+# two that wait on the agent — so a tick opens every terminal it will, and then
+# waits on them all at once.
+
+def _open_terminal(path, worker_command, prompt):
+    """Start the worker's agent in a worktree → (its terminal handle, the line to
+    submit to it). The agent is started with the run's OPAQUE worker launch
+    command (never `--agent`, ADR-0010), and the prompt goes to a brief FILE with
+    only a one-line pointer for the agent — a whole prompt sent as text arrives
+    as one paste, which the agent reads as quoted material and asks to have
+    confirmed instead of starting."""
     brief = _write_brief(path, prompt)
-    prompt = _BRIEF_POINTER.format(brief=brief)
     term = _orca(["terminal", "create", "--worktree", f"path:{path}",
                   "--command", worker_command]).get("terminal") or {}
     handle = term.get("handle")
     if not handle:
         raise RuntimeError("orca terminal create returned no terminal handle")
+    return handle, _BRIEF_POINTER.format(brief=brief)
+
+
+def _submit_prompt(path, handle, pointer, ready_timeout):
+    """Wait for the agent in a terminal, then hand it its prompt: it is waited
+    for until its TUI is idle, and the pointer is sent WITH `--enter` — typed but
+    unsubmitted, a worker sits idle forever, indistinguishable from one that
+    finished."""
     wait = _orca(["terminal", "wait", "--terminal", handle, "--for", "tui-idle",
                   "--timeout-ms", str(ready_timeout * 1000)],
                  timeout=ready_timeout + 30).get("wait") or {}
     if not wait.get("satisfied"):
         raise RuntimeError(f"the worker in {path} was not ready for a prompt within "
                            f"{ready_timeout}s (terminal {handle})")
-    sent = _orca(["terminal", "send", "--terminal", handle, "--text", prompt,
+    sent = _orca(["terminal", "send", "--terminal", handle, "--text", pointer,
                   "--enter"]).get("send") or {}
     if not sent.get("accepted"):
         raise RuntimeError(f"terminal {handle} did not accept the worker prompt")
-    return handle
 
 
 def _landing_fields(cfg, pr):
@@ -1377,7 +1512,16 @@ def _prompt_fields(a, cfg, issue, path, branch):
 
 
 def _start_worker(a, cfg, rem, issue, start, reason=None):
-    """Put a worker on an issue this fleet already holds the claim for.
+    """Put a worker on an issue this fleet already holds the claim for, start to
+    finish (`_begin_worker`, then the rest it returns)."""
+    return _begin_worker(a, cfg, rem, issue, start, reason)()
+
+
+def _begin_worker(a, cfg, rem, issue, start, reason=None):
+    """Begin putting a worker on an issue this fleet already holds the claim for:
+    everything up to its agent's terminal being open. Returns the rest as a
+    callable — wait for the agent, submit its prompt, upsert the status board —
+    which a tick starting several workers runs for all of them at once.
 
     `start` is "auto" — continue from whatever progress survives (the worktree
     still here, else the pushed branch, else a fresh start from base: the
@@ -1385,8 +1529,8 @@ def _start_worker(a, cfg, rem, issue, start, reason=None):
     start from base, which is what a retry is. A continued worker whose PR holds
     this fleet's landing turn is started ON it, briefed only to land the PR — in
     the worktree still here, else one recreated at the PR's head, never from base
-    (ADR-0027). Returns the tier taken plus where the worker now is: {tier,
-    action, prompt, reason, worktree, branch, terminal}."""
+    (ADR-0027). The callable returns the tier taken plus where the worker now
+    is: {tier, action, prompt, reason, worktree, branch, terminal}."""
     number = issue["number"]
     if issue["state"] != "open":
         raise RuntimeError(f"issue #{number} is {issue['state']}, not open — there is nothing "
@@ -1427,15 +1571,20 @@ def _start_worker(a, cfg, rem, issue, start, reason=None):
         else:
             prompt = afk_decide.render_worker_prompt(f.read(), plan["prompt"], fields,
                                                      reason=reason)
-    handle = _start_terminal(path, a.worker_command, prompt, a.ready_timeout)
-    if cfg["progress_comment"]:
-        if turn:
-            _upsert_board(a.repo, number, cfg, "landing", instance=a.instance, pr=pr["number"])
-        else:
-            _upsert_board(a.repo, number, cfg, "claimed", instance=a.instance)
-    return {**plan, "worktree": path, "branch": branch, "terminal": handle,
-            **({"landing": pr["number"]} if turn else {}),
-            **({"discarded": discarded} if discarded else {})}
+    handle, pointer = _open_terminal(path, a.worker_command, prompt)
+
+    def ready():
+        _submit_prompt(path, handle, pointer, a.ready_timeout)
+        if cfg["progress_comment"]:
+            if turn:
+                _upsert_board(a.repo, number, cfg, "landing", instance=a.instance,
+                              pr=pr["number"])
+            else:
+                _upsert_board(a.repo, number, cfg, "claimed", instance=a.instance)
+        return {**plan, "worktree": path, "branch": branch, "terminal": handle,
+                **({"landing": pr["number"]} if turn else {}),
+                **({"discarded": discarded} if discarded else {})}
+    return ready
 
 
 def cmd_dispatch(a):
@@ -1455,41 +1604,62 @@ def cmd_dispatch(a):
     discards whatever exists first — the tick's "this recovered state is not sane
     to build on" judgment. A failed attempt is not dispatched from here: `afk fail`
     counts the retry and starts it."""
+    job = _begin_dispatch(a)
+    return job() if callable(job) else job
+
+
+def _begin_dispatch(a):
+    """`afk dispatch` up to the agent's terminal being open → the rest of it, as
+    a callable returning its result (`_begin_worker`); or, when a peer holds the
+    issue, that result itself. A claim the scan already shows as mine is not
+    pushed again."""
     cfg, rem = _cfg(a), _remote(a)
     issue = _issue(a.repo, a.number)
     if issue["state"] != "open":           # before the claim: never lock a closed issue
         raise RuntimeError(f"issue #{a.number} is {issue['state']}, not open — nothing to dispatch")
-    claim = _claim(rem, cfg, a.number, a.instance, _now(a), a.host)
-    if not claim["won"] and claim["owner"].get("instance") != a.instance:
-        return {"issue": a.number, "started": False, "claim": "lost", "owner": claim["owner"]}
-    started = _start_worker(a, cfg, rem, issue, a.start)
-    return {"issue": a.number, "started": True,
-            "claim": "won" if claim["won"] else "held", **started}
+    won = False
+    if _claim_owner(rem, cfg, a.number) != a.instance:
+        claim = _claim(rem, cfg, a.number, a.instance, _now(a), a.host)
+        won = claim["won"]
+        if not won and claim["owner"].get("instance") != a.instance:
+            return {"issue": a.number, "started": False, "claim": "lost", "owner": claim["owner"]}
+    ready = _begin_worker(a, cfg, rem, issue, a.start)
+    return lambda: {"issue": a.number, "started": True,
+                    "claim": "won" if won else "held", **ready()}
 
 
 # --------------------------------------------------------------------------- #
 # act: the landing turn, and settling a claim — fail / escalate / park / close #
 # --------------------------------------------------------------------------- #
 
+# {issue number: `afk_decide.board_key`} of the status board each issue is known
+# to carry: the ones the cycle state remembered from the last tick, and every
+# one this process has written or found in place since.
+_BOARDS = {}
+
+
 def _upsert_board(repo, number, cfg, phase, instance=None, pr=None, attempt=0, blocked_by=()):
     """Upsert the human-facing progress status board comment (idempotent, ADR-0006).
     Renders the body from the given phase (pure), then find-or-create by marker
     and write ONLY when the body changed — so re-entrant/disposable ticks and
-    retry re-dispatches never spam the issue."""
+    retry re-dispatches never spam the issue. A body that is the one the issue is
+    already known to carry (`_BOARDS`) is not even read for: `known`."""
     body = afk_decide.render_status_board(phase, cfg["gate"]["ci"], cfg["retry"],
                                           instance=instance, pr=pr, attempt=attempt,
                                           blocked_by=blocked_by)
-    comments = f"repos/{repo}/issues/{number}/comments"
+    key = afk_decide.board_key(body)
+    if _BOARDS.get(number) == key:
+        return {"action": "known", "issue": number}
     board = next((c for c in _issue_comments(repo, number)
                   if afk_decide.STATUS_MARKER in (c["body"] or "")), None)
     if board is None:
-        p = _gh(["api", "--method", "POST", comments, "-f", f"body={body}"])
-        return {"action": "created", "issue": number, "comment_id": json.loads(p.stdout).get("id")}
-    if board["body"].strip() == body.strip():
-        return {"action": "unchanged", "issue": number, "comment_id": board["id"]}
-    _gh(["api", "--method", "PATCH", f"repos/{repo}/issues/comments/{board['id']}",
-         "-f", f"body={body}"])
-    return {"action": "updated", "issue": number, "comment_id": board["id"]}
+        done = {"action": "created", "comment_id": _comment(repo, number, body)}
+    elif board["body"].strip() == body.strip():
+        done = {"action": "unchanged", "comment_id": board["id"]}
+    else:
+        done = {"action": "updated", "comment_id": _comment(repo, number, body, board["id"])}
+    _BOARDS[number] = key
+    return {"issue": number, **done}
 
 
 def cmd_status(a):
@@ -1722,15 +1892,37 @@ def cmd_turn(a):
     return stop("granted", delivery="terminal", terminal=handle, worktree=path)
 
 
+def _await_checks(a, number, head, had_checks):
+    """Wait for a PR's checks to speak on `head`, the head that would land → their
+    `pr_checks_state` there; "pending" when `--checks-timeout` ran out first. The
+    landing waits here itself rather than going round the launcher: nothing
+    between a push and its checks finishing is a judgment (ADR-0027). Each look
+    is one fresh read of the open PRs."""
+    deadline = time.monotonic() + a.checks_timeout
+    while True:
+        _forget(("prs", a.repo))
+        pr = next((p for p in _open_prs(a.repo) if p["number"] == number), None)
+        if pr is None:
+            raise RuntimeError(f"PR #{number} is no longer open — it was closed or merged while "
+                               f"its checks were awaited; nothing was merged here")
+        checks = afk_decide.pr_checks_state(pr.get("statusCheckRollup"))
+        if not afk_decide.checks_owed(checks, pr["headRefOid"] == head, had_checks):
+            return checks
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return "pending"
+        time.sleep(min(a.checks_poll, left))
+
+
 def cmd_land(a):
     """A WORKER lands its own PR, in the worktree it is called from — the only way
     a PR lands (ADR-0027). Refused (exit 3, nothing changed) unless the PR holds
     the landing turn of the fleet instance that holds the issue's claim: the check
     guards against a worker that strays, not a malicious one — worker and launcher
     share one `gh` credential. Then, in order: sync by merging the target in
-    (never a rebase) → push → the machine gate on that exact head → the verify
-    check → `gh pr merge` pinned to the gated head → status board. It stops with
-    an `outcome`:
+    (never a rebase) → push → the machine gate on that exact head (in `required`
+    mode, the PR's checks on it, waited for) → the verify check → `gh pr merge`
+    pinned to the gated head → status board. It stops with an `outcome`:
 
       merged        landed. The worker sends its wake and stops.
       conflict      the sync conflicted; the merge is left in progress with
@@ -1739,8 +1931,10 @@ def cmd_land(a):
       gate_red      local mode: the gate was red on the synced head (`gate.excerpt`,
                     also a PR comment). required mode: the PR's checks are red.
                     The worker fixes the code, commits, and runs this again.
-      awaiting_ci   required mode: checks pending, or the sync just pushed and CI
-                    must run on the new head.
+      awaiting_ci   required mode: the checks on the head that would land were
+                    still running when `--checks-timeout` ran out. Up to then
+                    this waits for them itself — after a sync that pushed a
+                    new head too — and goes on to merge, or to `gate_red`.
       needs_verify  `gate.adversarial_verify` is on and the head that would land
                     is not the one the tick verified — the sync moved it.
       no_checks     required mode, the PR has no checks at all, and the tick has
@@ -1765,7 +1959,7 @@ def cmd_land(a):
     if pr is None:
         raise RuntimeError(f"no open PR closes issue #{a.number} — there is nothing to land (if "
                            f"it has already merged, send your wake and stop)")
-    owner = _claim_owner(rem, _claim_ref(cfg, a.number))
+    owner = _claim_owner(rem, cfg, a.number)
     turn = afk_decide.held_turn(_turn(a.repo, pr), owner)
     if turn is None:
         raise RuntimeError(f"PR #{pr['number']} does not hold the landing turn of the fleet "
@@ -1828,14 +2022,21 @@ def cmd_land(a):
                            if k in gate}
     else:
         checks = afk_decide.pr_checks_state(pr.get("statusCheckRollup"))
-        verdict = afk_decide.checks_gate(checks, pushed, turn["allow_no_checks"])
+        if pushed or checks == "pending":
+            checks = _await_checks(a, pr["number"], head, had_checks=checks is not None)
+        verdict = afk_decide.checks_gate(checks, turn["allow_no_checks"])
         if verdict == "gate_red":
             return stop(verdict, checks=checks,
                         detail="the PR's checks are red — fix the code, commit, and run this again")
+        if verdict == "awaiting_ci":
+            return stop(verdict, checks=checks,
+                        detail=f"the checks on this head were still running after "
+                               f"{a.checks_timeout}s — send your wake and stop; you are told to "
+                               f"run this again once they are in")
         if verdict != "green":
             return stop(verdict, checks=checks,
                         detail="send your wake and stop — you are told to run this again once "
-                               "the checks on this head are in")
+                               "that is settled")
     if cfg["gate"]["adversarial_verify"] and turn["verified"] != head:
         return stop("needs_verify",
                     detail="the head that would land is not the one that was verified — send "
@@ -1867,9 +2068,8 @@ def _escalate(a, cfg, rem, issue, attempt):
     _edit_labels(a.repo, number, add, remove)
     comment_id = None
     if cfg["escalate_comment"]:
-        p = _gh(["api", "--method", "POST", f"repos/{a.repo}/issues/{number}/comments", "-f",
-                 f"body={afk_decide.escalation_comment(a.reason, attempt, pr_number)}"])
-        comment_id = json.loads(p.stdout).get("id")
+        comment_id = _comment(a.repo, number,
+                              afk_decide.escalation_comment(a.reason, attempt, pr_number))
     _release(rem, cfg, number)
     return {"issue": number, "action": "escalate", "attempt": attempt, "pr": pr_number,
             "labels": {"added": add, "removed": remove}, "comment_id": comment_id,
@@ -1890,6 +2090,7 @@ def _edit_labels(repo, number, add, remove):
     for lb in remove:
         args += ["--remove-label", lb]
     _gh(args)
+    _forget(("issue", repo, number))
 
 
 def cmd_fail(a):
@@ -1981,6 +2182,7 @@ def cmd_close(a):
     if cfg["progress_comment"]:
         _upsert_board(a.repo, a.number, cfg, "closed", instance=a.instance)
     _gh(["issue", "close", str(a.number), "--repo", a.repo, "--reason", "completed"])
+    _forget(("issue", a.repo, a.number), ("state", a.repo, a.number))
     _release(rem, cfg, a.number)
     path, _ = _issue_worktree(a.repo, a.number)
     cleanup = _remove_worktree(path) if (path and cfg["worktree_cleanup"]) else None
@@ -2085,6 +2287,11 @@ def build_parser():
                    help="seconds before the local gate is called red (default %(default)s)")
     p.add_argument("--excerpt-lines", type=int, default=afk_decide.GATE_EXCERPT_LINES, metavar="k",
                    help="how many trailing log lines a red gate's excerpt keeps")
+    p.add_argument("--checks-timeout", type=int, default=1800, metavar="s",
+                   help="gate.ci required: seconds to wait for the checks on the head that "
+                        "would land before stopping with awaiting_ci (default %(default)s)")
+    p.add_argument("--checks-poll", type=float, default=15, metavar="s",
+                   help="seconds between looks at those checks (default %(default)s)")
 
     # --- the cycle ---
     p = command("cycle", cmd_cycle, remote="gh",
@@ -2105,6 +2312,9 @@ def build_parser():
     p.add_argument("--drain", action="store_true",
                    help="the last cycle of a run: release my claims with no open PR, keep "
                         "the rest, and do nothing else")
+    p.add_argument("--wake", action="store_true",
+                   help="a wake arrived while the previous cycle was running: tick whatever "
+                        "the fingerprint says")
 
     # --- claim refs ---
     command("scan", cmd_scan, "debug: read all claim + heartbeat refs", remote="refs")

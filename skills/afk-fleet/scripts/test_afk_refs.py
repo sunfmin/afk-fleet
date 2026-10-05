@@ -624,7 +624,7 @@ def test_recovery_reads_pushed_progress_from_the_remote_alone():
         for how in ((), ("--branch", "sunfmin/issue-31-continuation")):
             err = afk_error(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg,
                             "--remote", "no-such-remote", *how)
-            assert "ls-remote" in err, err
+            assert "no-such-remote" in err, err
         # a base branch the remote does not have is a config mistake, said as one
         err = afk_error(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg,
                         "--set", "base_branch=no-such-base")
