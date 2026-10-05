@@ -147,20 +147,22 @@ def test_subclassify_pr():
 
 
 def test_turn_record_round_trips_and_is_held_only_by_the_claims_owner():
-    body = d.turn_comment("fl-1", 1234)
+    body = d.turn_comment(d.single_turn(None, "fl-1", 1234))
     # the marker leads, the same facts follow for a human
     assert body.startswith("<!--afk:turn instance=fl-1 at=1234-->\n")
     assert "holds the landing turn" in body and "`fl-1`" in body and "`afk land`" in body
     rec = d.latest_turn([{"id": 7, "body": "a human note"}, {"id": 8, "body": body}])
-    single = {"batch": None, "members": [], "phase": None, "unbatched": None, "released": False}
+    single = {"batch": None, "members": [], "phase": None, "unbatched": None, "of": None,
+              "released": False}
     assert rec == {"instance": "fl-1", "at": 1234, "verified": None, "allow_no_checks": False,
                    "stopped": None, "head": None, "comment_id": 8, **single}
     assert d.latest_turn([]) is None and d.latest_turn([{"id": 1, "body": "x"}]) is None
     assert d.latest_turn([{"id": 1, "body": None}]) is None and d.latest_turn(None) is None
 
     # the tick's two judgments travel on the marker, and so does where the landing stopped
-    full = d.turn_comment("fl-1", 2000.9, verified="v" * 40, allow_no_checks=True,
-                          stopped="awaiting_ci", head="h" * 40)
+    full = d.turn_comment(d.next_turn(
+        d.single_turn(None, "fl-1", 2000.9, verified="v" * 40, allow_no_checks=True),
+        stopped="awaiting_ci", head="h" * 40))
     assert full.startswith(f"<!--afk:turn instance=fl-1 at=2000 verified={'v' * 40} "
                            f"allow_no_checks=1 stopped=awaiting_ci head={'h' * 40}-->\n")
     assert "stopped with `awaiting_ci` on `hhhhhhhhhhhh`" in full
@@ -197,7 +199,7 @@ def test_a_batchs_turn_is_one_marker_on_every_member_and_leaving_it_is_remembere
     without landing holds no turn — and says so on every marker written for it
     afterwards, so it is never batched again."""
     members = [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}, {"issue": 3, "pr": 30}]
-    body = d.batch_turn_comment("fl-1", 500, "fl-1-500", members, "gating")
+    body = d.turn_comment(d.batch_turn(None, "fl-1", 500, "fl-1-500", members, "gating"))
     assert body.startswith("<!--afk:turn instance=fl-1 at=500 batch=fl-1-500 "
                            "members=1:10,2:20,3:30 phase=gating-->\n")
     assert "#10, #20, #30" in body and "closed, not merged" in body
@@ -210,19 +212,21 @@ def test_a_batchs_turn_is_one_marker_on_every_member_and_leaving_it_is_remembere
     # leaving: the marker holds NO turn, whoever reads it — and remembers why
     for why in d.UNBATCHED:
         left = d.latest_turn([{"id": 4, "body": body},
-                              {"id": 5, "body": d.unbatched_comment("fl-1", 600, "fl-1-500", why)}])
+                              {"id": 5, "body": d.turn_comment(d.unbatched_turn(None, "fl-1", 600, "fl-1-500", why))}])
         assert (left["unbatched"], left["released"], left["batch"]) == (why, True, None)
         assert d.held_turn(left, "fl-1") is None
     # a single turn granted afterwards carries the fact along, and IS held
-    later = d.latest_turn([{"id": 6, "body": d.turn_comment("fl-1", 700, unbatched="left_out")}])
-    assert (later["unbatched"], later["released"]) == ("left_out", False)
+    later = d.latest_turn([{"id": 6, "body": d.turn_comment(d.single_turn(left, "fl-1", 700))}])
+    assert (later["unbatched"], later["of"], later["released"]) == (left["unbatched"], "fl-1-500",
+                                                                    False)
     assert d.held_turn(later, "fl-1") is later
 
     # closed vocabularies; a phase or a reason nobody knows is not written, nor read
     assert all(d.batch_outcome(o) == o for o in d.BATCH_OUTCOMES)
     for bad in (lambda: d.batch_outcome("merged"),
-                lambda: d.batch_turn_comment("fl-1", 1, "b", members, "bisecting"),
-                lambda: d.unbatched_comment("fl-1", 1, "b", "bored")):
+                lambda: d.turn_comment(d.batch_turn(None, "fl-1", 1, "b", members, "bisecting")),
+                lambda: d.turn_comment(d.unbatched_turn(None, "fl-1", 1, "b", "bored")),
+                lambda: d.next_turn(None, at=1, bogus=1)):
         try:
             bad()
             raise AssertionError("accepted")
@@ -231,6 +235,66 @@ def test_a_batchs_turn_is_one_marker_on_every_member_and_leaving_it_is_remembere
     odd = d.latest_turn([{"id": 1, "body": "<!--afk:turn instance=x at=5 batch=b members=1:10,zz,3 "
                                            "phase=bogus unbatched=bored-->"}])
     assert (odd["members"], odd["phase"], odd["unbatched"]) == ([{"issue": 1, "pr": 10}], None, None)
+
+
+def _turn_shapes():
+    """One record of every shape a turn marker takes, as a rewrite makes them."""
+    members = [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}]
+    single = d.single_turn(None, "fl-1", 100)
+    judged = d.single_turn(None, "fl-1", 100, verified="v" * 40, allow_no_checks=True)
+    left = d.unbatched_turn(d.batch_turn(None, "fl-1", 200, "fl-1-200", members, "stacking"),
+                            "fl-1", 300, "fl-1-200", "left_out")
+    return {"single": single,
+            "single, judged and stopped": d.next_turn(judged, at=150, stopped="needs_verify",
+                                                      head="h" * 40),
+            "batch": d.batch_turn(None, "fl-1", 200, "fl-1-200", members, "gating"),
+            "left a batch": left,
+            "single, after leaving a batch": d.single_turn(left, "fl-1", 400, verified="v" * 40)}
+
+
+def test_a_turn_marker_round_trips_in_every_shape():
+    """Render then parse gives the record back — one PR's turn, a merge batch's,
+    and the marker of a PR that left a batch — so a marker rewritten from the
+    record it was read as loses nothing."""
+    wording = {"single": "holds the landing turn", "single, judged and stopped": "stopped with",
+               "batch": "is in a merge batch", "left a batch": "was in merge batch `fl-1-200`",
+               "single, after leaving a batch": "holds the landing turn"}
+    for shape, record in _turn_shapes().items():
+        record = {**record, "comment_id": 7}
+        body = d.turn_comment(record)
+        assert d.latest_turn([{"id": 7, "body": body}]) == record, shape
+        assert wording[shape] in body, shape
+        # …and a rewrite that changes nothing writes the same comment
+        assert d.turn_comment(d.next_turn(d.latest_turn([{"id": 7, "body": body}]))) == body, shape
+
+
+def test_a_field_no_rewrite_names_survives_it():
+    """A marker is rewritten as the record read plus what changed: that a PR left
+    a batch survives a landing that stops and a turn granted again, and the
+    tick's two judgments survive a landing that stops — by construction, not
+    because each rewrite remembers to pass them along."""
+    def read(record):
+        return d.latest_turn([{"id": 9, "body": d.turn_comment({**record, "comment_id": 9})}])
+
+    members = [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}]
+    left = read(d.unbatched_turn(read(d.batch_turn(None, "fl-1", 1, "fl-1-1", members, "gating")),
+                                 "fl-1", 2, "fl-1-1", "dissolved"))
+    assert (left["unbatched"], left["of"], left["released"], left["batch"]) == \
+        ("dissolved", "fl-1-1", True, None)
+    granted = read(d.single_turn(left, "fl-1", 3, verified="v" * 40, allow_no_checks=True))
+    # a landing that stops names only when, with what, and on which head
+    stopped = read(d.next_turn(granted, at=4, stopped="awaiting_ci", head="h" * 40))
+    assert stopped == {**granted, "at": 4, "stopped": "awaiting_ci", "head": "h" * 40}
+    assert (stopped["unbatched"], stopped["of"]) == ("dissolved", "fl-1-1")
+    assert (stopped["verified"], stopped["allow_no_checks"]) == ("v" * 40, True)
+    # a turn granted again names the instance, when, and the judgments it was granted on
+    again = read(d.single_turn(stopped, "fl-1", 5, verified="w" * 40))
+    assert (again["unbatched"], again["of"], again["released"]) == ("dissolved", "fl-1-1", False)
+    assert (again["stopped"], again["head"], again["verified"], again["allow_no_checks"]) == \
+        (None, None, "w" * 40, False)
+    # the comment a record was read from is the one its rewrite replaces
+    assert again["comment_id"] == d.next_turn(again, at=6)["comment_id"] == 9
+    assert d.next_turn(None, instance="x", at=6.9)["at"] == 6
 
 
 def test_a_batch_is_known_by_its_id_wherever_orca_puts_its_branch():
@@ -554,10 +618,10 @@ def test_a_batch_shows_on_the_board_in_the_brief_and_in_the_working_set():
     def turn(body):
         return d.latest_turn([{"id": 1, "body": body}])
 
-    mine = turn(d.batch_turn_comment("me", 1000, "me-100", members, "gating"))
+    mine = turn(d.turn_comment(d.batch_turn(None, "me", 1000, "me-100", members, "gating")))
     ws = d.assemble_working_set(issues, prs, claims, beats, "me", 1000, cfg,
                                 turns={1: mine, 2: mine,
-                                       3: turn(d.unbatched_comment("me", 1000, "me-100", "left_out"))})
+                                       3: turn(d.turn_comment(d.unbatched_turn(None, "me", 1000, "me-100", "left_out")))})
     rows = {m["number"]: (m["status"], m["board_phase"], m["batch"], m["unbatched"]) for m in ws["mine"]}
     in_batch = {"id": "me-100", "members": [1, 2], "phase": "gating"}
     # (a batch row has no board phase: its board is the batch's to write, not the tick's)
@@ -572,7 +636,7 @@ def test_a_batch_shows_on_the_board_in_the_brief_and_in_the_working_set():
 
     # a batch a DEAD fleet recorded on claims I took holds no turn of mine — and is
     # listed, so the tick abandons it before it grants anything
-    theirs = turn(d.batch_turn_comment("old", 900, "old-90", members, "stacking"))
+    theirs = turn(d.turn_comment(d.batch_turn(None, "old", 900, "old-90", members, "stacking")))
     ws = d.assemble_working_set(issues, prs, claims, beats, "me", 1000, cfg,
                                 turns={1: theirs, 2: theirs})
     assert {m["number"]: (m["status"], m["batch"]) for m in ws["mine"]} == \
@@ -2043,8 +2107,8 @@ def test_assemble_working_set():
     ws3 = d.assemble_working_set(issues, more, claims, heartbeats, "me", now, cfg)
     assert ws["merge_order"] == [3] and ws3["merge_order"] == [4, 3]
     assert all(m["stopped"] is None for m in ws3["mine"])
-    turn = d.latest_turn([{"id": 1, "body": d.turn_comment("me", now, stopped="awaiting_ci",
-                                                           head="aaa")}])
+    turn = d.latest_turn([{"id": 1, "body": d.turn_comment(d.next_turn(
+        d.single_turn(None, "me", now), stopped="awaiting_ci", head="aaa"))}])
     held = d.assemble_working_set(issues, more, claims, heartbeats, "me", now, cfg,
                                   turns={3: turn})
     rows = {m["number"]: (m["status"], m["board_phase"], m["stopped"]) for m in held["mine"]}

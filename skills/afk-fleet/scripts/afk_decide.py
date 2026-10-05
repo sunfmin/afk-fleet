@@ -1148,9 +1148,14 @@ def stall_reason(reason, tail):
 #   batch=<id> members=<issue>:<pr>,… phase=<stacking|gating|fixing>
 #
 # and a PR that left a batch without landing — left out of the stack, or in a
-# batch that was abandoned or dissolved — carries `unbatched=<why>` from then
-# on, on every marker written for it: it lands on a single turn and is never
-# batched again. The marker that only says so holds no turn: `released=1`.
+# batch that was abandoned or dissolved — carries `unbatched=<why> of=<batch>`
+# from then on, on every marker written for it: it lands on a single turn and
+# is never batched again. The marker that only says so holds no turn:
+# `released=1`.
+#
+# A marker is never written from loose fields: it is REWRITTEN from the record
+# it was read as (`latest_turn`) plus what changed (`next_turn`), and rendered
+# by `turn_comment` — so a field no rewrite names survives it.
 
 _TURN_MARKER_RE = re.compile(r"<!--\s*afk:turn\b(.*?)-->", re.DOTALL)
 
@@ -1208,75 +1213,115 @@ def batch_outcome(outcome):
     return outcome
 
 
-def turn_comment(instance, at, verified=None, allow_no_checks=False, stopped=None, head=None,
-                 unbatched=None):
-    """The PR comment that records a landing turn: the marker `latest_turn` reads
-    back, then the same facts worded for a human reading the PR.
+# The record of a PR that was never granted a turn: every field `latest_turn`
+# gives back, at the value that says nothing.
+_NO_TURN = {"instance": None, "at": None, "verified": None, "allow_no_checks": False,
+            "stopped": None, "head": None, "batch": None, "members": [], "phase": None,
+            "unbatched": None, "of": None, "released": False, "comment_id": None}
+
+
+def next_turn(prev, **changed):
+    """The record a turn marker is REWRITTEN from: `prev` — the record as it was
+    read (`latest_turn`), None when the PR has none — plus what changed. A field
+    nobody names survives, `comment_id` among them: the rewrite replaces the
+    comment it was read from. Refuses a field `latest_turn` does not give back."""
+    unknown = sorted(set(changed) - set(_NO_TURN))
+    if unknown:
+        raise ValueError(f"not a field of a turn record: {', '.join(unknown)}")
+    turn = {**_NO_TURN, **(prev or {}), **changed}
+    if turn["at"] is not None:
+        turn["at"] = int(turn["at"])
+    return turn
+
+
+def single_turn(prev, instance, at, verified=None, allow_no_checks=False):
+    """The record of ONE PR's landing turn, granted now (or granted again) over
+    `prev`: the worker is told to land, so it has not stopped, and the turn is
+    no batch's.
 
       instance:        the fleet instance granting the turn
-      at:              when the worker was last told, or last stopped (epoch
-                       seconds) — the sign of life its silence is timed from
+      at:              when the worker was told (epoch seconds) — the sign of
+                       life its silence is timed from
       verified:        the head an adversarial verify passed, if one did
       allow_no_checks: the tick judged a PR with no checks at all may land
-      stopped, head:   the LAND_OUTCOMES word `afk land` last stopped with short
-                       of merging, and the head it stopped on; None while the
-                       worker has not stopped
-      unbatched:       the UNBATCHED word of a PR that left a merge batch without
-                       landing — carried on every later marker, so it is never
-                       batched again
     """
-    parts = [f"instance={instance}", f"at={int(at)}",
-             *([f"verified={verified}"] if verified else []),
-             *(["allow_no_checks=1"] if allow_no_checks else []),
-             *([f"stopped={stopped}", f"head={head}"] if stopped else []),
-             *([f"unbatched={unbatched}"] if unbatched else [])]
-    state = (f"Its last `afk land` stopped with `{stopped}` on `{(head or '')[:12]}`."
-             if stopped else "The worker has been told to land it.")
-    return (f"<!--afk:turn {' '.join(parts)}-->\n"
-            f"**afk-fleet: this PR holds the landing turn** of fleet instance `{instance}`. "
-            f"The worker that wrote the branch lands it with `afk land` — sync with the target, "
-            f"gate, merge — and the next PR's turn comes when this one has landed or failed. "
-            f"{state}")
+    return next_turn(prev, instance=instance, at=at, verified=verified,
+                     allow_no_checks=bool(allow_no_checks), stopped=None, head=None,
+                     batch=None, members=[], phase=None, released=False)
 
 
-def batch_turn_comment(instance, at, batch, members, phase):
-    """The comment that records a MERGE BATCH's landing turn on one member PR —
-    the same marker on every member (ADR-0029).
+def batch_turn(prev, instance, at, batch, members, phase):
+    """The record of a MERGE BATCH's landing turn on one member PR, over that
+    PR's `prev` — the same on every member (ADR-0029).
 
       batch:   the batch's id (`batch_id`)
       members: [{"issue", "pr"}...], in stack order — every PR the batch holds
       phase:   one of BATCH_PHASES
     """
-    if phase not in BATCH_PHASES:
-        raise ValueError(f"not a batch phase: {phase!r}")
-    listed = ",".join(f"{m['issue']}:{m['pr']}" for m in members)
-    prs = ", ".join(f"#{m['pr']}" for m in members)
-    return (f"<!--afk:turn instance={instance} at={int(at)} batch={batch} members={listed} "
-            f"phase={phase}-->\n"
-            f"**afk-fleet: this PR is in a merge batch** (`{batch}`) of fleet instance "
-            f"`{instance}`: {prs} are stacked on the target as one squash commit each, gated "
-            f"once as a stack, and landed together by the batch's own worker "
-            f"(`afk land --batch`). This PR's branch is not touched. It will be closed, not "
-            f"merged, with a comment naming the commit that landed it. Phase: `{phase}`.")
+    return next_turn(prev, instance=instance, at=at, verified=None, allow_no_checks=False,
+                     stopped=None, head=None, batch=batch, members=list(members), phase=phase,
+                     released=False)
 
 
-def unbatched_comment(instance, at, batch, why):
-    """The comment that replaces a batch's marker on a PR that left it without
-    landing. It holds no turn (`released=1`): the PR is back to waiting, takes a
+def unbatched_turn(prev, instance, at, batch, why):
+    """The record that replaces a batch's turn on a PR that left it without
+    landing. It holds no turn (`released`): the PR is back to waiting, takes a
     single landing turn, and is never batched again.
 
       why: one of UNBATCHED
     """
-    if why not in UNBATCHED:
-        raise ValueError(f"not a reason a PR leaves a batch: {why!r}")
-    said = {"left_out": "it conflicted with the PRs stacked before it, and was left out",
-            "abandoned": "the batch was abandoned, and nothing landed",
-            "dissolved": "fewer than two PRs were left in the batch, so it was dissolved"}[why]
-    return (f"<!--afk:turn instance={instance} at={int(at)} unbatched={why} of={batch} "
-            f"released=1-->\n"
-            f"**afk-fleet: this PR was in merge batch `{batch}`** — {said}. It now waits for "
-            f"a landing turn of its own, on which its worker lands it, and it is not batched "
-            f"again.")
+    return next_turn(prev, instance=instance, at=at, batch=None, members=[], phase=None,
+                     unbatched=why, of=batch, released=True)
+
+
+def turn_comment(turn):
+    """The PR comment that records a landing turn, from its record (`latest_turn`,
+    or one of `next_turn` / `single_turn` / `batch_turn` / `unbatched_turn`): the
+    marker `latest_turn` reads back — every field the record holds — then the
+    same facts worded for a human reading the PR. The record says which of the
+    three it is: a PR that left a batch and holds no turn (`released`), a merge
+    batch's turn (`batch`), or one PR's turn.
+    """
+    instance, batch, stopped = turn["instance"], turn["batch"], turn["stopped"]
+    if batch and turn["phase"] not in BATCH_PHASES:
+        raise ValueError(f"not a batch phase: {turn['phase']!r}")
+    if turn["released"] and turn["unbatched"] not in UNBATCHED:
+        raise ValueError(f"not a reason a PR leaves a batch: {turn['unbatched']!r}")
+    listed = ",".join(f"{m['issue']}:{m['pr']}" for m in turn["members"])
+    parts = [f"instance={instance}", f"at={int(turn['at'])}",
+             *([f"verified={turn['verified']}"] if turn["verified"] else []),
+             *(["allow_no_checks=1"] if turn["allow_no_checks"] else []),
+             *([f"stopped={stopped}", f"head={turn['head']}"] if stopped else []),
+             *([f"batch={batch}", f"members={listed}", f"phase={turn['phase']}"] if batch else []),
+             *([f"unbatched={turn['unbatched']}"] if turn["unbatched"] else []),
+             *([f"of={turn['of']}"] if turn["of"] else []),
+             *(["released=1"] if turn["released"] else [])]
+    marker = f"<!--afk:turn {' '.join(parts)}-->\n"
+    if turn["released"]:
+        said = {"left_out": "it conflicted with the PRs stacked before it, and was left out",
+                "abandoned": "the batch was abandoned, and nothing landed",
+                "dissolved": "fewer than two PRs were left in the batch, so it was dissolved"
+                }[turn["unbatched"]]
+        return (f"{marker}"
+                f"**afk-fleet: this PR was in merge batch `{turn['of']}`** — {said}. It now "
+                f"waits for a landing turn of its own, on which its worker lands it, and it is "
+                f"not batched again.")
+    if batch:
+        prs = ", ".join(f"#{m['pr']}" for m in turn["members"])
+        return (f"{marker}"
+                f"**afk-fleet: this PR is in a merge batch** (`{batch}`) of fleet instance "
+                f"`{instance}`: {prs} are stacked on the target as one squash commit each, gated "
+                f"once as a stack, and landed together by the batch's own worker "
+                f"(`afk land --batch`). This PR's branch is not touched. It will be closed, not "
+                f"merged, with a comment naming the commit that landed it. Phase: "
+                f"`{turn['phase']}`.")
+    state = (f"Its last `afk land` stopped with `{stopped}` on `{(turn['head'] or '')[:12]}`."
+             if stopped else "The worker has been told to land it.")
+    return (f"{marker}"
+            f"**afk-fleet: this PR holds the landing turn** of fleet instance `{instance}`. "
+            f"The worker that wrote the branch lands it with `afk land` — sync with the target, "
+            f"gate, merge — and the next PR's turn comes when this one has landed or failed. "
+            f"{state}")
 
 
 def _batch_members(raw):
@@ -1291,12 +1336,13 @@ def latest_turn(comments):
     """
     The landing turn recorded on a PR, from its comments ([{"id", "body"}...],
     oldest first) → {"instance", "at", "verified", "allow_no_checks", "stopped",
-    "head", "batch", "members", "phase", "unbatched", "released", "comment_id"},
-    or None when the PR was never granted one. The latest
+    "head", "batch", "members", "phase", "unbatched", "of", "released",
+    "comment_id"}, or None when the PR was never granted one. The latest
     marker wins; one that names no instance is not a record — nobody could hold it.
     `batch` / `members` / `phase` are a merge batch's turn (None / [] / None on a
-    single one); `unbatched` is the UNBATCHED word of a PR that left a batch;
-    `released` says the marker holds no turn at all.
+    single one); `unbatched` is the UNBATCHED word of a PR that left a batch and
+    `of` the batch it left; `released` says the marker holds no turn at all.
+    `turn_comment` renders the record back: the two are a round trip.
     """
     found = None
     for c in comments or []:
@@ -1318,6 +1364,7 @@ def latest_turn(comments):
                  "phase": attrs.get("phase") if attrs.get("phase") in BATCH_PHASES else None,
                  "unbatched": attrs.get("unbatched") if attrs.get("unbatched") in UNBATCHED
                  else None,
+                 "of": attrs.get("of"),
                  "released": attrs.get("released") == "1",
                  "comment_id": c.get("id")}
     return found

@@ -2107,6 +2107,34 @@ def test_dispatch_continues_from_whatever_progress_survived():
         assert "could not remove" in w.error(*dispatch(7, "--start", "fresh"))
 
 
+def test_what_a_turn_marker_says_survives_a_landing_that_stops_and_a_turn_granted_again():
+    """`afk land` stopping and `afk turn` granting again each REWRITE the PR's one
+    marker from what it said: that the PR left a merge batch, and the tick's two
+    judgments, are still on it — neither names them."""
+    with world(issues=[issue(7, "ready-for-agent")]) as w:
+        on = (*local_gate("true"), "--set", "gate.adversarial_verify=true")
+        d, head = with_pr(w, 7, 70)
+        wt = d["worktree"]
+        left = afk_decide.unbatched_turn(None, "me", T0, "me-1", "left_out")
+        w.set(comments={"70": [{"id": 2001, "html_url": "u", "body": afk_decide.turn_comment(
+            afk_decide.single_turn(left, "me", T0, verified="0" * 40, allow_no_checks=True))}]})
+
+        def marker():
+            [note] = _turns(w, 70)
+            return afk_decide.latest_turn([{"id": 2001, "body": note}])
+
+        before = marker()
+        # the landing stops: the head is not the one the tick verified
+        r = _land(w, 7, wt, *on, now=T0 + 10)
+        assert r["outcome"] == "needs_verify", r
+        assert marker() == {**before, "at": T0 + 10, "stopped": "needs_verify", "head": r["head"]}
+        assert (marker()["unbatched"], marker()["of"]) == ("left_out", "me-1")
+        assert (marker()["verified"], marker()["allow_no_checks"]) == ("0" * 40, True)
+        # the turn is granted again, on a verify of that head
+        assert w.afk(*_turn(7, *on, "--verified", r["head"], now=T0 + 20))["again"] is True
+        assert marker() == {**before, "at": T0 + 20, "verified": r["head"]}
+
+
 # --------------------------------------------------------------------------- #
 # act: the landing turn (`afk turn`) and the landing (`afk land`) — ADR-0027   #
 # --------------------------------------------------------------------------- #
@@ -2187,7 +2215,7 @@ def test_a_worker_lands_its_own_pr_on_the_turn_the_fleet_grants():
         assert "does not hold the landing turn" in _land_error(w, 3, wt, *gate)
         # …nor on a turn another fleet instance recorded: the claim is not theirs
         w.set(comments={"30": [{"id": 2001, "html_url": "u", "body":
-                                afk_decide.turn_comment("peer", T0)}]})
+                                afk_decide.turn_comment(afk_decide.single_turn(None, "peer", T0))}]})
         assert "does not hold the landing turn" in _land_error(w, 3, wt, *gate)
         assert w.sb.remote_ref(f"refs/heads/{branch}") == pr_head
         assert git(wt, "rev-parse", "HEAD") == pr_head and not _merging(wt)
@@ -2645,7 +2673,7 @@ def test_a_recorded_gate_run_is_void_unless_it_is_of_the_tree_that_lands():
         d, head = with_pr(w, 7, 70)
         wt = d["worktree"]
         w.set(comments={"70": [{"id": 2001, "html_url": "u", "body":
-                                afk_decide.turn_comment("me", T0, verified="0" * 40)}]})
+                                afk_decide.turn_comment(afk_decide.single_turn(None, "me", T0, verified="0" * 40))}]})
 
         def count():
             if not os.path.exists(runs):
@@ -2757,7 +2785,7 @@ def test_a_ref_afk_did_not_write_is_not_a_recorded_gate_run():
             forged = git(wt, "commit-tree", tree, "-m", message)
             git(wt, "push", "-q", "--force", "origin", f"{forged}:{ref}")
             w.set(comments={"60": [{"id": 2001, "html_url": "u", "body":
-                                    afk_decide.turn_comment("me", T0, verified="0" * 40)}]})
+                                    afk_decide.turn_comment(afk_decide.single_turn(None, "me", T0, verified="0" * 40))}]})
             r = _land(w, 6, wt, *gate, "--set", "gate.adversarial_verify=true")
             assert (r["outcome"], r["gate"]["source"]) == ("needs_verify", "run"), r
             assert "no green run" in r["gate"]["not_trusted"], r["gate"]
@@ -3122,7 +3150,8 @@ def test_a_pr_that_conflicts_with_the_stack_is_left_out_and_never_batched_again(
         c = cycle(w, c["state"], *gate)
         assert c["progress"].startswith("landing turn to #2; cleared #1, #4, #5; "), c["progress"]
         [note] = _turns(w, 20)
-        assert note.startswith(f"<!--afk:turn instance=me at={T0} unbatched=left_out-->\n"), note
+        assert note.startswith(f"<!--afk:turn instance=me at={T0} unbatched=left_out "
+                               f"of={b['batch']}-->\n"), note
         assert "released=1" in _turns(w, 30)[0]
         assert not os.path.isdir(b["worktree"])                       # the batch's worktree is gone
         # …and its own worker lands it: the first of the two conflict resolutions
@@ -3274,11 +3303,12 @@ def test_land_batch_without_the_batchs_turn_changes_nothing():
         w.set(comments={**marked, "20": []})
         assert "does not hold the landing turn of merge batch" in refused()
         w.set(comments={**marked, "20": [{"id": 5001, "html_url": "u", "body":
-              afk_decide.batch_turn_comment("peer", T0, batch, b_members(b), "stacking")}]})
+              afk_decide.turn_comment(afk_decide.batch_turn(
+                  None, "peer", T0, batch, b_members(b), "stacking"))}]})
         assert "does not hold the landing turn of merge batch" in refused()
         # a member's single turn is not the batch's
         w.set(comments={**marked, "20": [{"id": 5001, "html_url": "u", "body":
-              afk_decide.turn_comment("me", T0)}]})
+              afk_decide.turn_comment(afk_decide.single_turn(None, "me", T0))}]})
         assert "does not hold the landing turn of merge batch" in refused()
         w.set(comments=marked)
 
