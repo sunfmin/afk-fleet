@@ -1,6 +1,6 @@
 # The Act half is transitions, not recipes: one call per change of a claim's state
 
-**Status:** accepted — extends [ADR-0004](0004-deterministic-mechanics-as-tools.md) from the
+**Status:** accepted; its `merge` transition is **superseded by [ADR-0027](0027-a-worker-lands-its-own-pr-on-a-landing-turn.md)** — the tick grants a landing turn (`afk turn`) and the worker lands the PR (`afk land`); every other transition stands — extends [ADR-0004](0004-deterministic-mechanics-as-tools.md) from the
 Observe half of a tick to the Act half, and [ADR-0008](0008-rebuild-as-one-observation-tool.md)'s
 "one call, one answer" from `rebuild` to everything a tick *does*. Supersedes the parts of
 [ADR-0016](0016-the-seam-enforces-its-own-rules.md) that named `afk next-attempt`, `afk pace` and

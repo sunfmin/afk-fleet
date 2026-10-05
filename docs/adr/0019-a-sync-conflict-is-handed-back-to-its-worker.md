@@ -1,6 +1,6 @@
 # ADR-0019 — A sync conflict is handed back to the worker that wrote the branch
 
-**Status:** accepted — adds a transition to [ADR-0017](0017-the-act-half-is-transitions.md) and
+**Status:** superseded by [ADR-0027](0027-a-worker-lands-its-own-pr-on-a-landing-turn.md) — the tick no longer syncs a PR, so there is no conflict to hand back: the worker meets it on its landing turn and resolves it in place. `afk hand-back` and the `handed_back` status are removed. Originally: accepted — adds a transition to [ADR-0017](0017-the-act-half-is-transitions.md) and
 reverses one of its "considered and rejected" entries (*have `merge` resolve conflicts by
 re-dispatching a worker*: the objection was the cost of a retry, and a hand-back costs none). Reuses
 the silent-worker path of [ADR-0018](0018-nudge-a-silent-worker-before-failing-it.md) and the

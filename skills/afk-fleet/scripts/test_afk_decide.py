@@ -9,6 +9,7 @@ mine/peer_live/stale partition whose wrong answer silently corrupts state).
 import json
 import os
 import re
+import shlex
 
 import afk_decide as d
 
@@ -96,25 +97,22 @@ def test_classify_claims_my_own_expired_stays_mine():
 def test_subclassify_pr():
     # → (status, board_phase): what the tick does next, and what the board shows
     assert d.subclassify_pr(False, None, "required") == ("no_pr", "claimed")
-    assert d.subclassify_pr(True, "green", "required") == ("awaiting_merge", "awaiting_merge")
+    assert d.subclassify_pr(True, "green", "required") == ("awaiting_turn", "awaiting_turn")
     assert d.subclassify_pr(True, "red", "required") == ("failure", "ci_failed")
     assert d.subclassify_pr(True, "pending", "required") == ("awaiting_ci", "pr_open")
     # no checks at all is not "checks pending": nothing is running, so waiting
-    # would park the claim forever in a repo with no CI. It goes to `afk merge`,
-    # whose `no_checks` outcome asks the tick — and the board claims no green gate
-    assert d.subclassify_pr(True, None, "required") == ("awaiting_merge", "pr_open")
-    assert d.subclassify_pr(True, None, "required", queued=True) == ("queued", "queued")
+    # would park the claim forever in a repo with no CI. It goes to `afk turn`,
+    # whose `no_checks` outcome asks the tick
+    assert d.subclassify_pr(True, None, "required") == ("awaiting_turn", "awaiting_turn")
     # with no PR the checks are nobody's: stale rollup data cannot invent a status
     assert d.subclassify_pr(False, "green", "required") == ("no_pr", "claimed")
 
     # gate.ci: local — there are no checks to WAIT on, because gating is an action
-    # the tick takes at merge time (ADR-0012). Any open PR is awaiting_merge, and a
-    # red remote run (the repo's own on:push CI, which the fleet does not gate on)
-    # must never park the claim in `failure` forever. But the board stays at
-    # pr_open: the gate that merge sequence runs has not passed, and the board must
-    # not show a green gate nobody has run.
+    # the landing takes (ADR-0012). Any open PR is awaiting its turn, and a red
+    # remote run (the repo's own on:push CI, which the fleet does not gate on)
+    # must never park the claim in `failure` forever.
     for checks in ("green", "red", "pending", None):
-        assert d.subclassify_pr(True, checks, "local") == ("awaiting_merge", "pr_open"), checks
+        assert d.subclassify_pr(True, checks, "local") == ("awaiting_turn", "awaiting_turn"), checks
     assert d.subclassify_pr(False, None, "local") == ("no_pr", "claimed")
 
     # every board phase it can produce is one the board renders — the tick never translates
@@ -125,120 +123,112 @@ def test_subclassify_pr():
 
     # CLAIM_STATUSES is exactly what it can return: no status the docs were never
     # held to, and none listed that cannot happen
-    seen = {d.subclassify_pr(has_pr, checks, ci, closed=closed, handed_back=handed_back,
-                             queued=queued)[0]
+    seen = {d.subclassify_pr(has_pr, checks, ci, closed=closed, landing=landing)[0]
             for ci in d.GATE_CI_MODES for has_pr in (True, False)
             for checks in ("green", "red", "pending", None)
-            for closed in (True, False) for handed_back in (True, False)
-            for queued in (True, False)}
+            for closed in (True, False) for landing in (True, False)}
     assert seen == set(d.CLAIM_STATUSES)
 
-    # the issue is CLOSED but the claim is still mine — a merge or `afk close` that
-    # crashed before releasing. Nothing else about it matters, and there is no board
-    # to write: the only thing left to do is release.
+    # the issue is CLOSED but the claim is still mine — its worker landed the PR, or
+    # an `afk close` crashed before releasing. Nothing else about it matters, and
+    # there is no board to write: the only thing left to do is release.
     for ci in d.GATE_CI_MODES:
         for has_pr in (True, False):
             assert d.subclassify_pr(has_pr, "red", ci, closed=True) == ("closed", None)
 
-    # a sync conflict handed back to the worker and not yet answered: whatever the
-    # checks say, in either mode, the claim is NOT awaiting_merge — the merge would
-    # hit the same conflict and hand it back again every cycle (ADR-0019)
+    # a PR that holds the landing turn: whatever the checks say, in either mode, the
+    # claim is `landing` — its worker is at it, and red or pending checks on a head
+    # the sync just pushed are the landing's own to wait out (ADR-0027)
     for ci in d.GATE_CI_MODES:
         for checks in ("green", "red", "pending", None):
-            assert d.subclassify_pr(True, checks, ci, handed_back=True) == \
-                ("handed_back", "handed_back"), (ci, checks)
-        assert d.subclassify_pr(True, "green", ci, closed=True, handed_back=True)[0] == "closed"
-    assert "handed_back" in d.STATUS_PHASES
+            assert d.subclassify_pr(True, checks, ci, landing=True) == \
+                ("landing", "landing"), (ci, checks)
+        assert d.subclassify_pr(True, "green", ci, closed=True, landing=True)[0] == "closed"
+        assert d.subclassify_pr(False, None, ci, landing=True)[0] == "no_pr"
+    assert {"landing", "awaiting_turn"} <= set(d.STATUS_PHASES)
 
 
-def test_handback_record_round_trips_and_stays_open_until_the_head_contains_the_tip():
-    body = d.handback_comment("main", "t" * 40, "h" * 40, ["a/b.go", "c d.md"], 1234)
-    # the marker leads, the same facts follow for a human, and no retry is implied
-    assert body.startswith(f"<!--afk:handback target=main tip={'t' * 40} head={'h' * 40} at=1234-->\n")
-    assert "- `a/b.go`" in body and "no retry was spent" in body
-    rec = d.latest_handback([{"id": 7, "body": "a human note"}, {"id": 8, "body": body}])
-    assert rec == {"target": "main", "tip": "t" * 40, "head": "h" * 40, "at": 1234,
-                   "files": ["a/b.go", "c d.md"], "comment_id": 8}
-    assert d.latest_handback([]) is None and d.latest_handback([{"id": 1, "body": "x"}]) is None
-    assert d.latest_handback([{"id": 1, "body": None}]) is None
-    # the latest round wins; a marker that names no tip or head is not a record
-    later = d.handback_comment("main", "u" * 40, "i" * 40, [], 2000)
-    assert "reported no file" in later
-    rec2 = d.latest_handback([{"id": 8, "body": body}, {"id": 9, "body": later},
-                              {"id": 10, "body": "<!--afk:handback target=main at=3-->"}])
-    assert (rec2["tip"], rec2["files"], rec2["comment_id"]) == ("u" * 40, [], 9)
+def test_turn_record_round_trips_and_is_held_only_by_the_claims_owner():
+    body = d.turn_comment("fl-1", 1234)
+    # the marker leads, the same facts follow for a human
+    assert body.startswith("<!--afk:turn instance=fl-1 at=1234-->\n")
+    assert "holds the landing turn" in body and "`fl-1`" in body and "`afk land`" in body
+    rec = d.latest_turn([{"id": 7, "body": "a human note"}, {"id": 8, "body": body}])
+    assert rec == {"instance": "fl-1", "at": 1234, "verified": None, "allow_no_checks": False,
+                   "stopped": None, "head": None, "comment_id": 8}
+    assert d.latest_turn([]) is None and d.latest_turn([{"id": 1, "body": "x"}]) is None
+    assert d.latest_turn([{"id": 1, "body": None}]) is None and d.latest_turn(None) is None
 
-    # open while the head is the one that conflicted — GitHub is not even asked…
-    assert d.handback_open(rec, "h" * 40, False) is True
-    assert d.handback_open(rec, "h" * 40, True) is True
-    # …still open after a push that did not bring the named tip in…
-    assert d.handback_open(rec, "n" * 40, False) is True
-    # …and answered only once the head contains it
-    assert d.handback_open(rec, "n" * 40, True) is False
-    assert d.handback_open(None, "n" * 40, False) is False
+    # the tick's two judgments travel on the marker, and so does where the landing stopped
+    full = d.turn_comment("fl-1", 2000.9, verified="v" * 40, allow_no_checks=True,
+                          stopped="awaiting_ci", head="h" * 40)
+    assert full.startswith(f"<!--afk:turn instance=fl-1 at=2000 verified={'v' * 40} "
+                           f"allow_no_checks=1 stopped=awaiting_ci head={'h' * 40}-->\n")
+    assert "stopped with `awaiting_ci` on `hhhhhhhhhhhh`" in full
+    rec2 = d.latest_turn([{"id": 8, "body": body}, {"id": 9, "body": full},
+                          {"id": 10, "body": "<!--afk:turn at=3-->"}])       # names nobody: no record
+    assert rec2 == {"instance": "fl-1", "at": 2000, "verified": "v" * 40, "allow_no_checks": True,
+                    "stopped": "awaiting_ci", "head": "h" * 40, "comment_id": 9}
+    # a `stopped` word the code does not know is not a stop
+    odd = d.latest_turn([{"id": 1, "body": "<!--afk:turn instance=x at=5 stopped=bogus head=abc-->"}])
+    assert (odd["stopped"], odd["head"]) == (None, None)
+
+    # held only by the instance that holds the claim: a turn granted by the fleet a
+    # claim was taken over from is nobody's — and no claim, no turn
+    assert d.held_turn(rec, "fl-1") is rec
+    assert d.held_turn(rec, "fl-2") is None and d.held_turn(rec, None) is None
+    assert d.held_turn(rec, "") is None and d.held_turn(None, "fl-1") is None
+
+    # each vocabulary is closed: neither subcommand can stop with a word nobody routes
+    assert all(d.land_outcome(o) == o for o in d.LAND_OUTCOMES)
+    assert all(d.turn_outcome(o) == o for o in d.TURN_OUTCOMES)
+    assert set(d.LAND_WAITS) < set(d.LAND_OUTCOMES) and "merged" not in d.LAND_WAITS
+    for check, word in ((d.land_outcome, "granted"), (d.turn_outcome, "merged"),
+                        (d.land_outcome, "handed_back")):
+        try:
+            check(word)
+            raise AssertionError(word)
+        except ValueError:
+            pass
 
 
-def test_merge_queue_orders_prs_and_holds_one_behind_a_handed_back_pr_it_overlaps():
-    """ADR-0025. PRs that conflict with each other land one at a time: a handed-back
-    PR goes first, and a PR that changes a file it conflicted in waits behind it."""
-    def entry(issue, pr, at=None, rounds=0, files=(), open_=False):
-        rec = {"at": at, "files": list(files)} if rounds else None
-        return {"issue": issue, "pr": pr, "handbacks": rounds, "handback": rec, "open": open_}
+def test_the_ticks_judgments_are_settled_before_a_turn_is_granted():
+    def gate(ci, checks, allow=False, verify=False, verified=None, head="h1"):
+        return d.turn_gate(ci, checks, allow, verify, verified, head)
 
-    never_low, never_high = entry(1, 10), entry(2, 20)
-    once_old = entry(3, 30, at=100, rounds=1, files=["a.md"])
-    once_new = entry(4, 40, at=200, rounds=1, files=["b.md"], open_=True)
-    thrice = entry(5, 50, at=300, rounds=3, files=["a.md", "c.md"])
-    entries = [never_high, once_new, never_low, thrice, once_old]
+    # local: the machine gate is the landing's to run — nothing to wait for here
+    for checks in ("green", "red", "pending", None):
+        assert gate("local", checks) == "ready", checks
+    # required: the PR's checks speak first; absent ones are the tick's call
+    assert gate("required", "green") == "ready"
+    assert gate("required", "pending") == "awaiting_ci"
+    assert gate("required", "red") == "gate_red"
+    assert gate("required", None) == "no_checks" and gate("required", None, allow=True) == "ready"
+    assert gate("required", "red", allow=True) == "gate_red"       # waives ABSENT checks only
+    # the adversarial verify comes after the machine gate, pinned to the head
+    assert gate("local", None, verify=True) == "needs_verify"
+    assert gate("local", None, verify=True, verified="h0") == "needs_verify"
+    assert gate("local", None, verify=True, verified="h1") == "ready"
+    assert gate("required", "pending", verify=True, verified="h1") == "awaiting_ci"
+    # every refusal is a word `afk turn` may stop with
+    assert {gate("required", c, verify=True) for c in ("green", "red", "pending", None)} \
+        <= set(d.TURN_OUTCOMES)
 
-    # the ONE order: most rounds, then the oldest latest hand-back, then PR number —
-    # and every handed-back PR before every one that never was
-    assert d.queue_order(entries) == [5, 3, 4, 1, 2]
-    assert d.queue_order(reversed(entries)) == [5, 3, 4, 1, 2]          # not input order
-    assert d.queue_order([]) == []
 
-    # ahead of a PR: the handed-back ones before it, answered or open — never itself,
-    # never one that was not handed back
-    def ahead(e):
-        return [x["pr"] for x in d.queue_ahead(e, entries)]
+def test_turns_are_granted_in_one_order_a_held_turn_first_then_pr_number():
+    """The merge queue (ADR-0027): the ready PRs of mine, the one that already
+    holds a turn first, then the lower PR number — never the order claims were
+    scanned in."""
+    def row(number, status, pr):
+        return {"number": number, "status": status, "pr": pr}
 
-    assert ahead(thrice) == [] and ahead(once_old) == [50] and ahead(once_new) == [50, 30]
-    assert ahead(never_low) == ahead(never_high) == [50, 30, 40]
-    assert d.queue_ahead(never_high, [never_low, never_high]) == []     # no hand-back: no queue
+    rows = [row(1, "awaiting_turn", 30), row(2, "no_pr", None), row(3, "awaiting_turn", 10),
+            row(4, "landing", 40), row(5, "awaiting_ci", 5), row(6, "failure", 6),
+            row(7, "closed", None)]
+    assert d.turn_order(rows) == [4, 3, 1]
+    assert d.turn_order(reversed(rows)) == [4, 3, 1]                # not input order
+    assert d.turn_order([]) == [] and d.turn_order(rows[1:2]) == []
 
-    # it waits behind the FIRST one ahead whose conflicted files it changes
-    everyone = d.queue_ahead(never_high, entries)
-    assert d.waits_behind(["a.md", "b.md"], everyone) == 50
-    assert d.waits_behind(["b.md", "x.go"], everyone) == 40
-    assert d.waits_behind(["x.go"], everyone) is None                   # overlaps nothing: free
-    assert d.waits_behind([], everyone) is None and d.waits_behind(["a.md"], []) is None
-    # a hand-back whose sync named no file holds nobody up
-    assert d.waits_behind(["a.md"], [entry(9, 90, at=1, rounds=1)]) is None
-
-    # what a landing frees (#36): a PR that waited behind the one that landed and,
-    # with it gone, waits behind nothing
-    assert d.freed_by(50, ["c.md"], everyone) is True
-    assert d.freed_by(50, ["a.md"], everyone) is False       # #30 conflicted in a.md too
-    assert d.freed_by(30, ["a.md"], everyone) is False       # it waits behind #50, not #30
-    assert d.freed_by(40, ["b.md", "x.go"], everyone) is True
-    assert d.freed_by(50, ["x.go"], everyone) is False       # it never waited at all
-    assert d.freed_by(50, ["c.md"], []) is False
-
-    # only a claim that would merge is ever `queued`; the board says so
-    for ci, checks in (("local", None), ("local", "red"), ("required", "green")):
-        assert d.subclassify_pr(True, checks, ci, queued=True) == ("queued", "queued")
-    assert d.subclassify_pr(True, "pending", "required", queued=True)[0] == "awaiting_ci"
-    assert d.subclassify_pr(True, "red", "required", queued=True)[0] == "failure"
-    assert d.subclassify_pr(True, "green", "required", handed_back=True, queued=True)[0] == "handed_back"
-    assert d.subclassify_pr(False, None, "local", queued=True)[0] == "no_pr"
-    board = d.render_status_board("queued", "local", 2, instance="x", pr=9, behind=7)
-    assert "排队等合并" in board and "等 PR #7 先合并" in board and "- [x] PR 已开 (#9)" in board
-    assert "交还" not in board and "待合并\n\n" not in board
-    try:
-        d.render_status_board("queued", "local", 2, pr=9)
-        raise AssertionError("a queued board must name what it waits behind")
-    except ValueError:
-        pass
 
 
 def test_validate_config():
@@ -339,7 +329,7 @@ def test_a_recorded_gate_run_counts_only_for_the_commit_and_command_it_ran():
     void = d.gate_record_void(rec, "def456", "make test")
     assert "abc123" in void and "def456" in void
 
-    # only local mode has a merge-time run to skip: on `required` the key would be
+    # only local mode has a landing run to skip: on `required` the key would be
     # one a human sets to no effect
     on = {"local_command": "make test", "trust_recorded_run": True}
     d.validate_config(d.resolve_config({"gate": {**on, "ci": "local"}}))
@@ -611,18 +601,33 @@ def test_classify_no_pr_nudges_a_silent_worker_once_before_failing_it():
     assert routed(_verdict("already-satisfied"), nudged_at=NOW - 9000) == ("idle_done", "close_release")
     assert routed(None, terminal="none") == ("dead", "orphan")
 
-    # a hand-back is the same kind of sign of life (ADR-0019): one grace period to
-    # start on it, then the same nudge → failure path — never a parked claim
-    def handed(idle, at, **nudge):
+    # a landing turn is the same kind of sign of life (ADR-0027): one grace period
+    # to start on it, then the same nudge → failure path — never a parked queue
+    def turn(idle, at, **more):
         r = d.classify_no_pr({**ZERO, "commits_ahead": 3}, "idle", idle, None, {}, NOW, GRACE,
-                             handed_back_at=at, **nudge)
+                             turn_at=at, **more)
         return r["outcome"], r["action"], r["idle_seconds"]
-    assert handed(9000, NOW - 10) == ("coding", "leave", 10)
-    assert handed(9000, NOW - GRACE) == ("idle_stalled", "nudge", GRACE)
-    assert handed(9000, NOW - 2 * GRACE, nudged_at=NOW - GRACE) == \
+    assert turn(9000, NOW - 10) == ("coding", "leave", 10)
+    assert turn(9000, NOW - GRACE) == ("idle_stalled", "nudge", GRACE)
+    assert turn(9000, NOW - 2 * GRACE, nudged_at=NOW - GRACE) == \
         ("idle_failed", "next_attempt", GRACE)
-    r = d.classify_no_pr(ZERO, "none", None, None, {}, NOW, GRACE, handed_back_at=NOW - 10)
+    r = d.classify_no_pr(ZERO, "none", None, None, {}, NOW, GRACE, turn_at=NOW - 10)
     assert (r["outcome"], r["action"]) == ("dead", "orphan")      # a gone terminal is still dead
+    # a worker whose landing stopped FOR THE TICK (CI, a verify, absent checks) is
+    # waiting on the tick, not silent: never nudged, never failed, however long ago
+    for stopped in d.LAND_WAITS:
+        assert turn(9000, NOW - 5 * GRACE, turn_stopped=stopped)[:2] == ("coding", "leave"), stopped
+        assert turn(9000, NOW - 5 * GRACE, turn_stopped=stopped, nudged_at=NOW - 3 * GRACE)[:2] == \
+            ("coding", "leave")
+    # …while one that stopped on something that is ITS to fix is silent like any other
+    for stopped in ("conflict", "gate_red"):
+        assert turn(9000, NOW - GRACE, turn_stopped=stopped)[:2] == ("idle_stalled", "nudge")
+    # what the worker declared still wins, and so does a gone terminal
+    r = d.classify_no_pr(ZERO, "idle", 9000, _verdict("giving-up"), {}, NOW, GRACE,
+                         turn_at=NOW - 9000, turn_stopped="awaiting_ci")
+    assert (r["outcome"], r["action"]) == ("idle_failed", "next_attempt")
+    r = d.classify_no_pr(ZERO, "none", None, None, {}, NOW, GRACE, turn_stopped="awaiting_ci")
+    assert (r["outcome"], r["action"]) == ("dead", "orphan")
 
 
 def test_stall_reason_carries_where_the_worker_stopped():
@@ -1018,7 +1023,7 @@ def test_render_status_board():
     assert "认领方 `fl-abc`" in body
     assert "- [x] 已认领 · worker 实现中" in body
     assert "- [x] PR 已开 (#123) · 等 CI" in body
-    assert "- [ ] 门已绿 · 待合并" in body
+    assert "- [ ] 轮到落地 · worker 同步、过门、合并" in body
     assert "- [ ] 已合并" in body
     assert "CI 失败,修复重试中(2/2)" in body
     # retry_max is the caller's (config `retry`), never a number of the renderer's own
@@ -1050,10 +1055,14 @@ def test_render_status_board():
     assert "- [x]" not in parked and "等待依赖 #135、#140 关闭" in parked
     assert "认领方" not in parked and "无需人工处理" in parked
 
-    # handed_back: the PR is open and stays ticked; the line says where the work is
-    handed = d.render_status_board("handed_back", "required", 2, instance="x", pr=9)
-    assert handed.count("- [x]") == 2 and "- [x] PR 已开 (#9)" in handed
-    assert "已交还 worker 解决" in handed and "失败" not in handed
+    # awaiting_turn: the PR is open and ready; the line says what it waits for
+    waiting = d.render_status_board("awaiting_turn", "required", 2, instance="x", pr=9)
+    assert waiting.count("- [x]") == 2 and "- [x] PR 已开 (#9)" in waiting
+    assert "排队等落地轮次" in waiting and "失败" not in waiting
+    # landing: the turn is its own step, ticked while the worker lands the PR
+    landing = d.render_status_board("landing", "local", 2, instance="x", pr=9)
+    assert landing.count("- [x]") == 3 and "- [x] 轮到落地" in landing and "- [ ] 已合并" in landing
+    assert "已轮到落地" in landing and "worker" in landing
 
     # gate.ci: local — the board names the gate actually being waited on, and a
     # failed one is not blamed on a CI the fleet never read (ADR-0012)
@@ -1069,7 +1078,7 @@ def test_render_status_board():
     # every phase renders under every gate mode
     for phase in d.STATUS_PHASES:
         for ci in d.GATE_CI_MODES:
-            assert d.render_status_board(phase, ci, 2, behind=7).startswith(d.STATUS_MARKER)
+            assert d.render_status_board(phase, ci, 2).startswith(d.STATUS_MARKER)
 
     # an unknown phase or gate mode is rejected, not silently rendered as the default
     for bad in (("bogus", "required", 2), ("claimed", None, 2), ("claimed", "optional", 2)):
@@ -1135,7 +1144,7 @@ def test_cycle_ticked_folds_the_summary_and_counts_empty_ticks():
     assert r["state"]["empty_streak"] == 3 and r["sleep_seconds"] == 1500     # idle at last
     # anything that is not empty resets the streak — work done, a claim held, or
     # frontier the tick could not take (e.g. no free slot)
-    for summary in ({"merged": [3]}, {"escalated": [4]}, {"dispatched": [1]}, {"reclaimed": [6]},
+    for summary in ({"granted": [3]}, {"escalated": [4]}, {"dispatched": [1]}, {"reclaimed": [6]},
                     {"parked": [5]}, {"cleared": [7]},
                     {"in_flight": 2}, {"frontier_remaining": 5}):
         back = ticked(r["state"], **summary)
@@ -1279,6 +1288,7 @@ def _prompt_template():
 PROMPT_FIELDS = {"n": 31, "title": "Names inspector tab", "repo": "acme/widgets",
                  "base_branch": "main", "local_command": "make test",
                  "afk_path": "/skills/afk fleet/scripts/afk.py",
+                 "config": '{"merge": {"target": "main"}}',
                  "branch": "sunfmin/issue-31-names", "worktree_path": "/wt/issue-31",
                  "launcher_terminal": "term_launcher-1"}
 
@@ -1328,10 +1338,10 @@ def test_a_worker_is_told_how_to_wake_the_launcher_and_nothing_else():
     assert d.wake_command("term_launcher-1", 31) == wake and d.wake_line(31) == "afk-wake #31"
 
     # every way a worker is instructed carries the same one line: a fresh start, a
-    # continuation, and a hand-back delivered alone to a worker that is still there
+    # continuation, and the landing brief a worker is given with its turn
     for body in (d.render_worker_prompt(t, "fresh", PROMPT_FIELDS),
                  d.render_worker_prompt(t, "continue", PROMPT_FIELDS),
-                 d.render_handback(t, PROMPT_FIELDS, HANDBACK)):
+                 d.render_landing(t, PROMPT_FIELDS, LANDING)):
         assert wake in body and "launcher_terminal" not in body and "{wake_command}" not in body
 
     # no launcher terminal (a headless tick): a no-op with a note, never a broken
@@ -1344,47 +1354,70 @@ def test_a_worker_is_told_how_to_wake_the_launcher_and_nothing_else():
     assert "orca terminal send" not in headless and "no coordinator terminal to wake" in headless
 
 
-HANDBACK = {"pr": 77, "pr_branch": "sunfmin/issue-31-names", "target": "main",
-            "target_tip": "abc123def456", "files": ["a/names.go", "b/{branch}.md"]}
+LANDING = {"pr": 77, "pr_branch": "sunfmin/issue-31-names", "target": "main"}
 
 
-def test_render_handback_is_one_block_alone_or_appended_to_a_continuation():
+def test_a_worker_reads_the_one_way_its_pr_lands_when_it_holds_the_turn():
+    """ADR-0027. `afk land` is the only way a PR lands, and the landing brief is
+    the only place it is spelled: the command, and what to do on each outcome it
+    can stop with. A worker with a PR still to open is told only that it lands
+    later, on its turn, and never by hand."""
     t = _prompt_template()
-    alone = d.render_handback(t, PROMPT_FIELDS, HANDBACK)
-    # the whole instruction: target + tip, the files, merge-not-rebase, gate, same PR
-    assert alone.startswith("## A sync conflict on your PR was handed back to you")
-    assert d.gate_command(PROMPT_FIELDS["afk_path"], "make test") in alone
-    for needle in ("PR #77", "`main` moved first", "(`abc123def456`)", "- `a/names.go`",
-                   "git fetch origin main", "git merge origin/main", "never rebase", "make test",
-                   "git push origin HEAD:sunfmin/issue-31-names", "Do not open another PR",
-                   "phase=giving-up"):
+    # the config travels whole, quoted for the worker's shell — and it is free text
+    # to the template: a `{branch}` or an apostrophe inside it arrives verbatim
+    config = json.dumps({"merge": {"target": "main"}, "note": "it's {branch} {title} {pr}"})
+    fields = {**PROMPT_FIELDS, "config": config}
+    land = d.land_command(fields["afk_path"], 31, "acme/widgets", config)
+    assert land == ("'/skills/afk fleet/scripts/afk.py' land --issue 31 --repo acme/widgets "
+                    "--config " + shlex.quote(config))
+    assert shlex.split(land)[-1] == config
+    fresh = d.render_worker_prompt(t, "fresh", fields)
+    cont = d.render_worker_prompt(t, "continue", fields)
+    alone = d.render_landing(t, fields, LANDING)
+    assert alone.count(land) == 1, alone.count(land)
+    for outcome in d.LAND_OUTCOMES:
+        assert f"| `{outcome}` |" in alone, outcome
+    for body in (fresh, cont, alone):
+        assert "landing turn" in body and "gh pr merge" in body          # named only to forbid it
+        assert "afk:block" not in body
+    # a worker with a PR to open is told it does NOT merge until its turn — and is
+    # not handed the command, or its outcomes, before it can run it
+    for body in (fresh, cont):
+        assert "## Landing — later, on your PR's landing turn" in body
+        assert "never merge your PR yourself" in body and "only on its landing turn" in body
+        assert " land --issue " not in body and "| `outcome` |" not in body
+
+    # the landing brief is the whole instruction, alone: which PR, where it lands,
+    # the command, the wake — and nothing about implementing or opening a PR
+    assert alone.startswith("## Your PR holds the landing turn")
+    for needle in ("PR #77", "`sunfmin/issue-31-names`", "landing on `main`", "`/wt/issue-31`",
+                   "`acme/widgets#31` — Names inspector tab", "phase=giving-up",
+                   "<!--afk:verdict n=31 phase="):
         assert needle in alone, needle
-    # a file name that looks like a placeholder is delivered verbatim (free text, last)
-    assert "- `b/{branch}.md`" in alone
-    assert not re.search(r"\{(?!branch\})[a-z_0-9.]+\}", alone) and "afk:block" not in alone
-    assert "the merge itself will list them" in d.render_handback(
-        t, PROMPT_FIELDS, {**HANDBACK, "files": []})
+    assert "Closes #31" not in alone and "## Steps" not in alone
+    assert not re.search(r"\{[a-z_0-9.]+\}", alone.replace(land, ""))
 
-    # a worker STARTED on a hand-back (its predecessor is gone) gets the continue
-    # prompt with that same block last; every other worker's prompt has no such block
-    cont = d.render_worker_prompt(t, "continue", PROMPT_FIELDS)
-    started = d.render_worker_prompt(t, "continue", PROMPT_FIELDS, handback=HANDBACK)
-    assert started == cont.rstrip("\n") + "\n\n" + alone
-    assert "was handed back to you" not in cont
-    # …though every worker is told its PR may come back, so the message is no surprise
-    assert "Your PR may come back to you" in cont
-
-    for bad in ({k: v for k, v in HANDBACK.items() if k != "target_tip"},):
+    for bad in ({k: v for k, v in LANDING.items() if k != "pr_branch"},):
         try:
-            d.render_handback(t, PROMPT_FIELDS, bad)
+            d.render_landing(t, PROMPT_FIELDS, bad)
             assert False, "expected ValueError"
         except ValueError as e:
-            assert "target_tip" in str(e)
+            assert "pr_branch" in str(e)
     try:
-        d.render_handback("no blocks here", PROMPT_FIELDS, HANDBACK)
+        d.render_landing("no blocks here", PROMPT_FIELDS, LANDING)
         assert False, "expected ValueError"
     except ValueError as e:
-        assert "'handback' block" in str(e)
+        assert "'landing' block" in str(e)
+
+
+def test_a_worker_is_not_sent_to_this_repos_adrs():
+    """The worker is in the TARGET repo, and step 1 sends it to that repo's
+    `docs/adr/`: an ADR number from this repo would name the wrong document."""
+    t = _prompt_template()
+    for body in (d.render_worker_prompt(t, "fresh", PROMPT_FIELDS, reason="gate red"),
+                 d.render_worker_prompt(t, "continue", PROMPT_FIELDS),
+                 d.render_landing(t, PROMPT_FIELDS, LANDING)):
+        assert not re.search(r"ADR-\d", body), re.findall(r"ADR-\d+", body)
 
 
 def test_render_worker_prompt_never_ships_a_placeholder():
@@ -1510,12 +1543,12 @@ def test_assemble_working_set():
 
     # mine: subclassified with PR + checks + the attempt number — Act consumes this directly
     mine = {m["number"]: m for m in ws["mine"]}
-    assert mine[3]["status"] == "awaiting_merge" and mine[3]["pr"] == 30 and mine[3]["checks"] == "green"
+    assert mine[3]["status"] == "awaiting_turn" and mine[3]["pr"] == 30 and mine[3]["checks"] == "green"
     assert mine[4]["status"] == "no_pr" and mine[4]["pr"] is None
     assert mine[4]["attempt"] == 1 and mine[3]["attempt"] == 0
     assert "attempt_labels" not in mine[4]            # one shape: the number
     # each row carries the board phase it renders as — the tick never translates
-    assert mine[3]["board_phase"] == "awaiting_merge" and mine[4]["board_phase"] == "claimed"
+    assert mine[3]["board_phase"] == "awaiting_turn" and mine[4]["board_phase"] == "claimed"
 
     # peers: live one identified and left alone; stale one carries the sha reclaim needs
     assert ws["peer_live"] == [{"number": 5, "instance": "peerA"}]
@@ -1530,31 +1563,32 @@ def test_assemble_working_set():
     ws2 = d.assemble_working_set(issues, prs, claims, heartbeats, {}, "me", now, cfg)
     assert {e["number"] for e in ws2["frontier"]["dispatch"]} == {1, 2}
 
-    # gate.ci: local — a PR whose remote checks are RED is still awaiting_merge,
-    # because those checks are not the gate; the tick re-runs the local one at merge
-    # time instead (ADR-0012). Everything else about the working set is unchanged.
+    # gate.ci: local — a PR whose remote checks are RED still awaits its turn,
+    # because those checks are not the gate; the landing runs the local one
+    # instead (ADR-0012). Everything else about the working set is unchanged.
     red = [{**prs[0], "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "FAILURE"}]}]
     local_cfg = {**cfg, "gate": {**cfg["gate"], "ci": "local", "local_command": "make test"}}
     strict = d.assemble_working_set(issues, red, claims, heartbeats, {2: 1}, "me", now, cfg)
     local = d.assemble_working_set(issues, red, claims, heartbeats, {2: 1}, "me", now, local_cfg)
     assert {m["number"]: m["status"] for m in strict["mine"]} == {3: "failure", 4: "no_pr"}
-    assert {m["number"]: m["status"] for m in local["mine"]} == {3: "awaiting_merge", 4: "no_pr"}
+    assert {m["number"]: m["status"] for m in local["mine"]} == {3: "awaiting_turn", 4: "no_pr"}
     assert {m["number"]: m["board_phase"] for m in strict["mine"]} == {3: "ci_failed", 4: "claimed"}
-    assert {m["number"]: m["board_phase"] for m in local["mine"]} == {3: "pr_open", 4: "claimed"}
+    assert {m["number"]: m["board_phase"] for m in local["mine"]} == {3: "awaiting_turn", 4: "claimed"}
 
-    # the merge queue: `merge_order` is the awaiting_merge rows in the order to merge
-    # them, and a queued row names the PR it waits behind — while still holding its slot
-    more = [*prs, {**prs[0], "number": 40, "closingIssuesReferences": [{"number": 4}]}]
+    # the merge queue: `merge_order` is the ready rows in the order turns are
+    # granted — the PR that holds the turn first, then PR number — and a `landing`
+    # row carries where its `afk land` last stopped
+    more = [*prs, {**prs[0], "number": 20, "closingIssuesReferences": [{"number": 4}]}]
     ws3 = d.assemble_working_set(issues, more, claims, heartbeats, {}, "me", now, cfg)
-    assert ws["merge_order"] == [3] and ws3["merge_order"] == [3, 4]
-    assert all(m["behind"] is None for m in ws3["mine"])
-    assert d.assemble_working_set(issues, more, claims, heartbeats, {}, "me", now, cfg,
-                                  merge_queue=[4, 3])["merge_order"] == [4, 3]
+    assert ws["merge_order"] == [3] and ws3["merge_order"] == [4, 3]
+    assert all(m["stopped"] is None for m in ws3["mine"])
+    turn = d.latest_turn([{"id": 1, "body": d.turn_comment("me", now, stopped="awaiting_ci",
+                                                           head="aaa")}])
     held = d.assemble_working_set(issues, more, claims, heartbeats, {}, "me", now, cfg,
-                                  queued={4: 30}, merge_queue=[3, 4])
-    rows = {m["number"]: (m["status"], m["board_phase"], m["behind"]) for m in held["mine"]}
-    assert rows == {3: ("awaiting_merge", "awaiting_merge", None), 4: ("queued", "queued", 30)}
-    assert held["merge_order"] == [3] and held["free_slots"] == ws3["free_slots"] == 1
+                                  turns={3: turn})
+    rows = {m["number"]: (m["status"], m["board_phase"], m["stopped"]) for m in held["mine"]}
+    assert rows == {3: ("landing", "landing", "awaiting_ci"), 4: ("awaiting_turn", "awaiting_turn", None)}
+    assert held["merge_order"] == [3, 4] and held["free_slots"] == ws3["free_slots"] == 1
 
     # free_slots: how many more workers this tick may dispatch — the config's
     # concurrency less what I already hold, never negative
@@ -1570,7 +1604,7 @@ def test_assemble_working_set():
     ws3 = d.assemble_working_set(issues, prs, gone, heartbeats, {}, "me", now, cfg, closed=[9])
     row = {m["number"]: m for m in ws3["mine"]}[9]
     assert (row["status"], row["board_phase"], row["title"]) == ("closed", None, None)
-    assert {m["number"]: m["status"] for m in ws3["mine"]} == {3: "awaiting_merge", 4: "no_pr", 9: "closed"}
+    assert {m["number"]: m["status"] for m in ws3["mine"]} == {3: "awaiting_turn", 4: "no_pr", 9: "closed"}
     assert ws3["free_slots"] == 0                       # it still holds a slot until released
 
     # a STALE claim whose issue is closed is a phantom lock, not work to take over:
@@ -1580,14 +1614,6 @@ def test_assemble_working_set():
     assert ws4["stale"] == []
     assert ws4["stale_closed"] == [{"number": 6, "instance": "peerB", "sha": "s6"}]
     assert ws4["peer_live"] == ws["peer_live"] and ws4["mine"] == ws["mine"]
-
-    # a claim of mine whose PR carries an open hand-back: the worker is resolving a
-    # sync conflict, so the row is `handed_back` — not the awaiting_merge its green
-    # checks would otherwise make it
-    hb = d.assemble_working_set(issues, prs, claims, heartbeats, {}, "me", now, cfg,
-                                handed_back=[3])
-    row = {m["number"]: m for m in hb["mine"]}[3]
-    assert (row["status"], row["board_phase"], row["pr"]) == ("handed_back", "handed_back", 30)
 
     # the lease the partition uses is the CONFIG's: shorten it and the live peer goes stale
     short = d.assemble_working_set(issues, prs, claims, heartbeats, {2: 1}, "me", now,

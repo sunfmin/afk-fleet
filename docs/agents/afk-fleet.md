@@ -57,13 +57,13 @@ force_tick_after_skips: 6
 - **No CI yet.** This repo has no GitHub Actions; `gate.ci: required` degrades progressively to the
   issue's acceptance criteria + the local gate below until CI stands up. Because a real
   `local_command` exists and no status check is required on `master`, `gate.ci: local` (ADR-0012) is
-  also available here — flip it when you want the local run to *be* the gate, re-run at merge time,
+  also available here — flip it when you want the local run to *be* the gate, re-run by each landing,
   instead of a progressive judgment call.
 - **Local gate.** `gate.local_command` runs the skill's fixture tests (pure verdicts in
   `afk_decide.py`) via `uv`, per the repo's uv-only Python rule. It is a real gate for the
   code-touching issues and a no-op pass for prompt/docs-only issues.
 - **Sync, not rebase.** `merge.sync_before_merge` merges `origin/master` into the branch before the
-  merge-time re-gate (ADR-0012); the retired `rebase_before_merge` key is now a load-time error.
+  landing's re-gate (ADR-0012, ADR-0027); the retired `rebase_before_merge` key is now a load-time error.
 - **Reserved surfaces.** The fleet manages the `afk-attempt/<n>` labels, the `refs/afk/*` ref
-  namespace (`afk-claim/*`, `afk-heartbeat/*`), and the single `<!--afk:status-->` status-board
-  comment. Don't hand-edit them.
+  namespace (`afk-claim/*`, `afk-heartbeat/*`), the single `<!--afk:status-->` status-board
+  comment, and the `<!--afk:turn …-->` landing-turn comment on a PR. Don't hand-edit them.
