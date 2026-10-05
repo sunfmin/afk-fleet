@@ -1556,9 +1556,9 @@ def test_no_pr_gathers_every_signal_and_decides_in_one_call():
         assert 0 <= r["idle_seconds"] < 300 and r["worker_verdict"]["found"] is False
         # the tool's conclusion is `outcome`/`action`; what the WORKER declared is
         # `worker_verdict` — never one bare "verdict" that could be read as either
-        assert set(r) == {"issue", "outcome", "action", "idle_seconds", "pending_blockers",
-                          "worktree", "progress", "worker_verdict", "blockers", "nudged_at",
-                          "turn_at", "worker_state"}
+        assert list(r) == ["issue", "outcome", "action", "idle_seconds", "pending_blockers",
+                           "worktree", "progress", "worker_verdict", "blockers", "nudged_at",
+                           "turn_at", "worker_state"]
         assert r["issue"] == 4 and r["pending_blockers"] == [] and r["worktree"] == w.cwd
         assert r["blockers"] == []
         assert r["worker_state"] is None
@@ -1811,6 +1811,62 @@ def test_no_pr_asks_after_every_worker_in_one_call_and_only_reads_github_for_sto
             [(2, "idle_stalled", "done"), (1, "coding", "working")]
         read = [c for c in w.calls() if c[:1] == ["api"] or c[:2] == ["pr", "list"]]
         assert read and all("issues/1/" not in " ".join(c) for c in read), read
+
+
+def test_a_busy_or_gone_worker_costs_no_git_and_no_github_read():
+    """ADR-0021, counted: a worker its state alone settles — busy, or gone — is
+    asked after with no GitHub call and no read of the worktree's git progress,
+    for a claim's worker and for a merge batch's alike. The one git call left is
+    local: where the worktree keeps its nudge record."""
+    def cost(w, *args):
+        w.calls()
+        rows = w.afk("no-pr", *args, *R, env=w.spans())["workers"]
+        git_calls = [" ".join(c["argv"]) for c in w.spanned("git")]
+        return rows, w.calls(), [c for c in git_calls if "rev-parse --absolute-git-dir" not in c], \
+            len(git_calls)
+
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2, 3)]) as w:
+        w.afk(*dispatch(1))
+        w.afk(*dispatch(2, "--now", str(T0 + 1)))
+        w.afk(*dispatch(3, "--now", str(T0 + 2)))
+        now = int(time.time()) + 5000
+        w.worker(output=now - 3, state="working", since=now - 900, n=0)
+        terms = w.terminals()
+        terms[1]["open"] = False
+        w.orca(terminals=terms)
+        w.worker(output=now - 3, state="done", since=now - 600, n=2)
+
+        rows, gh, progress_reads, git_calls = cost(w, "--issue", "1", "--issue", "2",
+                                                   "--now", str(now))
+        assert [(x["issue"], x["outcome"], x["action"]) for x in rows] == \
+            [(1, "coding", "leave"), (2, "dead", "orphan")]
+        assert (gh, progress_reads) == ([], []) and git_calls <= 2, (gh, progress_reads)
+        # …while the one that stopped is what the reads are for
+        rows, gh, progress_reads, _ = cost(w, "--issue", "3", "--now", str(now))
+        assert [(x["issue"], x["outcome"]) for x in rows] == [(3, "idle_stalled")]
+        assert gh and progress_reads
+
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
+        gate = (*_counted(w), "--set", "fingerprint_gate=false")
+        for n in (1, 2):
+            with_pr(w, n, n * 10, gate=gate)
+        now = int(time.time()) + 5000
+        cycle(w, None, *gate, now=now)
+        batch = _the_batch(w, gate)["batch"]
+        asked = ("--batch", batch, *gate, "--now", str(now + 9000))
+
+        w.worker(output=now + 8999, state="working", since=now)
+        [row], gh, progress_reads, git_calls = cost(w, *asked)
+        assert (row["batch"], row["outcome"], row["action"], row["worker_state"]) == \
+            (batch, "coding", "leave", "working")
+        assert (gh, progress_reads, git_calls) == ([], [], 1), (gh, progress_reads)
+        # a batch's row is the claim's without what only a claim's worker has
+        assert list(row) == ["batch", "outcome", "action", "idle_seconds", "pending_blockers",
+                             "worktree", "progress", "nudged_at", "turn_at", "worker_state"]
+        _close_terminals(w)
+        [row], gh, progress_reads, git_calls = cost(w, *asked)
+        assert (row["outcome"], row["action"]) == ("dead", "orphan")
+        assert (gh, progress_reads, git_calls) == ([], [], 1), (gh, progress_reads)
 
 
 def test_worker_command_settles_the_launch_command_from_env_and_shell():
