@@ -136,10 +136,12 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    cycle state; the call digests what a rebuild would observe and decides skip or tick — the raw
    state never enters a context.
    `skills/afk-fleet/scripts/afk.py:cmd_cycle`
-5. When the digest moved, that same call runs the reconciliation pass (the mainline above) in code,
-   and returns what it could not decide as judgments, each with the transition for either answer;
-   the launcher runs the one it chooses and opens the next cycle at once.
-   `skills/afk-fleet/scripts/afk.py:_tick`
+5. When the digest moved, that same call runs the reconciliation pass (the mainline above) in code:
+   the decision core says which transition comes next, one step at a time, and the call carries
+   each one out and reports how it ended. What it could not decide comes back as judgments, each
+   with the transition for either answer; the launcher runs the one it chooses and opens the next
+   cycle at once.
+   `skills/afk-fleet/scripts/afk_decide.py:tick_plan`
 6. The call folds what the pass did into the cycle state — which also carries the two
    launcher-held facts (instance id, worker launch command) — with the digest of the fleet as the
    pass left it, so its own writes do not cause the next tick, and counts whether the cycle was empty.

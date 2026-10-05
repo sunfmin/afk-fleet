@@ -1,6 +1,6 @@
 # The Act half is transitions, not recipes: one call per change of a claim's state
 
-**Status:** accepted; its `merge` transition is **superseded by [ADR-0027](0027-a-worker-lands-its-own-pr-on-a-landing-turn.md)** — the tick grants a landing turn (`afk turn`) and the worker lands the PR (`afk land`); its `afk cycle` row is **amended** (see [Amendment](#amendment-afk-cycle-runs-the-tick-in-code)) — the tick itself now runs inside it; every other transition stands — extends [ADR-0004](0004-deterministic-mechanics-as-tools.md) from the
+**Status:** accepted; its `merge` transition is **superseded by [ADR-0027](0027-a-worker-lands-its-own-pr-on-a-landing-turn.md)** — the tick grants a landing turn (`afk turn`) and the worker lands the PR (`afk land`); its `afk cycle` row is **amended** (see [Amendment](#amendment-afk-cycle-runs-the-tick-in-code)) — the tick itself now runs inside it, in an order the pure core decides ([second amendment](#amendment-the-order-of-a-tick-is-decided-in-the-pure-core)); every other transition stands — extends [ADR-0004](0004-deterministic-mechanics-as-tools.md) from the
 Observe half of a tick to the Act half, and [ADR-0008](0008-rebuild-as-one-observation-tool.md)'s
 "one call, one answer" from `rebuild` to everything a tick *does*. Supersedes the parts of
 [ADR-0016](0016-the-seam-enforces-its-own-rules.md) that named `afk next-attempt`, `afk pace` and
@@ -177,3 +177,45 @@ between two calls.
 The tick was still an Agent subagent at this amendment: its instructions were "run `afk cycle`,
 answer the judgments". [ADR-0028](0028-the-launcher-runs-each-cycle-itself.md) removes it: the
 launcher makes the call itself, and `afk cycle --drain` is the stop.
+
+## Amendment: the order of a tick is decided in the pure core
+
+The first amendment moved the tick's table into code, but into the wrong half of it. Every *step*
+was decided by a pure function with a fixture — what to do about a stopped worker
+(`worker_step`), about a turn's result (`turn_step`), about a batch's worker (`batch_step`), which
+PR is due the turn (`turn_due`). How those steps were *put together* was not: the order they ran
+in, the slot count, "at most one landing turn a tick", "a start that fails to begin ends the
+starting", which claims count as settled and which had their board written — all of it lived in
+`afk.py`, interleaved with the `gh`, `git` and `orca` calls. It could only be tested end to end,
+against stand-ins for GitHub and orca, one subprocess per call. That is this ADR's own *Why* over
+again, one level up: the pure functions were right, and a bug could hide in how they were wired.
+
+The orchestration is now `afk_decide.tick_plan(working set, call, config)`:
+
+- **It is asked in stages.** Later choices depend on earlier results — did the reclaim win, did the
+  start begin, what did the turn answer — so the plan hands out ONE step (`{"do": <a TICK_STEPS
+  key>, **arguments}`), is told how it ended, and only then says what comes next. It is a
+  generator, which lets the order read top to bottom as the one procedure it is; `follow` is the
+  loop that drives it.
+- **The effectful side only carries it out.** `afk._tick` is a table from each step name to the
+  transition that performs it, and an answer per step: `(result, None)`, or `(None, what it
+  raised)`. It asks the decision core for nothing but the plan, branches on nothing, and keeps no
+  count — a fixture reads its source to hold it to that.
+- **The books are the plan's.** `TickBooks` — what was done, which claims were settled, taken or
+  begun — moved with it, so `did`, `in_flight`, `frontier_remaining` and the slots still free are
+  figures of the pure core, read back from one record.
+- **A failed step is still an answer.** The plan records it in `errors` under the step's name,
+  settles nothing, and goes on; a start that fails to begin ends the starting. Both are now rules
+  with fixtures rather than the shape of a `try`.
+
+Nothing a tick decides changed, no subcommand takes a different flag or prints a different result,
+and `afk cycle` returns what it returned. What changed is where the proof lives: the order, the
+slot accounting and each of the rules above are pinned by fixtures that start no process, and the
+end-to-end tick tests that remain prove that a plan is *carried out* — that `park` parks and a lost
+claim is answered as lost — not what the plan is.
+
+Considered and rejected: **a function per stage** (`after_observe`, `after_turn`, …), each taking
+the outcomes of the last — it splits one procedure across a state object the caller must thread
+through in the right order, which is an ordering rule on the effectful side again; and **returning
+the whole plan up front**, which cannot be done honestly: how many frontier issues are begun
+depends on which starts a peer won.
