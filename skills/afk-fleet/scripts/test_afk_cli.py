@@ -3849,6 +3849,36 @@ def test_a_batch_is_formed_only_from_prs_that_are_free_to_land_together():
                                            3: ("landing", "stacking", None)}
 
 
+def test_an_orca_that_cannot_be_asked_is_an_error_for_every_observation_of_a_worker():
+    """ADR-0021 §7, for an issue's worker and a batch's alike: an orca that cannot
+    be asked is never "no worktree" or "the worker is gone" — read that way a
+    second worker is started beside a live one, or a PR is batched under a worker
+    still moving it. Asking after a worker, after a batch's worker, and the busy
+    check made while a batch is formed all fail instead, and change nothing."""
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
+        gate = (*local_gate("true"), *BATCH)
+        for n in (1, 2):
+            with_pr(w, n, n * 10, gate=gate)
+        down = {"AFK_FAKE_ORCA_EXIT": "1"}
+
+        assert "orca worktree" in w.error("no-pr", "--issue", "1", "--issue", "2", *R, *gate,
+                                          env=down)
+        # forming a batch: neither PR's worker could be asked, so neither is "not busy"
+        w.orca_calls()
+        assert "orca worktree" in w.error(*_turn_batch(*gate), env=down)
+        assert _turns(w, 10) == _turns(w, 20) == [] and _batch_rows(w, gate)[2] == []
+        assert "worktree create" not in w.orca_calls()
+
+        assert w.afk(*_turn_batch(*gate))["outcome"] == "granted"
+        batch = _the_batch(w, gate)["batch"]
+        assert w.no_pr("--batch", batch, *R, *gate, *NOW)["worktree"]
+        assert "orca worktree" in w.error("no-pr", "--batch", batch, *R, *gate, *NOW, env=down)
+        # a `ps` page that stops short is no answer either
+        w.orca(ps_truncated=True)
+        assert "truncated" in w.error("no-pr", "--batch", batch, *R, *gate, *NOW)
+        assert "truncated" in w.error("no-pr", "--issue", "1", *R, *gate)
+
+
 def test_bootstrap_refuses_a_merge_batch_the_target_would_not_take():
     """A batch lands by PUSHING to the target. `afk probe` says so at bootstrap,
     as a hard error, when the target's protection would refuse that push — after
