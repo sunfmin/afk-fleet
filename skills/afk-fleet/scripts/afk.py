@@ -3125,8 +3125,18 @@ def build_parser():
         stamp(p)
         p.add_argument("--worker-command", required=True, metavar="cmd",
                        help="the run's worker launch command, verbatim (ADR-0010)")
+        ready_timeout(p)
+
+    # A default two subcommands take is defined once, here: the flag is added by
+    # one function, so the subcommands that take it cannot disagree.
+    def ready_timeout(p):
         p.add_argument("--ready-timeout", type=int, default=120, metavar="s",
-                       help="seconds to wait for the started agent to accept a prompt")
+                       help="seconds to wait for a started agent to accept a prompt "
+                            "(default %(default)s)")
+
+    def gate_timeout(p):
+        p.add_argument("--gate-timeout", type=int, default=1800, metavar="s",
+                       help="seconds before the local gate is called red (default %(default)s)")
 
     # --- bootstrap ---
     p = command("config", cmd_config, "parse + validate the repo config file → canonical JSON",
@@ -3150,8 +3160,7 @@ def build_parser():
                 help="a WORKER's run of the local gate, in the worktree it is called from: "
                      "the log streams to its terminal, and a green run on a committed tree "
                      "is put on record on the remote for `afk land`")
-    p.add_argument("--gate-timeout", type=int, default=1800, metavar="s",
-                   help="seconds before the local gate is called red (default %(default)s)")
+    gate_timeout(p)
 
     p = command("land", cmd_land, remote="gh",
                 help="a WORKER lands its own PR on its landing turn, in the worktree it is "
@@ -3162,8 +3171,7 @@ def build_parser():
     p.add_argument("--batch", dest="batch_id", default=None, metavar="batch",
                    help="land a merge batch, in the batch's worktree, instead of one PR: "
                         "the batch's id, as its brief gives it")
-    p.add_argument("--gate-timeout", type=int, default=1800, metavar="s",
-                   help="seconds before the local gate is called red (default %(default)s)")
+    gate_timeout(p)
     p.add_argument("--excerpt-lines", type=int, default=afk_decide.GATE_EXCERPT_LINES, metavar="k",
                    help="how many trailing log lines a red gate's excerpt keeps")
     p.add_argument("--checks-timeout", type=int, default=1800, metavar="s",
@@ -3186,8 +3194,7 @@ def build_parser():
     p.add_argument("--worker-command", default=None, metavar="cmd",
                    help="the run's worker launch command, verbatim (ADR-0010) — the first "
                         "cycle only; then --state carries it")
-    p.add_argument("--ready-timeout", type=int, default=120, metavar="s",
-                   help="seconds to wait for a started agent to accept a prompt")
+    ready_timeout(p)
     p.add_argument("--drain", action="store_true",
                    help="the last cycle of a run: release my claims with no open PR, keep "
                         "the rest, and do nothing else")

@@ -135,7 +135,7 @@ force_tick_after_skips: 6              # safety net: a full tick at least every 
 - **A tree is gated once (ADR-0030).** PRs land one at a time, so the gate's run time is the
   fleet's throughput: a 6-minute gate lands about ten PRs an hour. A green run made through
   `afk gate` or `afk land` on a committed tree is put on record on the remote
-  (`refs/afk/gate/<tree>-<command>`), and a landing skips its own run whenever a record of the
+  (`refs/afk/gate/<tree>-<hash of the command>`), and a landing skips its own run whenever a record of the
   command configured now stands for the tree that would land — in this worktree, a recreated one,
   or on another machine. A sync that moved the head, a later commit, a changed command, a red run
   of the same tree since, or a record more than a day old, and the landing runs the gate itself.
