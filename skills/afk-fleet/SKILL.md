@@ -299,7 +299,8 @@ instead of acting — same rebuild, zero side effects.
      blocked by stands — computes how long the worker has been quiet, and returns `{outcome, action,
      idle_seconds, pending_blockers, worktree, progress, worker_verdict, blockers, nudged_at,
      handed_back_at, worker_state}` (`worker_state` is the runtime's own report; null when it
-     reports none; `pending_blockers` is the named blockers not yet done — still open, or closed
+     reports none; `handed_back_at` is null for a busy or gone worker because it was **not read**,
+     never because no hand-back is open — the row's `status` says that; `pending_blockers` is the named blockers not yet done — still open, or closed
      without the work; `blockers` is `[{number, standing, reason}]` for a `blocked` verdict — each named
      blocker is `closed`, `waiting` (open, and the backlog will resolve it: a fleet holds its claim,
      a PR is open for it, or it carries `ready_label`) or `unmet` (nothing will, and `reason` says
@@ -463,6 +464,7 @@ from another machine). It stops, with an `outcome`, wherever the next move is yo
 | `merged` | Landed; board upserted, claim released, worktree removed. | Count it in `merged`; the slot is free. |
 | `conflict` | The sync conflicted. The merge is **left in progress** in `worktree`, `files` unmerged; nothing was pushed. | **Hand it back to its worker**: `afk hand-back --issue <n>` (see [Hand-back](#hand-back--a-sync-conflict-goes-back-to-its-worker)). Not `afk fail` — the work is not failing. |
 | `handed_back` | An earlier conflict on this PR is still with its worker. Nothing was touched. | Leave it — a *handed_back* row is never merged. |
+| `worker_busy` | The worker is **still working** in the PR's worktree — typically it pushed its answer to a hand-back and is now running the gate on it. Nothing was touched. | Leave it; a later tick merges once the worker has stopped. Count it in `in_flight`. |
 | `gate_red` | `local`: the merge-time gate was red, and its `gate.excerpt` is now a PR comment. `required`: the PR's checks are red. | `afk fail --issue <n> --reason "<the failure>"`. |
 | `awaiting_ci` | `required`: checks are pending — or the sync just pushed a new head, so CI must speak about *that* head first. | Leave it; a later tick merges. |
 | `no_checks` | `required`, and the PR has no checks at all — the progressive gate. | If you judge the issue's acceptance criteria met, re-run with `--allow-no-checks`; else `afk fail`. |
@@ -512,7 +514,11 @@ worker is resolving in. Treat a *handed_back* row as you treat a *no_pr* one: as
   new worker **on the hand-back** (the result carries `handed_back: <pr>`).
 
 Once the worker pushes a head that contains the tip, the row is *awaiting_merge* again and `afk merge`
-proceeds as usual. If the target moved again meanwhile, that merge conflicts again and you hand it
+proceeds as usual — **once the worker has stopped.** A worker often pushes the merge first and gates
+it afterwards, so the row can read *awaiting_merge* seconds after the hand-back while the worker is
+still at work in the worktree; `afk merge` checks that itself and answers `worker_busy`, touching
+nothing ([ADR-0024](../../docs/adr/0024-merge-stays-out-of-a-busy-workers-worktree.md)). You add no
+guard of your own: call `afk merge` on every *awaiting_merge* row and act on its outcome. If the target moved again meanwhile, that merge conflicts again and you hand it
 back again: each round merges a newer tip, so it converges.
 
 **The one conflict you may still resolve yourself** is a purely mechanical one: both sides added
