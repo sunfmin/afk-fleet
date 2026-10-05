@@ -50,6 +50,7 @@ REPO = "acme/widgets"
 LAUNCHER = "term_launcher"      # the orca terminal the launcher runs in (ADR-0020)
 HERE = os.path.dirname(os.path.abspath(__file__))
 SKILL = os.path.dirname(HERE)
+AFK = os.path.join(HERE, "afk.py")
 
 FAKE_GH = r'''#!%(python)s
 import json, os, subprocess, sys
@@ -570,8 +571,8 @@ class World:
         return row
 
     # --- the CLI ----------------------------------------------------------
-    def afk(self, *args, env=None):
-        return run(self.cwd, *args, env={**self.env, **(env or {})})
+    def afk(self, *args, env=None, cwd=None):
+        return run(cwd or self.cwd, *args, env={**self.env, **(env or {})})
 
     def error(self, *args, env=None, bare=False):
         return afk_error(self.cwd, *args, env={**self.env, **(env or {})}, bare=bare)
@@ -642,7 +643,7 @@ def local_gate(command):
 def with_pr(w, n, pr_number, conclusion="SUCCESS", **work):
     """Issue n as a tick finds it at merge time: dispatched, its worker committed and
     pushed, and a PR closing it is open → (the dispatch result, the PR head sha)."""
-    d = w.afk(*dispatch(n))
+    d = w.afk(*dispatch(n, *work.pop("gate", ()), instance=work.pop("instance", "me")))
     head = w.work(d["worktree"], work.pop("name", f"feature{n}.txt"), **work)
     w.open_pr(pr_number, closes=n, branch=d["branch"], conclusion=conclusion)
     return d, head
@@ -1335,7 +1336,7 @@ def _prompt(w, variant, n, title, started, reason=None):
         return afk_decide.render_worker_prompt(
             f.read(), variant,
             {"n": n, "title": title, "repo": REPO, "base_branch": w.sb.base, "local_command": "",
-             "branch": started["branch"], "worktree_path": started["worktree"],
+             "afk_path": AFK, "branch": started["branch"], "worktree_path": started["worktree"],
              "launcher_terminal": LAUNCHER}, reason=reason)
 
 
@@ -1679,6 +1680,149 @@ def test_merge_recreates_a_worktree_when_the_worker_ran_elsewhere():
 
 
 # --------------------------------------------------------------------------- #
+# the worker's own gate run, and the merge that trusts it (ADR-0026)           #
+# --------------------------------------------------------------------------- #
+
+TRUST = ("--set", "gate.trust_recorded_run=true")
+
+
+def _brief(wt):
+    """The brief the worker in a worktree is working from."""
+    with open(os.path.join(git(wt, "rev-parse", "--absolute-git-dir"), "afk-worker-prompt.md")) as f:
+        return f.read()
+
+
+def _gate(w, wt, command, *extra):
+    """`afk gate` as a worker runs it: in its own worktree, on a given command."""
+    return w.afk("gate", "--set", f"gate.local_command={command}", *extra, cwd=wt)
+
+
+def test_a_recorded_worker_gate_run_is_not_repeated_by_the_merge():
+    """#36. The worker gates through the line its brief gives it, the target does
+    not move, and `afk merge` lands the PR on that record: the gate command ran
+    ONCE across worker and merge — not twice on the same commit."""
+    with world(issues=[issue(3, "ready-for-agent"), issue(4, "ready-for-agent")]) as w:
+        runs = os.path.join(w.sb.root, "gate-runs")
+        command = f"echo gate-log; echo run >> {runs}"
+        gate = local_gate(command)
+
+        def count():
+            with open(runs) as f:
+                return len(f.read().split())
+
+        d, head = with_pr(w, 3, 30, gate=gate)
+        wt = d["worktree"]
+        # the brief hands the worker ONE line to gate with — the tool, carrying the
+        # configured command — and that line runs as written
+        brief = _brief(wt)
+        [line] = [ln.strip() for ln in brief.splitlines() if " gate --config " in ln]
+        assert line == afk_decide.gate_command(AFK, command) and line.startswith(AFK)
+        p = subprocess.run(line, shell=True, cwd=wt, capture_output=True, text=True, env=w.env)
+        ran = json.loads(p.stdout)                               # stdout is the JSON alone…
+        assert p.returncode == 0 and "gate-log" in p.stderr      # …the log went to the terminal
+        assert ran == {"status": "green", "exit_code": 0, "timed_out": False, "command": command,
+                       "head": head, "recorded": True, "detail": ran["detail"]}, ran
+        assert count() == 1 and git(wt, "status", "--porcelain") == ""
+
+        r = w.afk(*_merge(3, *gate, *TRUST))
+        assert (r["outcome"], r["synced"], r["head"]) == ("merged", False, head), r
+        # the outcome says the gate was trusted, not run, and names the recorded head
+        assert r["gate"] == {"status": "green", "source": "recorded", "head": head,
+                             "command": command, "recorded_at": r["gate"]["recorded_at"]}
+        assert count() == 1
+        assert w.pr(30)["merged"]["head"] == head and w.claimed_by(3) is None
+
+        # opt-in, default off: the same record, and the merge gates as it always did
+        d, head = with_pr(w, 4, 40, gate=gate)
+        assert _gate(w, d["worktree"], command)["recorded"] is True and count() == 2
+        r = w.afk(*_merge(4, *gate))
+        assert (r["outcome"], r["gate"]) == \
+            ("merged", {"status": "green", "source": "run", "head": head, "command": command})
+        assert count() == 3
+        # and only local mode has a merge-time run to skip
+        assert "gate.trust_recorded_run" in w.error(*_merge(4, *TRUST))
+
+
+def test_a_recorded_gate_run_is_void_unless_it_is_of_the_head_that_lands():
+    """With `gate.trust_recorded_run` on, the merge still runs the gate whenever the
+    record does not prove THIS command passed on THIS commit: no record, a red or
+    timed-out run, a dirty tree, another command, a later commit, a sync that moved
+    the head. (`needs_verify` holds the PR open between probes: the adversarial
+    verify still comes after the machine gate, pinned to the head.)"""
+    with world(issues=[issue(7, "ready-for-agent")]) as w:
+        runs = os.path.join(w.sb.root, "gate-runs")
+        command = f"echo run >> {runs}; test ! -f broken.txt"
+        on = (*local_gate(command), *TRUST, "--set", "gate.adversarial_verify=true")
+        d, head = with_pr(w, 7, 70)
+        wt = d["worktree"]
+
+        def count():
+            if not os.path.exists(runs):
+                return 0
+            with open(runs) as f:
+                return len(f.read().split())
+
+        def probe(why, *extra, outcome="needs_verify"):
+            """One `afk merge`: it must RUN the gate, and say why the record was void."""
+            before = count()
+            r = w.afk(*_merge(7, *on, *extra))
+            assert (r["outcome"], r["gate"]["source"]) == (outcome, "run"), r
+            assert why in r["gate"]["not_trusted"], r["gate"]
+            assert count() == before + 1
+            return r
+
+        # no record: the worker typed the bare command, or never gated
+        probe("no green run")
+
+        # a red run leaves nothing — not even the green record that was there before it
+        assert _gate(w, wt, command)["recorded"] is True
+        w.work(wt, "broken.txt")
+        g = _gate(w, wt, command)
+        assert (g["status"], g["exit_code"], g["recorded"]) == ("red", 1, False), g
+        probe("no green run", outcome="gate_red")
+        git(wt, "rm", "-q", "broken.txt")
+        git(wt, "commit", "-qm", "fix")
+        git(wt, "push", "-q", "origin", "HEAD")
+        # …nor does one that timed out
+        assert _gate(w, wt, command)["recorded"] is True
+        g = _gate(w, wt, "sleep 30", "--gate-timeout", "1")
+        assert (g["status"], g["timed_out"], g["recorded"]) == ("red", True, False), g
+        probe("no green run")
+
+        # green over an untracked file: it tested a tree no commit holds
+        with open(os.path.join(wt, "not-added.txt"), "w") as f:
+            f.write("the test only passes with this\n")
+        g = _gate(w, wt, command)
+        assert (g["status"], g["recorded"], g["uncommitted"]) == ("green", False, ["?? not-added.txt"])
+        probe("uncommitted or untracked")
+        os.remove(os.path.join(wt, "not-added.txt"))
+
+        # green, clean — of ANOTHER command than the one configured now
+        assert _gate(w, wt, "true")["recorded"] is True
+        probe("different command")
+
+        # the worker committed after the recorded run
+        g = _gate(w, wt, command)
+        w.work(wt, "afterthought.txt")
+        assert g["head"] in probe("a later commit moved it")["gate"]["not_trusted"]
+
+        # the merge-time sync moved the head: what lands is not what the worker gated
+        g = _gate(w, wt, command)
+        w.advance_base("landed-meanwhile.txt")
+        r = probe("not on the head that would land")
+        assert r["synced"] is True and r["head"] != g["head"]
+
+        # a record of exactly the head that lands: trusted — and still verified first
+        g = _gate(w, wt, command)
+        before = count()
+        r = w.afk(*_merge(7, *on))
+        assert (r["outcome"], r["gate"]["source"], r["head"]) == ("needs_verify", "recorded", g["head"])
+        r = w.afk(*_merge(7, *on, "--verified", r["head"]))
+        assert (r["outcome"], r["gate"]["source"], r["gate"]["head"]) == ("merged", "recorded", g["head"])
+        assert count() == before and w.pr(70)["merged"]["head"] == g["head"]
+
+
+# --------------------------------------------------------------------------- #
 # act: fail / escalate / close                                                 #
 # --------------------------------------------------------------------------- #
 
@@ -1702,16 +1846,16 @@ def _conflicted(w, n, pr_number, gate):
     return d, pr_head, base_tip
 
 
-def _resolve(w, wt, pr_branch, text="resolved: both"):
+def _resolve(w, wt, pr_branch, text="resolved: both", name="shared.txt"):
     """What a worker does with a hand-back: merge the target in, resolve, commit,
     push to the PR's branch → the new head."""
     git(wt, "fetch", "-q", "origin", w.sb.base)
     p = subprocess.run(["git", "merge", "--no-edit", f"origin/{w.sb.base}"], cwd=wt,
                        capture_output=True, text=True, env=ENV)
     assert p.returncode != 0, "the fixture expects this merge to conflict"
-    with open(os.path.join(wt, "shared.txt"), "w") as f:
+    with open(os.path.join(wt, name), "w") as f:
         f.write(text + "\n")
-    git(wt, "add", "shared.txt")
+    git(wt, "add", name)
     git(wt, "commit", "-qm", f"merge {w.sb.base}: keep both")
     git(wt, "push", "-q", "origin", f"HEAD:refs/heads/{pr_branch}")
     return git(wt, "rev-parse", "HEAD")
@@ -1724,7 +1868,7 @@ def _handback_fields(w, pr_number, pr_branch, tip, files=("shared.txt",)):
 
 def _prompt_fields(w, n, started):
     return {"n": n, "title": f"issue {n}", "repo": REPO, "base_branch": w.sb.base,
-            "local_command": "true", "branch": started["branch"],
+            "local_command": "true", "afk_path": AFK, "branch": started["branch"],
             "worktree_path": started["worktree"], "launcher_terminal": LAUNCHER}
 
 
@@ -1979,7 +2123,11 @@ def test_mutually_conflicting_prs_merge_one_at_a_time_each_resolving_once():
         assert ws["merge_order"] == [1, 4, 5, 2, 3] and set(state.values()) == {("awaiting_merge", None)}
         assert not [c for c in w.calls() if any("/pulls/" in x for x in c)]
 
-        assert merge(1)["outcome"] == "merged"
+        # a PR that was never handed back has nothing queued behind it — and asks nothing
+        w.calls()
+        r = merge(1)
+        assert (r["outcome"], r["unblocked"]) == ("merged", []), r
+        assert not [c for c in w.calls() if any("/pulls/" in x for x in c)]
         assert merge(2)["outcome"] == "conflict"
         w.afk(*_hand_back(2, *gate, now=t0))
 
@@ -2019,12 +2167,16 @@ def test_mutually_conflicting_prs_merge_one_at_a_time_each_resolving_once():
         assert state == {2: ("awaiting_merge", None), 3: ("queued", 20), 5: ("awaiting_merge", None)}
         assert ws["merge_order"] == [2, 5]
         assert merge(3)["outcome"] == "queued"
-        assert merge(2)["outcome"] == "merged"
+        # #2 lands and NAMES what it freed: the tick that read #3 as `queued` at its
+        # rebuild merges it next, in this same tick — no cycle is spent waiting (#36)
+        r = merge(2)
+        assert (r["outcome"], r["unblocked"]) == ("merged", [3]), r
 
-        # #3's turn: synced against a target that holds #1 and #2 — one hand-back, ever
+        # #3's turn, taken from `unblocked` with no rebuild in between: synced against
+        # a target that holds #1 and #2 — one hand-back, ever
+        assert merge(3)["outcome"] == "conflict"
         state, ws = rows()
         assert state == {3: ("awaiting_merge", None), 5: ("awaiting_merge", None)}
-        assert merge(3)["outcome"] == "conflict"
         w.afk(*_hand_back(3, *gate, now=t0 + 600))
         _resolve(w, wt3, d[3]["branch"], text="#1 + #2 + #3")
         assert rows()[1]["merge_order"] == [3, 5]
@@ -2033,6 +2185,51 @@ def test_mutually_conflicting_prs_merge_one_at_a_time_each_resolving_once():
         p = subprocess.run(["git", "--git-dir", w.sb.bare, "show", f"{w.sb.base}:shared.txt"],
                            capture_output=True, text=True, env=ENV)
         assert p.stdout == "#1 + #2 + #3\n" and rows()[0] == {}
+
+
+def test_a_landed_pr_names_the_claims_of_mine_it_freed_and_no_others():
+    """#36. `unblocked` is exactly what the tick may merge next: my claims that
+    waited behind the PR that landed, in merge order — never one still behind
+    another handed-back PR, and never a peer's."""
+    gate = local_gate("true")
+    with world(issues=[issue(n, "ready-for-agent") for n in range(1, 7)]) as w:
+        d = {}
+        d[1], _ = with_pr(w, 1, 10, name="shared.txt", text="from #1")
+        d[2], _ = with_pr(w, 2, 20, name="other.txt", text="from #2")
+        d[4], _ = with_pr(w, 4, 40, name="shared.txt", text="from #4")
+        d[3], _ = with_pr(w, 3, 30, name="shared.txt", text="from #3")
+        d[5], _ = with_pr(w, 5, 50, name="shared.txt", text="from #5")
+        w.work(d[5]["worktree"], "other.txt", text="from #5")       # #5 overlaps BOTH
+        with_pr(w, 6, 60, name="shared.txt", text="from a peer", instance="peer")
+        w.advance_base("shared.txt", text="landed first")
+        w.advance_base("other.txt", text="landed first")
+        t0 = int(time.time()) + 5000
+
+        def merge(n):
+            return w.afk(*_merge(n, *gate))
+
+        def behind():
+            ws = w.afk("rebuild", *ME, *R, *NOW, *gate)
+            return {m["number"]: m["behind"] for m in ws["mine"] if m["status"] == "queued"}
+
+        for n, at in ((1, t0), (2, t0 + 1)):
+            assert merge(n)["outcome"] == "conflict"
+            w.afk(*_hand_back(n, *gate, now=at))
+        assert behind() == {3: 10, 4: 10, 5: 10}
+
+        # #1 lands: #3 and #4 are free, in merge order (PR 30 before PR 40, whichever
+        # was dispatched first). #5 also changes the file #2 was handed back over, so
+        # it is still queued; #6 waited too, but it is a peer's to merge
+        _resolve(w, d[1]["worktree"], d[1]["branch"], text="base + #1")
+        r = merge(1)
+        assert (r["outcome"], r["unblocked"]) == ("merged", [3, 4]), r
+        assert behind() == {5: 20}
+        assert w.afk(*_merge(6, *gate, instance="peer"))["outcome"] != "queued"
+
+        _resolve(w, d[2]["worktree"], d[2]["branch"], text="base + #2", name="other.txt")
+        r = merge(2)
+        assert (r["outcome"], r["unblocked"]) == ("merged", [5]), r
+        assert behind() == {}
 
 
 def test_a_hand_back_never_answered_stops_holding_the_prs_queued_behind_it():
