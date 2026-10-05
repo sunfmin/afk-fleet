@@ -107,7 +107,9 @@ asks only the one thing code cannot derive (step 3, and only when it was not pas
      `merge.target` **requires status checks**, so `gh pr merge` would be rejected however green the
      local gate is: **stop here** — drop the required checks on that branch or
      switch to `gate.ci: required`. (`gh pr merge --admin` is not an option: it bypasses human review
-     too.) A `"warn"` verdict (the read was inconclusive — no admin rights) is reported and continues.
+     too.) With `merge.batch` it is also an `"error"` when the target would refuse a direct push
+     (required pull request reviews, push restrictions, a locked branch) — a merge batch lands by
+     pushing; **stop here** too. A `"warn"` verdict (the read was inconclusive — no admin rights) is reported and continues.
 3. **Settle the worker launch command** — `afk worker-command`. The tool first detects the
    **runtime** (ADR-0014): `QODERCN_CLI=1` in the environment → `qoderclicn` (always stock — no
    custom provider, no wrapping — returns its default and never asks); otherwise → `claude`, and
@@ -299,7 +301,8 @@ In this order, each step the same `afk` transition you could type yourself
 2. **Ask after the workers it is waiting on** (`afk no-pr`): every claim with no PR, and every
    landing one whose worker has not stopped for the tick. A worker's state is what its runtime
    reported to orca, never its screen (ADR-0021).
-3. **The landing turn** (`afk turn`) — at most one a cycle, to the head of the merge queue. See
+3. **The landing turn** (`afk turn`) — at most one a cycle: to the head of the merge queue, or,
+   with `merge.batch`, to a merge batch of the PRs that may land together. See
    [Landing](#landing--the-worker-lands-its-own-pr-on-its-turn).
 4. **Settle what a stopped worker left** where the reason is on record: a worker idle with no
    outcome is nudged once (`afk nudge`, ADR-0018); a `giving-up` verdict, a refuted
@@ -431,6 +434,20 @@ that moved the head invalidates checks and verifications of the old one, and gh 
 the branch moved after the gate. No landing outcome spends an attempt or closes the PR; only
 `afk fail` does.
 
+**A merge batch — several PRs on one turn** (`merge.batch`, `gate.ci: local`; off by default;
+[ADR-0029](../../docs/adr/0029-a-merge-batch-lands-n-prs-behind-one-gate-run.md)). When two or more
+finished PRs may land together, the pass gives the turn to all of them at once — `afk turn --batch`
+— instead of to the first: it records one marker on every member PR and starts a **batch worker**
+in a worktree of the batch's own. That worker runs `afk land --batch`, which stacks the PRs on the
+target as one squash commit each, runs the gate **once** on the stack, and pushes the stack to the
+target; each PR then reads **closed** (not merged) with a comment naming its commit, and its issue
+is closed. Which PRs are batched, and whether any are, is decided in code — you never choose. The
+members' own workers are told nothing, and a batch worker holds no claim and no slot. The pass
+watches the batch worker as it watches any worker on a turn: gone, it is continued; silent, it is
+nudged once and then the batch is **abandoned** (`afk turn --abandon`) with nothing landed — which
+fails no PR and spends no attempt. A PR the batch left out (it conflicts with the others) or an
+abandoned batch's PRs land on single turns, as above, and are never batched again.
+
 The turn guards against a worker that **strays**, not a malicious one: worker and launcher share one
 `gh` credential, so nothing here stops a worker that decides to run `gh pr merge` itself.
 
@@ -515,8 +532,9 @@ touch shared root config are naturally throttled by the DAG — chain them with 
   `afk nudge` / `afk fail` taking the last screen of a worker that went silent, to say *where* it
   stopped — never its result (ADR-0018).
 - **Never merge a PR yourself.** No `gh pr merge`, no push to `merge.target`: a PR lands only through
-  its worker's `afk land`, on the turn `afk turn` gave it. A turn nobody lands is failed, not merged
-  around (ADR-0027).
+  its worker's `afk land`, on the turn `afk turn` gave it — or, in a merge batch, through the batch
+  worker's `afk land --batch`. A turn nobody lands is failed, and a batch nobody lands abandoned, not
+  merged around (ADR-0027, ADR-0029).
 - **Claim before work; release on every terminal transition.** `afk dispatch` creates the
   `afk-claim/<n>` ref first — if the create is rejected, a peer owns it and nothing is started.
   `afk escalate`, `afk park` and `afk close` each delete it as their last step; a claim that outlived

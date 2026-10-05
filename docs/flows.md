@@ -87,6 +87,13 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   not told anything, its slot held — so each PR of a conflicting group is resolved once, against a
   target that already holds the ones before it, `skills/afk-fleet/scripts/afk_decide.py:turn_order`
   (ADR-0027).
+- `merge.batch` is on and two or more PRs may land together: the turn goes to all of them as one
+  **merge batch**, `skills/afk-fleet/scripts/afk_decide.py:batch_candidates` — a batch worker in a
+  worktree of the batch's own stacks them on the target as one squash commit per PR, gates the stack
+  once and pushes it to the target as a fast-forward, `skills/afk-fleet/scripts/afk.py:_land_batch`;
+  each PR is then closed with a comment naming its commit. A PR that conflicts with the stack is
+  left out and takes a single turn; a batch whose worker stays silent is abandoned
+  (ADR-0029).
 - The landing's sync conflicts: the merge is left in progress in the worker's own worktree, and the
   worker resolves it, commits and lands again — claim, PR, branch, worktree and turn kept, no
   attempt spent, `skills/afk-fleet/scripts/afk_decide.py:land_outcome`.
@@ -304,6 +311,16 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 - A turn whose worker is gone is delivered by continuation in the PR's own worktree or at its head,
   never from base, and there is no launcher-side merge. (ADR-0027;
   `test_a_turn_with_no_terminal_is_delivered_by_continuation_never_from_base`)
+- With `merge.batch`, a batch of PRs lands behind exactly one gate run, as one squash commit per PR
+  in merge order; the target is only ever moved — by a fast-forward push — to a commit the gate
+  passed on, so a red stack, a moved target and an abandoned batch each land nothing; and a PR that
+  left a batch is never batched again. (ADR-0029;
+  `test_a_merge_batch_lands_three_prs_behind_one_gate_run`,
+  `test_a_red_batch_lands_nothing_and_is_repaired_with_a_fix_commit_on_top`,
+  `test_a_target_that_moves_while_the_batch_gates_refuses_the_push`,
+  `test_land_batch_without_the_batchs_turn_changes_nothing`,
+  `test_a_pr_that_conflicts_with_the_stack_is_left_out_and_never_batched_again`,
+  `test_a_silent_batch_worker_is_nudged_once_then_the_batch_is_abandoned`)
 - A wake carries no state and nothing waits on one: the cycle it opens reads GitHub like any other,
   and a worker with no launcher terminal to wake is given a no-op. (ADR-0020;
   `test_a_worker_is_told_how_to_wake_the_launcher_and_nothing_else`)
@@ -327,6 +344,9 @@ stateDiagram-v2
   pr_open --> awaiting_turn: checks green, or local gate mode
   pr_open --> ci_failed: checks red
   awaiting_turn --> landing: the fleet grants it the landing turn, one PR at a time
+  awaiting_turn --> landing: with merge.batch, the turn goes to a merge batch it is in
+  landing --> merged: its batch stacked, gated once and pushed (the PR reads closed)
+  landing --> awaiting_turn: left out of its batch, or the batch abandoned (single turns from here)
   landing --> merged: its worker synced, gated and merged it
   landing --> landing: conflict or red gate fixed in place; or the tick settles checks or a verify on a moved head
   landing --> landing: worker died, continued onto the turn

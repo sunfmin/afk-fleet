@@ -3,7 +3,8 @@
 An unattended fleet that works a GitHub-issue backlog on its own, for days, in one session that can
 be compacted at any point and lose nothing: a **launcher** runs one cycle after another, and each
 cycle's **tick** — one reconciliation pass, run in code — dispatches worktree-isolated **workers** per ready issue and gives each finished PR its
-**landing turn**, on which its worker gates it and lands it on the target branch — one PR at a time.
+**landing turn**, on which its worker gates it and lands it on the target branch — one PR at a time, or, where a
+repo opts in, several as one **merge batch** behind a single gate run.
 
 ## Language
 
@@ -119,7 +120,9 @@ commit, a changed command, or no record at all voids it, and the landing runs th
 expected to scope remote CI away from worker branches, and a target branch whose protection requires
 checks is rejected at bootstrap. A red run at landing is the worker's to fix in place; its log
 excerpt is also posted as a PR comment, so a failure that does reach the retry ladder is re-read
-from where it lives, never from anyone's context.
+from where it lives, never from anyone's context. In a **merge batch** the landing's run is
+made once, on the batch's stack, and proves the stack rather than each PR alone — the invariant
+holds for the commit the target is moved to (ADR-0029); a recorded run is never trusted for a stack.
 _Avoid_: local CI (it substitutes for CI; it is not CI), pre-push check, local build
 
 **Sync**:
@@ -306,7 +309,8 @@ is the PR or the verdict, not this), **nudge** (that is fleet → worker; a wake
 
 **Landing turn**:
 The fleet's permission for one finished PR to land, granted by the **tick** in one **transition**
-(`afk turn`) and held by one PR of a **fleet instance** at a time. It is recorded as a single marker
+(`afk turn`) and held by one PR of a **fleet instance** at a time — or, with `merge.batch`, by
+the several PRs of one **merge batch** at once (ADR-0029). It is recorded as a single marker
 comment on the PR naming the instance that granted it — so it dies with the PR, and does not survive
 a **takeover** — and it carries the tick's judgments made *before* the grant (the head an adversarial
 verify passed, a PR with no checks waived) and where the worker's last `afk land` stopped. While its
@@ -332,16 +336,47 @@ _Avoid_: hand-back (retired: the tick no longer syncs a PR and returns its confl
 meets the conflict itself, on its turn), tick-side merge, auto-merge (the tick merges nothing),
 merge-time gate run (the gate run is the landing's)
 
+**Merge batch**:
+One **landing turn** held by several finished PRs of a **fleet instance** at once, so that they land
+behind ONE run of the **local gate** instead of one each (ADR-0029; opt-in with `merge.batch`,
+`gate.ci: local` only). Its whole record is the turn marker on every member PR, naming the batch,
+its members and its phase — `stacking`, `gating` or `fixing`. A **batch worker** stacks the members
+on the target's tip as one squash commit per PR, in **merge queue** order, gates the stack once, and
+pushes it to the target as a fast-forward: that push is the only lock, and a target that moved
+refuses it. Each PR then reads *closed* on GitHub, with a comment naming the commit that landed it
+— its commit was pushed, not merged. A red stack is repaired with a fix commit on top, never
+bisected. Whether the turn goes to a batch or to one PR is decided in code
+(`afk_decide.batch_candidates`): never while a turn is out, never a PR that owes an adversarial
+verify, whose own worker is still working, or that is a peer's. A PR that leaves a batch without
+landing — *left out* because it conflicts with the stack, or because the batch was *abandoned* or
+*dissolved* — takes a single turn next and is never batched again.
+_Avoid_: merge train (nothing is speculatively gated, and there is one batch at a time, not a
+pipeline of them), rollup PR (no PR is opened for a batch), bisect (a red batch is fixed, not
+searched)
+
+**Batch worker**:
+The **worker** that lands a **merge batch**, with one command (`afk land --batch`) in a worktree of
+the batch's own, cut at the target's tip and linked to no issue. It wrote none of the PRs it lands,
+holds no **claim**, takes no dispatch slot and spends nobody's **retry**. It is watched like any
+worker holding a turn: gone, it is replaced by **continuation** in the batch's worktree, else from
+the batch's pushed branch; silent past grace it is **nudged** once, and silent again the batch is
+abandoned with nothing landed — which fails no PR (ADR-0029).
+_Avoid_: merger, integrator, release manager (it decides nothing: which PRs, in what order, and
+whether to batch at all are the tick's, in code)
+
 **Merge queue**:
 The order **landing turns** are granted in (ADR-0027): among a **fleet instance**'s ready PRs, the
-one that already holds a turn first, then the lower PR number. `afk rebuild` returns it as
+one that already holds a turn first, then one that left a **merge batch** without landing, then the
+lower PR number. `afk rebuild` returns it as
 `merge_order`, and the **tick** grants the turn to its first PR only when none of its claims is
 landing. Every other ready PR waits as `awaiting_turn` — not synced, not told anything, holding its
 slot, its **status board** saying so — so PRs that conflict with each other are each resolved once,
 against a target that already holds everything landed before them. Waiting is bounded by the
 silent-worker ladder on the PR that holds the turn, and spends no **retry**. Turns are per fleet
-instance: two fleets on one repo each grant their own.
-_Avoid_: merge train (nothing is batched or speculatively gated), lock (nothing is held: the order
+instance: two fleets on one repo each grant their own. With `merge.batch`, when two or more of
+those PRs may land together the turn goes to all of them as one **merge batch**, in this same order.
+_Avoid_: merge train (nothing is speculatively gated; a **merge batch** is one turn, not a train),
+lock (nothing is held: the order
 is recomputed from GitHub every time), priority (it is not configurable)
 
 **Continuation**:

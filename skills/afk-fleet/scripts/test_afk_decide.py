@@ -152,8 +152,9 @@ def test_turn_record_round_trips_and_is_held_only_by_the_claims_owner():
     assert body.startswith("<!--afk:turn instance=fl-1 at=1234-->\n")
     assert "holds the landing turn" in body and "`fl-1`" in body and "`afk land`" in body
     rec = d.latest_turn([{"id": 7, "body": "a human note"}, {"id": 8, "body": body}])
+    single = {"batch": None, "members": [], "phase": None, "unbatched": None, "released": False}
     assert rec == {"instance": "fl-1", "at": 1234, "verified": None, "allow_no_checks": False,
-                   "stopped": None, "head": None, "comment_id": 8}
+                   "stopped": None, "head": None, "comment_id": 8, **single}
     assert d.latest_turn([]) is None and d.latest_turn([{"id": 1, "body": "x"}]) is None
     assert d.latest_turn([{"id": 1, "body": None}]) is None and d.latest_turn(None) is None
 
@@ -166,7 +167,7 @@ def test_turn_record_round_trips_and_is_held_only_by_the_claims_owner():
     rec2 = d.latest_turn([{"id": 8, "body": body}, {"id": 9, "body": full},
                           {"id": 10, "body": "<!--afk:turn at=3-->"}])       # names nobody: no record
     assert rec2 == {"instance": "fl-1", "at": 2000, "verified": "v" * 40, "allow_no_checks": True,
-                    "stopped": "awaiting_ci", "head": "h" * 40, "comment_id": 9}
+                    "stopped": "awaiting_ci", "head": "h" * 40, "comment_id": 9, **single}
     # a `stopped` word the code does not know is not a stop
     odd = d.latest_turn([{"id": 1, "body": "<!--afk:turn instance=x at=5 stopped=bogus head=abc-->"}])
     assert (odd["stopped"], odd["head"]) == (None, None)
@@ -188,6 +189,131 @@ def test_turn_record_round_trips_and_is_held_only_by_the_claims_owner():
             raise AssertionError(word)
         except ValueError:
             pass
+
+
+def test_a_batchs_turn_is_one_marker_on_every_member_and_leaving_it_is_remembered():
+    """ADR-0029: a merge batch's turn is the turn marker, on every member PR,
+    naming the batch, its members and its phase. A PR that leaves a batch
+    without landing holds no turn — and says so on every marker written for it
+    afterwards, so it is never batched again."""
+    members = [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}, {"issue": 3, "pr": 30}]
+    body = d.batch_turn_comment("fl-1", 500, "fl-1-500", members, "gating")
+    assert body.startswith("<!--afk:turn instance=fl-1 at=500 batch=fl-1-500 "
+                           "members=1:10,2:20,3:30 phase=gating-->\n")
+    assert "#10, #20, #30" in body and "closed, not merged" in body
+    rec = d.latest_turn([{"id": 4, "body": body}])
+    assert (rec["batch"], rec["members"], rec["phase"]) == ("fl-1-500", members, "gating")
+    assert (rec["unbatched"], rec["released"], rec["stopped"]) == (None, False, None)
+    # held like any turn: by the instance that holds the claim, and by no other
+    assert d.held_turn(rec, "fl-1") is rec and d.held_turn(rec, "fl-2") is None
+
+    # leaving: the marker holds NO turn, whoever reads it — and remembers why
+    for why in d.UNBATCHED:
+        left = d.latest_turn([{"id": 4, "body": body},
+                              {"id": 5, "body": d.unbatched_comment("fl-1", 600, "fl-1-500", why)}])
+        assert (left["unbatched"], left["released"], left["batch"]) == (why, True, None)
+        assert d.held_turn(left, "fl-1") is None
+    # a single turn granted afterwards carries the fact along, and IS held
+    later = d.latest_turn([{"id": 6, "body": d.turn_comment("fl-1", 700, unbatched="left_out")}])
+    assert (later["unbatched"], later["released"]) == ("left_out", False)
+    assert d.held_turn(later, "fl-1") is later
+
+    # closed vocabularies; a phase or a reason nobody knows is not written, nor read
+    assert all(d.batch_outcome(o) == o for o in d.BATCH_OUTCOMES)
+    for bad in (lambda: d.batch_outcome("merged"),
+                lambda: d.batch_turn_comment("fl-1", 1, "b", members, "bisecting"),
+                lambda: d.unbatched_comment("fl-1", 1, "b", "bored")):
+        try:
+            bad()
+            raise AssertionError("accepted")
+        except ValueError:
+            pass
+    odd = d.latest_turn([{"id": 1, "body": "<!--afk:turn instance=x at=5 batch=b members=1:10,zz,3 "
+                                           "phase=bogus unbatched=bored-->"}])
+    assert (odd["members"], odd["phase"], odd["unbatched"]) == ([{"issue": 1, "pr": 10}], None, None)
+
+
+def test_a_batch_is_known_by_its_id_wherever_orca_puts_its_branch():
+    batch = d.batch_id("fl/1 x", 1700000000)
+    assert batch == "fl-1-x-1700000000" and d.batch_name(batch) == "afk-batch-fl-1-x-1700000000"
+    heads = ["main", "felix/afk-batch-fl-1-170", "afk-batch-fl-1-170-2", "felix/afk-batch-fl-1-1700",
+             "felix/afk-batch-fl-2-170", "felix/issue-3-x", "felix/afk-batch-fl-1-170-x"]
+    assert d.batch_branches(heads, "fl-1-170") == ["afk-batch-fl-1-170-2", "felix/afk-batch-fl-1-170"]
+    assert d.batch_branches(heads, "fl-9-1") == [] and d.batch_branches(None, "fl-1-170") == []
+
+    def wt(branch, at=1, **more):
+        return {"path": f"/wt/{branch}", "branch": f"refs/heads/{branch}",
+                "projectId": "github:acme/widgets", "lastActivityAt": at, **more}
+
+    rows = [wt("felix/afk-batch-fl-1-170"), wt("felix/afk-batch-fl-1-170-2", at=5),
+            wt("felix/afk-batch-fl-1-200"), wt("felix/afk-batch-fl-2-170"),
+            wt("felix/afk-batch-fl-1-300", isArchived=True), wt("felix/issue-3-x", linkedIssue=3),
+            wt("felix/afk-batch-fl-1-400", projectId="github:other/repo")]
+    # one batch's worktrees, the most recently active first
+    assert [w["path"] for w in d.batch_worktrees(rows, "acme/widgets", batch="fl-1-170")] == \
+        ["/wt/felix/afk-batch-fl-1-170-2", "/wt/felix/afk-batch-fl-1-170"]
+    # every batch of one instance, each under its own id — never another fleet's, another repo's
+    mine = d.batch_worktrees(rows, "acme/widgets", instance="fl-1")
+    assert sorted({w["batch"] for w in mine}) == ["fl-1-170", "fl-1-200"]
+    assert d.batch_worktrees(rows, "acme/widgets", instance="fl-3") == []
+
+
+def test_the_cycle_forms_a_batch_only_from_two_or_more_eligible_prs():
+    """The batch-or-single decision, whole (ADR-0029) — a table lookup, so it is
+    this function and not a paragraph."""
+    on = d.resolve_config({"gate": {"ci": "local", "local_command": "make test"},
+                           "merge": {"batch": True}})
+    off = d.resolve_config({"gate": {"ci": "local", "local_command": "make test"}})
+
+    def rows(*specs):
+        mine = [_mine(n, status, pr=n * 10, **more) for n, status, more in specs]
+        return mine, d.turn_order(mine)
+
+    def picked(specs, cfg=on, busy=()):
+        return d.batch_candidates(*rows(*specs), cfg, busy=busy)
+
+    waiting = [(n, "awaiting_turn", {}) for n in (3, 1, 2)]
+    assert picked(waiting) == [1, 2, 3]                            # in merge order
+    assert picked(waiting, cfg=off) == []                          # opt-in: default off
+    assert picked(waiting[:1]) == []                               # one PR is a single turn
+    assert picked(waiting[:2]) == [1, 3]
+    # a claim with no PR, a failed one, one still waiting on CI are not in the queue at all
+    assert picked([*waiting[:2], (4, "no_pr", {}), (5, "failure", {}), (6, "closed", {})]) == [1, 3]
+    # a worker still working may yet move its PR: it is not stacked
+    assert picked(waiting, busy=[2]) == [1, 3] and picked(waiting, busy=[1, 2]) == []
+    # one turn out at a time: while a PR — or a batch — holds it, no batch is formed
+    assert picked([*waiting, (4, "landing", {})]) == []
+    assert picked([*waiting, (4, "landing", {"batch": {"id": "b", "members": [4, 5], "phase": "gating"}})]) == []
+    # a PR that left a batch goes first, on a single turn, and is never batched again
+    left = [*waiting, (4, "awaiting_turn", {"unbatched": "left_out"})]
+    assert picked(left) == [] and d.turn_order(rows(*left)[0])[0] == 4
+    assert d.turn_due(*rows(*left)) == 4
+    # every PR owes its own adversarial verify before its turn: none is eligible
+    verify = d.resolve_config({"gate": {"ci": "local", "local_command": "x", "adversarial_verify": True},
+                               "merge": {"batch": True}})
+    assert picked(waiting, cfg=verify) == []
+
+    # a row in a batch is not asked after as its own worker's: the batch's worker is
+    mine = [_mine(1, "landing", pr=10, batch={"id": "b", "members": [1, 2], "phase": "gating"}),
+            _mine(2, "landing", pr=20, batch={"id": "b", "members": [1, 2], "phase": "gating"}),
+            _mine(3, "landing", pr=30), _mine(4)]
+    assert d.asks_after(mine) == [3, 4]
+    assert d.turn_due(mine[:2], [1, 2]) is None
+    # its worker's reading routes the batch: left, continued, nudged once, abandoned
+    assert [d.batch_step({"action": a}) for a in ("leave", "orphan", "nudge", "next_attempt")] == \
+        ["leave", "continue", "nudge", "abandon"]
+
+
+def test_a_stack_is_read_back_from_its_commits():
+    assert d.squash_message("Add the thing", 12, 7) == "Add the thing (#12)\n\nCloses #7\n"
+    assert d.squash_message("  ", 12, 7).startswith("PR 12 (#12)\n")
+    log = [("a1", "Add the thing (#12)"), ("b2", "Fix a typo (#13)"), ("c3", "make the stack green"),
+           ("d4", "refs issue (#99)"), ("e5", "Add the thing (#12)")]
+    stacked, fixes = d.read_stack(log, {12, 13})
+    assert stacked == {12: "a1", 13: "b2"} and fixes == ["c3", "d4", "e5"]
+    assert d.read_stack([], {12}) == ({}, [])
+    said = d.batch_landed_comment("abc123", "main", "fl-1-5", [12, 13])
+    assert "landed on `main` as abc123" in said and "#12, #13" in said and "closed rather than merged" in said
 
 
 def test_the_ticks_judgments_are_settled_before_a_turn_is_granted():
@@ -344,6 +470,113 @@ def test_a_recorded_gate_run_counts_only_for_the_commit_and_command_it_ran():
     assert argv[:3] == ["/my skills/afk.py", "gate", "--config"] and len(argv) == 4
     assert json.loads(argv[3]) == {"gate": {"local_command": """pnpm test -- --grep 'a "b"'"""}}
     assert "no gate.local_command configured" in d.gate_command("/s/afk.py", "  ")
+
+
+def test_a_merge_batch_needs_the_local_gate_and_a_target_that_takes_a_push():
+    """What bootstrap refuses (ADR-0029). A batch is gated by ONE run of
+    `gate.local_command` on the stack, and lands by pushing to the target."""
+    local = {"gate": {"ci": "local", "local_command": "make test"}, "merge": {"batch": True}}
+    assert d.validate_config(d.resolve_config(local))["merge"]["batch"] is True
+    assert d.resolve_config({})["merge"]["batch"] is False                 # opt-in
+    for bad in ({"merge": {"batch": True}},                                # `required` is the default
+                {"gate": {"ci": "required"}, "merge": {"batch": True}}):
+        try:
+            d.validate_config(d.resolve_config(bad))
+        except ValueError as e:
+            assert "merge.batch" in str(e) and "local" in str(e)
+        else:
+            raise AssertionError(f"accepted {bad}")
+
+    refusing = ({"required_pull_request_reviews": {"required_approving_review_count": 1}},
+                {"restrictions": {"users": ["a"], "teams": []}},
+                {"lock_branch": {"enabled": True}})
+    for prot in refusing:
+        r = d.protection_verdict("local", prot, batch=True)
+        assert r["verdict"] == "error" and "merge.batch" in r["detail"], r
+        assert d.protection_verdict("local", prot)["verdict"] == "ok"      # only with the option
+    for fine in (None, {}, {"lock_branch": {"enabled": False}}, {"restrictions": None},
+                 {"enforce_admins": {"enabled": True}}):
+        assert d.protection_verdict("local", fine, batch=True)["verdict"] == "ok", fine
+    # required checks stay the error they were; an unreadable protection still warns
+    checks = {"required_status_checks": {"contexts": ["ci"]}}
+    assert d.protection_verdict("local", checks, batch=True)["required_checks"] == ["ci"]
+    assert d.protection_verdict("local", None, "HTTP 403", batch=True)["verdict"] == "warn"
+
+
+def test_a_batch_shows_on_the_board_in_the_brief_and_in_the_working_set():
+    # --- the status board of every member: the batch's PRs, and what is being done ---
+    for phase, word in zip(d.BATCH_PHASES, ("stacking", "gating", "being fixed")):
+        board = d.render_status_board("landing", "local", 2, instance="me", pr=20,
+                                      batch={"prs": [10, 20, 30], "phase": phase})
+        assert "#10、#20、#30" in board and word in board and "merge batch" in board, board
+    plain = d.render_status_board("landing", "local", 2, instance="me", pr=20)
+    assert "merge batch" not in plain
+
+    # --- the batch brief: the one command, the members in stack order, its own wake ---
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "..", "references", "worker-prompt.md")) as f:
+        template = f.read()
+    fields = {"batch": "me-100", "repo": "acme/widgets", "target": "main",
+              "branch": "u/afk-batch-me-100", "worktree_path": "/w/batch",
+              "members": [{"issue": 1, "pr": 10, "title": "one {braces}"},
+                          {"issue": 2, "pr": 20, "title": "two"}],
+              "afk_path": "/s/afk.py", "config": '{"merge": {"batch": true}}',
+              "launcher_terminal": "term_1"}
+    brief = d.render_batch_brief(template, fields)
+    assert "/s/afk.py land --batch me-100 --repo acme/widgets --config " in brief
+    assert brief.index("PR #10 — closes #1 — one {braces}") < brief.index("PR #20 — closes #2 — two")
+    assert d.wake_command("term_1", "batch-me-100") in brief and "/w/batch" in brief
+    for outcome in d.BATCH_OUTCOMES:
+        assert f"`{outcome}`" in brief
+    try:
+        d.render_batch_brief(template, {k: v for k, v in fields.items() if k != "target"})
+    except ValueError as e:
+        assert "target" in str(e)
+    else:
+        raise AssertionError("a brief with a field missing was rendered")
+
+    # --- what the tick does about the batch's worker ---
+    assert [d.batch_step({"action": a}) for a in ("leave", "orphan", "nudge", "next_attempt")] == \
+        ["leave", "continue", "nudge", "abandon"]
+
+    # --- the working set: a batch's members are `landing` rows that name it ---
+    cfg = d.resolve_config({"gate": {"ci": "local", "local_command": "make test"},
+                            "merge": {"batch": True}})
+    issues = [{"number": n, "title": f"i{n}", "labels": ["ready-for-agent"], "updatedAt": "t"}
+              for n in (1, 2, 3)]
+    prs = [{"number": n * 10, "headRefOid": f"h{n}", "statusCheckRollup": [],
+            "closingIssuesReferences": [{"number": n}]} for n in (1, 2, 3)]
+    claims = [{"number": n, "instance": "me", "sha": f"s{n}"} for n in (1, 2, 3)]
+    beats = [{"instance": "me", "ts": 1000}]
+    members = [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}]
+
+    def turn(body):
+        return d.latest_turn([{"id": 1, "body": body}])
+
+    mine = turn(d.batch_turn_comment("me", 1000, "me-100", members, "gating"))
+    ws = d.assemble_working_set(issues, prs, claims, beats, "me", 1000, cfg,
+                                turns={1: mine, 2: mine,
+                                       3: turn(d.unbatched_comment("me", 1000, "me-100", "left_out"))})
+    rows = {m["number"]: (m["status"], m["board_phase"], m["batch"], m["unbatched"]) for m in ws["mine"]}
+    in_batch = {"id": "me-100", "members": [1, 2], "phase": "gating"}
+    # (a batch row has no board phase: its board is the batch's to write, not the tick's)
+    assert rows == {1: ("landing", None, in_batch, None), 2: ("landing", None, in_batch, None),
+                    3: ("awaiting_turn", "awaiting_turn", None, "left_out")}
+    assert ws["batches"] == [{"id": "me-100", "instance": "me", "members": members,
+                              "phase": "gating", "at": 1000}]
+    assert ws["merge_order"] == [1, 2, 3]
+    assert d.asks_after(ws["mine"]) == []            # the batch's worker is asked after, not theirs
+    assert d.batch_candidates(ws["mine"], ws["merge_order"], cfg) == []
+    assert d.turn_due(ws["mine"], ws["merge_order"]) is None
+
+    # a batch a DEAD fleet recorded on claims I took holds no turn of mine — and is
+    # listed, so the tick abandons it before it grants anything
+    theirs = turn(d.batch_turn_comment("old", 900, "old-90", members, "stacking"))
+    ws = d.assemble_working_set(issues, prs, claims, beats, "me", 1000, cfg,
+                                turns={1: theirs, 2: theirs})
+    assert {m["number"]: (m["status"], m["batch"]) for m in ws["mine"]} == \
+        {n: ("awaiting_turn", None) for n in (1, 2, 3)}
+    assert [(b["id"], b["instance"]) for b in ws["batches"]] == [("old-90", "old")]
 
 
 def test_protection_verdict():
