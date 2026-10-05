@@ -239,16 +239,43 @@ def _contains(repo, sha, head):
     return int(behind.strip()) == 0
 
 
+def _queue_entry(repo, issue, pr):
+    """One claim's open PR as a merge-queue entry (`afk_decide.queue_rank`): how
+    many times it was handed back, its latest record, and whether that record is
+    still open (`afk_decide.handback_open`). One comments read; one compare more
+    for a handed-back PR whose head has moved."""
+    records = afk_decide.handback_records(_issue_comments(repo, pr["number"]))
+    handback, head = (records[-1] if records else None), pr["headRefOid"]
+    contains = bool(handback) and head != handback["head"] and _contains(repo, handback["tip"], head)
+    return {"issue": issue, "pr": pr["number"], "handbacks": len(records), "handback": handback,
+            "open": afk_decide.handback_open(handback, head, contains)}
+
+
 def _open_handback(repo, pr):
-    """The hand-back still open on a PR (`afk_decide.handback_open`) → its record,
-    or None when the PR was never handed back or its head already contains the
-    target tip the hand-back named."""
-    handback = afk_decide.latest_handback(_issue_comments(repo, pr["number"]))
-    if handback is None:
+    """The hand-back still open on a PR → its record, or None when the PR was
+    never handed back or its head already contains the target tip it named."""
+    entry = _queue_entry(repo, None, pr)
+    return entry["handback"] if entry["open"] else None
+
+
+def _merge_queue(repo, prs, claims):
+    """The merge queue: {issue number: `_queue_entry`} for every claim — mine and
+    my peers' — that has an open PR. Keyed on claims, so a PR whose claim was
+    released (escalated, parked) holds nobody up."""
+    pr_of = {c["number"]: afk_decide.closing_pr(prs, c["number"]) for c in claims}
+    return {n: _queue_entry(repo, n, pr) for n, pr in pr_of.items() if pr}
+
+
+def _waits_behind(repo, entry, queue):
+    """The PR number a queue entry waits behind (`afk_decide.waits_behind`), None
+    when it is free. The PR's changed files are read only when a handed-back PR
+    is ahead of it — with no hand-back anywhere, this costs nothing."""
+    ahead = afk_decide.queue_ahead(entry, queue.values())
+    if not ahead:
         return None
-    head = pr["headRefOid"]
-    contains = head != handback["head"] and _contains(repo, handback["tip"], head)
-    return handback if afk_decide.handback_open(handback, head, contains) else None
+    files = _gh(["api", "--paginate", f"repos/{repo}/pulls/{entry['pr']}/files",
+                 "--jq", ".[].filename"]).stdout.splitlines()
+    return afk_decide.waits_behind(files, ahead)
 
 
 def _orca_worktree_rows():
@@ -729,8 +756,9 @@ def cmd_rebuild(a):
     """One read-only call → the tick's whole working set (ADR-0008). The
     per-issue blocked_by read is paid only by issues that pass every cheaper
     eligibility check, the per-issue state read only by a claim whose issue is
-    missing from the open list, and the hand-back read only by a claim of mine
-    that has a PR. Strictly observation: nothing here writes a ref, a
+    missing from the open list, the hand-back read only by a claim that has a PR,
+    and the changed-files read only by a PR of mine with a handed-back PR ahead
+    of it in the merge queue. Strictly observation: nothing here writes a ref, a
     comment, or a PR."""
     cfg = _cfg(a)
     issues, prs, claims, heartbeats = _gather(a, cfg)
@@ -743,12 +771,15 @@ def cmd_rebuild(a):
     listed = {i["number"] for i in issues}
     closed = [c["number"] for c in claims
               if c["number"] not in listed and _issue_state(a.repo, c["number"]) == "closed"]
-    my_prs = {c["number"]: afk_decide.closing_pr(prs, c["number"])
-              for c in claims if c["instance"] == a.instance}
-    handed_back = [n for n, pr in my_prs.items() if pr and _open_handback(a.repo, pr)]
-    return afk_decide.assemble_working_set(issues, prs, claims, heartbeats, blocked,
-                                           a.instance, _now(a), cfg, closed=closed,
-                                           handed_back=handed_back)
+    queue = _merge_queue(a.repo, prs, claims)
+    mine = [e for c in claims if c["instance"] == a.instance
+            for e in [queue.get(c["number"])] if e]
+    queued = {e["issue"]: behind for e in mine if not e["open"]
+              for behind in [_waits_behind(a.repo, e, queue)] if behind}
+    return afk_decide.assemble_working_set(
+        issues, prs, claims, heartbeats, blocked, a.instance, _now(a), cfg, closed=closed,
+        handed_back=[e["issue"] for e in mine if e["open"]], queued=queued,
+        merge_queue=afk_decide.queue_order(queue.values()))
 
 
 def _issue_worktree(repo, number):
@@ -1265,14 +1296,15 @@ def cmd_dispatch(a):
 # act: settling a claim — merge / fail / escalate / park / close               #
 # --------------------------------------------------------------------------- #
 
-def _upsert_board(repo, number, cfg, phase, instance=None, pr=None, attempt=0, blocked_by=()):
+def _upsert_board(repo, number, cfg, phase, instance=None, pr=None, attempt=0, blocked_by=(),
+                  behind=None):
     """Upsert the human-facing progress status board comment (idempotent, ADR-0006).
     Renders the body from the given phase (pure), then find-or-create by marker
     and write ONLY when the body changed — so re-entrant/disposable ticks and
     retry re-dispatches never spam the issue."""
     body = afk_decide.render_status_board(phase, cfg["gate"]["ci"], cfg["retry"],
                                           instance=instance, pr=pr, attempt=attempt,
-                                          blocked_by=blocked_by)
+                                          blocked_by=blocked_by, behind=behind)
     comments = f"repos/{repo}/issues/{number}/comments"
     board = next((c for c in _issue_comments(repo, number)
                   if afk_decide.STATUS_MARKER in (c["body"] or "")), None)
@@ -1292,7 +1324,7 @@ def cmd_status(a):
     them (`afk merge`, `afk escalate`, `afk park`, `afk close`), before it releases
     the claim."""
     return _upsert_board(a.repo, a.number, _cfg(a), a.phase,
-                         instance=a.instance, pr=a.pr, attempt=a.attempt)
+                         instance=a.instance, pr=a.pr, attempt=a.attempt, behind=a.behind)
 
 
 def _run_gate(cfg, worktree, timeout, excerpt_lines):
@@ -1363,6 +1395,10 @@ def cmd_merge(a):
       handed_back   an earlier conflict on this PR is with its worker and the PR
                     head does not contain the target tip it named yet. Nothing was
                     touched; leave it (`afk no-pr` watches the worker).
+      queued        a handed-back PR ahead of this one in the merge queue conflicted
+                    in a file this PR also changes (`behind` names it). Nothing was
+                    touched and nothing is handed back; its turn comes when that
+                    PR has merged (ADR-0025). The status board says so.
       worker_busy   the worker is still working in the PR's worktree — typically it
                     pushed the answer to a hand-back and is now running the gate on
                     it. Nothing was touched; leave it, a later tick merges.
@@ -1381,7 +1417,8 @@ def cmd_merge(a):
     it lands (ADR-0012) — `gh pr merge` is pinned to the gated head."""
     cfg, rem = _cfg(a), _remote(a)
     _require_mine(rem, cfg, a.number, a.instance)
-    pr = afk_decide.closing_pr(_open_prs(a.repo), a.number)
+    prs = _open_prs(a.repo)
+    pr = afk_decide.closing_pr(prs, a.number)
     if pr is None:
         raise RuntimeError(f"no open PR closes issue #{a.number} — nothing to merge")
     branch, target = pr["headRefName"], cfg["merge"]["target"]
@@ -1390,10 +1427,21 @@ def cmd_merge(a):
     def stop(outcome, **more):
         return {**out, "outcome": afk_decide.merge_outcome(outcome), **more}
 
-    if _open_handback(a.repo, pr):         # before the worktree: the worker is in it
+    queue = _merge_queue(a.repo, prs, _scan(rem, cfg["claim_namespace"])[0])
+    entry = queue[a.number]
+    if entry["open"]:                      # before the worktree: the worker is in it
         return stop("handed_back",
                     detail="a sync conflict on this PR was handed back to its worker and is not "
                            "resolved yet; nothing was touched")
+    behind = _waits_behind(a.repo, entry, queue)
+    if behind:                             # before the sync: it would resolve against a stale tip
+        if cfg["progress_comment"]:
+            _upsert_board(a.repo, a.number, cfg, "queued", instance=a.instance, pr=pr["number"],
+                          behind=behind)
+        return stop("queued", behind=behind,
+                    detail=f"PR #{behind} is ahead of this one in the merge queue and was handed "
+                           f"back over a file this PR also changes; nothing was touched — it is "
+                           f"merged after #{behind} lands")
 
     # --- the branch's worktree: the worker's, else one recreated at the PR head ---
     path = _live_worktree(a.repo, a.number)
@@ -1911,6 +1959,8 @@ def build_parser():
     p.add_argument("--pr", type=int, default=None, metavar="pr", help="the PR number, once one is open")
     p.add_argument("--attempt", type=int, default=0, metavar="k",
                    help="the `mine` row's attempt (shown for ci_failed)")
+    p.add_argument("--behind", type=int, default=None, metavar="pr",
+                   help="the `mine` row's behind — the PR a queued claim waits for")
 
     return ap
 

@@ -294,6 +294,18 @@ a worktree whose worker is busy, stopping with `worker_busy` (ADR-0024).
 _Avoid_: retry (nothing is discarded), bounce, re-dispatch (the worker and its worktree are kept),
 conflict resolution (that is what the worker then does)
 
+**Merge queue**:
+The one order in which the fleet's open PRs land, and the rule that keeps conflicting PRs from being
+resolved against each other more than once (ADR-0025). A PR that was **handed back** goes before one
+that never was — most rounds first, then the oldest latest hand-back, then the lower PR number — and
+`afk rebuild` returns that order as `merge_order`. A PR is **queued** while a handed-back PR ahead of
+it, answered or not, conflicted in a file it also changes: it is neither merged nor synced (so never
+handed back) until the one ahead has merged, it holds its slot, and its **status board** names the PR
+it waits behind. The queue is every **claim**'s open PR, a peer fleet's included; a PR whose claim was
+released is not in it. Waiting is bounded by the unanswered-hand-back ladder, and spends no **retry**.
+_Avoid_: merge train (nothing is batched or speculatively gated), lock (nothing is held: the order
+is recomputed from GitHub every time), priority (it is not configurable)
+
 **Continuation**:
 The fleet's default way of recovering a claim whose **worker** died mid-flight — recovering it *from
 its durable progress* rather than re-dispatching fresh. It is tiered by what survived the death:
@@ -312,7 +324,7 @@ progress)
 **Status board** (a.k.a. progress comment):
 The human-facing projection of an issue's lifecycle onto the issue surface: a **single** comment the
 owning **fleet instance**'s **tick** upserts each **rebuild**, rendering a milestone checklist (claimed
-→ PR open → gate green → merged, with the *ci-failed*, *handed-back*, *escalated* and *parked* off-ramps) **derived** from
+→ PR open → gate green → merged, with the *ci-failed*, *handed-back*, *queued*, *escalated* and *parked* off-ramps) **derived** from
 **fleet state**. It exists because the **claim** lives in a hidden ref namespace and the assignee is
 unused, so the "claimed but no PR yet" phase is otherwise invisible to a reader. It is a *rendering* of
 existing state, **never a source of truth** and **never read back by a tick**; it is edited in place

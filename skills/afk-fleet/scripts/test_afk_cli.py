@@ -251,6 +251,11 @@ if parts[0] == "branches" and parts[2:] == ["protection"]:
         finish(code=1, err=prot["__error__"] + "\n")
     finish(json.dumps(prot))
 
+if parts[0] == "pulls" and parts[2:] == ["files"]:                  # what a PR changes
+    assert jq == ".[].filename", "fake gh: unsupported jq %%r" %% jq
+    row = next(r for r in st["prs"] if str(r["number"]) == parts[1])
+    finish(bare("diff", "--name-only", "refs/heads/%%s...%%s" %% (st["base"], head_of(row))))
+
 if parts[0] == "compare" and len(parts) == 2:                       # is base contained in head?
     assert jq == ".behind_by", "fake gh: unsupported jq %%r" %% jq
     base, _, head = parts[1].partition("...")
@@ -1941,6 +1946,119 @@ def test_merge_does_not_wait_on_a_worker_whose_stop_report_was_lost():
         assert w.afk(*_merge(3, *gate, "--now", str(t0 + 300)))["outcome"] == "merged"
 
 
+def _handbacks(w, pr_number):
+    return [c for c in w.comments(pr_number) if "<!--afk:handback" in c]
+
+
+def test_mutually_conflicting_prs_merge_one_at_a_time_each_resolving_once():
+    """#34. Three finished PRs all rewrite the same file. Handed back together,
+    whichever answers first lands and voids the resolutions the other two are
+    still making — up to n(n-1)/2 rounds. Queued, the second resolves against
+    the first, and the third is not even synced until the second has landed: one
+    resolution each (ADR-0025)."""
+    gate = local_gate("true")
+    issues = [issue(n, "ready-for-agent") for n in (1, 2, 3, 4, 5)]
+    with world(issues=issues) as w:
+        d = {}
+        for n, number in ((1, 10), (2, 20), (3, 30)):
+            d[n], _ = with_pr(w, n, number, name="shared.txt", text=f"from #{n}")
+        with_pr(w, 4, 15, name="other4.txt")                    # two that touch nothing shared
+        with_pr(w, 5, 16, name="other5.txt")
+        t0 = int(time.time()) + 5000
+
+        def rows():
+            ws = w.afk("rebuild", *ME, *R, *NOW, *gate)
+            return {m["number"]: (m["status"], m["behind"]) for m in ws["mine"]}, ws
+
+        def merge(n):
+            return w.afk(*_merge(n, *gate))
+
+        # nothing was handed back: PR-number order, and no PR's files are read
+        w.calls()
+        state, ws = rows()
+        assert ws["merge_order"] == [1, 4, 5, 2, 3] and set(state.values()) == {("awaiting_merge", None)}
+        assert not [c for c in w.calls() if any("/pulls/" in x for x in c)]
+
+        assert merge(1)["outcome"] == "merged"
+        assert merge(2)["outcome"] == "conflict"
+        w.afk(*_hand_back(2, *gate, now=t0))
+
+        # #3 would conflict too — it is neither synced nor handed back: it waits, visibly
+        head3 = w.sb.remote_ref(f"refs/heads/{d[3]['branch']}")
+        r = merge(3)
+        assert (r["outcome"], r["behind"], r["pr"]) == ("queued", 20, 30) and "worktree" not in r, r
+        wt3 = d[3]["worktree"]
+        assert git(wt3, "rev-parse", "HEAD") == head3 and git(wt3, "status", "--porcelain") == ""
+        assert subprocess.run(["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"], cwd=wt3,
+                              capture_output=True, env=ENV).returncode != 0
+        assert "no sync conflict in progress" in w.error(*_hand_back(3, *gate, now=t0))
+        assert _handbacks(w, 30) == [] and w.issue(3)["labels"] == ["ready-for-agent"]
+        assert "排队等合并" in w.board(3) and "等 PR #20 先合并" in w.board(3)
+        assert "交还" not in w.board(3) and "已交还 worker" in w.board(2)
+
+        # a PR that overlaps no hand-back merges exactly as before, at once
+        assert merge(4)["outcome"] == "merged"
+
+        state, ws = rows()
+        assert state == {2: ("handed_back", None), 3: ("queued", 20), 5: ("awaiting_merge", None)}
+        assert ws["merge_order"] == [5]
+        # waiting holds its slot, and the fleet keeps pacing at the busy interval
+        assert ws["free_slots"] == 0
+        st = w.afk("cycle", *ME, *R, *NOW)["state"]
+        paced = w.afk("cycle", *ME, *R, *NOW, "--state", json.dumps(st), "--summary",
+                      json.dumps({"in_flight": 3, "frontier_remaining": 0}))
+        assert paced["sleep_seconds"] == 90
+        # the tick's own render pass writes the same board the merge wrote
+        assert w.afk("status", "3", "--phase", "queued", "--behind", "20", "--pr", "30", *ME, *R,
+                     *gate)["action"] == "unchanged"
+
+        # #2's worker answers. Answered is not landed: #3 still waits, and #2 — handed
+        # back — now goes ahead of #5, which never was, lower PR number or not
+        _resolve(w, d[2]["worktree"], d[2]["branch"], text="#1 + #2")
+        state, ws = rows()
+        assert state == {2: ("awaiting_merge", None), 3: ("queued", 20), 5: ("awaiting_merge", None)}
+        assert ws["merge_order"] == [2, 5]
+        assert merge(3)["outcome"] == "queued"
+        assert merge(2)["outcome"] == "merged"
+
+        # #3's turn: synced against a target that holds #1 and #2 — one hand-back, ever
+        state, ws = rows()
+        assert state == {3: ("awaiting_merge", None), 5: ("awaiting_merge", None)}
+        assert merge(3)["outcome"] == "conflict"
+        w.afk(*_hand_back(3, *gate, now=t0 + 600))
+        _resolve(w, wt3, d[3]["branch"], text="#1 + #2 + #3")
+        assert rows()[1]["merge_order"] == [3, 5]
+        assert merge(3)["outcome"] == "merged" and merge(5)["outcome"] == "merged"
+        assert (len(_handbacks(w, 20)), len(_handbacks(w, 30))) == (1, 1)
+        p = subprocess.run(["git", "--git-dir", w.sb.bare, "show", f"{w.sb.base}:shared.txt"],
+                           capture_output=True, text=True, env=ENV)
+        assert p.stdout == "#1 + #2 + #3\n" and rows()[0] == {}
+
+
+def test_a_hand_back_never_answered_stops_holding_the_prs_queued_behind_it():
+    """Waiting is bounded by the ladder that already exists: an unanswered hand-back
+    is nudged, then failed — its PR is closed, and the PR that waited behind it is
+    free again, having spent no attempt of its own."""
+    gate = local_gate("true")
+    with world(issues=[issue(5, "ready-for-agent"), issue(6, "ready-for-agent")]) as w:
+        _conflicted(w, 5, 50, gate)
+        with_pr(w, 6, 60, name="shared.txt", text="from #6")
+        w.afk(*_hand_back(5, *gate))
+
+        def row(n):
+            [m] = [m for m in w.afk("rebuild", *ME, *R, *NOW, *gate)["mine"] if m["number"] == n]
+            return m["status"], m["behind"]
+
+        assert row(6) == ("queued", 50) and w.afk(*_merge(6, *gate))["outcome"] == "queued"
+        # a PEER's rebuild and merge see the same queue: the record is on the PR
+        assert w.afk("rebuild", "--instance", "peer", *R, *NOW, *gate)["mine"] == []
+
+        assert w.afk(*_fail(5, "sync conflict handed back and never answered", *gate))["action"] == "retry"
+        assert w.pr(50)["state"] == "closed"
+        assert row(6) == ("awaiting_merge", None) and w.issue(6)["labels"] == ["ready-for-agent"]
+        assert w.afk(*_merge(6, *gate))["outcome"] == "merged"
+
+
 def test_hand_back_with_no_terminal_continues_in_the_worktree_never_from_base():
     """The worker finished and its terminal is gone (closed, the machine restarted,
     the claim taken over from another machine). The hand-back then STARTS a worker
@@ -1988,6 +2106,7 @@ def test_hand_back_with_no_terminal_continues_in_the_worktree_never_from_base():
         # no worktree on this machine at all (a takeover from another machine): the
         # merge recreates one at the PR head, and the hand-back continues THERE — the
         # prompt carries orca's new local branch, the push goes to the PR's branch
+        w.afk("release", "6", *ME, *R)      # out of the merge queue: #7 is not behind PR 60
         d7, head7, _ = _conflicted(w, 7, 70, gate)
         git(w.cwd, "worktree", "remove", "--force", d7["worktree"])
         w.orca([row for row in w.worktrees() if row["linkedIssue"] != 7])

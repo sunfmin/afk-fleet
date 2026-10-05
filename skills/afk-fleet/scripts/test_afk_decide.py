@@ -120,10 +120,12 @@ def test_subclassify_pr():
 
     # CLAIM_STATUSES is exactly what it can return: no status the docs were never
     # held to, and none listed that cannot happen
-    seen = {d.subclassify_pr(has_pr, checks, ci, closed=closed, handed_back=handed_back)[0]
+    seen = {d.subclassify_pr(has_pr, checks, ci, closed=closed, handed_back=handed_back,
+                             queued=queued)[0]
             for ci in d.GATE_CI_MODES for has_pr in (True, False)
             for checks in ("green", "red", "pending", None)
-            for closed in (True, False) for handed_back in (True, False)}
+            for closed in (True, False) for handed_back in (True, False)
+            for queued in (True, False)}
     assert seen == set(d.CLAIM_STATUSES)
 
     # the issue is CLOSED but the claim is still mine — a merge or `afk close` that
@@ -169,6 +171,60 @@ def test_handback_record_round_trips_and_stays_open_until_the_head_contains_the_
     # …and answered only once the head contains it
     assert d.handback_open(rec, "n" * 40, True) is False
     assert d.handback_open(None, "n" * 40, False) is False
+
+
+def test_merge_queue_orders_prs_and_holds_one_behind_a_handed_back_pr_it_overlaps():
+    """ADR-0025. PRs that conflict with each other land one at a time: a handed-back
+    PR goes first, and a PR that changes a file it conflicted in waits behind it."""
+    def entry(issue, pr, at=None, rounds=0, files=(), open_=False):
+        rec = {"at": at, "files": list(files)} if rounds else None
+        return {"issue": issue, "pr": pr, "handbacks": rounds, "handback": rec, "open": open_}
+
+    never_low, never_high = entry(1, 10), entry(2, 20)
+    once_old = entry(3, 30, at=100, rounds=1, files=["a.md"])
+    once_new = entry(4, 40, at=200, rounds=1, files=["b.md"], open_=True)
+    thrice = entry(5, 50, at=300, rounds=3, files=["a.md", "c.md"])
+    entries = [never_high, once_new, never_low, thrice, once_old]
+
+    # the ONE order: most rounds, then the oldest latest hand-back, then PR number —
+    # and every handed-back PR before every one that never was
+    assert d.queue_order(entries) == [5, 3, 4, 1, 2]
+    assert d.queue_order(reversed(entries)) == [5, 3, 4, 1, 2]          # not input order
+    assert d.queue_order([]) == []
+
+    # ahead of a PR: the handed-back ones before it, answered or open — never itself,
+    # never one that was not handed back
+    def ahead(e):
+        return [x["pr"] for x in d.queue_ahead(e, entries)]
+
+    assert ahead(thrice) == [] and ahead(once_old) == [50] and ahead(once_new) == [50, 30]
+    assert ahead(never_low) == ahead(never_high) == [50, 30, 40]
+    assert d.queue_ahead(never_high, [never_low, never_high]) == []     # no hand-back: no queue
+
+    # it waits behind the FIRST one ahead whose conflicted files it changes
+    everyone = d.queue_ahead(never_high, entries)
+    assert d.waits_behind(["a.md", "b.md"], everyone) == 50
+    assert d.waits_behind(["b.md", "x.go"], everyone) == 40
+    assert d.waits_behind(["x.go"], everyone) is None                   # overlaps nothing: free
+    assert d.waits_behind([], everyone) is None and d.waits_behind(["a.md"], []) is None
+    # a hand-back whose sync named no file holds nobody up
+    assert d.waits_behind(["a.md"], [entry(9, 90, at=1, rounds=1)]) is None
+
+    # only a claim that would merge is ever `queued`; the board says so
+    for ci, checks in (("local", None), ("local", "red"), ("required", "green")):
+        assert d.subclassify_pr(True, checks, ci, queued=True) == ("queued", "queued")
+    assert d.subclassify_pr(True, "pending", "required", queued=True)[0] == "awaiting_ci"
+    assert d.subclassify_pr(True, "red", "required", queued=True)[0] == "failure"
+    assert d.subclassify_pr(True, "green", "required", handed_back=True, queued=True)[0] == "handed_back"
+    assert d.subclassify_pr(False, None, "local", queued=True)[0] == "no_pr"
+    board = d.render_status_board("queued", "local", 2, instance="x", pr=9, behind=7)
+    assert "排队等合并" in board and "等 PR #7 先合并" in board and "- [x] PR 已开 (#9)" in board
+    assert "交还" not in board and "待合并\n\n" not in board
+    try:
+        d.render_status_board("queued", "local", 2, pr=9)
+        raise AssertionError("a queued board must name what it waits behind")
+    except ValueError:
+        pass
 
 
 def test_validate_config():
@@ -954,7 +1010,7 @@ def test_render_status_board():
     # every phase renders under every gate mode
     for phase in d.STATUS_PHASES:
         for ci in d.GATE_CI_MODES:
-            assert d.render_status_board(phase, ci, 2).startswith(d.STATUS_MARKER)
+            assert d.render_status_board(phase, ci, 2, behind=7).startswith(d.STATUS_MARKER)
 
     # an unknown phase or gate mode is rejected, not silently rendered as the default
     for bad in (("bogus", "required", 2), ("claimed", None, 2), ("claimed", "optional", 2)):
@@ -1421,6 +1477,20 @@ def test_assemble_working_set():
     assert {m["number"]: m["status"] for m in local["mine"]} == {3: "awaiting_merge", 4: "no_pr"}
     assert {m["number"]: m["board_phase"] for m in strict["mine"]} == {3: "ci_failed", 4: "claimed"}
     assert {m["number"]: m["board_phase"] for m in local["mine"]} == {3: "pr_open", 4: "claimed"}
+
+    # the merge queue: `merge_order` is the awaiting_merge rows in the order to merge
+    # them, and a queued row names the PR it waits behind — while still holding its slot
+    more = [*prs, {**prs[0], "number": 40, "closingIssuesReferences": [{"number": 4}]}]
+    ws3 = d.assemble_working_set(issues, more, claims, heartbeats, {}, "me", now, cfg)
+    assert ws["merge_order"] == [3] and ws3["merge_order"] == [3, 4]
+    assert all(m["behind"] is None for m in ws3["mine"])
+    assert d.assemble_working_set(issues, more, claims, heartbeats, {}, "me", now, cfg,
+                                  merge_queue=[4, 3])["merge_order"] == [4, 3]
+    held = d.assemble_working_set(issues, more, claims, heartbeats, {}, "me", now, cfg,
+                                  queued={4: 30}, merge_queue=[3, 4])
+    rows = {m["number"]: (m["status"], m["board_phase"], m["behind"]) for m in held["mine"]}
+    assert rows == {3: ("awaiting_merge", "awaiting_merge", None), 4: ("queued", "queued", 30)}
+    assert held["merge_order"] == [3] and held["free_slots"] == ws3["free_slots"] == 1
 
     # free_slots: how many more workers this tick may dispatch — the config's
     # concurrency less what I already hold, never negative

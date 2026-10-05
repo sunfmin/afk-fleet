@@ -77,6 +77,10 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   `skills/afk-fleet/scripts/afk.py:cmd_hand_back` (ADR-0019). The claim is then `handed_back`, not
   awaiting merge, until the PR head contains the target tip it named
   (`skills/afk-fleet/scripts/afk_decide.py:handback_open`), and rejoins this mainline at step 10.
+- A handed-back PR ahead of it in the merge queue conflicted in a file this PR also changes: the
+  claim is `queued` — not merged, not synced, not handed back — until that PR has merged, so each
+  worker of a conflicting group resolves once, `skills/afk-fleet/scripts/afk_decide.py:waits_behind`
+  (ADR-0025).
 - The PR is awaiting merge but its worker is still working in the worktree — it pushed its answer
   to a hand-back and is gating it: the merge stops with `worker_busy`, nothing touched, and a later
   tick lands it, `skills/afk-fleet/scripts/afk.py:cmd_merge` (ADR-0024).
@@ -251,7 +255,10 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 - A sync conflict is not a failure of the work: it is handed back to the worker that wrote the
   branch, spends no attempt and discards nothing, and the claim is not awaiting merge again until
   the PR head contains the target tip the hand-back named; only a hand-back the worker never answers
-  enters the retry ladder. And no merge runs into a worktree whose worker is busy, whatever the
+  enters the retry ladder. PRs land in one order — handed-back ones first — and a PR waits, unsynced,
+  behind a handed-back PR ahead of it whose conflicted files it changes, so mutually conflicting PRs
+  are each resolved once (ADR-0025;
+  `test_mutually_conflicting_prs_merge_one_at_a_time_each_resolving_once`). And no merge runs into a worktree whose worker is busy, whatever the
   claim's status. (ADR-0019, ADR-0024;
   `test_merge_stays_out_of_a_worktree_whose_worker_is_still_working`;
   `test_hand_back_returns_a_sync_conflict_to_the_worker_that_wrote_the_branch`,
@@ -283,6 +290,9 @@ stateDiagram-v2
   awaiting_merge --> ci_failed: merge-time gate red
   awaiting_merge --> handed_back: sync conflict, returned to its worker
   awaiting_merge --> awaiting_merge: worker still busy in the worktree, merge waits
+  awaiting_merge --> queued: a handed-back PR ahead of it conflicted in a file it changes
+  pr_open --> queued: local gate mode, the same
+  queued --> awaiting_merge: the PR ahead merged, or its unanswered hand-back was failed
   pr_open --> handed_back: local gate mode, sync conflict at merge time
   handed_back --> awaiting_merge: worker merged the target in and pushed
   handed_back --> handed_back: worker died, continued on the hand-back

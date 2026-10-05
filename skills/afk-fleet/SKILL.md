@@ -267,20 +267,23 @@ instead of acting — same rebuild, zero side effects.
    It gathers issues + PRs + claim/heartbeat refs once (the same gatherer the launcher's cycle
    gate reads through — the raw 200-issue JSON lives and dies inside the tool) and returns the whole
    working set: `{frontier: {dispatch, excluded}, mine: [{number, status, board_phase, pr, checks,
-   attempt}…], peer_live, stale: [{number, sha}…], stale_closed: [{number, sha}…], free_slots,
-   fingerprint, now}`. Then act on it:
+   attempt, behind}…], merge_order: [number…], peer_live, stale: [{number, sha}…], stale_closed:
+   [{number, sha}…], free_slots, fingerprint, now}`. Then act on it:
    - **Frontier** — `frontier.dispatch` is the dispatchable set (`open` + `ready_label` + no
      `epic_labels` + **unclaimed** + **no open linked PR** + zero open `blocked_by`) — the published
      contract; `--plan` and live agree because both are this one code path. `free_slots` is how many
      of them `concurrency` leaves room for.
    - **In-flight** — each of **`mine`** arrives subclassified, and its `status` names what you do
-     next: *awaiting_merge* → `afk merge` (see [Merge](#merge-serialized)); *awaiting_ci* → leave;
+     next: *awaiting_merge* → `afk merge`, in the order `merge_order` lists them (see
+     [Merge](#merge-serialized)); *queued* → **leave it**: its PR waits its turn behind PR `behind`
+     in the [merge queue](#the-merge-queue--conflicting-prs-land-one-at-a-time), never `afk merge`
+     it and never hand it back — it still holds its slot and counts in `in_flight`; *awaiting_ci* → leave;
      *failure* → `afk fail` (see [Failure handling](#failure-handling--bounded-retry--escalate-never-silently-drop));
      *closed* → the issue is already closed but its claim outlived it (a merge or close that died
      before releasing): `afk release <n> --instance <id>`, nothing else — count it in `cleared`; *handed_back* → a sync conflict on its PR is
      with its worker and the PR head does not contain the target tip yet: **never `afk merge` it** —
      ask `afk no-pr` about it, exactly as for *no_pr* (see [Hand-back](#hand-back--a-sync-conflict-goes-back-to-its-worker));
-     *no_pr* → see below. (In `gate.ci: local` only *awaiting_merge*, *handed_back*, *closed* and
+     *no_pr* → see below. (In `gate.ci: local` only *awaiting_merge*, *queued*, *handed_back*, *closed* and
      *no_pr* occur — no checks are read, and the gate runs inside `afk merge` instead; ADR-0012.) For
      *no_pr*, **never look at a worker's terminal yourself.** A worker
      that ran to completion, concluded there was no PR to open, posted its reason, and went idle looks
@@ -358,7 +361,8 @@ instead of acting — same rebuild, zero side effects.
      a reclaim: it deletes nothing if somebody took the claim meanwhile). Count it in `cleared`, not
      `reclaimed`. It holds no slot of mine and frees none.
 2. **Act**, in this order — every step is one `afk` call that performs its whole sequence:
-   - **Merge** each *awaiting_merge* claim, one at a time: `afk merge --issue <n> --instance <id>`
+   - **Merge** each *awaiting_merge* claim, one at a time, **in exactly the order of `merge_order`**
+     — it is the merge queue's order, not yours to rearrange: `afk merge --issue <n> --instance <id>`
      (see [Merge](#merge-serialized) for its outcomes). A `merged` outcome has already upserted the
      status board, released the claim and removed the worktree.
    - **Fail / escalate / park** what the rebuild and the merges turned up (see
@@ -393,10 +397,10 @@ instead of acting — same rebuild, zero side effects.
      start, upsert the human-facing **status board** so a person reading the issue sees how far along
      it is (esp. the otherwise-invisible "claimed, coding, no PR yet" phase — the claim lives in the
      hidden `refs/afk/*` and the assignee is unused). `afk status <n> --phase <board_phase> --instance
-     <id> [--pr <pr>] [--attempt <k>] --repo <repo>` renders a progress checklist and writes the one
+     <id> [--pr <pr>] [--attempt <k>] [--behind <pr>] --repo <repo>` renders a progress checklist and writes the one
      marker-tagged comment **only when it changed** (idempotent — re-entrant ticks and retries never
      spam). Neither value is yours to derive: pass the `board_phase` and the `attempt` that `rebuild`
-     put on the claim's `mine` row. The **terminal** phases (merged, escalated, closed, parked) and the first
+     put on the claim's `mine` row — and, for a *queued* row, its `behind`. The **terminal** phases (merged, escalated, closed, parked) and the first
      `claimed` are written by the transition that reaches them — `afk merge`, `afk escalate`, `afk
      close`, `afk park`, `afk dispatch` — before it releases the claim. The board is human-read only — no tick ever
      parses it back (ADR-0006).
@@ -464,6 +468,7 @@ from another machine). It stops, with an `outcome`, wherever the next move is yo
 | `merged` | Landed; board upserted, claim released, worktree removed. | Count it in `merged`; the slot is free. |
 | `conflict` | The sync conflicted. The merge is **left in progress** in `worktree`, `files` unmerged; nothing was pushed. | **Hand it back to its worker**: `afk hand-back --issue <n>` (see [Hand-back](#hand-back--a-sync-conflict-goes-back-to-its-worker)). Not `afk fail` — the work is not failing. |
 | `handed_back` | An earlier conflict on this PR is still with its worker. Nothing was touched. | Leave it — a *handed_back* row is never merged. |
+| `queued` | A handed-back PR ahead of this one in the merge queue (`behind`) conflicted in a file this PR also changes. Nothing was touched, nothing is handed back, and the status board already says it waits. | Leave it — it holds its slot; count it in `in_flight`. Once PR `behind` has **merged in this tick**, call `afk merge` on it again; otherwise a later tick does. |
 | `worker_busy` | The worker is **still working** in the PR's worktree — typically it pushed its answer to a hand-back and is now running the gate on it. Nothing was touched. | Leave it; a later tick merges once the worker has stopped. Count it in `in_flight`. |
 | `gate_red` | `local`: the merge-time gate was red, and its `gate.excerpt` is now a PR comment. `required`: the PR's checks are red. | `afk fail --issue <n> --reason "<the failure>"`. |
 | `awaiting_ci` | `required`: checks are pending — or the sync just pushed a new head, so CI must speak about *that* head first. | Leave it; a later tick merges. |
@@ -476,6 +481,29 @@ the branch moved after the gate. An `{"error": …}` settles nothing — the cla
 
 The fleet's mandate **ends at a green merge to `merge.target`.** Deploying is a separate,
 human-gated step — never done here.
+
+## The merge queue — conflicting PRs land one at a time
+
+PRs that conflict with each other must each be resolved against a target that already holds
+everything landing before them. Handed back together, whichever worker answers first lands, and that
+voids the resolutions the others are still making — every worker resolves the same conflict once per
+PR that beats it. So the tool keeps a queue
+([ADR-0025](../../docs/adr/0025-conflicting-prs-land-one-at-a-time.md)), and **you add no ordering
+of your own**:
+
+- **`merge_order` is the order.** A PR that was handed back goes before one that never was; among
+  those, the one handed back the most times first, then the one whose latest hand-back is oldest,
+  then the lower PR number (which is the whole order among PRs never handed back).
+- **A PR waits behind a handed-back PR it would collide with.** While a handed-back PR ahead of it —
+  still being resolved, **or answered and not yet merged** — conflicted in a file it also changes, the
+  PR is *queued*: `afk rebuild` reports `status: queued` with `behind: <pr>`, and `afk merge` on it
+  answers `queued` and touches nothing. It is not synced, so it is not handed back: only one PR of an
+  overlapping group is with its worker at a time, and the next resolves against a tip that already
+  holds the one ahead.
+- **A PR that changes none of those files is never held up.** It merges exactly as before.
+- **Waiting is bounded by what already exists.** A hand-back its worker never answers is nudged, then
+  failed (below): its PR closes and whatever waited behind it is free again. A *queued* claim is never
+  nudged, never failed and spends no attempt for waiting — do not ask `afk no-pr` about it.
 
 ## Hand-back — a sync conflict goes back to its worker
 
