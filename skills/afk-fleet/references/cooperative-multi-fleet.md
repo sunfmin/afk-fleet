@@ -59,7 +59,7 @@ each one runs is shown so the mechanism is legible, but the tick calls the tool.
   `blocked_by` edge is recorded — for the same reason), `afk close`. `afk release <n> --instance <id>`
   (idempotent: a claim already gone counts as released; a claim another instance holds is refused) is
   the same step on its own, for an **orphan-release**, a `closed` row — which is what every landed PR leaves, since `afk land` runs in the worker's worktree and holds no instance id: releasing it also removes that worktree — and the drain. A delete that fails with the claim still on the
-  remote exits 3 — `released` is never reported for a claim that is still there. On **graceful stop**, the drain tick releases claims with **no PR yet** and
+  remote exits 3 — `released` is never reported for a claim that is still there. On **graceful stop**, the drain — `afk cycle --drain`, the run's last cycle — releases claims with **no PR yet** and
   **retains** those with an open PR (a peer inherits it once the lease expires — giving it a landing turn if it is
   finished, **continuing** it if it is not).
   The **open-PR guard** — an issue with an open linked PR is never in the frontier — is what makes

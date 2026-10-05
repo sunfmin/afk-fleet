@@ -54,11 +54,12 @@ gate:
   local_command: ""                    # the repo's build/test command (e.g. "pnpm build && pnpm test").
                                       #   In `required` mode: the worker's pre-PR filter. In `local` mode:
                                       #   the completion gate itself, at both ends.
-  trust_recorded_run: false            # `local` only (ADR-0026). true → `afk land` skips its own run of
-                                      #   local_command when the worker's `afk gate` run is on record,
-                                      #   green, for the exact head that would land — same command, a
-                                      #   committed tree. A sync that moved the head, a later commit or
-                                      #   a changed command voids the record and the landing gates as usual.
+  trust_recorded_run: true             # read in `local` only (ADR-0026). true → `afk land` skips its own
+                                      #   run of local_command when the worker's `afk gate` run is on
+                                      #   record, green, for the exact head that would land — same
+                                      #   command, a committed tree. A sync that moved the head, a later
+                                      #   commit or a changed command voids the record and the landing
+                                      #   gates as usual. false → the landing always runs the gate itself.
   adversarial_verify: false            # set true for content repos: an independent agent re-derives
                                        # the result and refutes wrong output before it lands (refute-first)
   adversarial_verify_prompt: ""        # what the verifier checks (e.g. "re-solve; assert final == official answer:")
@@ -72,7 +73,7 @@ merge:
                                       #   already resolved inside them), re-gate, then merge. Renamed from
                                       #   rebase_before_merge in ADR-0012; the old key is a load-time error.
   delete_branch: true
-  batch: false                         # `gate.ci: local` only (ADR-0028). true → when two or more finished
+  batch: false                         # `gate.ci: local` only (ADR-0029). true → when two or more finished
                                       #   PRs wait for the landing turn, the turn goes to a MERGE BATCH: a
                                       #   batch worker stacks them on the target (one squash commit per PR),
                                       #   runs gate.local_command ONCE on the stack, and pushes the stack to
@@ -127,7 +128,7 @@ force_tick_after_skips: 6              # safety net: a full tick at least every 
   repo's `on: push` / `on: pull_request` workflows while the fleet reads only the last run — and then
   the landing waits for yet another full run. In `local` mode the local command is the
   whole gate, run twice: by the worker after its pre-PR **sync**, and by its landing after
-  the landing's sync — or once, with `gate.trust_recorded_run`, when nothing moved in between (next
+  the landing's sync — or once, when nothing moved in between (`gate.trust_recorded_run`, next
   note). Three obligations come with it:
   - **Scope remote CI away from worker branches** (e.g. trigger `on: push` for the target branch only,
     and drop `on: pull_request`). The fleet cannot edit your workflows — if you leave them broad you
@@ -140,15 +141,15 @@ force_tick_after_skips: 6              # safety net: a full tick at least every 
 - **`gate.trust_recorded_run` — stop gating an unchanged commit twice (ADR-0026).** PRs land one
   at a time, so the gate's run time is the fleet's throughput: a 6-minute gate lands about
   ten PRs an hour, and when the target has not moved since the worker synced, the landing's run
-  re-tests the commit the worker just tested. Turn this on and `afk land` trusts the recorded run
+  re-tests the commit the worker just tested. So by default `afk land` trusts the recorded run
   instead — only one made through `afk gate` (the worker prompt says so), green, on a committed tree,
   of the command configured now, at the exact head that lands; anything else and the landing runs the
-  gate itself. It is off by default because it relaxes ADR-0012's "the landing's own run is the only
-  machine gate": you give up the second, independent run on an unchanged commit, which is what
-  catches a flaky test that happened to pass once. A gate that leaves untracked, un-ignored files
+  gate itself. Set it to `false` to keep ADR-0012's "the landing's own run is the only machine gate"
+  to the letter: what the default gives up is the second, independent run on an unchanged commit,
+  which is what catches a flaky test that happened to pass once. A gate that leaves untracked, un-ignored files
   behind makes every later run "not on a committed tree" — ignore its artifacts.
-- **Fingerprint gate.** On a skipped cycle the launcher spawns no tick — its only cost is the tool
-  call — and, while holding claims, refreshes the lease itself (`afk heartbeat`), so skipping never
+- **Fingerprint gate.** On a skipped cycle no tick runs — its only cost is the one `afk cycle`
+  call — which, while the fleet holds claims, refreshes the lease itself, so skipping never
   lapses a lease. Correctness never depends on the gate: a missed change waits at most
   `force_tick_after_skips` cycles (ADR-0007).
 - **Deploy is out of scope.** The fleet's mandate ends at a green merge to `merge.target`. Deploying

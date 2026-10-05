@@ -1,4 +1,4 @@
-# ADR-0028 — A merge batch lands N ready PRs behind one gate run
+# ADR-0029 — A merge batch lands N ready PRs behind one gate run
 
 **Status:** accepted — opt-in (`merge.batch`, default off, `gate.ci: local` only). Relaxes, per
 batch, the reading of [ADR-0012](0012-local-completion-gate.md)'s invariant that the gate proves
@@ -65,8 +65,8 @@ target's tip (named `afk-batch-<id>`, linked to no issue) and starts a **batch w
 batch brief. The batch worker holds no claim and takes no dispatch slot.
 
 Stacking and gating belong to a worker for the reason landing did in ADR-0027: a gate run takes
-minutes and a red one needs someone with a worktree and a context to repair it. A cycle is a short,
-disposable pass that runs no gate and holds no worktree; putting the batch's gate in it would bring
+minutes and a red one needs someone with a worktree and a context to repair it. A cycle is a short
+pass, run in code, that runs no gate and holds no worktree; putting the batch's gate in it would bring
 back the multi-minute tick ADR-0027 removed, and leave a red stack with nobody to fix it.
 
 ### `afk land --batch <batch>` — one command, the same every time

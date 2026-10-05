@@ -4,6 +4,11 @@
 fresh-context LLM passes; this decides *whether one is spawned at all*) and applies the
 [ADR-0004](0004-deterministic-mechanics-as-tools.md) bar (a deterministic verdict becomes an `afk`
 tool).
+**Note ([ADR-0028](0028-the-launcher-runs-each-cycle-itself.md)):** the gate stays; one of its
+reasons is gone. A tick is no longer a spawned context, so "the expensive part is spawning the fresh
+context" (the rejection of *fingerprint inside the tick*) no longer applies — the gate now runs
+inside `afk cycle`, in front of the pass, and what a skip saves is the pass's GitHub reads and
+writes, not a cold start.
 
 ## Context
 

@@ -1,6 +1,6 @@
 # ADR-0026 — A recorded gate run stands in for the merge-time run, and a landing names what it freed
 
-**Status:** accepted; amended by [ADR-0027](0027-a-worker-lands-its-own-pr-on-a-landing-turn.md) — the recorded gate run stands, now trusted by the worker's `afk land` instead of `afk merge`; the `unblocked` list of the `merged` outcome is removed with the queue it served. Originally: an opt-in relaxation of the merge-time re-run of
+**Status:** accepted; amended by [ADR-0027](0027-a-worker-lands-its-own-pr-on-a-landing-turn.md) — the recorded gate run stands, now trusted by the worker's `afk land` instead of `afk merge`; the `unblocked` list of the `merged` outcome is removed with the queue it served; and amended 2026-10-05 — `gate.trust_recorded_run` is **on by default** (see *Amendment* below). Originally: an opt-in relaxation of the merge-time re-run of
 [ADR-0012](0012-local-completion-gate.md), whose invariant is unchanged; and one addition to the
 `merged` outcome of the merge transition ([ADR-0017](0017-the-act-half-is-transitions.md)) for the
 merge queue of [ADR-0025](0025-conflicting-prs-land-one-at-a-time.md). Both are enforced in the seam
@@ -123,3 +123,22 @@ date) is not re-sampled at merge time. ADR-0012 calls the merge-time run the onl
 - With three PRs that all rewrite one file, the third is synced in the tick the second lands.
 - `afk merge` on a handed-back PR reads the changed files of each of my PRs behind it once more
   before merging: a few GitHub reads, against a busy interval saved.
+
+## Amendment (2026-10-05) — trust is the default
+
+`gate.trust_recorded_run` now defaults to `true`; a repo that wants the landing's own run on every
+head sets it to `false`. Decision 4's "(default `false`)", the consequence "the default is off", and
+the rejection of *Trust on by default* above are superseded; every other decision stands, and so
+does the void rule — a sync that moved the head, a later commit, a changed command, a dirty tree or
+no record still makes the landing run the gate.
+
+Why the default moved: landings are one at a time, so the gate's run time is the fleet's
+throughput, and the run the default now skips re-tests a commit that was tested minutes earlier by
+the same command on the same machine. Measured on this repo, one gate run is 187 s. The cost the
+rejection named — a guarantee relaxed without the repo choosing it — is real and is accepted: what
+is lost is only the second sample of a flaky or environment-dependent gate on an unchanged commit,
+and one line of config buys it back.
+
+The key keeps its name. With trust the default, the load-time error for setting it outside
+`gate.ci: local` is removed — the default itself would trip it in `required` mode — and the key is
+simply not read there.

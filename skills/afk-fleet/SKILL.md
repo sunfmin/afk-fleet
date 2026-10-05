@@ -13,36 +13,43 @@ description: >-
 # afk-fleet
 
 An **unattended fleet** that implements a decomposed GitHub-issue backlog by itself, and keeps
-running for days **without any session's context growing without bound**. Three roles, each
-context-bounded:
+running for days in one session **that can be compacted at any point and lose nothing**. Two roles
+hold a context:
 
 | Role | What it is | Lifetime |
 |---|---|---|
-| **launcher** | The interactive session you invoke `/afk-fleet` in. It bootstraps once, then loops: spawn a tick → keep the `state` it returns → pace → repeat. | Long-lived, but only accumulates ~one progress line per cycle (auto-compaction keeps it flat). |
-| **tick** | A **fresh-context [Agent] subagent** that runs exactly **one cycle**: `afk cycle` — which does the whole reconciliation pass against GitHub **in code** — then the few **judgments** that call hands back. It returns the cycle's `state`, sleep and progress line, and dies. | Short. Its context is discarded on return. |
-| **worker** | A fire-and-forget autonomous coding agent (Claude Code or qoderclicn — the run's **runtime**), one per issue: orca creates its worktree + branch, then starts it with the run's **worker launch command** so it runs on the same runtime as the launcher. Its outcome travels only through GitHub (its PR, and issue comments); the one thing it says to the launcher directly is a contentless **wake**. | Independent of the coordinator — never read by it. |
+| **launcher** | The interactive session you invoke `/afk-fleet` in. It bootstraps once, then loops: run one cycle (`afk cycle`) → answer the **judgments** it hands back → sleep → repeat. | Long-lived. A cycle leaves a few compact JSON objects behind; auto-compaction bounds that, and takes nothing the run needs. |
+| **worker** | A fire-and-forget autonomous coding agent (Claude Code or qoderclicn — the run's **runtime**), one per issue: orca creates its worktree + branch, then starts it with the run's **worker launch command** so it runs on the same runtime as the launcher. Its outcome travels only through GitHub (its PR, and issue comments); the one thing it says to the launcher directly is a contentless **wake**. | Independent of the launcher — never read by it. |
+
+A **tick** is not a third role and holds no context: it is one reconciliation pass against GitHub,
+run **in code** inside `afk cycle`. The launcher makes the call and gets back the cycle's `state`,
+sleep and progress line — and the few judgments code cannot make.
 
 **This skill only *consumes* a backlog.** It does not decompose a PRD/epic into issues — that is
 upstream work, and epics are explicitly excluded from dispatch. Assume the issues already exist,
 worker-sized, labelled, and dependency-ordered.
 
-## Why it runs forever (bounded by construction)
+## Why it runs forever (safe to compact, by construction)
 
-Permanent runtime is achieved by a **succession of disposable ticks**, not by one long-lived
-coordinator staying disciplined. No coordinator context is ever alive long enough to fill up:
+One session runs the fleet for days. Its context is bounded by ordinary auto-compaction, and that
+is safe because **nothing the launcher must remember lives only in its context**
+([ADR-0028](../../docs/adr/0028-the-launcher-runs-each-cycle-itself.md)):
 
-- Each **tick is a fresh subagent context**, dropped on return — the reset is structural, not a
-  hoped-for compaction.
-- The **launcher** does no coordination itself; it only keeps the opaque `state` and a progress
-  line per cycle, so its own growth is a tiny constant (and auto-compaction is the safety net).
 - **The reconciliation pass is code, not prose.** `afk cycle` rebuilds from GitHub and performs
-  every transition whose next step is a table lookup; a tick's context holds one call and its
-  result, and only what code cannot decide — a handful of **judgments** — reaches an LLM (ADR-0017).
+  every transition whose next step is a table lookup; only what code cannot decide — a handful of
+  **judgments** — reaches you, each with the command for either answer (ADR-0017). A compaction
+  cannot lose a rule, because no rule of the pass is yours to remember.
+- **A cycle leaves little behind.** One call, one compact JSON object. The issue lists, PR checks
+  and ref scans it read die inside the `afk` process (ADR-0008); a landing's long gate run happens
+  in the worker (ADR-0027).
+- **After any compaction you need three values: the repo, the config, and the last `state`.** The
+  `state` carries the instance id and the worker launch command, so the next `afk cycle` is the same
+  fleet instance's whatever else was forgotten. Never rebuild a `state` by hand. One lost outright
+  cannot be recovered: stop and say so — the claims it held are a [`--takeover`](#takeover-mode---takeover) away.
 - **A cycle whose observable state is unchanged runs no pass at all** — the gate inside `afk cycle`
-  (pure code) proves the no-op, refreshes the lease and returns the sleep, and the tick that made the
-  call returns at once; a forced full pass every `force_tick_after_skips` cycles backstops what a
-  state hash can't see (ADR-0007).
-- **All durable state lives in GitHub**, so any fresh tick reconstructs the exact working set:
+  (pure code) proves the no-op, refreshes the lease and returns the sleep; a forced full pass every
+  `force_tick_after_skips` cycles backstops what a state hash can't see (ADR-0007).
+- **All durable state lives in GitHub**, so any tick reconstructs the exact working set:
   `afk-claim/<n>` ref = claim (owned by a **fleet instance**) · PR (`Closes #n`) = result · an
   `afk:verdict` marker comment = a worker's machine-readable reason for opening **no** PR
   (already-satisfied / blocked / giving-up) · `afk-attempt/<n>` label = retry count ·
@@ -52,17 +59,17 @@ coordinator staying disciplined. No coordinator context is ever alive long enoug
 
 ## Modes
 
-- `/afk-fleet` — **launcher** (default): bootstrap, then loop spawning ticks. The main entry.
+- `/afk-fleet` — **launcher** (default): bootstrap, then loop, one cycle after another. The main entry.
   **Invoking it is the launch** — no preview, no confirmation (ADR-0023). `--worker-command "<cmd>"`
   answers bootstrap's one possible question up front.
 - `/afk-fleet --plan` — **dry-run**: a **tick short-circuited before the Act phase**. It does the full
   rebuild (frontier + in-flight + stale classification), prints the dispatch plan, and exits —
   grants/dispatches/reclaims **nothing**: the way to look before launching. Same rebuild code path as `--tick`,
   so the plan can't drift from what a live tick would do (ADR-0002).
-- `/afk-fleet --tick` — **one cycle** and exit with its progress line. This is what the
-  launcher spawns each cycle (and what you'd run headless). Invoked cold it is `afk cycle` with no
-  `state` — a first cycle, which always ticks — and acts exactly as a launcher's tick does, landing
-  turns included.
+- `/afk-fleet --tick` — **one cycle**, cold, and exit with its progress line: the
+  [Bootstrap](#bootstrap-once), then `afk cycle` with no `state` — a first cycle, which always
+  ticks — then its judgments answered, and no sleep. It acts exactly as a cycle of the loop does,
+  landing turns included, and releases nothing on the way out: it is not a drain.
 - `/afk-fleet --takeover` — a **launcher bootstrap variant** for when a fleet hard-stopped (quota) and
   you will not wait for its lease to lapse: the *full* bootstrap, then the opening working set
   is seeded from a dead peer's claims instead of the frontier alone. Thereafter an ordinary standing
@@ -81,7 +88,7 @@ asks only the one thing code cannot derive (step 3, and only when it was not pas
 1. **Load config** — `afk config --file <target repo>/docs/agents/afk-fleet.md` parses + validates
    the file against the one schema (unknown key or wrong shape → **error: stop and report it,
    don't guess**) and returns the **canonical config JSON**: every key present, defaults
-   filled (ADR-0009). That JSON is what the launcher holds and hands every tick — nothing
+   filled (ADR-0009). That JSON is what the launcher holds and hands every `afk` call — nothing
    downstream re-parses YAML or re-applies defaults. Missing file → offer to create it from the
    template ([references/config-template.md](references/config-template.md)) and stop; never run on
    guessed settings.
@@ -174,21 +181,21 @@ rather than loops.
 
 ### Loop
 
-Repeat until you stop it. The launcher's whole inter-cycle memory is **one opaque value** — the
-`state` the last cycle returned. Hand it back verbatim; never read into it, never do arithmetic
-on it (ADR-0017). Every counter the loop needs — the last fingerprint, the skip streak, the empty
-streak, what is in flight — lives in there, maintained by code; so do the instance id and the worker
-launch command, from the first cycle on.
+Repeat until you stop it. **You run each cycle yourself**, in this session: the tick is code,
+inside the call. The loop's whole memory is **one opaque value** — the `state` the last cycle
+returned. Hand it back verbatim; never read into it, never do arithmetic on it (ADR-0017). Every
+counter the loop needs — the last fingerprint, the skip streak, the empty streak, what is in
+flight — lives in there, maintained by code; so do the instance id and the worker launch command,
+from the first cycle on.
 
-1. **Spawn a tick** — call the [Agent] tool (fresh context) to run [one cycle](#a-tick---tick--one-cycle),
-   passing `{repo, config}` and the `state` the last tick returned, verbatim. On the very first
-   cycle there is no state yet: pass `{instance_id, worker_command}` instead. The tick runs `afk
-   cycle` — the gate, and on a tick the whole reconciliation pass, in code — answers the judgments
-   it hands back, and returns `{state, sleep_seconds, progress}`: the three values of the last `afk
-   cycle` it ran, untouched.
-2. **Keep `state`**, surface `progress` — the cycle's one human line — to the user, and discard the
-   rest.
-3. **Sleep `sleep_seconds`** (`ScheduleWakeup`). The number already encodes the pacing rules — you
+1. **Run [one cycle](#a-cycle---tick--one-call-the-tick-inside-it)** — `afk cycle`, in the
+   foreground (it is seconds long), with the repo, the config and the last `state`, verbatim. On
+   the very first cycle there is no state yet: pass `--instance` and `--worker-command` instead.
+2. **Answer its judgments**, if it returned any: for each one decide, then run the command it
+   handed you ([Judgments](#judgments)). Judgments answered → **step 1 at once**, with the `state`
+   this cycle returned.
+3. **Otherwise show `progress`** — the cycle's one human line — **and sleep `sleep_seconds`**
+   (`ScheduleWakeup`). The number already encodes the pacing rules — you
    apply none yourself: `busy_interval_seconds` (default 90) while the last tick did anything or anything is in
    flight, so finished PRs land promptly; `idle_interval_seconds` (default 1500) once `idle_ticks_before_sleep`
    consecutive cycles were **empty** (a tick that did nothing, or a skip, with nothing in flight and
@@ -197,19 +204,22 @@ launch command, from the first cycle on.
    saying its outcome is on GitHub (ADR-0020): go to step 1 **now** instead of waiting the sleep out,
    and let the sleep this new cycle ends with replace the one you were in. That is all it means — it
    is a hint, not a fact: never merge, dispatch or conclude anything from the line itself; the cycle
-   reads GitHub as always, and may well `skip`. A wake that arrives while a tick is running needs
-   nothing until that tick returns; then open the next cycle at once instead of sleeping.
-4. **Stop** on the user's word: spawn one final **drain** tick that runs `afk rebuild --instance <id>` and
-   `afk release <n> --instance <id>`s each of its claims with no PR yet, retaining those with an open PR
-   (see [Cooperative multi-fleet](references/cooperative-multi-fleet.md)), then
-   spawn no more ticks. In-flight workers finish on their own; their PRs are inherited and landed by a
+   reads GitHub as always, and may well `skip`. A wake that arrives while a cycle is running needs
+   nothing until it returns; then open the next cycle at once instead of sleeping.
+4. **Stop** on the user's word: one more cycle, the **drain** —
+   ```bash
+   <skill>/scripts/afk.py cycle --drain --repo <repo> --config '<config json>' --state '<state json>'
+   ```
+   — which releases each of this fleet's claims with no PR yet and keeps those with an open PR
+   (see [Cooperative multi-fleet](references/cooperative-multi-fleet.md)). Show its `progress`,
+   then run no more cycles. In-flight workers finish on their own; their PRs are inherited and landed by a
    peer (or a later run) once the lease expires; escalated issues stay labelled for the human.
 
-The launcher never dispatches, lands, or reads a worker itself, never computes the frontier in its own
-context, and never reads the tick's files (the `afk.py`/`afk_decide.py` source, `worker-prompt.md`) — it
-reads only the repo config, calls the bootstrap `afk` subcommands, and spawns ticks. All coordination
-happens inside a tick's `afk cycle`. This keeps the launcher thin *by construction*
-(ADR-0002), not by later compaction.
+The launcher types no transition of its own accord: besides the bootstrap subcommands, everything
+it runs is `afk cycle` or a command a judgment handed it. It never reads a worker, never computes
+the frontier in its own context, and has no reason to read the tool's source (`afk.py`,
+`afk_decide.py`) or `worker-prompt.md` — the procedure is in code, which is what makes its context
+safe to compact (ADR-0028).
 
 ## Tools (`scripts/afk.py`) — the deterministic muscle
 
@@ -217,7 +227,7 @@ Every **deterministic** step the skill runs is a subcommand of `afk.py`, each pr
 nothing is re-derived as git/gh/orca incantations from prose (ADR-0004). That holds for the **Act half** too: starting
 a worker, giving a PR its landing turn, failing, escalating, parking and closing a claim are each
 **one call that performs the whole ordered sequence** (ADR-0017) — and `afk cycle` is the one call that
-runs a whole pass of them, in order, returning a **judgment** wherever one is needed. A tick
+runs a whole pass of them, in order, returning a **judgment** wherever one is needed. The launcher
 therefore runs **no raw `git`, `gh pr merge`, `gh issue edit` or `orca worktree`/`terminal create`** of
 its own — and no orca command at all: even whether a worker is busy is read in code (ADR-0021). The full interface table — every
 subcommand with its arguments and return shape — is disclosed in
@@ -239,15 +249,17 @@ the commands chained after it still run.
 
 **Exit 3 is never an outcome.** A subcommand that could not do its job prints `{"error": …}` and exits
 3. That is an operational failure (auth, network, a rejected push, an unreadable remote, a claim that
-could not be deleted, a bad command line) — stop and report it in what you return; do not
-read it as "nothing to do". The converse holds too: an exit-0 result is always a real answer — an
+could not be deleted, a bad command line) — show it to the human; do not
+read it as "nothing to do". When it is `afk cycle` itself that failed, keep the `state` you had and
+open the next cycle after the sleep you were last given; an error that comes back every cycle is
+one to stop on. The converse holds too: an exit-0 result is always a real answer — an
 empty `mine` means you hold nothing, `"released": true` means the claim is gone. A transition that
 fails **inside** `afk cycle` is the same failure, reported in that cycle's `errors` while the rest of
 the pass goes on.
 
-## A tick (`--tick`) — one cycle
+## A cycle (`--tick`) — one call, the tick inside it
 
-A tick is stateless and makes **one call**. The reconciliation pass — rebuild from GitHub, then
+A cycle is **one call**. The tick — the reconciliation pass: rebuild from GitHub, then
 every transition whose next step is a table lookup — runs **inside it, in code** (ADR-0017): it
 costs no tokens, cannot be forgotten, and is the same whoever calls it.
 
@@ -256,7 +268,7 @@ costs no tokens, cannot be forgotten, and is the same whoever calls it.
      [--state '<state json>'] [--instance <id> --worker-command '<worker_command>']
 ```
 
-Pass the `--state` you were handed, verbatim. With none — the launcher's first cycle, or
+Pass the last `state`, verbatim. With none — the launcher's first cycle, or
 `/afk-fleet --tick` cold — pass `--instance` and `--worker-command` instead (the latter **verbatim**:
 it is opaque, ADR-0010); they travel inside `state` from then on, and a cycle given a `state` without
 them is refused. It returns `{action, reason, state, sleep_seconds, progress, judgments}`:
@@ -271,8 +283,11 @@ them is refused. It returns `{action, reason, state, sleep_seconds, progress, ju
 - `judgments` — what code **cannot** decide, returned instead of decided. See below.
 - `errors` (only when there are any) — `[{step, issue, error}]`: a transition of the pass failed.
   It settled nothing — the claim is **still held** — and the next cycle ticks again whatever the
-  digest says. Report them in what you return; never read one as "nothing to do", and do not
+  digest says. Show them with the progress line; never read one as "nothing to do", and do not
   re-run the step by hand.
+
+`--drain` makes it the run's last cycle (`"action": "drain"`, `sleep_seconds` null): no pass, only
+the [stop](#loop).
 
 ### What the pass does
 
@@ -321,10 +336,10 @@ instance id and the worker launch command.
   while judgments are open). Every answer is a transition, so the next cycle does not ask again;
   a judgment you left unanswered is asked again.
 - **`bulky: true`** (`adversarial_verify`, and a `reason` that lives in a CI log) — delegate it to
-  an ephemeral subagent that returns **one line**: the verdict, or the reason. A diff under review
-  or a CI log never enters your context (ADR-0001).
-- **Repeat until a cycle returns no judgments**, then return that cycle's `state`, `sleep_seconds`
-  and `progress` to your launcher, untouched, with any `errors` it reported — and **exit**.
+  an ephemeral subagent (the [Agent] tool) that returns **one line**: the verdict, or the reason. A
+  diff under review or a CI log never enters your context (ADR-0001). This is the **only** thing the
+  Agent tool is used for in this skill — a tick is never one.
+- **Repeat until a cycle returns no judgments**; that cycle's `sleep_seconds` is the one you sleep.
 
 **`--plan`** runs none of this: it is `afk rebuild --instance <id>`, printed — the frontier, the
 claims and what each would get — and nothing else. Same rebuild as the pass, zero side effects.
@@ -364,8 +379,8 @@ A PR may land only when **all** configured gates are green. Which **machine gate
 the PR's GitHub checks; `local` makes `gate.local_command` the gate, run by the landing on the head
 that lands, and never reads checks. `afk land` applies whichever is configured
 ([Landing](#landing--the-worker-lands-its-own-pr-on-its-turn)); the invariants
-behind them — the local gate's two-run rule, the one case `gate.trust_recorded_run` lets the landing
-skip its own run (an `afk gate` run is on record for the exact head that lands;
+behind them — the local gate's two-run rule, the one case the landing
+skips its own run unless `gate.trust_recorded_run` is turned off (an `afk gate` run is on record for the exact head that lands;
 [ADR-0026](../../docs/adr/0026-a-recorded-gate-run-stands-in-for-the-merge-time-run.md)), the
 ephemeral CI sub-read, and the adversarial-verify procedure when `gate.adversarial_verify` is on — are
 disclosed in [references/completion-gate.md](references/completion-gate.md). Read it before running an
@@ -378,7 +393,7 @@ adversarial verify or switching a repo to `gate.ci: local`. `afk gate` and `afk 
 `afk land`, in its own worktree — sync with `merge.target` (by **merging, never rebasing** —
 ADR-0012) → push → the machine gate on that exact head → `gh pr merge` **pinned to the gated head**.
 A sync conflict or a red gate at landing is fixed where the context is: by that worker, in place,
-with no round trip through a tick
+with no round trip through the launcher
 ([ADR-0027](../../docs/adr/0027-a-worker-lands-its-own-pr-on-a-landing-turn.md)). What the fleet
 gives is the **landing turn**: `afk land` refuses to run until its PR has the turn, and turns go out
 **one at a time**, so no PR is synced against a tip that is about to move.
@@ -415,7 +430,7 @@ the branch moved after the gate. No landing outcome spends an attempt or closes 
 `afk fail` does.
 
 **A merge batch — several PRs on one turn** (`merge.batch`, `gate.ci: local`; off by default;
-[ADR-0028](../../docs/adr/0028-a-merge-batch-lands-n-prs-behind-one-gate-run.md)). When two or more
+[ADR-0029](../../docs/adr/0029-a-merge-batch-lands-n-prs-behind-one-gate-run.md)). When two or more
 finished PRs may land together, the pass gives the turn to all of them at once — `afk turn --batch`
 — instead of to the first: it records one marker on every member PR and starts a **batch worker**
 in a worktree of the batch's own. That worker runs `afk land --batch`, which stacks the PRs on the
@@ -455,7 +470,7 @@ the verifier's review comment, the worker's verdict comment), never carried in c
 the call does the rest and reports which way it went:
 
 - `"action": "retry"` — under `retry` attempts (default 2). The attempt count lives as an
-  **`afk-attempt/<n>` label** on the issue (not in tick memory) and `afk fail` is its one writer: it
+  **`afk-attempt/<n>` label** on the issue (not in anyone's context) and `afk fail` is its one writer: it
   swaps the label up by one, **discards the failed attempt** (closes its PR, deletes its branch, removes
   its worktree — so the claim cannot loop on the same red PR) and starts a **fresh** worker from base
   under the same claim, handing it the reason. After an unanswered nudge it appends the worker's
@@ -508,13 +523,13 @@ touch shared root config are naturally throttled by the DAG — chain them with 
   a not-going-to-PR outcome is its `afk:verdict` marker comment; blockers are issue comments. Whether a
   worker is busy is its **worker state** — what its runtime reported to orca, read by `afk no-pr`,
   never from its screen — and a stopped worker is combined with the worktree's git progress and its
-  verdict marker (see In-flight — *stopped* alone is never *finished*). A full transcript never enters a tick or the launcher; the one terminal read is
+  verdict marker (see In-flight — *stopped* alone is never *finished*). A full transcript never enters the launcher; the one terminal read is
   `afk nudge` / `afk fail` taking the last screen of a worker that went silent, to say *where* it
   stopped — never its result (ADR-0018).
 - **Never merge a PR yourself.** No `gh pr merge`, no push to `merge.target`: a PR lands only through
   its worker's `afk land`, on the turn `afk turn` gave it — or, in a merge batch, through the batch
   worker's `afk land --batch`. A turn nobody lands is failed, and a batch nobody lands abandoned, not
-  merged around (ADR-0027, ADR-0028).
+  merged around (ADR-0027, ADR-0029).
 - **Claim before work; release on every terminal transition.** `afk dispatch` creates the
   `afk-claim/<n>` ref first — if the create is rejected, a peer owns it and nothing is started.
   `afk escalate`, `afk park` and `afk close` each delete it as their last step; a claim that outlived
@@ -529,7 +544,7 @@ touch shared root config are naturally throttled by the DAG — chain them with 
   work it is the one unrecoverable act in the fleet.
 - **Take a live lease only on a human's word.** `afk takeover --from` runs only on the human's
   explicit selection from `--list`, with `--yes` only after relaying the fresh-heartbeat warning and
-  getting an explicit yes; unattended, the lease is the only path (never `--yes` to ease a tick).
+  getting an explicit yes; unattended, the lease is the only path (never `--yes` to ease a cycle).
 - **Respect human reservation.** A human reserves an issue by removing `ready_label` (the fleet no
   longer reads the assignee); keep the tracker honest so a peer fleet or a human never double-takes.
 - **Stay off the reserved namespaces.** The fleet manages the `afk-attempt/<n>` labels, the

@@ -6,8 +6,9 @@ one or several machines.
 The nouns are in [`CONTEXT.md`](../CONTEXT.md), the reasons in [`docs/adr/`](adr/). This file is the
 verbs: what happens, in what order, and what it leaves behind.
 
-**Reading the anchors.** The fleet is a doc-driven skill (ADR-0004): the **launcher** and the
-**tick** are LLM sessions executing the prose of `skills/afk-fleet/SKILL.md`, the **worker** executes
+**Reading the anchors.** The fleet is a doc-driven skill (ADR-0004): the **launcher** is an LLM
+session executing the prose of `skills/afk-fleet/SKILL.md`, the **tick** it runs each cycle is code
+(ADR-0028), the **worker** executes
 `skills/afk-fleet/references/worker-prompt.md`, and every deterministic step is a subcommand of
 `skills/afk-fleet/scripts/afk.py` deciding through a pure function in
 `skills/afk-fleet/scripts/afk_decide.py`. Each thing a tick *does* to a claim — start a worker, land
@@ -90,13 +91,13 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   once and pushes it to the target as a fast-forward, `skills/afk-fleet/scripts/afk.py:_land_batch`;
   each PR is then closed with a comment naming its commit. A PR that conflicts with the stack is
   left out and takes a single turn; a batch whose worker stays silent is abandoned
-  (ADR-0028).
+  (ADR-0029).
 - The landing's sync conflicts: the merge is left in progress in the worker's own worktree, and the
   worker resolves it, commits and lands again — claim, PR, branch, worktree and turn kept, no
   attempt spent, `skills/afk-fleet/scripts/afk_decide.py:land_outcome`.
 - The landing's gate is red: the worker fixes the code, commits and lands again; the excerpt is
   also a PR comment, `skills/afk-fleet/scripts/afk_decide.py:gate_comment`.
-- The repo set `gate.trust_recorded_run`, and a recorded run is of the command configured
+- `gate.trust_recorded_run` is on (the default), and a recorded run is of the command configured
   now, on a committed tree, at the exact head that would land: step 13 does not run the local gate
   again, `skills/afk-fleet/scripts/afk_decide.py:gate_record_void` (ADR-0026). Any sync that moved
   the head, any later commit, or no record, and it runs as written.
@@ -128,30 +129,31 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    a custom provider uses the command passed with the invocation, or has the human pick one, and the
    answer is checked to resolve.
    `skills/afk-fleet/scripts/afk.py:cmd_worker_command`
-4. Each cycle, the launcher spawns a fresh tick, handing it only the repo, the config and the cycle
-   state; the tick makes one call, which digests what a rebuild would observe and decides skip or
-   tick — the raw state never enters a context.
+4. Each cycle, the launcher itself makes one call, handing it only the repo, the config and the
+   cycle state; the call digests what a rebuild would observe and decides skip or tick — the raw
+   state never enters a context.
    `skills/afk-fleet/scripts/afk.py:cmd_cycle`
 5. When the digest moved, that same call runs the reconciliation pass (the mainline above) in code,
    and returns what it could not decide as judgments, each with the transition for either answer;
-   the tick runs the one it chooses and opens the next cycle at once.
+   the launcher runs the one it chooses and opens the next cycle at once.
    `skills/afk-fleet/scripts/afk.py:_tick`
 6. The call folds what the pass did into the cycle state — which also carries the two
    launcher-held facts (instance id, worker launch command) — and counts whether the cycle was empty.
    `skills/afk-fleet/scripts/afk_decide.py:cycle_ticked`
 7. The launcher sleeps the interval that call returned — busy, or idle after enough consecutive
    empty cycles, never longer than half the lease while the fleet holds a claim — then repeats from
-   step 4, keeping nothing but the cycle state.
+   step 4. Its context may be compacted at any point: the repo, the config and the cycle state are
+   all the next cycle needs (ADR-0028).
    `skills/afk-fleet/scripts/afk_decide.py:pace`
-8. On the human's word, one final drain tick releases the claims that have no PR, keeps the ones
-   that do, and the launcher spawns no more ticks.
-    `skills/afk-fleet/scripts/afk.py:cmd_release`
+8. On the human's word, one last cycle — the drain — releases the claims that have no PR and keeps
+   the ones that do, and the launcher runs no more cycles.
+    `skills/afk-fleet/scripts/afk.py:_drain`
 
 **Where it forks.**
 - The digest is unchanged: no pass is run, the same call refreshes the heartbeat if the fleet
   holds claims and returns the sleep, and a full tick is forced every `force_tick_after_skips`
   cycles: `skills/afk-fleet/scripts/afk_decide.py:cycle_wake`, ADR-0007.
-- A worker's **wake** arrives during the sleep of step 9: the launcher goes to step 6 at once, and
+- A worker's **wake** arrives during the sleep of step 7: the launcher goes to step 4 at once, and
   acts on nothing the line says, `skills/afk-fleet/SKILL.md:wake`, ADR-0020.
 - The org forbids `refs/afk/*`, so claims fall back to ordinary branches:
   `skills/afk-fleet/scripts/afk.py:_usable_namespace`.
@@ -304,7 +306,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 - With `merge.batch`, a batch of PRs lands behind exactly one gate run, as one squash commit per PR
   in merge order; the target is only ever moved — by a fast-forward push — to a commit the gate
   passed on, so a red stack, a moved target and an abandoned batch each land nothing; and a PR that
-  left a batch is never batched again. (ADR-0028;
+  left a batch is never batched again. (ADR-0029;
   `test_a_merge_batch_lands_three_prs_behind_one_gate_run`,
   `test_a_red_batch_lands_nothing_and_is_repaired_with_a_fix_commit_on_top`,
   `test_a_target_that_moves_while_the_batch_gates_refuses_the_push`,

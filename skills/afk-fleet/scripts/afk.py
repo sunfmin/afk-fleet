@@ -29,7 +29,7 @@ Two subcommands are a worker's, not the tick's, run in its own worktree: `gate`
 runs the local gate and puts a green run on record (ADR-0026), and `land` lands
 the worker's PR on its landing turn — sync → gate → merge pinned to the gated
 head — which is the only way a PR lands (ADR-0027) — or, as a merge batch's
-worker, a whole stack of PRs behind one gate run (`land --batch`, ADR-0028).
+worker, a whole stack of PRs behind one gate run (`land --batch`, ADR-0029).
 
 Every subcommand that reads config REQUIRES the same `--config` (the canonical
 JSON from `afk config`, then `afk probe`) and resolves it one way, in `_cfg`:
@@ -585,7 +585,7 @@ def cmd_config(a):
     ```yaml block in docs/agents/afk-fleet.md), validate every key against the
     schema (unknown key / wrong shape → error — with the human present at
     bootstrap), fill defaults, and print the canonical JSON the launcher
-    injects into every tick. `--defaults` prints the pure defaults table."""
+    hands every `afk` call. `--defaults` prints the pure defaults table."""
     if a.defaults:
         return afk_decide.resolve_config({})
     if not a.file:
@@ -650,7 +650,7 @@ def cmd_probe(a):
        target REQUIRE status checks? Then `gh pr merge` is rejected however green the
        local gate is, so that combination is a hard `error` at bootstrap; an
        inconclusive read is a `warn`. With `merge.batch`, so is a target that
-       refuses a direct push — a merge batch lands by pushing (ADR-0028)."""
+       refuses a direct push — a merge batch lands by pushing (ADR-0029)."""
     cfg = _cfg(a)
     ns, rejection = _usable_namespace(_remote(a), cfg["claim_namespace"], _now(a))
     cfg["claim_namespace"] = ns
@@ -748,11 +748,20 @@ def cmd_cycle(a):
     tick could not decide comes back as `judgments`, each with the `afk` command
     for either answer; the caller runs one and opens the next cycle at once
     (`sleep_seconds` is then 0). Only that ever reaches a context — the raw
-    issue/PR/ref JSON lives and dies here."""
+    issue/PR/ref JSON lives and dies here.
+
+    `--drain` is the last cycle of a run, the launcher's stop: no gate and no
+    tick — `_drain` releases my claims that no open PR stands behind and keeps
+    the rest → `"action": "drain"`, `sleep_seconds` null."""
     cfg = _cfg(a)
     state = afk_decide.cycle_state(json.loads(a.state) if a.state else None,
                                    a.instance, a.worker_command)
     a.instance, a.worker_command = state["instance"], state["worker_command"]
+    if a.drain:
+        released, kept, errors = _drain(a, _rebuild(a, cfg))
+        return {"action": "drain", "reason": "stop",
+                **afk_decide.cycle_drained(state, released, kept, len(errors)),
+                "judgments": [], **({"errors": errors} if errors else {})}
     gathered = _gather(a, cfg) if cfg["fingerprint_gate"] else None
     fp = afk_decide.fingerprint(*gathered[:3]) if gathered else None  # heartbeats: see fingerprint
     woke = afk_decide.cycle_wake(state, fp, cfg)
@@ -765,6 +774,29 @@ def cmd_cycle(a):
     return {"action": "tick", "reason": woke["reason"],
             **afk_decide.cycle_ticked(woke["state"], did, cfg, len(judgments), len(errors)),
             "judgments": judgments, **({"errors": errors} if errors else {})}
+
+
+def _drain(a, ws):
+    """The stop: release every claim of mine that no open PR stands behind — a
+    worker still coding, an orphan, a claim that outlived its issue — and keep
+    the rest → (released, kept, errors). A kept claim's PR is landed by a peer,
+    or a later run, once this instance's lease lapses; a release that failed is
+    recorded in `errors` and its claim counted as kept, which it is. Nothing
+    is dispatched, granted or failed, and no worker is touched: the ones in
+    flight finish on their own."""
+    released, kept, errors = [], [], []
+    for row in ws["mine"]:
+        if row["pr"] and row["status"] != "closed":
+            kept.append(row["number"])
+            continue
+        try:
+            cmd_release(argparse.Namespace(**{**vars(a), "number": row["number"],
+                                              "expect_sha": None}))
+            released.append(row["number"])
+        except (OSError, ValueError, RuntimeError) as e:
+            errors.append({"step": "release", "issue": row["number"], "error": str(e)})
+            kept.append(row["number"])
+    return released, kept, errors
 
 
 def _tick(a, cfg, ws):
@@ -889,7 +921,7 @@ def _tick(a, cfg, ws):
 def _tick_turn(a, cfg, ws, run, call, did, touched, judgments):
     """The landing-turn step of one tick → the ids of the merge batches that
     hold a turn when it is done. One turn is out at a time, held by one PR or by
-    one batch (ADR-0028), so exactly one of these happens:
+    one batch (ADR-0029), so exactly one of these happens:
 
       a dead fleet's batch on claims I took   abandoned; nothing is granted until
                                               the next cycle reads the result
@@ -1426,9 +1458,9 @@ def _landing_fields(cfg, pr):
 
 def _prompt_fields(a, cfg, issue, path, branch):
     """The PROMPT_FIELDS of a worker prompt for one issue in one worktree. The
-    launcher's terminal is read off the environment, never passed in: a tick is a
-    subagent of the launcher, so the handle orca gave that terminal is the one
-    this process inherited (ADR-0020). The config travels whole, as the JSON
+    launcher's terminal is read off the environment, never passed in: the launcher
+    runs `afk cycle` itself, so the handle orca gave its terminal is the one
+    this process inherited (ADR-0020, ADR-0028). The config travels whole, as the JSON
     `afk land` is run with: the worker lands on the settings the tick ran on."""
     return {"n": issue["number"], "title": issue["title"], "repo": a.repo,
             "base_branch": cfg["base_branch"], "local_command": cfg["gate"]["local_command"],
@@ -1731,7 +1763,7 @@ def cmd_turn(a):
                     `--verified <head>`.
 
     Two more shapes give the turn to a MERGE BATCH instead of to one PR
-    (ADR-0028) — `--batch` (`_turn_batch`: form one from the PRs waiting, or
+    (ADR-0029) — `--batch` (`_turn_batch`: form one from the PRs waiting, or
     continue the one that holds the turn) and `--abandon <batch>`
     (`_abandon_batch`). They add `too_few` and `abandoned` to the outcomes."""
     cfg, rem = _cfg(a), _remote(a)
@@ -1839,7 +1871,7 @@ def cmd_land(a):
     run again (ADR-0026); `gate.not_trusted` says why a record was not enough.
 
     `--batch <batch>` is a merge batch's worker landing its whole batch instead
-    (`_land_batch`, ADR-0028), with outcomes of its own."""
+    (`_land_batch`, ADR-0029), with outcomes of its own."""
     cfg, rem = _cfg(a), _remote(a)
     if (a.number is None) == (a.batch is None):
         raise ValueError("afk land takes exactly one of --issue <n>, --batch <batch>")
@@ -1937,7 +1969,7 @@ def cmd_land(a):
 
 
 # --------------------------------------------------------------------------- #
-# act: the merge batch — N ready PRs behind one gate run (ADR-0028)            #
+# act: the merge batch — N ready PRs behind one gate run (ADR-0029)            #
 # --------------------------------------------------------------------------- #
 #
 # A batch is one landing turn, held by several PRs at once and landed by a
@@ -2040,7 +2072,7 @@ def _busy_workers(a, cfg, numbers):
 
 
 def _turn_batch(a, cfg, rem):
-    """`afk turn --batch` — give the landing turn to a MERGE BATCH (ADR-0028):
+    """`afk turn --batch` — give the landing turn to a MERGE BATCH (ADR-0029):
 
       form      no turn is out and two or more of my claims' PRs are eligible
                 (`afk_decide.batch_candidates`, less the ones whose own worker
@@ -2142,7 +2174,7 @@ def _start_batch_worker(a, cfg, rem, batch, members, phase, again):
 
 def _abandon_batch(a, cfg, rem):
     """`afk turn --abandon <batch>` — give a batch up with nothing landed
-    (ADR-0028): every member PR's marker is replaced by one that holds no turn
+    (ADR-0029): every member PR's marker is replaced by one that holds no turn
     and says so → its pushed branch is deleted → the batch's worktree removed.
     The members are back to `awaiting_turn`, take single landing turns, and are
     not batched again. For a batch whose worker stayed silent after its nudge —
@@ -2284,7 +2316,7 @@ def _batch_turns(a, cfg, rem, batch, listed):
 
 def _land_batch(a, cfg, rem):
     """`afk land --batch <batch>` — a BATCH WORKER stacks, gates and lands its
-    merge batch, in the batch's worktree (ADR-0028). Refused (exit 3, nothing
+    merge batch, in the batch's worktree (ADR-0029). Refused (exit 3, nothing
     changed) unless every member PR carries the batch's turn marker, naming the
     fleet instance that holds its issue's claim. Then, in order:
 
@@ -2714,6 +2746,9 @@ def build_parser():
                         "cycle only; then --state carries it")
     p.add_argument("--ready-timeout", type=int, default=120, metavar="s",
                    help="seconds to wait for a started agent to accept a prompt")
+    p.add_argument("--drain", action="store_true",
+                   help="the last cycle of a run: release my claims with no open PR, keep "
+                        "the rest, and do nothing else")
 
     # --- claim refs ---
     command("scan", cmd_scan, "debug: read all claim + heartbeat refs", remote="refs")

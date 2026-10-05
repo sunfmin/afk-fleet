@@ -55,7 +55,7 @@ one recreated at the PR's head — never from base — and briefed only to land 
 not with the task. The result says so (`prompt: landing`, `landing: <pr>`). `afk turn` itself takes
 this path when the worker's terminal is already gone.
 
-**A merge batch is continued too** (ADR-0028). Its worker has no claim, so `afk dispatch` is not
+**A merge batch is continued too** (ADR-0029). Its worker has no claim, so `afk dispatch` is not
 its path: the pass asks after it with `afk no-pr --batch`, and when its terminal is gone
 `afk turn --batch` starts a new batch worker — in the batch's worktree if it is on this machine (fix
 commits and all), else in one cut from the batch's pushed branch, which holds the stack as of its

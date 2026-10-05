@@ -13,7 +13,7 @@ A PR may land only when **all** configured gates are green. Which **machine gate
   **on the head that lands**: if its sync moved the head, the old checks describe a tree that will
   not merge, so it returns `awaiting_ci`, the worker stops, and the next pass's `afk turn` tells it to land
   again once CI has spoken about that head. On red, read the failing-log excerpt for the `afk fail` reason in an **ephemeral sub-read** that
-  returns only `{status: red, reason}`; raw logs never enter the tick. Progressive: before CI exists a
+  returns only `{status: red, reason}`; raw logs never enter the launcher. Progressive: before CI exists a
   PR has no checks at all — `rebuild` reports it `awaiting_turn` (there is nothing to wait for), `afk turn` returns `no_checks`, the gate is then the issue's acceptance
   criteria + whatever local build/test exists, and `--allow-no-checks` is how you say it passed.
 - **`local` — `gate.local_command` *is* the completion gate.** GitHub checks are **never read** in this
@@ -34,11 +34,11 @@ A PR may land only when **all** configured gates are green. Which **machine gate
   [Bootstrap](../SKILL.md#bootstrap-once-with-the-human-present) step 2).
 - **`gate.trust_recorded_run` — the two runs become one when nothing moved**
   ([ADR-0026](../../../docs/adr/0026-a-recorded-gate-run-stands-in-for-the-merge-time-run.md); `local`
-  only, opt-in). When the landing's sync is a no-op, the landing's run tests the very commit the
+  only; on by default). When the landing's sync is a no-op, the landing's run tests the very commit the
   worker's pre-PR run did. The worker runs the gate **through `afk gate`** — its prompt hands it that line —
   which runs `gate.local_command` in the worker's worktree and, on green, records the head it ran on
   and the command it ran in the worktree's git dir (a green run by `afk land` itself is recorded the
-  same way). With the option on, `afk land` skips its own run
+  same way). Unless the option is turned off, `afk land` skips its own run
   when — and only when — that record proves the gate passed on **the exact head that would land**:
   the recorded head is that head, the recorded command is the one configured now, and the tree it ran
   on had nothing uncommitted or untracked. Anything else voids the record — the sync moved the head,
@@ -51,7 +51,7 @@ A PR may land only when **all** configured gates are green. Which **machine gate
   given up is the second run's independence on an unchanged commit — a flaky test that passed once
   is not asked again — so the default is off.
 - **`merge.batch` — one landing run for several PRs**
-  ([ADR-0028](../../../docs/adr/0028-a-merge-batch-lands-n-prs-behind-one-gate-run.md); `local`
+  ([ADR-0029](../../../docs/adr/0029-a-merge-batch-lands-n-prs-behind-one-gate-run.md); `local`
   only, opt-in). The landing's run is the fleet's landing throughput: N finished PRs are N runs.
   With the option on, when two or more finished PRs may land together the landing turn goes to all
   of them as a **merge batch**: a batch worker, in a worktree of the batch's own, stacks them on the

@@ -23,8 +23,8 @@ worker_idle_grace_seconds: 300
 
 # --- completion gate ---
 gate:
-  ci: required
-  local_command: "uv run --with pytest pytest skills/afk-fleet/scripts -q"
+  ci: local
+  local_command: "uv run --with pytest --with pytest-xdist pytest skills/afk-fleet/scripts -q -n auto"
   adversarial_verify: false
   adversarial_verify_prompt: ""
 
@@ -54,14 +54,15 @@ force_tick_after_skips: 6
 
 ## Notes
 
-- **No CI yet.** This repo has no GitHub Actions; `gate.ci: required` degrades progressively to the
-  issue's acceptance criteria + the local gate below until CI stands up. Because a real
-  `local_command` exists and no status check is required on `master`, `gate.ci: local` (ADR-0012) is
-  also available here — flip it when you want the local run to *be* the gate, re-run by each landing,
-  instead of a progressive judgment call.
-- **Local gate.** `gate.local_command` runs the skill's fixture tests (pure verdicts in
-  `afk_decide.py`) via `uv`, per the repo's uv-only Python rule. It is a real gate for the
-  code-touching issues and a no-op pass for prompt/docs-only issues.
+- **The local gate is the gate.** This repo has no GitHub Actions and requires no status check on
+  `master`, so `gate.ci: local` (ADR-0012): `gate.local_command` is run by the worker before its PR
+  and by its landing on the head that lands — no `no_checks` judgment per PR, and nothing lands
+  ungated. `gate.trust_recorded_run` is left at its default (on), so a landing whose sync moved
+  nothing does not run the gate a second time (ADR-0026).
+- **Local gate.** `gate.local_command` runs the skill's tests via `uv`, per the repo's uv-only Python
+  rule, in parallel (`pytest-xdist`, `-n auto`): 52 s against 188 s serial, measured on 14 cores
+  with 125 tests. It is a real gate for the code-touching issues and a no-op pass for
+  prompt/docs-only issues.
 - **Sync, not rebase.** `merge.sync_before_merge` merges `origin/master` into the branch before the
   landing's re-gate (ADR-0012, ADR-0027); the retired `rebase_before_merge` key is now a load-time error.
 - **Reserved surfaces.** The fleet manages the `afk-attempt/<n>` labels, the `refs/afk/*` ref

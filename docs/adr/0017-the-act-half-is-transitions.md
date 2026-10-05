@@ -174,4 +174,6 @@ between two calls.
   `adversarial_verify` whose yes carries both flags; a `no_checks` whose yes changed nothing would be
   asked forever.
 
-The tick is still an Agent subagent: its instructions are "run `afk cycle`, answer the judgments".
+The tick was still an Agent subagent at this amendment: its instructions were "run `afk cycle`,
+answer the judgments". [ADR-0028](0028-the-launcher-runs-each-cycle-itself.md) removes it: the
+launcher makes the call itself, and `afk cycle --drain` is the stop.

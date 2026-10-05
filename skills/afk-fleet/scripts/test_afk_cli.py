@@ -37,6 +37,7 @@ owner/name` reaches it through a `url.<bare>.insteadOf` rewrite in the clone.
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -936,6 +937,96 @@ def test_the_cycle_state_carries_the_instance_and_the_worker_launch_command():
                                              "--worker-command", "claude")
 
 
+def test_a_compacted_launcher_carries_on_from_the_repo_the_config_and_the_last_state():
+    """The launcher runs each cycle itself, in a context auto-compaction may cut
+    at any point. What it must still hold afterwards is three values — the repo,
+    the config and the last `state` — and nothing else: no instance id, no worker
+    launch command, no rule. From those alone the next cycle is the same fleet
+    instance's: it claims as that instance, starts workers with the same command,
+    hands back judgments whose commands carry both, and drains its own claims."""
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2, 3)]) as w:
+        config = json.dumps({"concurrency": 2})
+        first = w.afk("cycle", *R, *NOW, "--config", config, "--instance", "fl-7",
+                      "--worker-command", WORKER)
+        assert first["progress"] == "dispatched #1, #2; 2 in flight, 1 left on the frontier"
+        # the compaction: all that survives is this one line of text
+        note = json.dumps({"repo": REPO, "config": config, "state": first["state"]})
+        del first, config
+
+        def launcher(note, *extra, now=T0):
+            """One cycle by a launcher that kept only `note` → (its result, the next note)."""
+            kept = json.loads(note)
+            assert set(kept) == {"repo", "config", "state"}
+            r = w.afk("cycle", "--repo", kept["repo"], "--config", kept["config"],
+                      "--state", json.dumps(kept["state"]), "--now", str(now), *extra)
+            return r, json.dumps({**kept, "state": r["state"]})
+
+        # #1 landed, and #2's worker says there was nothing to do: the pass settles
+        # the first, fills the slot it freed, and asks about the second
+        w.set(issues=[issue(1, "ready-for-agent", state="closed"),
+                      issue(2, "ready-for-agent"), issue(3, "ready-for-agent")])
+        verdict(w, 2, "already-satisfied")
+        r, note = launcher(note, now=int(time.time()) + 5000)
+        assert r["progress"] == ("dispatched #3; cleared #1; 1 judgment open; "
+                                 "2 in flight, 0 left on the frontier")
+        assert w.claimed_by(3) == "fl-7" and w.claimed_by(1) is None
+        assert [t["command"] for t in w.terminals()] == [WORKER] * 3
+        # the judgment is answered with what it carries, not with what was remembered
+        (j,) = r["judgments"]
+        assert (j["issue"], j["kind"], r["sleep_seconds"]) == (2, "empty_diff", 0)
+        assert "--instance fl-7 " in j["if_yes"] and "--instance fl-7 " in j["if_no"]
+        assert shlex.quote(WORKER) in j["if_no"]                     # a retry starts a worker
+        assert answer(w, j["if_yes"])["action"] == "closed" and w.claimed_by(2) is None
+
+        # answered → the next cycle at once, and it does not ask again
+        r, note = launcher(note, now=int(time.time()))
+        assert r["judgments"] == [] and r["state"]["instance"] == "fl-7"
+        assert r["state"]["worker_command"] == WORKER
+
+        # the stop, from the same three values
+        r, note = launcher(note, "--drain")
+        assert (r["action"], r["progress"]) == ("drain", "drained; released #3")
+        assert w.claimed_by(3) is None
+
+
+def test_the_drain_releases_claims_with_no_pr_and_keeps_those_with_one():
+    """`afk cycle --drain` is the launcher's stop, in code: a claim no open PR
+    stands behind is released — its worker still coding, or its issue already
+    closed — and one with an open PR is kept, for a peer or a later run to land
+    once the lease lapses. Nothing else happens: no turn, no dispatch, no worker
+    told anything, no peer's claim touched."""
+    issues = [issue(n, "ready-for-agent") for n in (1, 2, 3, 4)]
+    issues += [issue(5, "ready-for-agent", state="closed")]
+    with world(issues=issues) as w:
+        with_pr(w, 1, 10, conclusion="PENDING")                      # finished, checks running
+        w.afk(*dispatch(2))                                          # still coding
+        w.afk("claim", "4", "--instance", "peer-live", *NOW, *R)
+        w.afk("heartbeat", "--instance", "peer-live", "--now", str(T0 - 60), *R)
+        r = cycle(w, None, "--set", "concurrency=2")
+        assert r["progress"] == "2 in flight, 1 left on the frontier"
+        w.afk("claim", "5", *ME, *NOW, *R)                           # mine, outlived its issue
+        sent = [len(t["sent"]) for t in w.terminals()]
+
+        done = cycle(w, r["state"], "--drain", "--set", "concurrency=2")
+        assert set(done) == {"action", "reason", "state", "sleep_seconds", "progress", "judgments"}
+        assert (done["action"], done["reason"]) == ("drain", "stop")
+        assert done["progress"] == "drained; released #2, #5; kept #1"
+        # nothing follows a drain: no sleep, nothing to answer
+        assert done["sleep_seconds"] is None and done["judgments"] == []
+        assert done["state"]["in_flight"] == 1 and done["state"]["instance"] == "me"
+        assert w.claimed_by(2) is None and w.claimed_by(5) is None
+        assert w.claimed_by(1) == "me" and "state" not in w.pr(10)   # the PR is left open
+        # the frontier was not worked, the peer not touched, no worker told anything
+        assert w.claimed_by(3) is None and w.claimed_by(4) == "peer-live"
+        assert [len(t["sent"]) for t in w.terminals()] == sent
+        # an open issue's worktree may hold work: the drain removes none
+        assert {wt["linkedIssue"] for wt in w.worktrees()} == {1, 2}
+
+        # draining twice is harmless, and so is a drain that was never preceded by a cycle
+        assert cycle(w, done["state"], "--drain")["progress"] == "drained; kept #1"
+        assert cycle(w, None, "--drain")["progress"] == "drained; kept #1"
+
+
 def test_a_tick_in_code_settles_every_row_the_rebuild_routes():
     """One `afk cycle` does what a tick used to read 300 lines to do: release a
     claim that outlived its issue, delete a dead peer's phantom lock under its sha,
@@ -1728,7 +1819,8 @@ def test_dispatch_continues_from_whatever_progress_survived():
 # act: the landing turn (`afk turn`) and the landing (`afk land`) — ADR-0027   #
 # --------------------------------------------------------------------------- #
 
-TRUST = ("--set", "gate.trust_recorded_run=true")
+TRUST = ("--set", "gate.trust_recorded_run=true")      # the default, spelled out
+RERUN = ("--set", "gate.trust_recorded_run=false")     # the landing always gates itself
 
 
 def _turn(n, *extra, now=T0, instance="me"):
@@ -1858,8 +1950,11 @@ def test_a_worker_lands_its_own_pr_on_the_turn_the_fleet_grants():
         r = json.loads(p.stdout)
         assert p.returncode == 0 and (r["outcome"], r["pr"], r["synced"], r["head"]) == \
             ("merged", 30, False, synced), r
-        assert r["gate"] == {"status": "green", "source": "run", "head": synced,
-                             "command": "test -f feature3.txt && test -f landed-meanwhile.txt"}
+        # the landing gh refused had gated this very head, green: that run is on
+        # record, so this one does not gate it again (ADR-0026)
+        assert r["gate"] == {"status": "green", "source": "recorded", "head": synced,
+                             "command": "test -f feature3.txt && test -f landed-meanwhile.txt",
+                             "recorded_at": r["gate"]["recorded_at"]}
         # gh was pinned to the gated head, with the configured strategy
         assert w.pr(30)["merged"] == {"strategy": "squash", "head": synced, "delete_branch": True}
         # what landed contains both sides, by MERGE (the base tip is an ancestor)
@@ -2192,19 +2287,17 @@ def test_a_recorded_worker_gate_run_is_not_repeated_by_the_landing():
                              "command": command, "recorded_at": r["gate"]["recorded_at"]}
         assert count() == 1 and w.pr(30)["merged"]["head"] == head
 
-        # opt-in, default off: the same record, and the landing gates as it always did
+        # turned off: the same record, and the landing gates for itself anyway
         d, _ = with_pr(w, 4, 40, gate=gate)
         git(d["worktree"], "pull", "-q", "--no-edit", "origin", w.sb.base)   # the worker's own sync
         head = git(d["worktree"], "rev-parse", "HEAD")
         git(d["worktree"], "push", "-q", "origin", "HEAD")
         assert _gate(w, d["worktree"], command)["recorded"] is True and count() == 2
-        w.afk(*_turn(4, *gate))
-        r = _land(w, 4, d["worktree"], *gate)
+        w.afk(*_turn(4, *gate, *RERUN))
+        r = _land(w, 4, d["worktree"], *gate, *RERUN)
         assert (r["outcome"], r["gate"]) == \
             ("merged", {"status": "green", "source": "run", "head": head, "command": command})
         assert count() == 3
-        # and only local mode has a landing run to skip
-        assert "gate.trust_recorded_run" in _land_error(w, 4, d["worktree"], *TRUST)
 
 
 def test_a_recorded_gate_run_is_void_unless_it_is_of_the_head_that_lands():
@@ -2420,7 +2513,7 @@ def test_a_turn_with_no_terminal_is_delivered_by_continuation_never_from_base():
 
 
 # --------------------------------------------------------------------------- #
-# act: the merge batch (ADR-0028)                                              #
+# act: the merge batch (ADR-0029)                                              #
 # --------------------------------------------------------------------------- #
 
 BATCH = ("--set", "merge.batch=true")
@@ -3534,11 +3627,40 @@ def test_the_docs_name_exactly_the_words_the_code_returns():
     for phase in afk_decide.VERDICT_PHASES:
         assert f"`{phase}`" in skill and f"**`{phase}`**" in docs["worker-prompt.md"], phase
 
-    # the tick's instructions are the short form: one call, then the judgments. The
+    # a cycle's instructions are the short form: one call, then the judgments. The
     # routing table a tick used to re-read every pass is code under test, not prose
-    tick = skill[skill.index("## A tick ("):skill.index("## Cooperative multi-fleet")]
+    tick = skill[skill.index("## A cycle ("):skill.index("## Cooperative multi-fleet")]
     assert " cycle --repo <repo> --config" in tick and len(tick.splitlines()) < 90
     assert "idle_stalled" not in skill and "merge_order" not in skill
+
+
+def test_the_docs_have_the_launcher_run_each_cycle_itself():
+    """A tick is a pass in code, not a context (ADR-0028): no document a launcher
+    or a human reads this skill from tells anyone to spawn one. The one subagent
+    left is the ephemeral reader of a `bulky` judgment, and the stop is a cycle."""
+    docs = _skill_docs()
+    skill = docs["SKILL.md"]
+    for name, text in docs.items():
+        spawned = re.findall(r".*(?<!re-)\bspawn.*", text)       # a worker may be re-spawned
+        assert not spawned, (name, spawned)
+        assert "fresh-context" not in text and "disposable tick" not in text, name
+    # two roles hold a context; the tick is described beside them, not among them
+    roles = re.findall(r"^\| \*\*(\w+)\*\* \|", skill[:skill.index("## Why it runs forever")], re.M)
+    assert roles == ["launcher", "worker"], roles
+    # every paragraph that names a subagent or the Agent tool is the bulky judgment's
+    named = [para for para in re.split(r"\n(?=- |\n)", skill)
+             if re.search(r"subagent|\bAgent\b", para)]
+    assert len(named) == 1 and "`bulky: true`" in named[0], named
+    # the stop is the drain, and the drain is `afk cycle`
+    loop = skill[skill.index("### Loop"):skill.index("## Tools (")]
+    assert " cycle --drain --repo <repo> --config" in loop and "afk release" not in loop
+    assert "`afk cycle --drain`" in docs["cooperative-multi-fleet.md"]
+    assert "--drain" in next(ln for ln in docs["tools.md"].splitlines()
+                             if ln.startswith("| `afk cycle"))
+    # the glossary agrees: the launcher runs the tick, and the facts ride in the state
+    context = docs.get("CONTEXT.md")
+    if context is not None:                       # an installed skill ships without it
+        assert "ADR-0028" in context and "does no coordination" not in context
 
 
 def test_the_tools_table_is_the_one_the_parser_generates():

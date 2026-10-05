@@ -194,7 +194,7 @@ def test_turn_record_round_trips_and_is_held_only_by_the_claims_owner():
 
 
 def test_a_batchs_turn_is_one_marker_on_every_member_and_leaving_it_is_remembered():
-    """ADR-0028: a merge batch's turn is the turn marker, on every member PR,
+    """ADR-0029: a merge batch's turn is the turn marker, on every member PR,
     naming the batch, its members and its phase. A PR that leaves a batch
     without landing holds no turn — and says so on every marker written for it
     afterwards, so it is never batched again."""
@@ -261,7 +261,7 @@ def test_a_batch_is_known_by_its_id_wherever_orca_puts_its_branch():
 
 
 def test_the_cycle_forms_a_batch_only_from_two_or_more_eligible_prs():
-    """The batch-or-single decision, whole (ADR-0028) — a table lookup, so it is
+    """The batch-or-single decision, whole (ADR-0029) — a table lookup, so it is
     this function and not a paragraph."""
     on = d.resolve_config({"gate": {"ci": "local", "local_command": "make test"},
                            "merge": {"batch": True}})
@@ -455,16 +455,13 @@ def test_a_recorded_gate_run_counts_only_for_the_commit_and_command_it_ran():
     void = d.gate_record_void(rec, "def456", "make test")
     assert "abc123" in void and "def456" in void
 
-    # only local mode has a landing run to skip: on `required` the key would be
-    # one a human sets to no effect
-    on = {"local_command": "make test", "trust_recorded_run": True}
-    d.validate_config(d.resolve_config({"gate": {**on, "ci": "local"}}))
-    assert d.CONFIG_DEFAULTS["gate"]["trust_recorded_run"] is False     # opt-in
-    try:
-        d.validate_config(d.resolve_config({"gate": on}))
-        assert False, "expected ValueError"
-    except ValueError as e:
-        assert "trust_recorded_run" in str(e)
+    # on unless a repo turns it off — and so never an error in `required` mode,
+    # which has no landing run of the command to skip: the key is inert there
+    assert d.CONFIG_DEFAULTS["gate"]["trust_recorded_run"] is True
+    for ci in d.GATE_CI_MODES:
+        for trust in (True, False):
+            d.validate_config(d.resolve_config(
+                {"gate": {"ci": ci, "local_command": "make test", "trust_recorded_run": trust}}))
 
     # the line a worker gates with: the tool, carrying the command — quoted for a shell
     assert d.gate_command("/s/afk.py", " make test ") == \
@@ -478,7 +475,7 @@ def test_a_recorded_gate_run_counts_only_for_the_commit_and_command_it_ran():
 
 
 def test_a_merge_batch_needs_the_local_gate_and_a_target_that_takes_a_push():
-    """What bootstrap refuses (ADR-0028). A batch is gated by ONE run of
+    """What bootstrap refuses (ADR-0029). A batch is gated by ONE run of
     `gate.local_command` on the stack, and lands by pushing to the target."""
     local = {"gate": {"ci": "local", "local_command": "make test"}, "merge": {"batch": True}}
     assert d.validate_config(d.resolve_config(local))["merge"]["batch"] is True
@@ -1431,6 +1428,20 @@ def test_cycle_ticked_folds_what_the_tick_did_and_counts_empty_ticks():
     assert ticked(asked["state"])["state"]["unsettled"] is False     # a clean tick settles it
 
 
+def test_cycle_drained_folds_the_stop_and_schedules_nothing():
+    st = d.cycle_ticked(d.cycle_state(None, **FACTS), _did(in_flight=3), PACE_CFG)["state"]
+    r = d.cycle_drained(st, [1, 2], [7])
+    assert r["progress"] == "drained; released #1, #2; kept #7"
+    assert r["sleep_seconds"] is None                          # no cycle follows a drain
+    assert (r["state"]["in_flight"], r["state"]["unsettled"]) == (1, False)
+    assert d.cycle_state(r["state"]) == r["state"]             # still a state the code takes back
+    assert d.cycle_drained(st, [], [])["progress"] == "drained"
+    # a release that failed left its claim held: said, and never read as settled
+    failed = d.cycle_drained(st, [1], [2, 7], errors=1)
+    assert failed["progress"] == "drained; released #1; kept #2, #7; 1 error"
+    assert failed["state"]["unsettled"] is True
+
+
 def test_cycle_wake_gates_beats_and_paces_a_skipped_cycle():
     cfg, st = PACE_CFG, d.cycle_state(None, **FACTS)
     first = d.cycle_wake(st, "aaa", cfg)
@@ -1762,7 +1773,7 @@ def test_a_worker_reads_the_one_way_its_pr_lands_when_it_holds_the_turn():
     """ADR-0027. `afk land` is the only way a PR lands, and the landing brief is
     the only place it is spelled: the command, and what to do on each outcome it
     can stop with. A worker with a PR still to open is told only that it lands
-    later, on its turn, and never by hand."""
+    when it is told to, and never by hand."""
     t = _prompt_template()
     # the config travels whole, quoted for the worker's shell — and it is free text
     # to the template: a `{branch}` or an apostrophe inside it arrives verbatim
@@ -1779,14 +1790,15 @@ def test_a_worker_reads_the_one_way_its_pr_lands_when_it_holds_the_turn():
     for outcome in d.LAND_OUTCOMES:
         assert f"| `{outcome}` |" in alone, outcome
     for body in (fresh, cont, alone):
-        assert "landing turn" in body and "gh pr merge" in body          # named only to forbid it
-        assert "afk:block" not in body
-    # a worker with a PR to open is told it does NOT merge until its turn — and is
-    # not handed the command, or its outcomes, before it can run it
+        assert "gh pr merge" in body and "afk:block" not in body         # named only to forbid it
+    assert "landing turn" in alone
+    # a worker with a PR to open is told it does NOT merge it, and that it is told
+    # when to land it — and is not handed the command, or its outcomes, or how the
+    # fleet takes turns, before it can act on any of them
     for body in (fresh, cont):
-        assert "## Landing — later, on your PR's landing turn" in body
-        assert "never merge your PR yourself" in body and "only on its landing turn" in body
+        assert "Do not merge the PR" in body and "you are told\n   here when to land it" in body
         assert " land --issue " not in body and "| `outcome` |" not in body
+        assert "landing turn" not in body
 
     # the landing brief is the whole instruction, alone: which PR, where it lands,
     # the command, the wake — and nothing about implementing or opening a PR

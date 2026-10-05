@@ -52,7 +52,7 @@ CONFIG_DEFAULTS = {
     "gate": {
         "ci": "required",
         "local_command": "",
-        "trust_recorded_run": False,
+        "trust_recorded_run": True,
         "adversarial_verify": False,
         "adversarial_verify_prompt": "",
     },
@@ -143,17 +143,13 @@ def validate_config(cfg):
         raise ValueError("config gate.ci: 'local' requires a non-empty gate.local_command — in "
                          "local mode that command IS the completion gate (ADR-0012), so an empty "
                          "one would merge every PR unverified")
-    if gate.get("trust_recorded_run") and ci != "local":
-        raise ValueError("config gate.trust_recorded_run: only gate.ci: 'local' has a landing "
-                         "run of gate.local_command to skip (ADR-0026) — set gate.ci to 'local' "
-                         "or leave this false")
     strategy = (cfg.get("merge") or {}).get("strategy")
     if strategy not in MERGE_STRATEGIES:
         raise ValueError(f"config merge.strategy: expected one of "
                          f"{' | '.join(MERGE_STRATEGIES)}, got {strategy!r}")
     if (cfg.get("merge") or {}).get("batch") and ci != "local":
         raise ValueError("config merge.batch: a merge batch is gated by one run of "
-                         "gate.local_command on the stack (ADR-0028), which only gate.ci: "
+                         "gate.local_command on the stack (ADR-0029), which only gate.ci: "
                          "'local' has — with 'required', GitHub's own merge queue is the tool. "
                          "Set gate.ci to 'local' or leave this false")
     return cfg
@@ -499,7 +495,7 @@ def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, landing=False):
 # the worker runs it after its pre-PR sync, and `afk land` runs it again on the
 # landing turn, after the landing's sync, in the same worktree. The invariant
 # both runs serve: *what lands on the target branch was tested in the form it
-# lands.* With `gate.trust_recorded_run` the second run is skipped when — and
+# lands.* With `gate.trust_recorded_run` (the default) the second run is skipped when — and
 # only when — a green run is on record for the exact head that lands
 # (`gate_record_void`, ADR-0026). A red run comes back as a bounded excerpt,
 # never a raw log.
@@ -591,7 +587,7 @@ def protection_verdict(ci_mode, protection, unavailable=None, batch=False):
              surprise on the first merge.
              Likewise `merge.batch` + a target that refuses a direct push (it
              requires a pull request, restricts who may push, or is locked): every
-             batch would gate its stack and then be refused (ADR-0028).
+             batch would gate its stack and then be refused (ADR-0029).
       warn   the probe itself was inconclusive: continue, but say so.
       ok     nothing incompatible. In `required` mode required checks are exactly
              what the fleet waits for, so they are never a problem.
@@ -1114,7 +1110,7 @@ def stall_reason(reason, tail):
 # `afk land` last stopped short of merging, on which `head`. The record lives
 # and dies with the PR: merged or closed, the turn is free.
 #
-# A turn is held by one PR or by one MERGE BATCH (ADR-0028). A batch's turn is
+# A turn is held by one PR or by one MERGE BATCH (ADR-0029). A batch's turn is
 # the same marker on every member PR, with three more fields:
 #
 #   batch=<id> members=<issue>:<pr>,… phase=<stacking|gating|fixing>
@@ -1213,7 +1209,7 @@ def turn_comment(instance, at, verified=None, allow_no_checks=False, stopped=Non
 
 def batch_turn_comment(instance, at, batch, members, phase):
     """The comment that records a MERGE BATCH's landing turn on one member PR —
-    the same marker on every member (ADR-0028).
+    the same marker on every member (ADR-0029).
 
       batch:   the batch's id (`batch_id`)
       members: [{"issue", "pr"}...], in stack order — every PR the batch holds
@@ -1350,7 +1346,7 @@ def turn_order(rows):
 
 
 # --------------------------------------------------------------------------- #
-# The merge batch — N ready PRs behind one gate run (ADR-0028)                 #
+# The merge batch — N ready PRs behind one gate run (ADR-0029)                 #
 # --------------------------------------------------------------------------- #
 #
 # When two or more finished PRs wait for the landing turn, the turn goes to a
@@ -1414,7 +1410,7 @@ def batch_candidates(mine, merge_order, config, busy=()):
     """
     The claims a merge batch is formed from — their issue numbers, in merge
     order — or [] when the turn goes to ONE PR as before. The cycle's
-    batch-or-single decision, whole (ADR-0028):
+    batch-or-single decision, whole (ADR-0029):
 
       mine, merge_order: the working set's
       config:  read for merge.batch, gate.ci and gate.adversarial_verify
@@ -1768,9 +1764,10 @@ def select_recovery(worktree, branch):
 # is handed over. The `landing` block is a brief of its own — `render_landing` —
 # pointed at when the worker is given its landing turn: the one command a worker
 # lands its PR with and what each of its outcomes asks for (ADR-0027). It is the
-# only place either is spelled; the body says no more than that the PR lands
-# later, on its turn. The `batch` block is a third brief, for a merge batch's
-# worker — `render_batch_brief`, with fields of its own (ADR-0028). Everything else in braces is a
+# only place either is spelled; the body says no more than that the worker does
+# not merge its PR and is told when to land it. The `batch` block is a third
+# brief, for a merge batch's worker — `render_batch_brief`, with fields of its
+# own (ADR-0029). Everything else in braces is a
 # field — four of them derived: {wake_command}, the line a worker runs to wake
 # the launcher once its outcome is on GitHub, built from the `launcher_terminal`
 # field (ADR-0020), {gate_command}, the line a worker runs the local gate with —
@@ -1927,7 +1924,7 @@ BATCH_FIELDS = ("batch", "members", "repo", "target", "afk_path", "config", "bra
 
 def batch_land_command(afk_path, batch, repo, config):
     """The one command a batch worker stacks, gates and lands its batch with:
-    `afk land --batch`, carrying the run's config (ADR-0028)."""
+    `afk land --batch`, carrying the run's config (ADR-0029)."""
     return (f"{shlex.quote(afk_path)} land --batch {shlex.quote(batch)} --repo {shlex.quote(repo)} "
             f"--config {shlex.quote(config)}")
 
@@ -2027,7 +2024,7 @@ _PHASES = {
 STATUS_PHASES = tuple(_PHASES)
 
 # The 'where are we now' line of a claim whose PR holds the turn as a member of
-# a merge batch (ADR-0028), and what its batch worker is doing, by BATCH_PHASES.
+# a merge batch (ADR-0029), and what its batch worker is doing, by BATCH_PHASES.
 _BATCH_LINE = ("▸ 当前:已轮到落地,与 {prs} 合为一个 merge batch —— batch worker {doing},"
                "整批过一次门后一起落地")
 _BATCH_DOING = {"stacking": "正在把各 PR 叠放到目标分支上(stacking)",
@@ -2303,6 +2300,29 @@ def cycle_ticked(state, did, config, judgments=0, errors=0):
             "sleep_seconds": 0 if judgments else pace(did_work, in_flight,
                                                       new["empty_streak"], config),
             "progress": "; ".join([*parts, _standing(new)])}
+
+
+def cycle_drained(state, released, kept, errors=0):
+    """
+    The bottom of the LAST cycle of a run — `afk cycle --drain`, the launcher's
+    stop: fold what the drain released and kept into the cycle state.
+
+      released: issue numbers whose claim was released — it had no PR yet, or
+                had outlived its issue
+      kept:     issue numbers whose claim is still held: an open PR closes the
+                issue, and a peer (or a later run) lands it once the lease lapses
+      errors:   how many releases failed — those claims are still held too
+
+    Returns {"state", "sleep_seconds", "progress"}. `sleep_seconds` is None:
+    nothing follows a drain. One that met an error is `unsettled`, so a caller
+    that does run it again is not told it has nothing to do.
+    """
+    new = {**state, "in_flight": len(kept), "unsettled": bool(errors)}
+    parts = [f"{word} {', '.join(f'#{n}' for n in numbers)}"
+             for word, numbers in (("released", released), ("kept", kept)) if numbers]
+    parts += [f"{errors} error{'' if errors == 1 else 's'}"] if errors else []
+    return {"state": new, "sleep_seconds": None,
+            "progress": "; ".join(["drained", *parts])}
 
 
 def _standing(state):
@@ -2637,9 +2657,9 @@ def resolve_worker_command(base_url, supplied=None, resolved=None, runtime="clau
 # Fingerprint gate — skip ticks code can prove are no-ops (ADR-0007)           #
 # --------------------------------------------------------------------------- #
 #
-# A tick is a fresh LLM context; spawning one just to conclude "still waiting"
-# is the fleet's main steady-state token spend. The gate collapses everything a
-# tick's Rebuild observes into a short digest; the launcher spawns a tick only
+# A tick is a rebuild and a pass of transitions: dozens of gh calls, just to
+# conclude "still waiting", most cycles of a run. The gate collapses everything a
+# tick's Rebuild observes into a short digest; `afk cycle` runs a tick only
 # when the digest moved (or a forced full pass is due). A false "changed" costs
 # one tick; a missed change waits at most `force_after`
 # cycles. Correctness never depends on the gate.
