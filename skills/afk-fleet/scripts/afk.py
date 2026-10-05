@@ -40,6 +40,7 @@ Invoked as:  <skill>/scripts/afk.py <subcommand> [flags]
 import argparse
 import concurrent.futures
 import dataclasses
+import functools
 import json
 import os
 import shlex
@@ -1174,10 +1175,35 @@ def cmd_rebuild(a):
     return _rebuild(_run(a), a.instance)
 
 
+# --------------------------------------------------------------------------- #
+# the worker of an issue, or of a merge batch: where it is, what it is doing   #
+# --------------------------------------------------------------------------- #
+#
+# The one place orca is asked where a worker's worktree is and what its worker
+# is doing, for an issue's worker and a merge batch's alike. How orca is read
+# follows from what the answer is for, so no caller picks:
+#
+#   what a worker is DOING    `_Workers` — HARD. Its answer may be "the worker is
+#                             gone", and an orca that cannot be asked, read that
+#                             way, starts a second worker beside a live one
+#                             (ADR-0021): it is an error instead.
+#   WHERE a worktree is, to   `_issue_worktree`, `_live_worktree`,
+#   act on it or recover      `_batch_worktree`, `_batch_worktrees` — SOFT. No orca
+#   from it                   is "no worktree here": a recovery has tiers that
+#                             need none (ADR-0011), and whatever then has to
+#                             start or tell a worker asks orca hard itself.
+
+def _on_disk(path):
+    """`path` when it is a directory on this machine's disk, else None — the one
+    place a path orca remembers but the disk no longer has reads as "no worktree
+    here"."""
+    return path if path and os.path.isdir(path) else None
+
+
 def _issue_worktree(repo, number):
     """This machine's orca worktree for an issue → (path, branch), each None when
-    there is none. Soft, like the read behind it: no orca means no worktree. A
-    path orca remembers but the disk no longer has is returned as-is — a caller
+    there is none. A path orca remembers but the disk no longer has is returned
+    as-is, for the callers that must still see it: removing it, reporting it. One
     that will read the worktree asks `_live_worktree` instead."""
     hit = afk_decide.find_orca_worktree(_orca_worktree_rows(), number, repo)
     return hit["path"], hit["branch"]
@@ -1185,11 +1211,101 @@ def _issue_worktree(repo, number):
 
 def _live_worktree(repo, number):
     """The path of an issue's worktree that is really on this machine's disk, None
-    when orca knows none or the directory is gone — what every caller that reads
-    or works IN the worktree wants. (`_issue_worktree` is for the ones that must
-    also see a path orca still remembers: removing it, reporting it.)"""
-    path, _ = _issue_worktree(repo, number)
-    return path if path and os.path.isdir(path) else None
+    when orca knows none or the directory is gone — what every caller that works
+    IN the worktree wants."""
+    return _on_disk(_issue_worktree(repo, number)[0])
+
+
+def _batch_worktrees(repo, instance):
+    """Every worktree orca remembers here for a merge batch of `instance` →
+    [{"batch", "path", "branch"}], whether or not the disk still has it."""
+    return afk_decide.batch_worktrees(_orca_worktree_rows(), repo, instance=instance)
+
+
+def _batch_worktree(repo, batch):
+    """The path of a merge batch's worktree that is really on this machine's
+    disk, None when there is none."""
+    return _batch_path(_orca_worktree_rows(), repo, batch)
+
+
+def _batch_path(rows, repo, batch):
+    """`_batch_worktree`, from orca's worktree `rows` however they were read."""
+    return next((path for hit in afk_decide.batch_worktrees(rows, repo, batch=batch)
+                 for path in [_on_disk(hit["path"])] if path), None)
+
+
+# Far above any one machine's worktree count: a page that stops short is an error.
+_PS_LIMIT = 10000
+
+
+class _Worker:
+    """One worker as `_Workers` saw it: where its worktree is on this machine,
+    and what it is doing."""
+
+    def __init__(self, path, reading, now, grace):
+        self.path = path            # its worktree, on this disk — None: none here, so no worker
+        self.reading = reading      # `afk_decide.read_worker_state`: busy, idle or none
+        self.now, self.grace = now, grace  # the clock and the grace period it was read with
+
+    @property
+    def busy(self):
+        return self.reading["terminal"] == "busy"
+
+    @functools.cached_property
+    def nudged_at(self):
+        """When this worker was nudged, None when it never was."""
+        return (_nudge(self.path) or {}).get("at")
+
+    @property
+    def settled(self):
+        """Its classification when the reading alone decides it — busy, or gone
+        (`afk_decide.settled_by_worker_state`) — else None: only then is anything
+        in git or on GitHub worth reading for it."""
+        return afk_decide.settled_by_worker_state(self.reading, self.now, self.grace,
+                                                  self.nudged_at)
+
+
+class _Workers:
+    """What the workers on this machine are doing, as their runtimes reported it
+    to orca (ADR-0021) — one read of orca for every worker then asked after, an
+    issue's (`of_issue`) or a merge batch's (`of_batch`).
+
+    HARD, and a truncated `ps` page is an error too: an orca that cannot be asked
+    is never "no worktree" or "no worker there"."""
+
+    def __init__(self, run):
+        self._repo = run.repo
+        self.now, self.grace = run.now(), run.cfg["worker_idle_grace_seconds"]
+
+    @functools.cached_property
+    def _rows(self):
+        return _orca(["worktree", "list"]).get("worktrees") or []
+
+    @functools.cached_property
+    def _states(self):
+        ps = _orca(["worktree", "ps", "--limit", str(_PS_LIMIT)])
+        if ps.get("truncated"):
+            raise RuntimeError(f"orca worktree ps truncated at {_PS_LIMIT} rows")
+        return {r.get("path"): r for r in ps.get("worktrees") or []}
+
+    def of_issue(self, number):
+        """The worker on issue <number>."""
+        return self.at(afk_decide.find_orca_worktree(self._rows, number, self._repo)["path"])
+
+    def of_batch(self, batch):
+        """The batch worker of merge batch `batch`."""
+        return self.at(_batch_path(self._rows, self._repo, batch))
+
+    def at(self, path):
+        """The worker in the worktree at `path`, wherever that path came from: one
+        the disk does not have holds no worker."""
+        path = _on_disk(path)
+        row = self._states.get(path) if path else None
+        reading = afk_decide.read_worker_state(row, self.now, self.grace)
+        if reading["terminal"] != "none" and reading["state"] is None:
+            # a runtime that reports nothing: ask orca whether its terminal is idle
+            reading = afk_decide.read_worker_state(row, self.now, self.grace, _tui_idle(path))
+        return _Worker(path, reading, self.now, self.grace)
 
 
 def cmd_no_pr(a):
@@ -1222,76 +1338,42 @@ def _workers_seen(run, numbers=None, batch_id=None, worktree=None):
     or for the worker of merge batch `batch_id`: each also carries the `cause`
     its worker was classified with, which is what the tick routes on
     (`afk_decide.worker_step`, `batch_step`)."""
-    cfg = run.cfg
     if bool(numbers) == bool(batch_id):
         raise ValueError("afk no-pr takes --issue <n> (repeatable), or --batch <batch>")
-    if batch_id:
-        return {"workers": [_batch_worker(run, batch_id)]}
-    if worktree is not None:
+    if worktree is not None and not batch_id:
         if len(numbers) != 1:
             raise ValueError("--worktree names one worker's worktree: give it with one --issue")
-        if not os.path.isdir(worktree):
+        if not _on_disk(worktree):
             raise ValueError(f"worktree not found: {worktree} (omit --worktree to let orca find it)")
-    # HARD reads: an orca that cannot be asked is never "the worker is gone" —
-    # read that way it would start a second worker beside a live one
-    rows = _orca(["worktree", "list"]).get("worktrees") or []
-    states = _worker_states()
-    now, grace = run.now(), cfg["worker_idle_grace_seconds"]
-    workers = []
+    workers = _Workers(run)
+    if batch_id:
+        return {"workers": [_batch_worker(run, batch_id, workers.of_batch(batch_id))]}
+    seen = []
     for number in numbers:
-        path = worktree
-        if path is None:
-            found = afk_decide.find_orca_worktree(rows, number, run.repo)["path"]
-            path = found if found and os.path.isdir(found) else None
-        reading = _worker_reading(states, path, now, grace)
-        workers.append({"issue": number,
-                        **_worker_outcome(run, number, path, reading, now, grace),
-                        "worker_state": reading["state"]})
-    return {"workers": workers}
+        worker = workers.of_issue(number) if worktree is None else workers.at(worktree)
+        seen.append({"issue": number, **_worker_outcome(run, number, worker),
+                     "worker_state": worker.reading["state"]})
+    return {"workers": seen}
 
 
-# Far above any one machine's worktree count: a page that stops short is an error.
-_PS_LIMIT = 10000
-
-
-def _worker_states():
-    """Every worktree's row of `orca worktree ps`, by path — what each worker's
-    runtime reported (ADR-0021). HARD: an orca that cannot be asked is never "no
-    worker there"."""
-    ps = _orca(["worktree", "ps", "--limit", str(_PS_LIMIT)])
-    if ps.get("truncated"):
-        raise RuntimeError(f"orca worktree ps truncated at {_PS_LIMIT} rows")
-    return {r.get("path"): r for r in ps.get("worktrees") or []}
-
-
-def _worker_reading(states, path, now, grace):
-    """`afk_decide.read_worker_state` for the worker in the worktree at `path`
-    (None: this machine has no worktree, so no worker), from `_worker_states`."""
-    row = states.get(path) if path else None
-    reading = afk_decide.read_worker_state(row, now, grace)
-    if reading["terminal"] != "none" and reading["state"] is None:
-        # a runtime that reports nothing: ask orca whether its terminal is idle
-        reading = afk_decide.read_worker_state(row, now, grace, _tui_idle(path))
-    return reading
-
-
-def _worker_outcome(run, number, path, reading, now, grace):
+def _worker_outcome(run, number, worker):
     """One worker's classification, gathering only what its reading leaves open:
-    busy or gone is settled by the reading alone
-    (`afk_decide.settled_by_worker_state`), so it costs no git and no GitHub."""
-    cfg = run.cfg
-    nudged_at = (_nudge(path) or {}).get("at")
-    settled = afk_decide.settled_by_worker_state(reading, now, grace, nudged_at)
+    busy or gone is settled by the reading alone (`_Worker.settled`), so it costs
+    no git and no GitHub."""
+    cfg, path, nudged_at = run.cfg, worker.path, worker.nudged_at
+    settled = worker.settled
     if settled:
         return {**settled, "worktree": path, "progress": {}, "worker_verdict": None,
                 "blockers": [], "nudged_at": nudged_at, "turn_at": None}
+    now, grace = worker.now, worker.grace
     progress = _worktree_progress(path, run.rem, cfg["base_branch"]) if path else {}
     declared = afk_decide.latest_verdict(_issue_comments(run.repo, number))
     prs = _open_prs(run.repo)
     blockers = _blocker_standings(run, number, declared["blocked_by"], prs)
     pr = afk_decide.closing_pr(prs, number)
     turn = (_turn(run.repo, pr["number"]) if pr else None) or {}
-    return {**afk_decide.classify_stopped(progress, reading["terminal_idle_seconds"], declared,
+    return {**afk_decide.classify_stopped(progress, worker.reading["terminal_idle_seconds"],
+                                          declared,
                                           {b["number"]: b["standing"] for b in blockers},
                                           now, grace, nudged_at=nudged_at,
                                           can_nudge=path is not None, turn=turn),
@@ -1418,7 +1500,7 @@ def _recovery(cfg, rem, repo, number, path=None, branch=None, no_worktree=False)
     if path is None and not no_worktree:
         path, found_branch = _issue_worktree(repo, number)
         branch = branch or found_branch
-    present = bool(path and os.path.isdir(path))
+    present = _on_disk(path) is not None
     worktree = {"present": present, "path": path,
                 **(_worktree_progress(path, rem, base) if present else {})}
 
@@ -2324,17 +2406,6 @@ def _save_batch_state(path, state):
         json.dump(state, f)
 
 
-def _batch_worktree(repo, batch, rows=None):
-    """The path of a batch's worktree that is really on this machine's disk, None
-    when there is none. `rows` are orca's worktree rows when the caller has
-    read them (a HARD read); else they are read softly, like `_issue_worktree`."""
-    rows = _orca_worktree_rows() if rows is None else rows
-    for hit in afk_decide.batch_worktrees(rows, repo, batch=batch):
-        if hit["path"] and os.path.isdir(hit["path"]):
-            return hit["path"]
-    return None
-
-
 def _require_my_batch(run, instance, batch):
     """The turn marker of a batch one of MY claims' PRs is in → that marker.
     Raises when no PR of mine carries it: a batch is only ever moved by the
@@ -2377,21 +2448,6 @@ def _delete_batch_branches(rem, batch, keep=None):
     for branch in gone:
         _delete_branch(rem, branch, check=False)
     return gone
-
-
-def _busy_workers(run, numbers):
-    """The issues among `numbers` whose own worker is still working, as orca
-    reports its worker state (ADR-0021). HARD reads, like `afk no-pr`'s."""
-    rows = _orca(["worktree", "list"]).get("worktrees") or []
-    states = _worker_states()
-    now, grace = run.now(), run.cfg["worker_idle_grace_seconds"]
-    busy = []
-    for number in numbers:
-        found = afk_decide.find_orca_worktree(rows, number, run.repo)["path"]
-        path = found if found and os.path.isdir(found) else None
-        if _worker_reading(states, path, now, grace)["terminal"] == "busy":
-            busy.append(number)
-    return busy
 
 
 def _turn_batch(run, instance, agent, working_set=None):
@@ -2450,7 +2506,9 @@ def _turn_batch(run, instance, agent, working_set=None):
                     detail=f"issue #{holder}'s PR holds this fleet's landing turn; nothing was "
                            f"touched — no batch is formed while a turn is out")
     eligible = afk_decide.batch_candidates(ws["mine"], ws["merge_order"], cfg)
-    busy = _busy_workers(run, eligible) if eligible else []
+    # a PR whose own worker is still working may yet move
+    workers = _Workers(run)
+    busy = [n for n in eligible if workers.of_issue(n).busy]
     picked = afk_decide.batch_candidates(ws["mine"], ws["merge_order"], cfg, busy=busy)
     if not picked:
         return stop("too_few", busy=busy,
@@ -2530,32 +2588,28 @@ def _abandon_batch(run, instance, batch):
             "deleted_branches": deleted, **({"cleanup": cleanup} if cleanup else {})}
 
 
-def _batch_worker(run, batch):
+def _batch_worker(run, batch, worker):
     """`afk no-pr --batch` — is the batch's worker still at it? The same reading
     and the same ladder as any worker holding a turn (`classify_stopped`), from the
     batch's worktree: busy, or within grace of its turn or of its last
     `afk land --batch`, it is left; gone (`dead` / `orphan`), it is continued;
     silent past grace it is nudged once, and silent again the batch is
     abandoned (`afk_decide.batch_step`)."""
-    cfg = run.cfg
-    rows = _orca(["worktree", "list"]).get("worktrees") or []
-    path = _batch_worktree(run.repo, batch, rows)
-    now, grace = run.now(), cfg["worker_idle_grace_seconds"]
-    reading = _worker_reading(_worker_states(), path, now, grace)
-    nudged_at = (_nudge(path) or {}).get("at")
+    cfg, path, nudged_at = run.cfg, worker.path, worker.nudged_at
     turn_at, progress = None, {}
-    seen = afk_decide.settled_by_worker_state(reading, now, grace, nudged_at)
+    seen = worker.settled
     if not seen:
+        now, grace = worker.now, worker.grace
         told = [(_turn(run.repo, m["pr"]) or {}).get("at")
                 for m in (_batch_state(path) or {}).get("members") or []]
         turn_at = max((t for t in told if t), default=None)
         progress = _worktree_progress(path, run.rem, cfg["merge"]["target"])
         # a batch's worker declares no verdict and names no blocker
-        seen = afk_decide.classify_stopped(progress, reading["terminal_idle_seconds"], None, {},
-                                           now, grace, nudged_at=nudged_at,
+        seen = afk_decide.classify_stopped(progress, worker.reading["terminal_idle_seconds"],
+                                           None, {}, now, grace, nudged_at=nudged_at,
                                            turn={"at": turn_at})
     return {"batch": batch, **seen, "worktree": path, "progress": progress,
-            "nudged_at": nudged_at, "turn_at": turn_at, "worker_state": reading["state"]}
+            "nudged_at": nudged_at, "turn_at": turn_at, "worker_state": worker.reading["state"]}
 
 
 def _landed_commit(path, tip, pr_number):
@@ -2810,14 +2864,13 @@ def _sweep_batches(run, instance, live):
     one whose worker is still busy: it is finishing) and its pushed branch.
     `live` are the ids of the batches that still do."""
     cfg, rem = run.cfg, run.rem
-    stale = [w for w in afk_decide.batch_worktrees(_orca_worktree_rows(), run.repo,
-                                                   instance=instance)
+    stale = [w for w in _batch_worktrees(run.repo, instance)
              if w["batch"] not in live and w["path"]]
     removed = []
     if stale and cfg["worktree_cleanup"]:
-        states, now, grace = _worker_states(), run.now(), cfg["worker_idle_grace_seconds"]
+        workers = _Workers(run)
         for w in stale:
-            if _worker_reading(states, w["path"], now, grace)["terminal"] != "busy":
+            if not workers.at(w["path"]).busy:
                 removed.append(_remove_worktree(w["path"]))
     rx = afk_decide.batch_branch_regex(instance=instance)
     gone = [h for h in _remote_heads(rem) for m in [rx.match(h)] if m and m.group(1) not in live]
