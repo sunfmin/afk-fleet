@@ -665,7 +665,7 @@ _VERDICT_MARKER_RE = re.compile(r"<!--\s*afk:verdict\b(.*?)-->", re.DOTALL)
 # The phases a worker may declare in its marker (worker-prompt.md asks for exactly
 # these; anything else `classify_no_pr` treats as a failure).
 VERDICT_PHASES = ("already-satisfied", "blocked", "giving-up")
-_SATISFIED, _BLOCKED, _ = VERDICT_PHASES
+_SATISFIED, _BLOCKED, _GIVING_UP = VERDICT_PHASES
 
 # What the orca liveness probe can say about a worker's terminal.
 TERMINAL_STATES = ("busy", "idle", "none")
@@ -1852,128 +1852,323 @@ def pace(did_work, in_flight, empty_streak, config):
 
 
 # --------------------------------------------------------------------------- #
-# The launcher's cycle — gate, heartbeat, streaks and sleep as one state machine#
+# The cycle — gate, heartbeat, streaks and sleep as one state machine          #
 # --------------------------------------------------------------------------- #
 #
-# Everything the launcher carries between cycles is ONE opaque value, the cycle
-# state, which `afk cycle` hands back and takes again:
+# Everything carried between cycles is ONE opaque value, the cycle state, which
+# `afk cycle` hands back and takes again:
 #
 #   fingerprint         the digest the last gate computed (ADR-0007)
 #   skips               consecutive skipped cycles
 #   empty_streak        consecutive EMPTY cycles — a tick that did nothing with
 #                       nothing in flight and nothing on the frontier, or a skip
 #                       while that was still so
-#   in_flight           claims held, per the last tick's summary
+#   in_flight           claims held as the last tick ended
 #   frontier_remaining  dispatchable issues the last tick left undispatched
+#   unsettled           the last tick left a judgment open or met an error: the
+#                       next cycle ticks whatever the digest says
+#   instance            the fleet instance id      } the run's two launcher-held
+#   worker_command      the worker launch command  } facts, passed once
 #
-# The launcher never reads or edits a field; it is state for this code alone.
+# The caller never reads or edits a field; it is state for this code alone.
 
 CYCLE_START = {"fingerprint": "", "skips": 0, "empty_streak": 0,
-               "in_flight": 0, "frontier_remaining": 0}
+               "in_flight": 0, "frontier_remaining": 0, "unsettled": False}
+CYCLE_FACTS = ("instance", "worker_command")
 
-# The tick summary's keys this code reads, each with what the tick puts there:
-# the lists that mean a tick did work, and the two integers pacing needs.
-# `summary_schema` is built from these, and it is what the launcher constrains a
-# tick's return with — so the writer and the reader of a summary share one shape.
-SUMMARY_WORK = {
-    "granted": "the issues whose PR this tick gave the landing turn, or told to land again",
-    "dispatched": "the issues this tick started a worker on",
-    "reclaimed": "the issues this tick took over from a stale peer claim, to continue the work",
-    "cleared": "the claims this tick released because their issue was already closed: a PR "
-               "its worker landed, an issue a human closed, or a dead peer's phantom lock",
-    "escalated": "the issues this tick handed to a human",
-    "parked": "the issues this tick left waiting on an open blocker",
+# What a tick reports having done, per issue number — each with the word the
+# progress line uses for it. The first six are WORK: any of them keeps the fleet
+# on the busy interval (`cycle_ticked`).
+TICK_WORK = {
+    "granted": "landing turn to",
+    "dispatched": "dispatched",
+    "reclaimed": "reclaimed",
+    "cleared": "cleared",
+    "escalated": "escalated",
+    "parked": "parked",
 }
-SUMMARY_COUNTS = {
-    "in_flight": "claims this fleet still holds as the tick ends",
-    "frontier_remaining": "dispatchable issues this tick did not take",
-}
+TICK_DID = {**TICK_WORK, "retried": "retried", "nudged": "nudged"}
+TICK_COUNTS = ("in_flight", "frontier_remaining")
 
 
-def summary_schema():
-    """The JSON schema of a tick's summary — what `cycle_ticked` takes back."""
-    props = {k: {"type": "array", "items": {"type": "integer"}, "description": why}
-             for k, why in SUMMARY_WORK.items()}
-    props.update({k: {"type": "integer", "description": why}
-                  for k, why in SUMMARY_COUNTS.items()})
-    props["note"] = {"type": "string",
-                     "description": "anything the human should hear: an error, a judgment call"}
-    return {"type": "object", "properties": props,
-            "required": [*SUMMARY_WORK, *SUMMARY_COUNTS]}
-
-
-def cycle_state(raw):
-    """The cycle state from what the launcher handed back (None / "" on the first
-    cycle → CYCLE_START). Raises ValueError on anything that is not a state this
-    code produced — a launcher that mangled it must hear so, not run on zeros."""
+def cycle_state(raw, instance=None, worker_command=None):
+    """The cycle state from what the caller handed back (None / "" on the first
+    cycle → CYCLE_START plus the two facts, which the first cycle must be given).
+    Raises ValueError on anything that is not a state this code produced — a
+    caller that mangled it must hear so, not run on zeros — and on a fact passed
+    again that disagrees with the one the state carries."""
+    given = {"instance": instance, "worker_command": worker_command}
     if raw is None or raw == "":
-        return dict(CYCLE_START)
-    if not isinstance(raw, dict) or set(raw) != set(CYCLE_START):
-        raise ValueError(f"--state is not a cycle state (pass back the `state` the previous "
-                         f"`afk cycle` returned, verbatim): {raw!r}")
-    return {"fingerprint": str(raw["fingerprint"]),
-            **{k: int(raw[k]) for k in CYCLE_START if k != "fingerprint"}}
+        missing = [f"--{k.replace('_', '-')}" for k, v in given.items() if not v]
+        if missing:
+            raise ValueError(f"the first cycle (no --state) needs {' and '.join(missing)}: "
+                             f"they are carried in the state from then on")
+        return {**CYCLE_START, **given}
+    if not isinstance(raw, dict) or set(raw) != {*CYCLE_START, *CYCLE_FACTS} \
+            or not all(isinstance(raw[k], str) and raw[k] for k in CYCLE_FACTS):
+        raise ValueError(f"--state is not a cycle state carrying the instance id and the worker "
+                         f"launch command (pass back the `state` the previous `afk cycle` "
+                         f"returned, verbatim): {raw!r}")
+    for key, value in given.items():
+        if value and value != raw[key]:
+            raise ValueError(f"--{key.replace('_', '-')} {value!r} is not the one --state carries "
+                             f"({raw[key]!r}): omit it after the first cycle")
+    return {"fingerprint": str(raw["fingerprint"]), "unsettled": bool(raw["unsettled"]),
+            **{k: int(raw[k]) for k in ("skips", "empty_streak", *TICK_COUNTS)},
+            **{k: raw[k] for k in CYCLE_FACTS}}
 
 
 def cycle_wake(state, current_fp, config):
     """
-    The top of one launcher cycle: tick, or skip?
+    The top of one cycle: tick, or skip?
 
       state:      the cycle state (`cycle_state`)
       current_fp: `fingerprint` of what a rebuild would observe now; None when
                   `fingerprint_gate` is off (nothing was gathered)
 
-    Returns {"action": "tick"|"skip", "reason", "state"}. A tick also carries
-    `summary_schema`, the shape its summary must come back in. A skip carries the two
-    things a skipped cycle still owes: `sleep_seconds`, and `heartbeat` — True when
-    the fleet holds claims, so the effect layer refreshes the lease no tick will.
-    On a tick the launcher spawns one and reports back through `cycle_ticked`,
-    which is what returns that cycle's sleep.
+    Returns {"action": "tick"|"skip", "reason", "state"}. A skip is the whole
+    cycle, so it carries what a cycle owes: `sleep_seconds`, `progress`, and
+    `heartbeat` — True when the fleet holds claims, so the effect layer refreshes
+    the lease no tick will. On a tick the pass runs and `cycle_ticked` closes it.
 
-    A skipped cycle extends the empty streak only while nothing is in flight and
-    nothing is left on the frontier: unchanged state then proves the cycle empty.
+    A cycle after a tick that left something `unsettled` — an open judgment, an
+    error — ticks whatever the digest says: nothing may have moved, and the
+    judgment is still owed. A skipped cycle extends the empty streak only while
+    nothing is in flight and nothing is left on the frontier: unchanged state
+    then proves the cycle empty.
     """
     if not config["fingerprint_gate"]:
-        return {"action": "tick", "reason": "gate_off", "state": {**state, "skips": 0},
-                "summary_schema": summary_schema()}
+        return {"action": "tick", "reason": "gate_off", "state": {**state, "skips": 0}}
     gate = fingerprint_gate(state["fingerprint"], current_fp, state["skips"],
                             config["force_tick_after_skips"])
     new = {**state, "fingerprint": current_fp, "skips": gate["skips"]}
     if gate["action"] == "tick":
-        return {"action": "tick", "reason": gate["reason"], "state": new,
-                "summary_schema": summary_schema()}
+        return {"action": "tick", "reason": gate["reason"], "state": new}
+    if state["unsettled"]:
+        return {"action": "tick", "reason": "unsettled", "state": {**new, "skips": 0}}
     if new["in_flight"] == 0 and new["frontier_remaining"] == 0:
         new["empty_streak"] += 1
     return {"action": "skip", "reason": gate["reason"], "state": new,
             "heartbeat": new["in_flight"] > 0,
-            "sleep_seconds": pace(False, new["in_flight"], new["empty_streak"], config)}
+            "sleep_seconds": pace(False, new["in_flight"], new["empty_streak"], config),
+            "progress": f"nothing moved; {_standing(new)}"}
 
 
-def cycle_ticked(state, summary, config):
+def cycle_ticked(state, did, config, judgments=0, errors=0):
     """
-    The bottom of a cycle that ran a tick: fold the tick's summary into the cycle
+    The bottom of a cycle that ran a tick: fold what the tick did into the cycle
     state and say how long to sleep.
 
-      summary: the tick's return — {"granted":[], "escalated":[], "parked":[],
-               "dispatched":[], "reclaimed":[], "cleared":[], "in_flight": int,
-               "frontier_remaining": int, ...}
+      did:       the tick's own account — a list of issue numbers per TICK_DID
+                 key, and the two integers of TICK_COUNTS
+      judgments: how many judgments the tick returned instead of deciding
+      errors:    how many of its transitions failed
 
-    `in_flight` and `frontier_remaining` are REQUIRED: a summary missing either
-    would read as an idle fleet holding nothing, and pace it past its own lease.
-    Returns {"state", "sleep_seconds"}.
+    Returns {"state", "sleep_seconds", "progress"}. A tick with open judgments
+    sleeps 0: the caller answers them and opens the next cycle at once. One that
+    left a judgment or an error is `unsettled`, and never counts as empty.
     """
-    if not isinstance(summary, dict):
-        raise ValueError(f"--summary must be the tick's summary object, got {summary!r}")
-    for key in SUMMARY_COUNTS:
-        if not isinstance(summary.get(key), int) or isinstance(summary.get(key), bool):
-            raise ValueError(f"--summary needs an integer {key!r} (the tick's return schema)")
-    did_work = any(summary.get(k) for k in SUMMARY_WORK)
-    in_flight, remaining = summary["in_flight"], summary["frontier_remaining"]
-    empty = not did_work and in_flight == 0 and remaining == 0
+    did_work = any(did.get(k) for k in TICK_WORK)
+    in_flight, remaining = (int(did[k]) for k in TICK_COUNTS)
+    unsettled = bool(judgments or errors)
+    empty = not did_work and in_flight == 0 and remaining == 0 and not unsettled
     new = {**state, "in_flight": in_flight, "frontier_remaining": remaining,
-           "empty_streak": state["empty_streak"] + 1 if empty else 0}
+           "unsettled": unsettled, "empty_streak": state["empty_streak"] + 1 if empty else 0}
+    parts = [f"{word} {', '.join(f'#{n}' for n in did[k])}"
+             for k, word in TICK_DID.items() if did.get(k)]
+    parts += [f"{count} {noun}{'' if count == 1 else 's'}{tail}"
+              for count, noun, tail in ((judgments, "judgment", " open"), (errors, "error", ""))
+              if count]
     return {"state": new,
-            "sleep_seconds": pace(did_work, in_flight, new["empty_streak"], config)}
+            "sleep_seconds": 0 if judgments else pace(did_work, in_flight,
+                                                      new["empty_streak"], config),
+            "progress": "; ".join([*parts, _standing(new)])}
+
+
+def _standing(state):
+    return (f"{state['in_flight']} in flight, "
+            f"{state['frontier_remaining']} left on the frontier")
+
+
+# --------------------------------------------------------------------------- #
+# The tick's routing — which transition each row gets, and what is a judgment  #
+# --------------------------------------------------------------------------- #
+#
+# After `rebuild` gives each claim a `status` and `no-pr` an `action`, the next
+# `afk` call is a table lookup: `afk cycle` runs it. What code cannot decide is
+# RETURNED as a judgment — a question, and for each answer the one transition to
+# run. Every answer is a transition, so the next cycle does not ask again.
+
+JUDGMENT_KINDS = ("empty_diff", "no_checks", "adversarial_verify", "reason")
+
+
+def afk_command(call, sub, number, *flags):
+    """One runnable `afk` transition on issue <number>, as a shell line.
+
+      call:  {"afk_path", "repo", "config" (the run's config, as JSON),
+              "instance", "worker_command"} — what every such line repeats
+      flags: the transition's own, last — a `--reason` is the final argument
+    """
+    argv = [call["afk_path"], sub, "--issue", str(number), "--instance", call["instance"]]
+    if sub in ("dispatch", "turn", "fail"):
+        argv += ["--worker-command", call["worker_command"]]
+    return shlex.join([*argv, "--repo", call["repo"], "--config", call["config"], *flags])
+
+
+def judgment(kind, number, question, context, if_yes, if_no, bulky=False):
+    """One judgment a tick returns instead of deciding. `bulky` marks one whose
+    answer takes reading something long (a diff under review, a CI log): the
+    caller delegates it to an ephemeral subagent that returns one line."""
+    assert kind in JUDGMENT_KINDS, kind
+    return {"issue": number, "kind": kind, "question": question, "context": context,
+            "if_yes": if_yes, "if_no": if_no, **({"bulky": True} if bulky else {})}
+
+
+def reason_judgment(call, number, sub, default, where, context=None, bulky=False):
+    """A `reason` judgment: the transition is already fixed — `afk fail` or `afk
+    escalate` — and what is asked for is its wording. Both answers are therefore
+    the SAME command, runnable as it stands with `default`; the answer is the
+    text put in place of it, after `--reason`."""
+    command = afk_command(call, sub, number, "--reason", default)
+    doing = "failure" if sub == "fail" else "escalation"
+    return judgment("reason", number,
+                    f"Word the {doing} reason for issue #{number}, re-read from {where}, and put "
+                    f"it in place of the text after --reason.",
+                    {"where": where, **(context or {})}, command, command, bulky=bulky)
+
+
+def asks_after(mine):
+    """The claims a tick asks `afk no-pr` about, in one call: every `no_pr` row,
+    and every `landing` row whose worker has not stopped for the tick."""
+    return [r["number"] for r in mine
+            if r["status"] == "no_pr"
+            or (r["status"] == "landing" and r["stopped"] not in LAND_WAITS)]
+
+
+def turn_due(mine, merge_order):
+    """The ONE issue a tick runs `afk turn` on, or None: the head of the merge
+    queue — unless its PR holds the turn and its worker is at it."""
+    row = next((r for r in mine if merge_order and r["number"] == merge_order[0]), None)
+    if row is None or (row["status"] == "landing" and row["stopped"] not in LAND_WAITS):
+        return None
+    return row["number"]
+
+
+def failure_judgment(call, row):
+    """The judgment for a `failure` row — its PR's checks are red: the reason
+    lives in a CI log, which is bulky to read."""
+    return reason_judgment(call, row["number"], "fail", f"the checks of PR #{row['pr']} are red",
+                           f"the failing checks of PR #{row['pr']}", {"pr": row["pr"]}, bulky=True)
+
+
+def turn_step(call, result, config):
+    """
+    What a tick does with `afk turn`'s result → (do, judgment):
+
+      ("granted", None)   the worker was told: count it
+      ("leave", None)     waiting / landing / awaiting_ci: nothing this tick
+      ("judge", {...})    gate_red → `reason`; no_checks → `no_checks`;
+                          needs_verify → `adversarial_verify`
+
+    With `gate.adversarial_verify` on, a PR with no checks at all owes both
+    judgments, and `afk turn` records neither until both are in: they are asked
+    as ONE `adversarial_verify` whose yes carries both flags — a head that
+    survives the verify is one whose acceptance criteria are met.
+    """
+    number, pr, head, outcome = result["issue"], result["pr"], result["head"], result["outcome"]
+    if outcome == "granted":
+        return "granted", None
+    context = {"pr": pr, "head": head}
+    if outcome == "gate_red":
+        return "judge", reason_judgment(call, number, "fail", f"the checks of PR #{pr} are red",
+                                        f"the failing checks of PR #{pr}", context, bulky=True)
+    verify = config["gate"]["adversarial_verify"]
+    if outcome == "needs_verify" or (outcome == "no_checks" and verify):
+        flags = [*(["--allow-no-checks"] if outcome == "no_checks" else []), "--verified", head]
+        bare = " It has no checks at all, so the verify is its only gate." \
+            if outcome == "no_checks" else ""
+        return "judge", judgment(
+            "adversarial_verify", number,
+            f"Does head {head} of PR #{pr} survive the adversarial verify?{bare}",
+            {**context, "prompt": config["gate"]["adversarial_verify_prompt"]},
+            afk_command(call, "turn", number, *flags),
+            afk_command(call, "fail", number, "--reason",
+                        f"the adversarial verify refuted head {head} of PR #{pr}"), bulky=True)
+    if outcome == "no_checks":
+        return "judge", judgment(
+            "no_checks", number,
+            f"PR #{pr} has no checks at all — are issue #{number}'s acceptance criteria met?",
+            context, afk_command(call, "turn", number, "--allow-no-checks"),
+            afk_command(call, "fail", number, "--reason",
+                        f"PR #{pr} has no checks, and it does not meet the issue's acceptance "
+                        f"criteria"))
+    return "leave", None
+
+
+def worker_step(call, row, worker, config):
+    """
+    What a tick does about one claim `afk no-pr` was asked about → (do, detail):
+
+      ("leave", None)       the worker is at it
+      ("dispatch", None)    `redispatch` (its blockers closed) or `orphan` (no
+                            worker left): `afk dispatch` — an orphaned claim is
+                            ALWAYS continued, never released back
+      ("park", None)        `afk park`
+      ("nudge", None)       `afk nudge`
+      ("escalate", reason)  `afk escalate`: the reason is on record
+      ("fail", reason)      `afk fail`: the reason is on record
+      ("judge", {...})      `close_release` → `empty_diff`; a failure or an
+                            escalation whose reason is NOT on record → `reason`
+
+      row:    the claim's `mine` row      worker: its `afk no-pr` row
+    """
+    number, action = row["number"], worker["action"]
+    verdict = worker.get("worker_verdict") or {}
+    said = {"verdict": verdict.get("comment_url")}
+    if action == "leave":
+        return "leave", None
+    if action in ("redispatch", "orphan"):
+        return "dispatch", None
+    if action in ("park", "nudge"):
+        return action, None
+    if action == "close_release":
+        base = config["base_branch"]
+        return "judge", judgment(
+            "empty_diff", number,
+            f"Is the diff of issue #{number}'s branch against {base} really empty? Its worker "
+            f"declared `already-satisfied`.",
+            {"worktree": worker.get("worktree"), "base_branch": base, **said},
+            afk_command(call, "close", number),
+            afk_command(call, "fail", number, "--reason",
+                        f"its worker declared `already-satisfied`, but the branch's diff "
+                        f"against {base} is not empty"))
+    if action == "escalate":
+        unmet = [f"#{b['number']} {b['reason']}" for b in worker.get("blockers") or []
+                 if b["standing"] == "unmet"]
+        if unmet:
+            return "escalate", f"blocked by a dependency nothing will resolve: {'; '.join(unmet)}"
+        if verdict.get("reason"):
+            return "escalate", f"its worker reported blocked, naming no blocker: {verdict['reason']}"
+        return "judge", reason_judgment(
+            call, number, "escalate", "its worker reported blocked without naming a blocker",
+            "its worker's verdict comment", said)
+    assert action == "next_attempt", action
+    phase = verdict.get("phase") if verdict.get("found") else None
+    if phase == _SATISFIED:
+        return "fail", "its worker declared `already-satisfied`, but the branch holds changes"
+    if phase == _GIVING_UP:
+        if verdict.get("reason"):
+            return "fail", f"its worker gave up: {verdict['reason']}"
+        return "judge", reason_judgment(call, number, "fail", "its worker gave up",
+                                        "its worker's verdict comment", said)
+    if phase is not None or verdict.get("found"):
+        return "fail", f"its worker's verdict names no phase the fleet knows ({phase!r})"
+    if row["status"] == "landing":
+        return "fail", (f"given the landing turn and never landed: "
+                        f"{row.get('stopped') or 'no `afk land` outcome'}")
+    if worker.get("nudged_at") is not None:
+        return "fail", "idle with no PR and no verdict a grace period after its nudge"
+    return "fail", "idle with no PR and no verdict, and no worktree here to nudge it in"
 
 
 # --------------------------------------------------------------------------- #
