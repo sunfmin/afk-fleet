@@ -72,6 +72,12 @@ merge:
                                       #   already resolved inside them), re-gate, then merge. Renamed from
                                       #   rebase_before_merge in ADR-0012; the old key is a load-time error.
   delete_branch: true
+  batch: false                         # `gate.ci: local` only (ADR-0028). true → when two or more finished
+                                      #   PRs wait for the landing turn, the turn goes to a MERGE BATCH: a
+                                      #   batch worker stacks them on the target (one squash commit per PR),
+                                      #   runs gate.local_command ONCE on the stack, and pushes the stack to
+                                      #   the target as a fast-forward. One gate run instead of one per PR.
+                                      #   Needs a target that accepts a direct push (checked at bootstrap).
 
 # --- failure handling ---
 retry: 2                               # per-issue retries; count tracked via an afk-attempt/<n> label on the issue

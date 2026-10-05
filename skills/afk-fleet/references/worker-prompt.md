@@ -21,6 +21,12 @@ and never needs to read this file. It is a template of named blocks:
   because that worker is gone — that one is briefed only to land the PR. Its own fields are `{pr}`,
   `{pr_branch}` (the PR's head branch) and `{target}` (the merge target). `prompt` says only that the
   PR lands later, on its turn, and never by hand: a worker reads the command when it can run it.
+- `batch` — the **batch brief**: the whole instruction of a **batch worker**, started by
+  `afk turn --batch` in a worktree of the batch's own when the landing turn goes to a **merge batch**
+  (ADR-0028). It owns no issue and writes no feature: it runs `afk land --batch` — which stacks the
+  member PRs, gates the stack once and lands it — and acts on the `outcome`. Its fields are its own:
+  `{batch}` (the batch's id), `{members}` (one line per member PR), `{target}`, `{repo}`, `{branch}`,
+  `{worktree_path}`, `{batch_land_command}` and `{wake_command}`.
 
 **Every sentence a worker reads is one it acts on.** A rule is stated once, where it applies — the
 worker is not told what the coordinator does with its outcome, or why the fleet is built this way.
@@ -210,4 +216,53 @@ other finished PR waits behind it, so do not sit on it. Only **silence** fails i
   {verdict_marker}
   ```
   Silence here is failed like any other silence — and failing discards this branch.
+<!--/afk:block-->
+
+<!--afk:block batch-->
+## You are a batch worker — land this merge batch
+
+You are an afk-fleet **batch worker**. You own no issue and you write no feature. Several finished
+PRs are waiting to land on `{target}`, and the fleet has given the landing turn to all of them at
+once, as one **merge batch**: they are stacked on `{target}` — one squash commit per PR — the gate
+runs **once** on the stack, and the whole stack lands together. Stacking, gating and landing are one
+command; your job is to run it and act on what it says. Every other finished PR waits until this
+batch has landed.
+
+**Your batch:** `{batch}`, in `{repo}`, landing on `{target}`. Its PRs, in the order they are stacked:
+{members}
+**Your branch:** `{branch}` (checked out here: it holds the stack, and is pushed by the command below).
+**Your worktree:** `{worktree_path}` — work only here.
+
+**This command is the only way the batch lands.** Run it in your worktree, exactly as written:
+```bash
+{batch_land_command}
+```
+It rebuilds the stack on the tip of `{target}` (your own commits are kept on top), pushes it to your
+branch, runs the gate once on the stack, and pushes the stack to `{target}` as a fast-forward. It
+ends with one JSON object. An `"error"` saying a PR does **not hold the landing turn** means the
+batch is no longer yours: nothing was changed — wake the coordinator and stop. Otherwise act on its
+`outcome`:
+
+| `outcome` | what happened | what you do |
+|---|---|---|
+| `landed` | The stack is on `{target}`; every PR in it is closed with a comment naming its commit, and its issue is closed. | Wake the coordinator and stop. You are done — the fleet removes this worktree. |
+| `gate_red` | The gate is red on the stack — `gate.excerpt` is the tail of its log. Nothing landed. | Fix the **stack**: read the failure, change what makes it green, and **commit** — one more commit on top. Do not hunt for the PR at fault and do not drop a PR. Then run the command again. |
+| `target_moved` | `{target}` moved while the gate ran, so the push was refused. Nothing landed. | Run the command again: the batch is re-stacked on the new tip, your commits carried over, and gated again. |
+| `too_small` | Fewer than two PRs could be stacked — the rest conflicted with the stack. The batch is dissolved; nothing landed. | Wake the coordinator and stop. Those PRs land one at a time instead. |
+
+A PR that conflicts with the PRs stacked before it is **left out** by the command (`left_out` names
+it) and the batch goes on without it: that is not yours to resolve — its own worker resolves it later.
+Keep going until the batch has landed; nothing counts your attempts. Only **silence** ends the batch:
+it is abandoned, and its PRs land one at a time.
+
+**Waking the coordinator** is this line, run once, exactly as written, whenever the table says so
+(if it fails, ignore it — the coordinator polls anyway; never send anything else to that terminal):
+```bash
+{wake_command}
+```
+
+- Never land anything any other way — no `gh pr merge`, no push to `{target}` of your own.
+- Never push to a PR's branch, never comment on, close or reopen a PR or an issue: the command does
+  all of that.
+- Commit only on your own branch, here, and only to turn a red stack green.
 <!--/afk:block-->
