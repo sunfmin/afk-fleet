@@ -449,11 +449,12 @@ def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=Fals
       no_pr            asks `afk no-pr` why                      claimed
       handed_back      asks `afk no-pr` whether its worker is    handed_back
                        still resolving — never `afk merge`
-      awaiting_ci      leaves it                                 pr_open
+      awaiting_ci      leaves it: checks exist and are still     pr_open
+                       running
       failure          runs `afk fail`                           ci_failed
       awaiting_merge   runs `afk merge`                          awaiting_merge
-                       (`local`: an open PR, whatever its        (`local`: pr_open)
-                       remote checks say)
+                       (`local`: an open PR, whatever its        (`local`, or no
+                       remote checks say)                        checks: pr_open)
       queued           leaves it: its turn comes when the PR     queued
                        it is behind has merged
 
@@ -465,6 +466,13 @@ def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=Fals
     the gate that sequence runs has not passed yet, and the board must not show a
     green gate nobody has run. (`merged` / `escalated`, the two terminal board
     phases, are set by the merge and escalate steps themselves.)
+
+    A PR with **no checks at all** (`checks_state` None) is `awaiting_merge` in
+    `required` mode too. Nothing is running, so nothing will ever arrive to wait
+    for: `awaiting_ci` would park the claim forever in a repo that has no CI. What
+    such a PR needs is the tick's judgment, and `afk merge` is where that is asked
+    for (its `no_checks` outcome, answered with `--allow-no-checks`). Its board
+    stays at `pr_open`, as in `local` mode: no gate has passed yet.
     """
     if closed:
         return "closed", None
@@ -474,10 +482,11 @@ def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, handed_back=Fals
         # whatever the checks say: re-running the merge against the same head would
         # hit the same conflict and hand it back again, every cycle
         return "handed_back", "handed_back"
-    if ci_mode == "local" or checks_state == "green":
+    if ci_mode == "local" or checks_state in ("green", None):
         if queued:
             return "queued", "queued"
-        return "awaiting_merge", "pr_open" if ci_mode == "local" else "awaiting_merge"
+        gated = ci_mode != "local" and checks_state == "green"
+        return "awaiting_merge", "awaiting_merge" if gated else "pr_open"
     if checks_state == "red":
         return "failure", "ci_failed"
     return "awaiting_ci", "pr_open"
