@@ -279,6 +279,20 @@ takeover never counts as a **retry** (ADR-0011).
 _Avoid_: failover (implies automatic), rescue (it seeds a standing fleet, not a bounded mission),
 stale reclaim (that is the unattended, lease-gated path)
 
+**Retry**:
+What a failed attempt costs and gets: the failure is counted on the issue — its `afk-attempt/<n>`
+label goes up by one — the failed attempt is discarded (its PR closed, its branch deleted, its
+worktree removed) and a fresh **worker** starts from the base under the same **claim**, told why the
+last attempt failed. Config `retry` is how many an issue gets; the failure after the last one is
+escalated to a human instead. One **transition** (`afk fail`), and its one writer. A failure is
+counted **once**: the edit that raises the number also adds `afk-attempt/starting` — this failure is
+counted, its fresh worker has not started — and starting a worker removes it, so an `afk fail` that
+was cut short after counting and runs again (by hand, or from the next **tick**, which reads the
+label as the row's `starting`) finishes the same retry instead of spending another. A new failure
+of the fresh attempt finds no such label and is counted.
+_Avoid_: re-dispatch (that is a **continuation**: nothing discarded, nothing counted), nudge,
+attempt (the attempt is the thing that failed; the retry is what replaces it)
+
 **Nudge**:
 The one line the fleet types at a live **worker** that went idle past the grace period with no PR and
 no verdict — the `idle_stalled` **outcome** of `afk no-pr`. Such a worker has not failed; it stopped

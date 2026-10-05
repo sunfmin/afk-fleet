@@ -4119,6 +4119,114 @@ def test_fail_retries_from_a_clean_base_then_escalates_when_exhausted():
         assert w.orca_calls() == []
 
 
+def _refuse_branch_deletes(w, refuse):
+    """The remote refuses (or takes again) the deletion of a branch."""
+    hook = os.path.join(w.sb.bare, "hooks", "update")
+    if not refuse:
+        os.remove(hook)
+        return
+    os.makedirs(os.path.dirname(hook), exist_ok=True)
+    with open(hook, "w") as f:
+        f.write('#!/bin/sh\ncase "$1 $3" in refs/heads/*\\ 0000*) echo "deletion refused" >&2; '
+                'exit 1;; esac\n')
+    os.chmod(hook, 0o755)
+
+
+# Every step of a retry that comes after the attempt label is written, as
+# (what goes wrong, what `afk fail` then says, how it is put right).
+_CUTS = {
+    "the PR's close refused": (lambda w: w.set(fail=["pr close"]), "gh pr close failed",
+                               lambda w: w.set(fail=[])),
+    "the branch delete refused": (lambda w: _refuse_branch_deletes(w, True), "deletion refused",
+                                  lambda w: _refuse_branch_deletes(w, False)),
+    "the worker start failing": (lambda w: w.orca(create_fails=[5]), "worktree_create_failed",
+                                 lambda w: w.orca(create_fails=[])),
+}
+
+
+def _a_failure_cut_short(w, cut):
+    """Issue 5 with a red PR (#50) and a branch an earlier attempt left behind,
+    and an `afk fail` of it that `cut` stopped after the attempt label was
+    written → (the dispatch, the branch left behind, how to put `cut` right)."""
+    breaks, says, mends = _CUTS[cut]
+    first, _ = with_pr(w, 5, 50, conclusion="FAILURE")
+    left = "tester/issue-5-left-behind"
+    git(first["worktree"], "push", "-q", "origin", f"HEAD:refs/heads/{left}")
+    breaks(w)
+    assert says in w.error(*_fail(5, "CI red: TestNames fails")), cut
+    # the failure is counted, and nothing is settled: the claim is still held
+    assert "afk-attempt/1" in w.issue(5)["labels"] and w.claimed_by(5) == "me", cut
+    return first, left, mends
+
+
+def _the_retry_completed(w, cut, first, left):
+    """…exactly one attempt spent, the failed attempt gone, a fresh worker on it."""
+    assert w.issue(5)["labels"] == ["ready-for-agent", "afk-attempt/1"], cut
+    assert w.pr(50)["state"] == "closed", cut
+    assert not w.sb.remote_ref(f"refs/heads/{first['branch']}"), cut
+    assert not w.sb.remote_ref(f"refs/heads/{left}"), cut
+    assert not os.path.isdir(first["worktree"]) and w.claimed_by(5) == "me", cut
+    assert "## Why the previous attempt failed" in _told(_worker_of(w, 5)), cut
+
+
+def test_a_failure_spends_one_attempt_however_often_fail_runs_to_finish():
+    """`afk fail` counts the attempt and only then discards the failed attempt
+    and starts a fresh worker. Cut short at any of those later steps, the claim is
+    still held and the same failure is still there to be failed again — which
+    must finish the retry, not count the failure a second time."""
+    for cut in _CUTS:
+        with world(issues=[issue(5, "ready-for-agent")]) as w:
+            first, left, mends = _a_failure_cut_short(w, cut)
+            w.error(*_fail(5, "CI red: TestNames fails"))         # …and cut short again
+            mends(w)
+            r = w.afk(*_fail(5, "CI red: TestNames fails"))
+            assert (r["action"], r["attempt"], r["retry_max"]) == ("retry", 1, 2), (cut, r)
+            _the_retry_completed(w, cut, first, left)
+            assert "CI red: TestNames fails" in _told(_worker_of(w, 5)), cut
+            row = w.afk("rebuild", *ME, *R, *NOW)["mine"][0]
+            assert (row["status"], row["attempt"], row["starting"]) == ("no_pr", 1, False), cut
+
+            # a NEW failure, of the fresh attempt, is counted…
+            w.work(r["worker"]["worktree"], "attempt1.txt")
+            w.open_pr(51, closes=5, branch=r["worker"]["branch"], conclusion="FAILURE")
+            r2 = w.afk(*_fail(5, "still red"))
+            assert (r2["action"], r2["attempt"]) == ("retry", 2), (cut, r2)
+            assert w.issue(5)["labels"] == ["ready-for-agent", "afk-attempt/2"], cut
+            # …and the one after the last retry escalates, once
+            w.work(r2["worker"]["worktree"], "attempt2.txt")
+            w.open_pr(52, closes=5, branch=r2["worker"]["branch"], conclusion="FAILURE")
+            r3 = w.afk(*_fail(5, "needs a human"))
+            assert (r3["action"], r3["attempt"]) == ("escalate", 2), (cut, r3)
+            assert w.issue(5)["labels"] == ["ready-for-human"] and w.claimed_by(5) is None, cut
+            assert ["escalated to a human" in c for c in w.comments(5)].count(True) == 1, cut
+
+
+def test_the_next_tick_finishes_a_retry_that_was_cut_short_without_counting_it_again():
+    """The same, when it is the next tick that comes back to the failure: by the
+    judgment a red PR still asks for, or — the PR already closed — by itself,
+    from the claim saying its failure is counted and no fresh worker started."""
+    for cut in _CUTS:
+        with world(issues=[issue(5, "ready-for-agent")]) as w:
+            t = int(time.time()) + 5000                 # the worker has been quiet past the grace
+            first, left, mends = _a_failure_cut_short(w, cut)
+            row = w.afk("rebuild", *ME, *R, *NOW)["mine"][0]
+            assert (row["attempt"], row["starting"]) == (1, True), cut
+            mends(w)
+
+            r = cycle(w, None, now=t)
+            for j in r["judgments"]:                    # the PR is still open, and red
+                assert (j["kind"], j["issue"]) == ("reason", 5), (cut, j)
+                assert answer(w, j["if_yes"])["attempt"] == 1, cut
+            if not r["judgments"]:
+                assert r["progress"].startswith("retried #5"), (cut, r)
+            _the_retry_completed(w, cut, first, left)
+
+            # the fresh worker is not the failure: the tick after spends nothing
+            cycle(w, r["state"], now=t)
+            assert w.issue(5)["labels"] == ["ready-for-agent", "afk-attempt/1"], cut
+            assert w.claimed_by(5) == "me", cut
+
+
 def test_escalate_relabels_before_it_releases():
     """Released first, a PR-less issue still carrying the ready label is back on
     the frontier — a peer dispatches the issue a human was just handed."""
