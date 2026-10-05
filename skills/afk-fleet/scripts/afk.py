@@ -1098,7 +1098,7 @@ def _tick(run, instance, host, agent, ws):
     cfg, rem = run.cfg, run.rem
     finish = {}                         # issue → the rest of the start begun for it
 
-    def attempt(fn, **args):
+    def answered(fn, **args):
         """One step's answer, as the plan reads it: (result, None), or (None, why it failed)."""
         try:
             return fn(**args), None
@@ -1112,7 +1112,7 @@ def _tick(run, instance, host, agent, ws):
 
     def finish_all(issues):
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(issues)) as pool:
-            return list(pool.map(lambda n: attempt(finish[n]), issues))
+            return list(pool.map(lambda n: answered(finish[n]), issues))
 
     steps = {
         "no-pr": lambda issues=None, batch=None: _workers_seen(run, numbers=issues, batch_id=batch),
@@ -1138,7 +1138,7 @@ def _tick(run, instance, host, agent, ws):
     def carry_out(step):
         fn, args = steps[step["do"]], {k: v for k, v in step.items() if k != "do"}
         # `finish` answers per start itself: one may fail, and the others ran
-        return fn(**args) if step["do"] == "finish" else attempt(fn, **args)
+        return fn(**args) if step["do"] == "finish" else answered(fn, **args)
 
     call = {"afk_path": os.path.abspath(__file__), "repo": run.repo, "instance": instance,
             "worker_command": agent.command, "config": json.dumps(cfg, ensure_ascii=False)}
