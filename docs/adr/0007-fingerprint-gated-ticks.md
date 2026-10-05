@@ -9,6 +9,24 @@ reasons is gone. A tick is no longer a spawned context, so "the expensive part i
 context" (the rejection of *fingerprint inside the tick*) no longer applies — the gate now runs
 inside `afk cycle`, in front of the pass, and what a skip saves is the pass's GitHub reads and
 writes, not a cold start.
+**Note (#51) — what the digest holds, and which digest is kept.** Three things changed; the gate and
+its two invariants did not.
+
+- **A PR's checks enter as the one word a tick acts on** — `green` / `red` / `pending` / none — not
+  each check's own status and conclusion. A check going queued → in progress, or the first of
+  several finishing green, used to move the digest and run a tick that concluded the claim was
+  still `awaiting_ci`; now only the verdict arriving (pending → green, pending → red) does.
+- **An issue's open-blocker count is in its row.** The issue list carries the count, so the
+  frontier reads it from there instead of once per candidate; a blocker recorded or closed moves
+  the digest directly rather than through an `updatedAt`.
+- **The cycle state keeps the digest of the fleet as the tick LEFT it**, gathered again after the
+  tick's last write, not the one taken before the tick. A tick writes status boards, claim refs,
+  turn markers and labels, each of which moves an `updatedAt` or a ref; with the opening digest
+  kept, every tick was followed by a second one that found nothing. What that closing digest
+  would swallow — something that changed on GitHub while the tick ran — is covered twice: a
+  **wake** that arrived during a cycle is passed to the next one (`afk cycle --wake`), which then
+  ticks whatever the digest says (`reason: wake`), and the forced tick remains the backstop for a
+  change nobody announced.
 
 ## Context
 

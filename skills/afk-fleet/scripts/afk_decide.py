@@ -290,20 +290,21 @@ def override_config(cfg, assignments):
 # --------------------------------------------------------------------------- #
 #
 # Issues arrive from afk.py's gatherer as OPEN issues with `labels` already a
-# list of names; the three eligibility facts that are not on the issue itself
-# (claimed / has_open_pr / open_blockers) are grafted by `_eligibility_rows`.
+# list of names and `blocked_by` their open-blocker count — the issue list read
+# carries it on every row; the two eligibility facts that are not on the issue
+# itself (claimed / has_open_pr) are grafted by `_eligibility_rows`.
 
-def _eligibility_rows(issues, prs, claims, blocked_by):
+def _eligibility_rows(issues, prs, claims):
     """Each issue + the three eligibility facts `select_frontier` reads:
     `claimed` (a claim ref exists, any owner — not the assignee, ADR-0003),
     `has_open_pr` (an open PR closes it — the open-PR guard) and
-    `open_blockers` (from `blocked_by`, {issue number: count}; missing → 0)."""
+    `open_blockers` (the issue's own `blocked_by` count; missing → 0)."""
     claimed = {c.get("number") for c in claims}
     pr_for = _closing_pr_map(prs)
     return [{**i,
              "claimed": i.get("number") in claimed,
              "has_open_pr": i.get("number") in pr_for,
-             "open_blockers": int(blocked_by.get(i.get("number"), 0))}
+             "open_blockers": int(i.get("blocked_by") or 0)}
             for i in issues]
 
 
@@ -357,14 +358,6 @@ def select_frontier(issues, ready_label, epic_labels):
             continue
         excluded.append({"number": num, "reason": reason})
     return {"dispatch": dispatch, "excluded": excluded}
-
-
-def frontier_candidates(issues, prs, claims, ready_label, epic_labels):
-    """The issue numbers that pass every eligibility check EXCEPT open blockers —
-    the only ones whose blocker count is worth a per-issue API read. `afk rebuild`
-    fetches counts for exactly these, then `assemble_working_set` decides."""
-    return select_frontier(_eligibility_rows(issues, prs, claims, {}),
-                           ready_label, epic_labels)["dispatch"]
 
 
 # --------------------------------------------------------------------------- #
@@ -625,26 +618,42 @@ def protection_verdict(ci_mode, protection, unavailable=None, batch=False):
             "detail": "target branch requires no status checks — a local gate can merge"}
 
 
-def checks_gate(checks_state, pushed, allow_no_checks=False):
+def checks_gate(checks_state, allow_no_checks=False):
     """
     The `gate.ci: required` machine gate, for `afk turn` and `afk land` alike:
     may this PR land on what its GitHub checks say, right now?
 
-      checks_state:    `pr_checks_state` of the PR as read BEFORE any sync
-      pushed:          the landing's sync just pushed new commits to the PR — those
-                       checks describe a tree that is no longer the one that would land
+      checks_state:    `pr_checks_state` of the PR AT THE HEAD THAT WOULD LAND —
+                       a landing whose sync pushed a new head reads them again
+                       on that head (`checks_owed`), never the ones it had before
       allow_no_checks: the tick's judgment that a repo with no CI at all may land
                        on its acceptance criteria (the progressive gate)
 
-    Returns "green" | "awaiting_ci" | "gate_red" | "no_checks". A sync that moved
-    the head always waits: CI must run on the tree that lands, and the next
-    `afk land` finds the sync a no-op and reads the fresh verdict.
+    Returns "green" | "awaiting_ci" | "gate_red" | "no_checks".
     """
     if checks_state is None:
         return "green" if allow_no_checks else "no_checks"
-    if pushed:
-        return "awaiting_ci"
     return {"green": "green", "red": "gate_red"}.get(checks_state, "awaiting_ci")
+
+
+def checks_owed(checks_state, at_head, had_checks):
+    """
+    Is a landing still waiting for its PR's checks to speak? `afk land` asks after
+    every read of the PR while it waits (ADR-0027); the first False ends the wait
+    and `checks_gate` decides.
+
+      checks_state: `pr_checks_state` of the PR as just read
+      at_head:      that read was of the head that would land — GitHub has caught
+                    up with the landing's push
+      had_checks:   the PR had checks before a push of this landing moved its head
+
+    Owed while GitHub still shows the head before the push, while a check is
+    running, and while a head just pushed shows no checks although the PR had
+    them: they have not been registered yet, which is not a repo with no CI.
+    """
+    if not at_head or checks_state == "pending":
+        return True
+    return checks_state is None and had_checks
 
 
 def gate_comment(verdict, command):
@@ -1323,7 +1332,7 @@ def turn_gate(ci_mode, checks_state, allow_no_checks, adversarial_verify, verifi
     run by `afk land`, so there is nothing to wait for), then `needs_verify`.
     """
     if ci_mode != "local":
-        checks = checks_gate(checks_state, False, allow_no_checks)
+        checks = checks_gate(checks_state, allow_no_checks)
         if checks != "green":
             return checks
     if adversarial_verify and verified != head:
@@ -2079,6 +2088,13 @@ def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attem
     return "\n".join(lines)
 
 
+def board_key(body):
+    """A short digest of a status board body — what the cycle state keeps per
+    claim instead of the body. A board that renders to the key the state holds
+    is the one already on the issue, and is not read to find that out."""
+    return hashlib.sha256(body.strip().encode("utf-8")).hexdigest()[:8]
+
+
 # --------------------------------------------------------------------------- #
 # Retry accounting + launcher pacing                                          #
 # --------------------------------------------------------------------------- #
@@ -2183,13 +2199,17 @@ def pace(did_work, in_flight, empty_streak, config):
 #   frontier_remaining  dispatchable issues the last tick left undispatched
 #   unsettled           the last tick left a judgment open or met an error: the
 #                       next cycle ticks whatever the digest says
+#   boards              {issue number: `board_key`} for the claims held as the
+#                       last tick ended — the status board each one was left
+#                       with, so a tick that would render the same one again
+#                       spends no read on it
 #   instance            the fleet instance id      } the run's two launcher-held
 #   worker_command      the worker launch command  } facts, passed once
 #
 # The caller never reads or edits a field; it is state for this code alone.
 
 CYCLE_START = {"fingerprint": "", "skips": 0, "empty_streak": 0,
-               "in_flight": 0, "frontier_remaining": 0, "unsettled": False}
+               "in_flight": 0, "frontier_remaining": 0, "unsettled": False, "boards": {}}
 CYCLE_FACTS = ("instance", "worker_command")
 
 # What a tick reports having done, per issue number — each with the word the
@@ -2220,9 +2240,10 @@ def cycle_state(raw, instance=None, worker_command=None):
         if missing:
             raise ValueError(f"the first cycle (no --state) needs {' and '.join(missing)}: "
                              f"they are carried in the state from then on")
-        return {**CYCLE_START, **given}
+        return {**CYCLE_START, "boards": {}, **given}
     if not isinstance(raw, dict) or set(raw) != {*CYCLE_START, *CYCLE_FACTS} \
-            or not all(isinstance(raw[k], str) and raw[k] for k in CYCLE_FACTS):
+            or not all(isinstance(raw[k], str) and raw[k] for k in CYCLE_FACTS) \
+            or not isinstance(raw["boards"], dict):
         raise ValueError(f"--state is not a cycle state carrying the instance id and the worker "
                          f"launch command (pass back the `state` the previous `afk cycle` "
                          f"returned, verbatim): {raw!r}")
@@ -2231,17 +2252,21 @@ def cycle_state(raw, instance=None, worker_command=None):
             raise ValueError(f"--{key.replace('_', '-')} {value!r} is not the one --state carries "
                              f"({raw[key]!r}): omit it after the first cycle")
     return {"fingerprint": str(raw["fingerprint"]), "unsettled": bool(raw["unsettled"]),
+            "boards": {str(n): str(key) for n, key in raw["boards"].items()},
             **{k: int(raw[k]) for k in ("skips", "empty_streak", *TICK_COUNTS)},
             **{k: raw[k] for k in CYCLE_FACTS}}
 
 
-def cycle_wake(state, current_fp, config):
+def cycle_wake(state, current_fp, config, woke=False):
     """
     The top of one cycle: tick, or skip?
 
       state:      the cycle state (`cycle_state`)
       current_fp: `fingerprint` of what a rebuild would observe now; None when
                   `fingerprint_gate` is off (nothing was gathered)
+      woke:       a wake arrived while the previous cycle was running. The digest
+                  that cycle kept was taken as its tick ENDED, so whatever the
+                  wake announced may already be inside it, unseen by that tick
 
     Returns {"action": "tick"|"skip", "reason", "state"}. A skip is the whole
     cycle, so it carries what a cycle owes: `sleep_seconds`, `progress`, and
@@ -2250,7 +2275,7 @@ def cycle_wake(state, current_fp, config):
 
     A cycle after a tick that left something `unsettled` — an open judgment, an
     error — ticks whatever the digest says: nothing may have moved, and the
-    judgment is still owed. A skipped cycle extends the empty streak only while
+    judgment is still owed. So does one that `woke`. A skipped cycle extends the empty streak only while
     nothing is in flight and nothing is left on the frontier: unchanged state
     then proves the cycle empty.
     """
@@ -2261,8 +2286,9 @@ def cycle_wake(state, current_fp, config):
     new = {**state, "fingerprint": current_fp, "skips": gate["skips"]}
     if gate["action"] == "tick":
         return {"action": "tick", "reason": gate["reason"], "state": new}
-    if state["unsettled"]:
-        return {"action": "tick", "reason": "unsettled", "state": {**new, "skips": 0}}
+    if state["unsettled"] or woke:
+        return {"action": "tick", "reason": "unsettled" if state["unsettled"] else "wake",
+                "state": {**new, "skips": 0}}
     if new["in_flight"] == 0 and new["frontier_remaining"] == 0:
         new["empty_streak"] += 1
     return {"action": "skip", "reason": gate["reason"], "state": new,
@@ -2271,7 +2297,7 @@ def cycle_wake(state, current_fp, config):
             "progress": f"nothing moved; {_standing(new)}"}
 
 
-def cycle_ticked(state, did, config, judgments=0, errors=0):
+def cycle_ticked(state, did, config, judgments=0, errors=0, left=None, boards=None):
     """
     The bottom of a cycle that ran a tick: fold what the tick did into the cycle
     state and say how long to sleep.
@@ -2280,6 +2306,12 @@ def cycle_ticked(state, did, config, judgments=0, errors=0):
                  key, and the two integers of TICK_COUNTS
       judgments: how many judgments the tick returned instead of deciding
       errors:    how many of its transitions failed
+      left:      `fingerprint` of the fleet as the tick LEFT it, taken after its
+                 last write — what the state keeps, so the boards, refs, markers
+                 and labels the tick itself wrote do not read as a change next
+                 cycle (ADR-0007). None keeps the digest the cycle opened with
+      boards:    {issue number: `board_key`} for the claims the tick ended
+                 holding; None keeps the state's
 
     Returns {"state", "sleep_seconds", "progress"}. A tick with open judgments
     sleeps 0: the caller answers them and opens the next cycle at once. One that
@@ -2290,7 +2322,10 @@ def cycle_ticked(state, did, config, judgments=0, errors=0):
     unsettled = bool(judgments or errors)
     empty = not did_work and in_flight == 0 and remaining == 0 and not unsettled
     new = {**state, "in_flight": in_flight, "frontier_remaining": remaining,
-           "unsettled": unsettled, "empty_streak": state["empty_streak"] + 1 if empty else 0}
+           "unsettled": unsettled, "empty_streak": state["empty_streak"] + 1 if empty else 0,
+           "fingerprint": state["fingerprint"] if left is None else left,
+           "boards": state["boards"] if boards is None
+           else {str(n): key for n, key in boards.items()}}
     parts = [f"{word} {', '.join(f'#{n}' for n in did[k])}"
              for k, word in TICK_DID.items() if did.get(k)]
     parts += [f"{count} {noun}{'' if count == 1 else 's'}{tail}"
@@ -2657,7 +2692,7 @@ def resolve_worker_command(base_url, supplied=None, resolved=None, runtime="clau
 # Fingerprint gate — skip ticks code can prove are no-ops (ADR-0007)           #
 # --------------------------------------------------------------------------- #
 #
-# A tick is a rebuild and a pass of transitions: dozens of gh calls, just to
+# A tick is a rebuild and a pass of transitions: a run of gh calls, just to
 # conclude "still waiting", most cycles of a run. The gate collapses everything a
 # tick's Rebuild observes into a short digest; `afk cycle` runs a tick only
 # when the digest moved (or a forced full pass is due). A false "changed" costs
@@ -2667,10 +2702,15 @@ def resolve_worker_command(base_url, supplied=None, resolved=None, runtime="clau
 def fingerprint(issues, prs, claims):
     """
     Digest the observable fleet inputs — open issues (number + labels +
-    updatedAt, so label churn, closes, and fresh blocker comments all move it),
-    open PRs (number + head sha + updatedAt + per-check status/conclusion, so
-    pushes and CI finishing move it), and claim refs (number + sha, so peer
-    claims/releases/reclaims move it).
+    updatedAt + open-blocker count, so label churn, closes, fresh blocker
+    comments and a dependency edge all move it), open PRs (number + head sha +
+    updatedAt + `pr_checks_state`, so pushes and CI finishing move it), and
+    claim refs (number + sha, so peer claims/releases/reclaims move it).
+
+    A PR's checks enter as the ONE word a tick acts on — green / red / pending /
+    none — not check by check: a check going queued → in progress, or the first
+    of several finishing green, leaves the claim `awaiting_ci` and so leaves the
+    digest alone. Only the verdict changing moves it.
 
     Heartbeats are deliberately NOT an input: the launcher refreshes its own
     lease on skipped cycles, which would move the digest every cycle and defeat
@@ -2680,16 +2720,12 @@ def fingerprint(issues, prs, claims):
     Canonicalizes (sorts, keeps only the fields above) so row order and extra
     fields never move the digest. Returns a 16-hex digest.
     """
-    def check_row(c):
-        return [c.get("name") or c.get("context") or "",
-                c.get("status") or "",
-                c.get("conclusion") or c.get("state") or ""]
-
     canon = {
-        "issues": sorted([i.get("number"), sorted(i.get("labels") or []), i.get("updatedAt") or ""]
+        "issues": sorted([i.get("number"), sorted(i.get("labels") or []), i.get("updatedAt") or "",
+                          int(i.get("blocked_by") or 0)]
                          for i in issues),
         "prs": sorted([p.get("number"), p.get("headRefOid") or "", p.get("updatedAt") or "",
-                       sorted(check_row(c) for c in (p.get("statusCheckRollup") or []))]
+                       pr_checks_state(p.get("statusCheckRollup")) or "none"]
                       for p in prs),
         "claims": sorted([c.get("number"), c.get("sha") or ""] for c in claims),
     }
@@ -2725,7 +2761,7 @@ def fingerprint_gate(last, current, skips, force_after):
 # --------------------------------------------------------------------------- #
 #
 # One pure function turns the raw observables (issues, PRs, claim/heartbeat
-# refs, open-blocker counts) into the tick's whole working set: graft the
+# refs) into the tick's whole working set: graft the
 # eligibility facts, match each claim to its PR, partition mine/peer_live/stale.
 # The gh/git gather lives in afk.py; why a `no_pr` claim has no PR is a separate,
 # machine-dependent question (`afk no-pr`).
@@ -2782,20 +2818,18 @@ def superseded_prs(prs, number, branch_pattern):
             and rx.match(p.get("headRefName") or "")]
 
 
-def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, config,
+def assemble_working_set(issues, prs, claims, heartbeats, me, now, config,
                          closed=(), turns=None):
     """
     The tick's whole working set from the raw observables. Pure — afk.py's
     `rebuild` gathers, this assembles, and a fixture pins the join.
 
-      issues:      open issues {number, title, labels: [name...], updatedAt}
+      issues:      open issues {number, title, labels: [name...], updatedAt,
+                   blocked_by: <open blocker count>}
       prs:         gh pr list rows (number, headRefOid, updatedAt,
                    statusCheckRollup, closingIssuesReferences)
       claims:      [{"number","instance","sha",...}]  (ref-scan shape)
       heartbeats:  {instance: last_ts}
-      blocked_by:  {issue number: open blocker count}; missing → 0. Only
-                   `frontier_candidates` need real counts — every other issue
-                   already fails a cheaper eligibility check first.
       me, now:     my instance id / epoch seconds
       config:      the canonical config — read for ready_label, epic_labels,
                    claim_lease_ttl_seconds, gate.ci and concurrency
@@ -2842,7 +2876,7 @@ def assemble_working_set(issues, prs, claims, heartbeats, blocked_by, me, now, c
     by_num = {i.get("number"): i for i in issues}
     pr_for = _closing_pr_map(prs)
 
-    frontier = select_frontier(_eligibility_rows(issues, prs, claims, blocked_by),
+    frontier = select_frontier(_eligibility_rows(issues, prs, claims),
                                config["ready_label"], config["epic_labels"])
     frontier["dispatch"] = [{"number": n, "title": by_num.get(n, {}).get("title")}
                             for n in frontier["dispatch"]]

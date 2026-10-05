@@ -20,7 +20,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 ## How does a ready issue become a merged PR?
 
 1. A **tick** starts with nothing in memory and **rebuilds** its **working set** from GitHub: open
-   issues, open PRs, claim and heartbeat refs.
+   issues, open PRs, claim and heartbeat refs — three reads made at once, each made once a tick.
    `skills/afk-fleet/scripts/afk.py:cmd_rebuild`
 2. The **frontier** is selected: an issue is dispatchable only if it is open, carries the ready
    label, is not an epic, is unclaimed, has no open linked PR and has zero open blockers.
@@ -34,8 +34,9 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    `skills/afk-fleet/scripts/afk.py:_create_worktree`
 5. It starts a **worker** there with the run's **worker launch command**, waits until the agent is
    ready, and delivers the worker prompt, filled with the branch and path orca returned, as a brief
-   file plus one submitted line pointing at it.
-   `skills/afk-fleet/scripts/afk.py:_start_terminal`
+   file plus one submitted line pointing at it. A tick filling several slots begins every start
+   first and then waits for all the agents together.
+   `skills/afk-fleet/scripts/afk.py:_submit_prompt`
 6. It upserts the issue's **status board** to "claimed"; the tick refreshes its **heartbeat**
    and ends, without waiting for the worker.
    `skills/afk-fleet/scripts/afk.py:_upsert_board`
@@ -60,8 +61,9 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
     branch with the merge target again and pushes what that produced.
     `skills/afk-fleet/scripts/afk.py:_sync`
 13. The landing re-confirms the gate against the exact head that will land: the local gate run
-    there, or the PR's checks, which count only if the sync did not move the head.
-    `skills/afk-fleet/scripts/afk_decide.py:checks_gate`
+    there, or the PR's checks on that head, which the landing waits for itself when its sync
+    pushed a new one.
+    `skills/afk-fleet/scripts/afk_decide.py:checks_owed`
 14. It merges the PR, pinned to the gated head, which closes the issue, and upserts the status
     board to "merged"; the worker wakes the launcher and stops.
     `skills/afk-fleet/scripts/afk.py:cmd_land`
@@ -101,8 +103,9 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   now, on a committed tree, at the exact head that would land: step 13 does not run the local gate
   again, `skills/afk-fleet/scripts/afk_decide.py:gate_record_void` (ADR-0026). Any sync that moved
   the head, any later commit, or no record, and it runs as written.
-- The landing's sync moved the head and the next move is the tick's — checks must run on the new
-  head, or an adversarial verify is owed on it: the landing stops, the worker wakes the launcher,
+- The landing's sync moved the head and the next move is the tick's — the checks on the new head
+  were still running when the landing's wait ran out, or an adversarial verify is owed on it: the
+  landing stops, the worker wakes the launcher,
   the turn stays with the PR, and the tick's next `afk turn` tells the worker to land again once
   that is settled, `skills/afk-fleet/scripts/afk_decide.py:turn_gate`.
 - The PR has no checks at all, or an adversarial verify is required: the turn is not granted until
@@ -138,7 +141,8 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    the launcher runs the one it chooses and opens the next cycle at once.
    `skills/afk-fleet/scripts/afk.py:_tick`
 6. The call folds what the pass did into the cycle state — which also carries the two
-   launcher-held facts (instance id, worker launch command) — and counts whether the cycle was empty.
+   launcher-held facts (instance id, worker launch command) — with the digest of the fleet as the
+   pass left it, so its own writes do not cause the next tick, and counts whether the cycle was empty.
    `skills/afk-fleet/scripts/afk_decide.py:cycle_ticked`
 7. The launcher sleeps the interval that call returned — busy, or idle after enough consecutive
    empty cycles, never longer than half the lease while the fleet holds a claim — then repeats from
@@ -155,6 +159,9 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   cycles: `skills/afk-fleet/scripts/afk_decide.py:cycle_wake`, ADR-0007.
 - A worker's **wake** arrives during the sleep of step 7: the launcher goes to step 4 at once, and
   acts on nothing the line says, `skills/afk-fleet/SKILL.md:wake`, ADR-0020.
+- A wake arrives while the call of step 4 is still running: the next cycle is opened at once with
+  `--wake`, and ticks whatever its digest says — the pass may have digested, unseen, the change the
+  wake was about, `skills/afk-fleet/scripts/afk_decide.py:cycle_wake`, ADR-0007.
 - The org forbids `refs/afk/*`, so claims fall back to ordinary branches:
   `skills/afk-fleet/scripts/afk.py:_usable_namespace`.
 - A local gate meets a target branch that requires checks, and bootstrap stops:
@@ -297,7 +304,8 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   `test_a_red_gate_on_the_turn_is_the_workers_to_fix_and_spends_nothing`,
   `test_a_worker_silent_on_its_turn_is_nudged_once_then_failed_and_the_turn_moves_on`)
 - The tick's judgments — a PR's checks, a PR with none, an adversarial verify — are settled before
-  a turn is granted and pinned to the head; a landing that moved the head waits for them again, and
+  a turn is granted and pinned to the head; a landing that moved the head waits for its checks itself
+  and stops for the tick only when a judgment is owed on the new head or that wait ran out, and
   a worker never verifies itself. (ADR-0027;
   `test_the_adversarial_verify_is_settled_before_the_turn_and_pinned_to_the_head`)
 - A turn whose worker is gone is delivered by continuation in the PR's own worktree or at its head,

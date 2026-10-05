@@ -174,8 +174,8 @@ _Avoid_: recipe, procedure, step list (those were the prose a tick used to re-de
 
 **Cycle state**:
 The one value the **launcher** carries between cycles: an opaque object `afk cycle` returns and takes
-back verbatim, holding the last fingerprint, the skip streak, the empty streak, what the last
-**tick** left in flight and whether it left anything unsettled — and the **fleet instance**'s two facts, its id and the
+back verbatim, holding the fingerprint of the fleet as the last **tick** left it, the skip streak, the empty streak, what that
+tick left in flight, whether it left anything unsettled and which **status board** each claim already shows — and the **fleet instance**'s two facts, its id and the
 **worker launch command**, from the first cycle on. The launcher never reads into it or does arithmetic on it; pacing, the
 skipped cycle's heartbeat and the forced tick are all decided from it in code (ADR-0017).
 _Avoid_: launcher memory, last summary (a tick's account of what it did is folded in by the same call, and never travels)
@@ -193,7 +193,8 @@ _Avoid_: coordinator memory, session state
 
 **Frontier**:
 The set of currently-dispatchable issues — `open` + `ready_label` + not an epic + **unclaimed** (no
-`afk-claim` ref) + **no open linked PR** + zero open `blocked_by`. Recomputed from GitHub every tick.
+`afk-claim` ref) + **no open linked PR** + zero open `blocked_by`. Recomputed from GitHub every tick, over
+every open issue: the issue list carries each one's open-blocker count, and the pull requests GitHub lists among them are left out.
 It is also what does the waiting for a **parked** issue: nothing else remembers that one is parked.
 _Avoid_: queue, backlog (the backlog is the whole issue set; the frontier is only the ready edge)
 
@@ -224,7 +225,8 @@ state: recompute the frontier, and reconstruct the in-flight set (the `afk-claim
 this instance, sub-classified from each issue's PR + checks). Any tick — a fresh one or a later one — produces the
 same working set from the same GitHub; this equivalence is the re-entrancy invariant that makes
 a killed tick, and a launcher that forgot the last one, safe. Its deterministic half is one read-only tool call — `afk rebuild`, which
-gathers and assembles the working set (plus its fingerprint digest) in code. Why a `no_pr` claim has
+gathers and assembles the working set (plus its fingerprint digest) in code: three reads — open issues, open PRs, the claim refs — made at once,
+and each read once for the whole tick, kept in step with what the tick then writes. Why a `no_pr` claim has
 no PR is a second, machine-dependent call — `afk no-pr`, which reads the worktree, the worker's
 verdict marker and its blockers and returns the **outcome** (what the tick does about it — distinct
 from the worker's *verdict*, which is only what the worker declared); it reads the **worker state**
@@ -296,7 +298,9 @@ verdict; park is what the fleet does about it), escalate (that hands the issue t
 The one line a **worker** types into the **launcher**'s terminal once its outcome is on GitHub — a PR,
 a verdict marker, a **landing** that merged or stopped for the tick: `afk-wake #<n>`. It ends the launcher's sleep
 so the next cycle opens now rather than a busy interval later, and it carries nothing: the cycle it
-triggers reads GitHub like any other, and the launcher never acts on the line itself. A lost wake
+triggers reads GitHub like any other, and the launcher never acts on the line itself. One that arrives
+while a cycle is running is passed to the next (`afk cycle --wake`), which then ticks whatever its
+fingerprint says — the running tick may already have digested, unseen, what the wake was about. A lost wake
 costs only the wait it would have saved — polling is unchanged underneath. The worker is handed the
 line ready-made in its prompt; the launcher's terminal handle is read from the environment by the
 **transition** that fills the prompt, never configured (ADR-0020).
@@ -323,8 +327,9 @@ What a **worker** does on its **landing turn**, with one command in its own work
 **sync** with the merge target → push → the machine gate on that exact head → merge pinned to the
 gated head. It stops with an outcome the worker acts on itself: a **sync** conflict is left in
 progress and resolved in place, a red gate is fixed in place, and the worker lands again — no round
-trip through the tick, no **retry** spent, the PR and the turn kept. Where the next move is the
-tick's (checks still running on the pushed head, a verify owed on a moved head, absent checks) the
+trip through the tick, no **retry** spent, the PR and the turn kept. Checks that must run on the head
+it pushed are waited for by the landing itself, up to a bound. Where the next move is the
+tick's (checks still running when that bound runs out, a verify owed on a moved head, absent checks) the
 worker **wakes** the launcher and stops, and the tick tells it to land again. The claim and the
 worktree are settled by the next cycle, from the claim whose issue is now closed (ADR-0027).
 _Avoid_: hand-back (retired: the tick no longer syncs a PR and returns its conflict — the worker

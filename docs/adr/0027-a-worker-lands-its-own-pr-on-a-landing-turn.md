@@ -16,6 +16,10 @@ and ADR-0026's recorded gate run, are kept. Reuses the silent-worker ladder of
 **Extended, opt-in, by [ADR-0029](0029-a-merge-batch-lands-n-prs-behind-one-gate-run.md):** with
 `merge.batch` one landing turn may be held by several PRs — a merge batch — and landed by a batch
 worker behind a single gate run.
+**Amended (#51):** in `gate.ci: required` a landing waits for its checks itself — see
+[the amendment](#amendment-51--a-landing-waits-for-its-own-checks) at the end. Where the text below
+has `awaiting_ci` send the worker round the launcher, read it as what happens only once that wait
+has run out.
 
 ## Context
 
@@ -163,3 +167,31 @@ The tick's summary counts `granted` where it counted
 - **Let the worker run the adversarial verify.** The author verifying itself is what the gate
   exists to prevent.
 - **Move the tick's routing into code** in the same change. Out of scope here.
+
+## Amendment (#51) — a landing waits for its own checks
+
+As first decided, a landing in `gate.ci: required` whose sync pushed a new head stopped with
+`awaiting_ci`: the worker sent its wake and stopped, a cycle ran `afk turn` again once CI was
+green, the worker was told again, and ran `afk land` again. Nothing in that loop is a judgment —
+it is waiting, done by four parties in turn, and it cost at least one cycle per landing on any
+repo whose base moves.
+
+**`afk land` now waits for the checks of the head that would land**, in the same run: after the
+push (and equally when the checks of an unmoved head are still running), it re-reads the PR every
+`--checks-poll` seconds (default 15) until those checks say `green` or `red`, for at most
+`--checks-timeout` seconds (default 1800). What it waits out is decided in one pure place
+(`afk_decide.checks_owed`): GitHub still showing the head from before the push, a check still
+running, and a just-pushed head that shows no checks although the PR had them — they are not
+registered yet, which is not a repo without CI.
+
+| the wait ends with | the landing |
+|---|---|
+| green | goes on: the verify check, then the merge pinned to that head |
+| red | `gate_red` — the worker's to fix, as before |
+| the bound | `awaiting_ci` — and the path above takes over unchanged: wake, the tick's `afk turn` once CI has spoken, land again |
+
+`needs_verify` and `no_checks` are untouched: those are the tick's judgments, and a worker still
+never answers them. The turn check, the pin of the merge to the gated head, and "what lands was
+gated in the form it lands" are as they were; the only thing that moved is who does the waiting.
+A landing can therefore run for as long as CI does, inside the worker — the same place a long
+local gate run already happens.
