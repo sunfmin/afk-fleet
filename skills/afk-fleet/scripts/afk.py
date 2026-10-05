@@ -117,11 +117,13 @@ def _gh(args, check=True):
 # One process is one tick, or one transition typed by hand: seconds long, and
 # everything in it acts on one view of GitHub. So what a process has read it does
 # not read again — the open PRs, the claim scan, an issue, an issue's comments
-# are each one round trip however many steps ask (`_once`). A write this process
-# makes is carried into what it already read (`_claim_written`, `_comment`) or
-# drops it (`_forget`), so every read after a write sees it. The two reads that
+# are each one round trip however many steps ask (`_once`). Every read after a
+# write sees it, and that is the WRITE's doing: each helper that writes to GitHub
+# or to the remote's refs carries what it wrote into the reads already made
+# (`_claim_written`, `_comment`) or drops the ones it made stale (`_forget`). A
+# call site makes the write and reads on; it names no read. The two reads that
 # must be new each time — the fingerprint a cycle closes on, a landing polling
-# its checks — say so by forgetting first.
+# its checks — say so where they are made (`fresh=True`).
 _READS = {}
 
 
@@ -260,9 +262,11 @@ _PR_FIELDS = ("number,title,headRefName,headRefOid,updatedAt,statusCheckRollup,"
               "closingIssuesReferences")
 
 
-def _open_prs(repo):
+def _open_prs(repo, fresh=False):
     """Every open PR, with the fields the working set, the merge and a fresh
-    start all read."""
+    start all read. `fresh`: read now, whatever this process read before."""
+    if fresh:
+        _forget(("prs", repo))
     return _once(("prs", repo), lambda: json.loads(
         _gh(["pr", "list", "--repo", repo, "--state", "open", "--json", _PR_FIELDS]).stdout))
 
@@ -302,6 +306,61 @@ def _issue_state(repo, number):
         p = _gh(["api", f"repos/{repo}/issues/{number}", "--jq", ".state"], check=False)
         return p.stdout.strip() or None if p.returncode == 0 else None
     return _once(("state", repo, number), read)
+
+
+def _issue_written(repo, number):
+    """Drop what this process read of an issue it just wrote to: the issue, its
+    state, and the list of open issues that carries its labels and blockers."""
+    _forget(("issue", repo, number), ("state", repo, number), ("issues", repo))
+
+
+def _edit_labels(repo, number, add, remove):
+    args = ["issue", "edit", str(number), "--repo", repo]
+    for lb in add:
+        args += ["--add-label", lb]
+    for lb in remove:
+        args += ["--remove-label", lb]
+    _gh(args)
+    _issue_written(repo, number)
+
+
+def _close_issue(repo, number):
+    """Close an issue as completed."""
+    _gh(["issue", "close", str(number), "--repo", repo, "--reason", "completed"])
+    _issue_written(repo, number)
+
+
+def _add_blocker(repo, number, blocker):
+    """Record issue <number> as blocked by <blocker> — a native dependency edge."""
+    blocker_id = _gh(["api", f"repos/{repo}/issues/{blocker}", "--jq", ".id"]).stdout.strip()
+    _gh(["api", "--method", "POST", f"repos/{repo}/issues/{number}/dependencies/blocked_by",
+         "-F", f"issue_id={blocker_id}"])
+    _issue_written(repo, number)
+
+
+def _pr_comment(repo, number, body):
+    """Add one comment to a PR."""
+    _gh(["pr", "comment", str(number), "--repo", repo, "--body", body])
+    _forget(("comments", repo, number))
+
+
+def _close_pr(repo, rem, number, comment, delete_branch):
+    """Close an open PR unmerged, with the comment that says why; `delete_branch`
+    takes its branch off the remote with it."""
+    _gh(["pr", "close", str(number), "--repo", repo, "--comment", comment,
+         *(["--delete-branch"] if delete_branch else [])])
+    _forget(("prs", repo), ("comments", repo, number),
+            *([("heads", rem)] if delete_branch else []))
+
+
+def _merge_pr(repo, rem, pr, head, strategy, delete_branch):
+    """Merge an open PR, only while its head is still `head`. The issues it
+    closes are closed by GitHub with it."""
+    _gh(["pr", "merge", str(pr["number"]), "--repo", repo, f"--{strategy}",
+         "--match-head-commit", head, *(["--delete-branch"] if delete_branch else [])])
+    _forget(("prs", repo), ("heads", rem))
+    for ref in pr.get("closingIssuesReferences") or []:
+        _issue_written(repo, ref["number"])
 
 
 def _blocker(repo, number):
@@ -391,6 +450,23 @@ def _remote_heads(remote):
         return [r[1][len("refs/heads/"):] for r in rows
                 if len(r) == 2 and r[1].startswith("refs/heads/")]
     return _once(("heads", remote), read)
+
+
+def _push_branch(repo, rem, path, sha, branch, force=False, check=True):
+    """Push `sha` from the repo at `path` to a branch on the remote → git's
+    result. An open PR of that branch has a new head."""
+    p = _git(["-C", path, "push", *(["--force"] if force else []), rem,
+              f"{sha}:refs/heads/{branch}"], check=check)
+    if p.returncode == 0:
+        _forget(("heads", rem), ("prs", repo))
+    return p
+
+
+def _delete_branch(rem, branch, check=True):
+    """Delete one branch on the remote. `check=False`: a branch already gone is
+    what was wanted."""
+    _git(["push", rem, "--delete", f"refs/heads/{branch}"], check=check)
+    _forget(("heads", rem))
 
 
 def _branch_ahead(remote, branch, base, slot):
@@ -853,12 +929,15 @@ def cmd_worker_command(a):
 # the cycle: gate, tick, pace                                                  #
 # --------------------------------------------------------------------------- #
 
-def _gather(a, cfg):
+def _gather(a, cfg, fresh=False):
     """The ONE gatherer of the observable fleet inputs (ADR-0008): open issues,
     open PRs, and the claim/heartbeat ref scan. Both `rebuild` and the `cycle`
     gate read through here, so their views cannot drift. The three reads do not
     depend on each other, so they are made at once: a gather costs the slowest
-    of them, not their sum. The raw JSON lives and dies in this process."""
+    of them, not their sum. The raw JSON lives and dies in this process.
+    `fresh`: read now — nothing this process read before is kept."""
+    if fresh:
+        _forget()
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         issues = pool.submit(_open_issues, a.repo)
         prs = pool.submit(_open_prs, a.repo)
@@ -913,8 +992,7 @@ def cmd_cycle(a):
     left = None
     if gathered:
         try:
-            _forget()
-            left = afk_decide.fingerprint(*_gather(a, cfg)[:3])
+            left = afk_decide.fingerprint(*_gather(a, cfg, fresh=True)[:3])
         except (OSError, RuntimeError):
             pass        # keep the opening digest: the next cycle reads `changed`, and ticks
     return {"action": "tick", "reason": woke["reason"],
@@ -1483,15 +1561,14 @@ def _discard_attempt(a, cfg, rem, number):
     continuation from resuming the attempt that was discarded."""
     closed = []
     for pr in afk_decide.superseded_prs(_open_prs(a.repo), number, cfg["branch_pattern"]):
-        _gh(["pr", "close", str(pr["number"]), "--repo", a.repo, "--delete-branch", "--comment",
-             "afk-fleet: superseded — this attempt failed and the issue is being retried "
-             "from a clean base."])
+        _close_pr(a.repo, rem, pr["number"],
+                  "afk-fleet: superseded — this attempt failed and the issue is being retried "
+                  "from a clean base.", delete_branch=True)
         closed.append(pr["number"])
     deleted = []
     for branch in afk_decide.branch_candidates(_remote_heads(rem), cfg["branch_pattern"], number):
-        _git(["push", rem, "--delete", f"refs/heads/{branch}"])
+        _delete_branch(rem, branch)
         deleted.append(branch)
-    _forget(("prs", a.repo), ("heads", rem))
     path, _ = _issue_worktree(a.repo, number)
     removed = _remove_worktree(path) if path else None
     if removed and not removed["removed"]:
@@ -1862,6 +1939,12 @@ def _record_gate(rem, path, tree, command, now):
     return None if p.returncode == 0 else (p.stderr.strip() or f"git push exited {p.returncode}")
 
 
+def _drop_gate_record(rem, path, tree, command):
+    """Take a tree's record off the remote. Soft: none there is what was wanted."""
+    _git(["-C", path, "push", "--quiet", rem, "--delete",
+          afk_decide.gate_record_ref(tree, command)], check=False)
+
+
 def _gate_run(cfg, rem, path, timeout, excerpt_lines, now, live=False):
     """One run of the local gate in a worktree, put on record when green →
     (`_run_gate`'s verdict, the head it ran on, the uncommitted paths, why the
@@ -1876,8 +1959,7 @@ def _gate_run(cfg, rem, path, timeout, excerpt_lines, now, live=False):
     gate = _run_gate(cfg, path, timeout, excerpt_lines, live=live)
     if gate["status"] != "green":
         if not dirty:
-            _git(["-C", path, "push", "--quiet", rem, "--delete",
-                  afk_decide.gate_record_ref(tree, gate["command"])], check=False)
+            _drop_gate_record(rem, path, tree, gate["command"])
         return gate, head, dirty, "the gate is red"
     if dirty or _git(["-C", path, "rev-parse", "HEAD"], check=False).stdout.strip() != head:
         return gate, head, dirty, "the run was not on a committed tree"
@@ -2074,8 +2156,7 @@ def _await_checks(a, number, head, had_checks):
     is one fresh read of the open PRs."""
     deadline = time.monotonic() + a.checks_timeout
     while True:
-        _forget(("prs", a.repo))
-        pr = next((p for p in _open_prs(a.repo) if p["number"] == number), None)
+        pr = next((p for p in _open_prs(a.repo, fresh=True) if p["number"] == number), None)
         if pr is None:
             raise RuntimeError(f"PR #{number} is no longer open — it was closed or merged while "
                                f"its checks were awaited; nothing was merged here")
@@ -2179,7 +2260,7 @@ def cmd_land(a):
     head = _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip()
     pushed = head != pr_tip
     if pushed:
-        _git(["-C", path, "push", rem, f"HEAD:refs/heads/{branch}"])
+        _push_branch(a.repo, rem, path, head, branch)
     out.update(head=head, synced=pushed)
 
     # --- the machine gate, against exactly `head` ---
@@ -2195,8 +2276,7 @@ def cmd_land(a):
             gate, *_ = _gate_run(cfg, rem, path, a.gate_timeout, a.excerpt_lines, _now(a))
             gate = {**gate, "source": "run", "head": head, "not_trusted": void}
             if gate["status"] != "green":
-                _gh(["pr", "comment", str(pr["number"]), "--repo", a.repo, "--body",
-                     afk_decide.gate_comment(gate, gate["command"])])
+                _pr_comment(a.repo, pr["number"], afk_decide.gate_comment(gate, gate["command"]))
                 return stop("gate_red", gate=gate,
                             detail="the gate is red on the synced head — fix the code, commit, "
                                    "and run this again")
@@ -2225,9 +2305,7 @@ def cmd_land(a):
                            "your wake and stop; you are told to run this again once it is")
 
     # --- land it. The claim and this worktree are the next cycle's to settle ---
-    _gh(["pr", "merge", str(pr["number"]), "--repo", a.repo, f"--{cfg['merge']['strategy']}",
-         "--match-head-commit", head,
-         *(["--delete-branch"] if cfg["merge"]["delete_branch"] else [])])
+    _merge_pr(a.repo, rem, pr, head, cfg["merge"]["strategy"], cfg["merge"]["delete_branch"])
     if cfg["progress_comment"]:
         _upsert_board(a.repo, a.number, cfg, "merged", instance=owner, pr=pr["number"])
     return {**out, "outcome": afk_decide.land_outcome("merged"),
@@ -2318,7 +2396,7 @@ def _delete_batch_branches(rem, batch, keep=None):
     deleted. Soft: a branch that is already gone is what was wanted."""
     gone = [b for b in afk_decide.batch_branches(_remote_heads(rem), batch) if b != keep]
     for branch in gone:
-        _git(["push", rem, "--delete", f"refs/heads/{branch}"], check=False)
+        _delete_branch(rem, branch, check=False)
     return gone
 
 
@@ -2525,9 +2603,9 @@ def _close_landed_pr(a, cfg, rem, number):
 
 def _close_batched_pr(a, cfg, pr, commit, batch, prs):
     """Close one PR a batch landed, with the comment that names its commit."""
-    _gh(["pr", "close", str(pr["number"]), "--repo", a.repo, "--comment",
-         afk_decide.batch_landed_comment(commit, cfg["merge"]["target"], batch, prs),
-         *(["--delete-branch"] if cfg["merge"]["delete_branch"] else [])])
+    _close_pr(a.repo, _remote(a), pr["number"],
+              afk_decide.batch_landed_comment(commit, cfg["merge"]["target"], batch, prs),
+              cfg["merge"]["delete_branch"])
 
 
 def _squash(rem, path, pr, issue):
@@ -2678,7 +2756,7 @@ def _land_batch(a, cfg, rem):
             _git(["-C", path, "reset", "-q", "--hard", "HEAD"])
     head = _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip()
     branch = _git(["-C", path, "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
-    _git(["-C", path, "push", "--force", rem, f"{head}:refs/heads/{branch}"])
+    _push_branch(a.repo, rem, path, head, branch, force=True)
     _delete_batch_branches(rem, batch, keep=branch)
     more = {"head": head, "target": target, "fix_commits": len(kept)}
 
@@ -2706,7 +2784,7 @@ def _land_batch(a, cfg, rem):
         raise RuntimeError(f"merge batch {batch} no longer holds the landing turn (it was "
                            f"abandoned while the gate ran); nothing landed — send your wake "
                            f"and stop")
-    p = _git(["-C", path, "push", rem, f"{head}:refs/heads/{target}"], check=False)
+    p = _push_branch(a.repo, rem, path, head, target, check=False)
     if p.returncode != 0:
         if _remote_sha(rem, f"refs/heads/{target}") == tip:
             raise RuntimeError(f"the push of the batch to {target} failed although {target} "
@@ -2731,7 +2809,7 @@ def _finish_batch(a, cfg, rem, state, landed, result, **more):
         if cfg["progress_comment"]:
             _upsert_board(a.repo, m["issue"], cfg, "merged", instance=instance, pr=m["pr"])
         if _issue_state(a.repo, m["issue"]) == "open":
-            _gh(["issue", "close", str(m["issue"]), "--repo", a.repo, "--reason", "completed"])
+            _close_issue(a.repo, m["issue"])
     _delete_batch_branches(rem, batch)
     still_open = {p["number"]: p for p in _open_prs(a.repo)}
     for m in landed:
@@ -2760,7 +2838,7 @@ def _sweep_batches(a, cfg, rem, live):
     rx = afk_decide.batch_branch_regex(instance=a.instance)
     gone = [h for h in _remote_heads(rem) for m in [rx.match(h)] if m and m.group(1) not in live]
     for branch in gone:
-        _git(["push", rem, "--delete", f"refs/heads/{branch}"], check=False)
+        _delete_branch(rem, branch, check=False)
     return {"removed": removed, "deleted_branches": gone}
 
 
@@ -2793,16 +2871,6 @@ def _ensure_label(repo, name):
     one). Created without `--force`, so a label that already exists keeps its
     colour and description — that failure is the expected case and is ignored."""
     _gh(["label", "create", name, "--repo", repo], check=False)
-
-
-def _edit_labels(repo, number, add, remove):
-    args = ["issue", "edit", str(number), "--repo", repo]
-    for lb in add:
-        args += ["--add-label", lb]
-    for lb in remove:
-        args += ["--remove-label", lb]
-    _gh(args)
-    _forget(("issue", repo, number))
 
 
 def cmd_fail(a):
@@ -2873,9 +2941,7 @@ def cmd_park(a):
     recorded = {e["number"] for e in _blocked_by(a.repo, a.number)}
     added = [n for n in waiting if n not in recorded]
     for n in added:
-        blocker_id = _gh(["api", f"repos/{a.repo}/issues/{n}", "--jq", ".id"]).stdout.strip()
-        _gh(["api", "--method", "POST", f"repos/{a.repo}/issues/{a.number}/dependencies/blocked_by",
-             "-F", f"issue_id={blocker_id}"])
+        _add_blocker(a.repo, a.number, n)
     if cfg["progress_comment"]:
         _upsert_board(a.repo, a.number, cfg, "parked", blocked_by=waiting)
     _release(rem, cfg, a.number)
@@ -2893,8 +2959,7 @@ def cmd_close(a):
     _require_mine(rem, cfg, a.number, a.instance)
     if cfg["progress_comment"]:
         _upsert_board(a.repo, a.number, cfg, "closed", instance=a.instance)
-    _gh(["issue", "close", str(a.number), "--repo", a.repo, "--reason", "completed"])
-    _forget(("issue", a.repo, a.number), ("state", a.repo, a.number))
+    _close_issue(a.repo, a.number)
     _release(rem, cfg, a.number)
     path, _ = _issue_worktree(a.repo, a.number)
     cleanup = _remove_worktree(path) if (path and cfg["worktree_cleanup"]) else None
