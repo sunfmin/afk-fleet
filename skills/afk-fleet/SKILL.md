@@ -182,8 +182,8 @@ rather than loops.
 Repeat until you stop it. **You run each cycle yourself**, in this session: the tick is code,
 inside the call. The loop's whole memory is **one opaque value** — the `state` the last cycle
 returned. Hand it back verbatim; never read into it, never do arithmetic on it (ADR-0017). Every
-counter the loop needs — the last fingerprint, the skip streak, the empty streak, what is in
-flight — lives in there, maintained by code; so do the instance id and the worker launch command,
+counter the loop needs — the fingerprint of the fleet as the last tick left it, the skip streak,
+the empty streak, what is in flight — lives in there, maintained by code; so do the instance id and the worker launch command,
 from the first cycle on.
 
 1. **Run [one cycle](#a-cycle---tick--one-call-the-tick-inside-it)** — `afk cycle`, in the
@@ -202,8 +202,10 @@ from the first cycle on.
    saying its outcome is on GitHub (ADR-0020): go to step 1 **now** instead of waiting the sleep out,
    and let the sleep this new cycle ends with replace the one you were in. That is all it means — it
    is a hint, not a fact: never merge, dispatch or conclude anything from the line itself; the cycle
-   reads GitHub as always, and may well `skip`. A wake that arrives while a cycle is running needs
-   nothing until it returns; then open the next cycle at once instead of sleeping.
+   reads GitHub as always, and may well `skip`. A wake that arrives **while a cycle is running**
+   needs nothing until it returns; then open the next cycle at once instead of sleeping, and add
+   `--wake` to it: the running tick may already have digested, unseen, the change the wake was
+   about, and `--wake` makes that next cycle tick whatever its fingerprint says.
 4. **Stop** on the user's word: one more cycle, the **drain** —
    ```bash
    <skill>/scripts/afk.py cycle --drain --repo <repo> --config '<config json>' --state '<state json>'
@@ -417,9 +419,12 @@ stopped on the PR:
   PR-less worker: nudged once when it goes silent, failed a grace period later — which closes the
   PR and frees the turn — and replaced by continuation onto the turn when its terminal is gone.
   That ladder is what bounds a turn.
-- `awaiting_ci`, `needs_verify` or `no_checks` means the landing's sync moved the head and the next
-  move is the fleet's: the pass runs `afk turn` again, which waits for the checks on the new head,
-  asks for the verify of it, and then tells the worker to land again. The turn stays with the PR.
+- checks that must run on the head its sync pushed are waited for by `afk land` itself, in the
+  same run: green and it merges, red and it is `gate_red`. No cycle is involved.
+- `awaiting_ci`, `needs_verify` or `no_checks` means the next move is the fleet's — the checks were
+  still running when the landing's wait ran out (`--checks-timeout`), or the sync moved the head a
+  judgment was made about: the pass runs `afk turn` again, which waits for the checks on the new
+  head, asks for the verify of it, and then tells the worker to land again. The turn stays with the PR.
 
 The invariant every path keeps: **what lands on the target was gated in the form it lands.** A sync
 that moved the head invalidates checks and verifications of the old one, and gh refuses the merge if

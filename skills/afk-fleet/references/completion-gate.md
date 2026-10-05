@@ -11,8 +11,9 @@ A PR may land only when **all** configured gates are green. Which **machine gate
 - **`required` (default) — the CI machine gate.** Wait for the PR's GitHub checks. `afk turn` grants
   the landing turn only when they are green, and `afk land` lands the PR only when they are green
   **on the head that lands**: if its sync moved the head, the old checks describe a tree that will
-  not merge, so it returns `awaiting_ci`, the worker stops, and the next pass's `afk turn` tells it to land
-  again once CI has spoken about that head. On red, read the failing-log excerpt for the `afk fail` reason in an **ephemeral sub-read** that
+  not merge, so it waits — in that same run — for CI to speak about the head it pushed, then merges
+  or returns `gate_red`. Only when that wait runs out (`--checks-timeout`, default 1800 s) does it return
+  `awaiting_ci`: the worker stops, and the next pass's `afk turn` tells it to land again once CI has spoken. On red, read the failing-log excerpt for the `afk fail` reason in an **ephemeral sub-read** that
   returns only `{status: red, reason}`; raw logs never enter the launcher. Progressive: before CI exists a
   PR has no checks at all — `rebuild` reports it `awaiting_turn` (there is nothing to wait for), `afk turn` returns `no_checks`, the gate is then the issue's acceptance
   criteria + whatever local build/test exists, and `--allow-no-checks` is how you say it passed.

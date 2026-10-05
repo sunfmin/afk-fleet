@@ -157,7 +157,8 @@ your PR holds the landing turn:
 {land_command}
 ```
 It syncs your branch with the merge target (a merge, never a rebase), pushes, runs the gate on that
-exact head, and merges the PR pinned to the head it gated. It ends with one JSON object. An
+exact head — or waits for the PR's checks on it, which can take as long as CI does: let it run — and
+merges the PR pinned to the head it gated. It ends with one JSON object. An
 `"error"` saying the PR does **not hold the landing turn** means it is not your turn: nothing was
 changed — stop and wait to be told; do not land it any other way. Otherwise act on its `outcome`:
 
@@ -166,7 +167,7 @@ changed — stop and wait to be told; do not land it any other way. Otherwise ac
 | `merged` | The PR landed. | Wake the coordinator and stop. You are done — the fleet removes this worktree. |
 | `conflict` | Merging the target into your branch conflicted. The merge is **left in progress** here, with `files` unmerged. | Resolve every file so both sides' intent survives (read what landed first: `git log HEAD..MERGE_HEAD`), `git add` it, **commit the merge**, and run the command again. Never rebase, never abort the merge, never drop the other change to make yours fit. |
 | `gate_red` | The gate is red on the synced head — `gate.excerpt` is the tail of its log (or, with required checks, the PR's checks are red). | Fix the code, **commit**, and run the command again. |
-| `awaiting_ci` | The PR's checks have not finished on the head that would land — the sync just pushed it. | Wake the coordinator and stop. The turn stays yours; you are told to run the command again. |
+| `awaiting_ci` | The command waited for the PR's checks on the head that would land, and they had not finished when its wait ran out. | Wake the coordinator and stop. The turn stays yours; you are told to run the command again. |
 | `needs_verify` | The head that would land is not the one that was verified — the sync moved it. | Wake the coordinator and stop. The turn stays yours; you are told to run the command again. |
 | `no_checks` | The PR has no checks at all, and that has not been waived. | Wake the coordinator and stop. The turn stays yours; you are told to run the command again. |
 
