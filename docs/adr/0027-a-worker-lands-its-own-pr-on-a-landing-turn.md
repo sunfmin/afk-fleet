@@ -20,6 +20,9 @@ worker behind a single gate run.
 [the amendment](#amendment-51--a-landing-waits-for-its-own-checks) at the end. Where the text below
 has `awaiting_ci` send the worker round the launcher, read it as what happens only once that wait
 has run out.
+**Amended by [ADR-0035](0035-a-silent-landing-worker-is-restarted-onto-its-turn.md) (#90):** a
+worker still silent after its nudge on the turn is restarted onto the turn once, not failed — see
+[What bounds a turn](#what-bounds-a-turn).
 
 ## Context
 
@@ -104,12 +107,18 @@ lands** — and so is merge-never-rebase. What moved is who runs the gate at lan
 
 ### What bounds a turn
 
-The ladder that already exists. A `landing` claim's worker is asked after with `afk no-pr`, like a
-PR-less one: busy or within grace of the turn it is left; silent past grace it is nudged once
-(ADR-0018), then failed — `afk fail` closes the PR, which frees the turn, and the next PR gets it. A
-worker with no terminal is an orphan, and its continuation (`afk dispatch`) is started on the turn.
-A worker whose landing stopped *for the tick* is waiting, not silent, and is never nudged or failed
-for it.
+The ladder that already exists, with one rung added by
+[ADR-0035](0035-a-silent-landing-worker-is-restarted-onto-its-turn.md). A `landing` claim's worker
+is asked after with `afk no-pr`, like a PR-less one: busy or within grace of the turn it is left;
+silent past grace it is nudged once (ADR-0018); silent again it is **restarted onto the turn** —
+`afk turn --restart`: the delivery below for a gone terminal, applied to an idle one, recorded on
+the turn marker and made once per turn; and silent again after the restarted worker's own nudge it
+is failed — `afk fail` closes the PR, which frees the turn, and the next PR gets it. (As first
+written, the unanswered nudge failed the attempt outright: a PR the tick had judged ready was
+closed and redone from base because one line to an idle session was not acted on.) A worker with
+no terminal is an orphan, and its continuation (`afk dispatch`) is started on the turn. A worker
+whose landing stopped *for the tick* is waiting, not silent, and is never nudged, restarted or
+failed for it.
 
 ### What the landing does not do
 
