@@ -1111,18 +1111,34 @@ def test_classification_nudges_a_silent_worker_once_before_failing_it():
     assert _classify({**ZERO, "commits_ahead": 3}, "idle", 9000, nudged_at=NOW - GRACE,
                      turn={"at": NOW - 2 * GRACE, "stopped": None})["cause"] == "silent_on_turn"
     # ONE restart per turn: the restarted worker is told anew (`at` moves), nudged
-    # once like any worker, and silent again after that it takes the failure path
+    # once like any worker, and silent again after that it is ESCALATED with its
+    # PR, branch and worktree kept — never `next_attempt`: no silence of a landing
+    # turn reaches `afk fail` (#91)
     assert turn(9000, NOW - 10, restarted=NOW - 10) == ("coding", "leave", 10)
     assert turn(9000, NOW - GRACE, restarted=NOW - GRACE) == ("idle_stalled", "nudge", GRACE)
     assert turn(9000, NOW - 2 * GRACE, restarted=NOW - 2 * GRACE, nudged_at=NOW - GRACE) == \
-        ("idle_failed", "next_attempt", GRACE)
+        ("idle_stalled", "escalate", GRACE)
+    assert _classify(ZERO, "idle", 9000, nudged_at=NOW - GRACE,
+                     turn={"at": NOW - 2 * GRACE, "restarted": NOW - 2 * GRACE})["cause"] == \
+        "silent_past_restart"
+    # with nowhere to record a nudge the turn takes its next rung at once — the
+    # restart, then the escalation — where a PR-less claim fails at once
+    assert _classify(ZERO, "idle", 9000, can_nudge=False,
+                     turn={"at": NOW - GRACE})["action"] == "restart"
+    assert _classify(ZERO, "idle", 9000, can_nudge=False,
+                     turn={"at": NOW - GRACE, "restarted": NOW - GRACE})["action"] == "escalate"
+    assert _classify(ZERO, "idle", 9000, can_nudge=False)["cause"] == "silent_unnudgeable"
     # a turn that is not one PR's — a merge batch's, or a marker that holds no turn
-    # — is never restarted; nor is a claim that has no turn (a no_pr claim)
+    # — is never restarted or escalated for its silence; nor is a claim that has no
+    # turn (a no_pr claim)
     for held in ({"at": NOW - 2 * GRACE, "batch": "b1"}, {"at": NOW - 2 * GRACE, "released": True},
                  {}, None):
         r = _classify(ZERO, "idle", 9000, nudged_at=NOW - GRACE, turn=held)
         assert (r["cause"], r["action"]) == ("silent_after_nudge", "next_attempt"), held
+        r = _classify(ZERO, "idle", 9000, can_nudge=False, turn=held)
+        assert (r["cause"], r["action"]) == ("silent_unnudgeable", "next_attempt"), held
     assert d.restartable_turn({"at": 1}) and not d.restartable_turn({"at": 1, "restarted": 2})
+    assert d.single_turn_held({"at": 1, "restarted": 2}) and not d.single_turn_held({"at": 1, "batch": "b"})
     r = _classify(ZERO, "none", None, turn={"at": NOW - 10})
     assert (r["outcome"], r["action"]) == ("dead", "orphan")      # a gone terminal is still dead
     # a worker whose landing stopped FOR THE TICK (CI, a verify, absent checks) is
@@ -1151,7 +1167,7 @@ def test_stall_reason_carries_where_the_worker_stopped():
     assert d.stall_tail([str(i) for i in range(100)], limit=3) == ["97", "98", "99"]
     assert d.stall_tail(None) == []
     reason = d.stall_reason("idle with no outcome\n", screen)
-    assert reason.startswith("idle with no outcome\n\nThe previous worker stopped")
+    assert reason.startswith("idle with no outcome\n\nThe worker stopped")
     assert "```\n● 要我按这段说明把 #41 从头做到开 PR 吗？\n" in reason and reason.endswith("❯\n```")
     assert d.stall_reason("idle with no outcome", []) == "idle with no outcome"   # nothing to add
     # the nudge is one short line — a long one is the very paste it is sent to break
@@ -1938,6 +1954,18 @@ def test_worker_step_routes_every_cause_or_returns_the_judgment():
     # a landing worker silent after its nudge is RESTARTED onto its turn — `afk turn
     # --restart` — not failed: nothing is closed, deleted or counted (ADR-0035)
     assert step("silent_on_turn", _mine(4, "landing", pr=30)) == ("restart", None)
+    # …and silent again past that one restart it is ESCALATED with its PR, branch
+    # and worktree kept, the reason saying the PR was ready and the landing was
+    # restarted once (#91); a landing row's silence has NO failure route at all
+    do, reason = step("silent_past_restart", _mine(4, "landing", pr=30, stopped="conflict"))
+    assert (do, reason) == ("escalate", _KEPT.format(pr=30, stopped="conflict"))
+    for cause in ("silent_after_nudge", "silent_unnudgeable"):
+        try:
+            step(cause, _mine(4, "landing", pr=30))
+        except ValueError as e:
+            assert "never a failure" in str(e), cause
+        else:
+            raise AssertionError(f"a landing claim's {cause} was routed")
     # a claim with no worker left is CONTINUED, with no judgment asked: an unattended
     # run never releases it back to the frontier
     assert step("gone") == step("blockers_closed") == ("dispatch", None)
@@ -1973,13 +2001,17 @@ def test_worker_step_routes_every_cause_or_returns_the_judgment():
     assert {c for c in d.WORKER_CAUSES if c not in d._BATCH_STEPS} == {
         "satisfied", "satisfied_refuted", "blockers_closed", "blockers_waiting", "blocker_unmet",
         "no_blocker_named", "gave_up", "unknown_phase",         # a batch worker declares nothing
-        "silent_on_turn"}                                       # …and is abandoned, never restarted
+        "silent_on_turn", "silent_past_restart"}                # …and is abandoned, never restarted
 
 
 # Every failure and escalation reason a tick words by itself, pinned to the cause
 # it is worded for: (cause, what was gathered, the claim's status → the reason).
 _UNMET = [{"number": 9, "standing": "unmet", "reason": "was closed as not planned"},
           {"number": 8, "standing": "waiting", "reason": None}]
+# the reason a landing turn is escalated with past its one restart (#91)
+_KEPT = ("PR #{pr} was judged ready and given the landing turn, its worker was restarted onto "
+         "the turn once, and the landing still did not happen: {stopped}. The PR, its branch "
+         "and its worktree are kept as they are")
 _GONE_QUIET = {"progress": ZERO, "idle": 9000}
 REASONS = (
     ("blocker_unmet", "escalate",
@@ -2001,13 +2033,15 @@ REASONS = (
      "idle with no PR and no verdict a grace period after its nudge"),
     ("silent_unnudgeable", "fail", {"can_nudge": False}, "no_pr",
      "idle with no PR and no verdict, and no worktree here to nudge it in"),
-    # a landing worker silent after its nudge is failed only once its turn had its
-    # restart (ADR-0035); with no worktree here there is nothing to restart in
-    ("silent_after_nudge", "fail",
+    # a landing worker silent after its nudge is restarted once (ADR-0035), and
+    # silent again past that restart it is ESCALATED with its PR, branch and
+    # worktree kept — the only end a landing claim's silence has, and never `afk
+    # fail` (#91); with no worktree here to nudge in, the same rung at once
+    ("silent_past_restart", "escalate",
      {"nudged_at": NOW - GRACE, "stopped": "conflict", "restarted": NOW - 2 * GRACE}, "landing",
-     "given the landing turn and never landed: conflict"),
-    ("silent_unnudgeable", "fail", {"can_nudge": False}, "landing",
-     "given the landing turn and never landed: no `afk land` outcome"),
+     _KEPT.format(pr=30, stopped="conflict")),
+    ("silent_past_restart", "escalate", {"can_nudge": False, "restarted": NOW - 2 * GRACE},
+     "landing", _KEPT.format(pr=30, stopped="no `afk land` outcome")),
     # what the worker declared still words the failure of a claim that holds the turn
     ("gave_up", "fail", {"verdict": _declared("giving-up", reason="flaky build")}, "landing",
      "its worker gave up: flaky build"),
@@ -2470,11 +2504,21 @@ def test_a_landing_worker_silent_after_its_nudge_is_restarted_onto_its_turn():
     steps, done = _play(ws, {("restart", 5): _Raises("orca is down")}, causes={5: "silent_on_turn"})
     assert done["errors"] == [{"step": "turn", "issue": 5, "error": "orca is down"}]
     assert ("status", 5) in _brief(steps) and done["held"] == {5, 6}
-    # past its one restart the same silence is a failure, with the turn's reason
-    steps, done = _play(ws, causes={5: "silent_after_nudge"})
-    assert ("fail", 5) in _brief(steps) and done["did"]["retried"] == [5]
-    assert steps[_brief(steps).index(("fail", 5))]["reason"] == \
-        "given the landing turn and never landed: conflict"
+    # past its one restart the same silence is an ESCALATION with the turn's reason
+    # (#91): the claim is settled — its slot freed, its board the escalation's —
+    # and nothing is retried; `afk fail` is never a step of it
+    steps, done = _play(ws, causes={5: "silent_past_restart"})
+    assert _brief(steps) == [("no-pr", [5]), ("escalate", 5), ("heartbeat",), ("status", 6)]
+    assert done["did"] == _nothing_done(escalated=[5], in_flight=1)
+    assert done["held"] == {6} and done["judgments"] == []
+    assert steps[1]["reason"] == _KEPT.format(pr=50, stopped="conflict")
+    # a landing row's silence is never routed to `afk fail`: the plan refuses it
+    try:
+        _play(ws, causes={5: "silent_after_nudge"})
+    except ValueError as e:
+        assert "never a failure" in str(e)
+    else:
+        raise AssertionError("a landing claim's silence reached `afk fail`")
 
 
 def test_a_plan_names_only_steps_the_table_lists_and_refuses_an_unknown_cause():

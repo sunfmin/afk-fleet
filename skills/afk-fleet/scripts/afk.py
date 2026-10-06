@@ -2176,14 +2176,17 @@ def cmd_turn(a):
     terminal that is gone. The PR, the branch, the worktree and the attempt label
     are not touched; the restart is written on the turn marker (`restarted`), and
     it happens ONCE per turn — a second call is refused, and a restarted worker
-    that goes silent again after its own nudge is failed.
+    that goes silent again after its own nudge is escalated (`afk escalate`) with
+    the PR, the branch and the worktree kept: a landing turn never spends an
+    attempt.
 
       granted       the worker was told (`delivery`: "terminal" | "continuation").
                     `again` is true when the PR already held the turn and its
                     `afk land` had stopped for the tick: it was told to land again;
                     `restarted` (epoch seconds) is set when `--restart` did this.
       waiting       another claim of mine (`holder`) holds the turn. Nothing was
-                    touched; this PR's turn comes when that one has landed or failed.
+                    touched; this PR's turn comes when that one has landed, failed
+                    or been escalated (a released claim holds no turn).
       landing       this PR already holds the turn and its worker has not stopped
                     for the tick. Nothing was touched; `afk no-pr` watches it.
       awaiting_ci   required mode: the PR's checks are still running. Leave it.
@@ -2243,12 +2246,12 @@ def _grant_turn(run, instance, agent, number, allow_no_checks=False, verified=No
                                f"(`afk turn --issue {number}` grants one)")
         if mine["restarted"]:
             raise RuntimeError(f"the worker on issue #{number} was already restarted onto this "
-                               f"turn once — a second silence is a failure (`afk fail`), not "
-                               f"another restart")
+                               f"turn once — a second silence is escalated (`afk escalate`), "
+                               f"with the PR kept, not restarted again")
     elif others:
         return stop("waiting", holder=others[0],
                     detail=f"issue #{others[0]}'s PR holds this fleet's landing turn; nothing was "
-                           f"touched — this PR's turn comes when that one has landed or failed")
+                           f"touched — this PR's turn comes when that one has landed, failed or been escalated")
     prev = _turn(run.repo, pr["number"])
     if not restart and mine and mine["stopped"] not in afk_decide.LAND_WAITS:
         return stop("landing",
@@ -3015,8 +3018,11 @@ def _ensure_label(repo, name):
 
 def cmd_fail(a):
     """One of my claims FAILED — its checks are red, a verifier refuted it, or its
-    worker gave up or went quiet with no outcome: no PR, or a landing turn it did
-    not land. A failed PR is closed, which is also what frees its landing turn. The retry ladder, as one
+    worker gave up or went quiet with no PR and no outcome. A failed PR is closed,
+    which is also what frees its landing turn — but a landing turn's silence never
+    comes here: it is restarted onto, then escalated with the PR kept (ADR-0035),
+    and `afk fail` reaches a landing claim only by the tick's own judgments (red
+    checks in `required`, a refuted verify). The retry ladder, as one
     transition (ADR-0017): read the attempt off the issue's `afk-attempt/<n>`
     label, then either
 
@@ -3069,8 +3075,12 @@ def _fail_claim(run, instance, agent, number, reason):
 def cmd_escalate(a):
     """Hand one of my claims straight to a human, outside the retry ladder — a DAG
     gap (`afk no-pr` → `idle_blocked` / `escalate`: a blocker nothing will resolve,
-    or none named). Same ordered transition `afk fail` ends in; the attempt count is
-    reported, not consulted."""
+    or none named), or a landing turn nobody could get a worker to perform
+    (`afk no-pr` → `idle_stalled` / `escalate`: silent again after its one restart,
+    ADR-0035). Same ordered transition `afk fail` ends in; the attempt count is
+    reported, not consulted, and no attempt is spent: the PR stays open, the
+    branch and the worktree stay. After an unanswered nudge the worker's last
+    screen is appended to the reason, as `afk fail` appends it."""
     return _escalate_claim(_run(a), a.instance, a.number, a.reason)
 
 
@@ -3080,7 +3090,7 @@ def _escalate_claim(run, instance, number, reason):
     _require_mine(rem, cfg, number, instance)
     issue = _issue(run.repo, number)
     return _escalate(run, instance, issue, afk_decide.current_attempt(issue["labels"]),
-                     reason)
+                     _stalled_reason(run.repo, number, reason))
 
 
 def cmd_park(a):
