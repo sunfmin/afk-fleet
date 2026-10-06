@@ -918,9 +918,6 @@ def gate_comment(verdict, command):
 VERDICT_PHASES = ("already-satisfied", "blocked", "giving-up")
 _SATISFIED, _BLOCKED, _GIVING_UP = VERDICT_PHASES
 
-# What the orca liveness probe can say about a worker's terminal.
-TERMINAL_STATES = ("busy", "idle", "none")
-
 class Cause(NamedTuple):
     """One reason a claim waiting on its worker is where it is — the row of
     WORKER_CAUSES it is declared in is everything that follows from it."""
@@ -997,8 +994,8 @@ _NO_VERDICT = blank_record(VERDICT_RECORD)
 
 
 def verdict_marker(n, phase, blocked_by=(), reason=None):
-    """The marker a worker posts for one verdict — what `parse_verdict_marker`
-    reads back (a test round-trips every phase)."""
+    """The marker a worker posts for one verdict — what `latest_verdict` reads
+    back (a test round-trips every phase)."""
     return record_marker(VERDICT_RECORD, {"n": n, "phase": phase, "blocked_by": list(blocked_by),
                                           "reason": reason})
 
@@ -1010,16 +1007,6 @@ def verdict_marker_format(n):
                          {"n": n, "phase": f"<{'|'.join(VERDICT_PHASES)}>",
                           "blocked_by": "<csv of issue numbers>", "reason": "<short>"},
                          optional=("blocked_by", "reason"))
-
-
-def parse_verdict_marker(body):
-    """
-    The verdict one comment body carries (`VERDICT_RECORD`), or None if the body
-    carries no marker. Returns:
-      {"found": True, "n": int|None, "phase": str|None, "blocked_by": [int], "reason": str|None}
-    """
-    record = read_marker(VERDICT_RECORD, body)
-    return None if record is None else {"found": True, **_NO_VERDICT, **record}
 
 
 def latest_verdict(comments):
@@ -1413,7 +1400,8 @@ def stall_reason(reason, tail):
 # is made of.
 
 # Every `outcome` `afk land` can stop with — the vocabulary the worker's prompt
-# routes on (a test holds the prompt and the docs to it).
+# routes on (a test holds the prompt and the docs to it). What each means is
+# `afk.cmd_land`'s docstring, and nowhere else in the code.
 LAND_OUTCOMES = ("merged", "conflict", "gate_red", "awaiting_ci", "needs_verify", "no_checks")
 
 # The landing outcomes where the next move is the TICK's, not the worker's: the
@@ -1421,7 +1409,8 @@ LAND_OUTCOMES = ("merged", "conflict", "gate_red", "awaiting_ci", "needs_verify"
 LAND_WAITS = ("awaiting_ci", "needs_verify", "no_checks")
 
 # Every `outcome` `afk turn` can stop with — the vocabulary the tick's
-# instructions route on (a test holds the docs to it).
+# instructions route on (a test holds the docs to it). What each means is
+# `afk.cmd_turn`'s docstring; what the tick does next with it is `turn_step`.
 TURN_OUTCOMES = ("granted", "waiting", "landing", "awaiting_ci", "gate_red", "no_checks",
                  "needs_verify")
 
@@ -1771,6 +1760,26 @@ def batch_candidates(mine, merge_order, config, busy=()):
     return picked if len(picked) >= 2 else []
 
 
+def turn_holder(ws, instance):
+    """Who holds this fleet's landing turn, as far as a merge batch goes → (who,
+    what), the first of these that is so — the one precedence `tick_plan` and
+    `afk turn --batch` both read:
+
+      "dead"    the merge batches of other (dead) fleet instances still on record
+                on claims I took — nothing is granted until they are abandoned
+      "mine"    my own batch
+      "single"  the issue number of the one PR that holds the turn
+      None      no turn is out (what is None too)"""
+    dead = [b for b in ws["batches"] if b["instance"] != instance]
+    if dead:
+        return "dead", dead
+    mine = next((b for b in ws["batches"] if b["instance"] == instance), None)
+    if mine:
+        return "mine", mine
+    single = next((r["number"] for r in ws["mine"] if r["status"] == "landing"), None)
+    return ("single", single) if single is not None else (None, None)
+
+
 def stack_message(title, pr, issue):
     """The message of the merge commit a batched PR is stacked with: the PR's
     title, `(#<pr>)`, and the closing keyword. The `(#<pr>)` is also how the
@@ -2050,7 +2059,7 @@ def furthest_ahead(ahead_by_branch):
     return max(names, key=lambda b: ahead_by_branch[b] or 0) if names else None
 
 
-def select_recovery(worktree, branch):
+def select_recovery(worktree, branch, fresh=False, landing_pr=None):
     """
     How to recover ONE claim whose worker has died — the continue-vs-fresh
     selection of ADR-0011, tiered by what survived. Pure: `afk recovery` gathers
@@ -2060,6 +2069,13 @@ def select_recovery(worktree, branch):
                 {"present": bool, "commits_ahead": int|None, "dirty": bool}
       branch:   the issue's branch on the remote (None / {} if unknown)
                 {"name": str|None, "commits_ahead": int|None}   (ahead of base)
+      fresh:    the previous attempt was discarded — a retry. Nothing is read:
+                tier 3, whatever the signals say.
+      landing_pr: the number of the issue's PR when it holds this fleet's landing
+                turn on its own (not in a merge batch), else None. The worker is
+                then started ON the turn (ADR-0027): `prompt` is "landing", and
+                with no worktree here one is recreated at the PR's head — never
+                from base.
 
     Returns {"tier", "action", "prompt", "reason"}:
       1  reuse_worktree   a worktree is still HERE → spawn the new worker inside
@@ -2071,16 +2087,21 @@ def select_recovery(worktree, branch):
       3  dispatch_fresh   nothing survived → re-dispatch from base. The ONLY
                           tier that tears down.
 
-    `prompt` picks the worker-prompt variant: `continue` (inspect the existing
-    progress first) or `fresh`. A surviving worktree that is *provably* pristine
+    `prompt` picks the brief: a worker-prompt variant — `continue` (inspect the
+    existing progress first) or `fresh` — or `landing`, the landing brief
+    (`render_landing`). A surviving worktree that is *provably* pristine
     — zero commits ahead, a clean tree, and nothing pushed on its branch either —
     gets the fresh prompt: there is nothing to continue, and telling a worker
     otherwise sends it looking for work that isn't there. Unreadable progress
     (`commits_ahead: None`) is NOT pristine: we never hand out a fresh prompt over
     a worktree we could not read.
     """
+    if fresh:
+        return {"tier": 3, "action": "dispatch_fresh", "prompt": "fresh",
+                "reason": "fresh start: the previous attempt was discarded"}
     wt, br = worktree or {}, branch or {}
     pushed = int(br.get("commits_ahead") or 0)
+    held = "landing" if landing_pr else None
     if wt.get("present"):
         ahead = wt.get("commits_ahead")
         known = ahead is not None
@@ -2096,7 +2117,11 @@ def select_recovery(worktree, branch):
             reason = (f"local worktree present with {int(ahead)} commit(s) ahead"
                       + (" and uncommitted changes" if wt.get("dirty") else ""))
         return {"tier": 1, "action": "reuse_worktree",
-                "prompt": "fresh" if pristine else "continue", "reason": reason}
+                "prompt": held or ("fresh" if pristine else "continue"), "reason": reason}
+    if held:
+        return {"tier": 2, "action": "recreate_at_tip", "prompt": held,
+                "reason": f"no local worktree; PR #{landing_pr} holds the landing turn — "
+                          f"recreate at its head"}
 
     name, ahead = br.get("name"), br.get("commits_ahead")
     if name and ahead is not None and int(ahead) > 0:
@@ -3253,15 +3278,15 @@ def _turn_plan(tick, call, config):
             tick.did("abandoned", *gone["issues"])
         return gone
 
-    dead = [b for b in ws["batches"] if b["instance"] != instance]
-    mine = next((b for b in ws["batches"] if b["instance"] == instance), None)
-    live = {mine["id"]} if mine else set()
-    if dead:
-        for batch in dead:
+    who, what = turn_holder(ws, instance)
+    live = {b["id"] for b in ws["batches"] if b["instance"] == instance}
+    if who == "dead":
+        for batch in what:
             if not (yield from abandon(batch)):
                 live.add(batch["id"])
         return live
-    if mine:
+    if who == "mine":
+        mine = what
         seen = yield from run("no-pr", batch=mine["id"])
         do = batch_step(seen["workers"][0]) if seen else "leave"
         if do == "continue":

@@ -655,7 +655,7 @@ def test_each_record_in_a_comment_round_trips_through_its_own_reader():
             ("blocked", [71], "no record mechanism yet"),
     }
     for body, (phase, blocked_by, reason) in verdicts.items():
-        assert d.parse_verdict_marker(body) == {"found": True, "n": 72, "phase": phase,
+        assert _verdict_in(body) == {"found": True, "n": 72, "phase": phase,
                                                 "blocked_by": blocked_by, "reason": reason}, body
     assert d.STATUS_MARKER == "<!--afk:status-->"
 
@@ -874,13 +874,19 @@ def test_protection_verdict():
     assert d.protection_verdict("required", None, unavailable="boom")["verdict"] == "ok"
 
 
-def test_the_verdict_marker_round_trips_through_its_parser():
+def _verdict_in(body):
+    """The verdict one comment body carries, blanks filled in, or None."""
+    record = d.read_marker(d.VERDICT_RECORD, body)
+    return None if record is None else {"found": True, **d.blank_record(d.VERDICT_RECORD), **record}
+
+
+def test_the_verdict_marker_round_trips_through_its_reader():
     # one writer, one reader: whatever `verdict_marker` spells, the parser reads back
     for phase in d.VERDICT_PHASES:
-        got = d.parse_verdict_marker(d.verdict_marker(12, phase, [3, 4], "needs pages from #3"))
+        got = _verdict_in(d.verdict_marker(12, phase, [3, 4], "needs pages from #3"))
         assert got == {"found": True, "n": 12, "phase": phase, "blocked_by": [3, 4],
                        "reason": "needs pages from #3"}, phase
-        bare = d.parse_verdict_marker(d.verdict_marker(7, phase))
+        bare = _verdict_in(d.verdict_marker(7, phase))
         assert (bare["n"], bare["phase"], bare["blocked_by"], bare["reason"]) == (7, phase, [], None)
     # what the worker is shown is that same spelling, with placeholders
     shown = d.verdict_marker_format(31)
@@ -888,31 +894,31 @@ def test_the_verdict_marker_round_trips_through_its_parser():
                      "[blocked_by=<csv of issue numbers>] [reason=<short>]-->")
 
 
-def test_parse_verdict_marker():
+def test_a_verdict_marker_is_read_leniently():
     # valid, every field; reason (last) keeps its spaces
     body = ("<!--afk:verdict n=12 phase=blocked blocked_by=3,4 reason=needs pages from #3-->\n"
             "Blocked on #3 and #4 — no PRs there yet.")
-    p = d.parse_verdict_marker(body)
+    p = _verdict_in(body)
     assert p["found"] is True and p["n"] == 12 and p["phase"] == "blocked"
     assert p["blocked_by"] == [3, 4]
     assert p["reason"] == "needs pages from #3"
 
     # already-satisfied, no blocked_by / reason
-    p = d.parse_verdict_marker("<!--afk:verdict n=7 phase=already-satisfied-->\nEmpty diff vs base.")
+    p = _verdict_in("<!--afk:verdict n=7 phase=already-satisfied-->\nEmpty diff vs base.")
     assert p["phase"] == "already-satisfied" and p["blocked_by"] == [] and p["reason"] is None
 
     # giving-up, tolerant of extra whitespace around the marker + tokens
-    assert d.parse_verdict_marker("<!--  afk:verdict   phase=giving-up  -->")["phase"] == "giving-up"
+    assert _verdict_in("<!--  afk:verdict   phase=giving-up  -->")["phase"] == "giving-up"
 
     # missing marker → None (a plain human comment is not a verdict)
-    assert d.parse_verdict_marker("just a normal comment, no marker") is None
-    assert d.parse_verdict_marker("") is None
-    assert d.parse_verdict_marker(None) is None
+    assert _verdict_in("just a normal comment, no marker") is None
+    assert _verdict_in("") is None
+    assert _verdict_in(None) is None
 
     # malformed: marker present but no phase → found True, phase None. Parse is
     # lenient by design; classify_stopped treats a None/unknown phase as failed, and
     # whether to trust the marker at all stays the tick's call.
-    p = d.parse_verdict_marker("<!--afk:verdict n=9-->")
+    p = _verdict_in("<!--afk:verdict n=9-->")
     assert p["found"] is True and p["phase"] is None and p["blocked_by"] == []
 
 
@@ -1507,6 +1513,34 @@ def test_select_recovery():
 
     # a branch we could not measure is not evidence of progress (never a silent tier 2)
     assert d.select_recovery({"present": False}, {"name": "b", "commits_ahead": None})["tier"] == 3
+
+
+def test_select_recovery_knows_a_retry_and_a_held_landing_turn():
+    here = {"present": True, "commits_ahead": 3, "dirty": False}
+    pushed = {"name": "b", "commits_ahead": 4}
+    # a retry discarded the attempt: from base, whatever is still lying around
+    r = d.select_recovery(here, pushed, fresh=True)
+    assert (r["tier"], r["action"], r["prompt"]) == (3, "dispatch_fresh", "fresh")
+    assert "discarded" in r["reason"]
+    # a PR that holds the turn: its worker is started on the landing brief …
+    r = d.select_recovery(here, pushed, landing_pr=30)
+    assert (r["tier"], r["action"], r["prompt"]) == (1, "reuse_worktree", "landing")
+    # … and with no worktree here, at the PR's head — never from base, pushed or not
+    for br in (pushed, {"name": "b", "commits_ahead": 0}, None):
+        r = d.select_recovery({"present": False}, br, landing_pr=30)
+        assert (r["tier"], r["action"], r["prompt"]) == (2, "recreate_at_tip", "landing"), br
+        assert "PR #30" in r["reason"]
+
+
+def test_turn_holder_reads_one_precedence():
+    mine_b = {"id": "m", "instance": "me", "members": [], "phase": None}
+    dead_b = {"id": "x", "instance": "gone", "members": [], "phase": None}
+    rows = [_mine(1, "landing", pr=10), _mine(2, "awaiting_turn", pr=20)]
+    ws = lambda batches, mine=(): {"batches": batches, "mine": list(mine)}
+    assert d.turn_holder(ws([mine_b, dead_b], rows), "me") == ("dead", [dead_b])
+    assert d.turn_holder(ws([mine_b], rows), "me") == ("mine", mine_b)
+    assert d.turn_holder(ws([], rows), "me") == ("single", 1)
+    assert d.turn_holder(ws([], rows[1:]), "me") == (None, None)
 
 
 def test_current_attempt_is_the_one_reader_of_the_label():

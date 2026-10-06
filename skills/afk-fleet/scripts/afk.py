@@ -1739,7 +1739,7 @@ def _stalled_reason(repo, number, reason):
     return afk_decide.stall_reason(reason, tail or nudge.get("tail"))
 
 
-def _recovery(run, number, path=None, branch=None, no_worktree=False):
+def _recovery(run, number, path=None, branch=None, no_worktree=False, landing_pr=None):
     """What survived a dead worker, and the tier it selects (ADR-0011).
 
     Two signals, both mechanics: (1) is a worktree for this issue still on THIS
@@ -1774,7 +1774,7 @@ def _recovery(run, number, path=None, branch=None, no_worktree=False):
     branch_sig = {"name": branch, "commits_ahead": ahead.get(branch), "candidates": candidates}
 
     return {"issue": number, "base": base, "worktree": worktree, "branch": branch_sig,
-            **afk_decide.select_recovery(worktree, branch_sig)}
+            **afk_decide.select_recovery(worktree, branch_sig, landing_pr=landing_pr)}
 
 
 def cmd_recovery(a):
@@ -1867,27 +1867,23 @@ def _begin_worker(run, instance, agent, issue, start, reason=None):
     discarded, pr, turn = None, None, None
     if start == "fresh":
         discarded = _discard_attempt(run, number)
-        plan = {"tier": 3, "action": "dispatch_fresh", "prompt": "fresh",
-                "reason": "fresh start: the previous attempt was discarded"}
+        plan = afk_decide.select_recovery(None, None, fresh=True)
     else:
-        rec = _recovery(run, number)
-        plan = {k: rec[k] for k in ("tier", "action", "prompt", "reason")}
         pr = afk_decide.closing_pr(_open_prs(run.repo), number)
         turn = afk_decide.held_turn(_turn(run.repo, pr["number"]), instance) if pr else None
         if turn and turn["batch"]:       # a merge batch's turn is its batch worker's
             turn = None
+        rec = _recovery(run, number, landing_pr=pr["number"] if turn else None)
+        plan = {k: rec[k] for k in ("tier", "action", "prompt", "reason")}
 
     if plan["action"] == "reuse_worktree":
         wt = _Worktree.at(rec["worktree"]["path"])
         branch = wt.checked_out()
-    elif turn:
-        plan = {"tier": 2, "action": "recreate_at_tip", "prompt": "continue",
-                "reason": f"no local worktree; PR #{pr['number']} holds the landing turn — "
-                          f"recreate at its head"}
-        wt = _Worktree.cut(run, pr["headRefName"], issue=issue)
-        branch = wt.branch
     else:
-        tip = rec["branch"]["name"] if plan["action"] == "recreate_at_tip" else cfg["base_branch"]
+        if plan["action"] == "dispatch_fresh":
+            tip = cfg["base_branch"]
+        else:                            # recreate_at_tip: the PR's head, else the pushed branch
+            tip = pr["headRefName"] if turn else rec["branch"]["name"]
         wt = _Worktree.cut(run, tip, issue=issue)
         branch = wt.branch
 
@@ -1895,7 +1891,6 @@ def _begin_worker(run, instance, agent, issue, start, reason=None):
     fields = _prompt_fields(run, issue, path, branch)
     with open(_WORKER_PROMPT) as f:
         if turn:
-            plan["prompt"] = "landing"
             prompt = afk_decide.render_landing(f.read(), fields, _landing_fields(cfg, pr))
         else:
             prompt = afk_decide.render_worker_prompt(f.read(), plan["prompt"], fields,
@@ -2213,17 +2208,12 @@ def cmd_turn(a):
     paths repair — the nudge points at the brief, and a dead worker's
     continuation (`afk dispatch`) is started on the turn.
 
-    `--restart` is for a PR that holds the turn and whose worker is still silent
-    after its nudge (`afk no-pr` → `idle_stalled` / `restart`, ADR-0035): the
-    turn is not failed, its worker is replaced — the idle session is closed and a
-    worker is started by continuation in the same worktree (or one recreated at
-    the PR's head, never from base), briefed only to land, exactly as for a
-    terminal that is gone. The PR, the branch, the worktree and the attempt label
-    are not touched; the restart is written on the turn marker (`restarted`), and
-    it happens ONCE per turn — a second call is refused, and a restarted worker
-    that goes silent again after its own nudge is escalated (`afk escalate`) with
-    the PR, the branch and the worktree kept: a landing turn never spends an
-    attempt.
+    `--restart` replaces the worker of a PR that holds the turn (`afk no-pr` →
+    `restart`, ADR-0035): the idle session is closed and the delivery is made
+    again as for a terminal that is gone. Nothing else is touched; the restart
+    is written on the turn marker (`restarted`), and a second one on the same
+    turn is refused. When it is asked for, and what follows a second silence,
+    are `afk_decide.WORKER_CAUSES`'s rows.
 
       granted       the worker was told (`delivery`: "terminal" | "continuation").
                     `again` is true when the PR already held the turn and its
@@ -2283,13 +2273,13 @@ def _grant_turn(run, instance, agent, number, allow_no_checks=False, verified=No
     turns = _claim_turns(run.repo, prs, _scan(run)[0], instance)
     held = {n: t for n, t in turns.items() if afk_decide.held_turn(t, instance)}
     others = sorted(n for n in held if n != number)
-    mine = held.get(number)
+    held_here = held.get(number)
     if restart:
-        if not mine:
+        if not held_here:
             raise RuntimeError(f"PR #{pr['number']} does not hold this fleet's landing turn — "
                                f"there is no turn to restart issue #{number}'s worker onto "
                                f"(`afk turn --issue {number}` grants one)")
-        if mine["restarted"]:
+        if held_here["restarted"]:
             raise RuntimeError(f"the worker on issue #{number} was already restarted onto this "
                                f"turn once — a second silence is escalated (`afk escalate`), "
                                f"with the PR kept, not restarted again")
@@ -2298,13 +2288,13 @@ def _grant_turn(run, instance, agent, number, allow_no_checks=False, verified=No
                     detail=f"issue #{others[0]}'s PR holds this fleet's landing turn; nothing was "
                            f"touched — this PR's turn comes when that one has landed, failed or been escalated")
     prev = _turn(run.repo, pr["number"])
-    if not restart and mine and mine["stopped"] not in afk_decide.LAND_WAITS:
+    if not restart and held_here and held_here["stopped"] not in afk_decide.LAND_WAITS:
         return stop("landing",
                     detail="this PR already holds the landing turn and its worker has not "
                            "stopped for you; nothing was touched — `afk no-pr` watches it")
     # a judgment made about this PR stands: a re-delivery need not repeat it
-    allow = allow_no_checks or bool(mine and mine["allow_no_checks"])
-    verified = verified or (mine or {}).get("verified")
+    allow = allow_no_checks or bool(held_here and held_here["allow_no_checks"])
+    verified = verified or (held_here or {}).get("verified")
     checks = afk_decide.pr_checks_state(pr.get("statusCheckRollup"))
     ready = afk_decide.turn_gate(cfg["gate"]["ci"], checks, allow,
                                  cfg["gate"]["adversarial_verify"], verified, head)
@@ -2320,10 +2310,10 @@ def _grant_turn(run, instance, agent, number, allow_no_checks=False, verified=No
                 f.read(), _prompt_fields(run, issue, wt.path, wt.checked_out()),
                 _landing_fields(cfg, pr)))
     now = run.now()
-    restarted = now if restart else (mine or {}).get("restarted")
+    restarted = now if restart else (held_here or {}).get("restarted")
     out["comment_id"] = _record_turn(run.repo, pr["number"], afk_decide.single_turn(
         prev, instance, now, verified=verified, allow_no_checks=allow, restarted=restarted))
-    out["again"] = bool(mine)
+    out["again"] = bool(held_here)
     if restart:
         out["restarted"] = now
     if not there:           # the worker is gone (or replaced): its continuation is started on the turn
@@ -2597,8 +2587,15 @@ def _turn_batch(run, instance, agent, working_set=None):
     def stop(outcome, **more):
         return {"outcome": afk_decide.batch_turn_outcome(outcome), **more}
 
-    mine = next((b for b in ws["batches"] if b["instance"] == instance), None)
-    if mine:
+    who, what = afk_decide.turn_holder(ws, instance)
+    if who == "dead":
+        dead = what[0]
+        return stop("waiting", batch=dead["id"],
+                    detail=f"merge batch {dead['id']} of fleet instance {dead['instance']} is "
+                           f"still on record on PRs of claims this fleet took; nothing was "
+                           f"touched — abandon it first (`afk turn --abandon`)")
+    if who == "mine":
+        mine = what
         if _Worktree.of_batch(run.repo, mine["id"]).terminal:
             return stop("landing", batch=mine["id"],
                         detail="this batch already holds the landing turn and its worker is "
@@ -2608,14 +2605,8 @@ def _turn_batch(run, instance, agent, working_set=None):
                    if ((_turn(run.repo, m["pr"]) or {}).get("batch") == mine["id"])]
         return _start_batch_worker(run, instance, agent, mine["id"], members,
                                    mine["phase"] or afk_decide.BATCH_PHASES[0], again=True)
-    dead = next((b for b in ws["batches"] if b["instance"] != instance), None)
-    if dead:
-        return stop("waiting", batch=dead["id"],
-                    detail=f"merge batch {dead['id']} of fleet instance {dead['instance']} is "
-                           f"still on record on PRs of claims this fleet took; nothing was "
-                           f"touched — abandon it first (`afk turn --abandon`)")
-    holder = next((r["number"] for r in ws["mine"] if r["status"] == "landing"), None)
-    if holder is not None:
+    if who == "single":
+        holder = what
         return stop("waiting", holder=holder,
                     detail=f"issue #{holder}'s PR holds this fleet's landing turn; nothing was "
                            f"touched — no batch is formed while a turn is out")
@@ -3059,12 +3050,10 @@ def _ensure_label(repo, name):
 
 def cmd_fail(a):
     """One of my claims FAILED — its checks are red, a verifier refuted it, or its
-    worker gave up or went quiet with no PR and no outcome. A failed PR is closed,
-    which is also what frees its landing turn — but a landing turn's silence never
-    comes here: it is restarted onto, then escalated with the PR kept (ADR-0035),
-    and `afk fail` reaches a landing claim only by the tick's own judgments (red
-    checks in `required`, a refuted verify). The retry ladder, as one
-    transition (ADR-0017): read the attempt off the issue's `afk-attempt/<n>`
+    worker gave up or went quiet with no PR and no outcome (which silences come
+    here is `afk_decide.WORKER_CAUSES`'s to say: a landing turn's never does).
+    A failed PR is closed, which is also what frees its landing turn. The retry
+    ladder, as one transition (ADR-0017): read the attempt off the issue's `afk-attempt/<n>`
     label, then either
 
       retry     swap the label up by one, discard the failed attempt (close its PR,
@@ -3114,11 +3103,9 @@ def _fail_claim(run, instance, agent, number, reason):
 
 
 def cmd_escalate(a):
-    """Hand one of my claims straight to a human, outside the retry ladder — a DAG
-    gap (`afk no-pr` → `idle_blocked` / `escalate`: a blocker nothing will resolve,
-    or none named), or a landing turn nobody could get a worker to perform
-    (`afk no-pr` → `idle_stalled` / `escalate`: silent again after its one restart,
-    ADR-0035). Same ordered transition `afk fail` ends in; the attempt count is
+    """Hand one of my claims straight to a human, outside the retry ladder — where
+    `afk no-pr` says `escalate` (`afk_decide.WORKER_CAUSES`: a DAG gap, or a
+    landing turn nobody could get a worker to perform). Same ordered transition `afk fail` ends in; the attempt count is
     reported, not consulted, and no attempt is spent: the PR stays open, the
     branch and the worktree stay. After an unanswered nudge the worker's last
     screen is appended to the reason, as `afk fail` appends it."""
