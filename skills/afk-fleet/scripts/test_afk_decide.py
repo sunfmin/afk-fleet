@@ -152,8 +152,8 @@ def test_turn_record_round_trips_and_is_held_only_by_the_claims_owner():
     assert body.startswith("<!--afk:turn instance=fl-1 at=1234-->\n")
     assert "holds the landing turn" in body and "`fl-1`" in body and "`afk land`" in body
     rec = d.latest_turn([{"id": 7, "body": "a human note"}, {"id": 8, "body": body}])
-    single = {"batch": None, "members": [], "phase": None, "unbatched": None, "of": None,
-              "released": False}
+    single = {"restarted": None, "batch": None, "members": [], "phase": None, "unbatched": None,
+              "of": None, "released": False}
     assert rec == {"instance": "fl-1", "at": 1234, "verified": None, "allow_no_checks": False,
                    "stopped": None, "head": None, "comment_id": 8, **single}
     assert d.latest_turn([]) is None and d.latest_turn([{"id": 1, "body": "x"}]) is None
@@ -247,6 +247,8 @@ def _turn_shapes():
     return {"single": single,
             "single, judged and stopped": d.next_turn(judged, at=150, stopped="needs_verify",
                                                       head="h" * 40),
+            "single, restarted": d.single_turn(judged, "fl-1", 160, verified="v" * 40,
+                                               allow_no_checks=True, restarted=160),
             "batch": d.batch_turn(None, "fl-1", 200, "fl-1-200", members, "gating"),
             "left a batch": left,
             "single, after leaving a batch": d.single_turn(left, "fl-1", 400, verified="v" * 40)}
@@ -257,6 +259,7 @@ def test_a_turn_marker_round_trips_in_every_shape():
     and the marker of a PR that left a batch — so a marker rewritten from the
     record it was read as loses nothing."""
     wording = {"single": "holds the landing turn", "single, judged and stopped": "stopped with",
+               "single, restarted": "a new one was started onto it",
                "batch": "is in a merge batch", "left a batch": "was in merge batch `fl-1-200`",
                "single, after leaving a batch": "holds the landing turn"}
     for shape, record in _turn_shapes().items():
@@ -295,6 +298,18 @@ def test_a_field_no_rewrite_names_survives_it():
     # the comment a record was read from is the one its rewrite replaces
     assert again["comment_id"] == d.next_turn(again, at=6)["comment_id"] == 9
     assert d.next_turn(None, instance="x", at=6.9)["at"] == 6
+    # a restart (ADR-0035) is named by the turn that carries it over, so a landing
+    # that stops keeps it, and a re-delivery of the same turn passes it on — while
+    # a turn granted anew says none: another instance's restart does not outlive it
+    restarted = read(d.single_turn(again, "fl-1", 7, restarted=7))
+    assert (restarted["restarted"], restarted["at"], restarted["stopped"]) == (7, 7, None)
+    stopped = read(d.next_turn(restarted, at=8, stopped="conflict", head="c" * 40))
+    assert stopped["restarted"] == 7
+    assert read(d.single_turn(stopped, "fl-1", 9, restarted=stopped["restarted"]))["restarted"] == 7
+    assert read(d.single_turn(stopped, "fl-2", 9))["restarted"] is None
+    # and nothing of a turn says a batch's worker was restarted: a batch is abandoned
+    assert d.batch_turn(stopped, "fl-1", 10, "fl-1-10", members, "stacking")["restarted"] == 7
+    assert d.restartable_turn(d.batch_turn(None, "fl-1", 10, "fl-1-10", members, "stacking")) is False
 
 
 def test_a_batch_is_known_by_its_id_wherever_orca_puts_its_branch():
@@ -517,7 +532,9 @@ def test_records_kept_in_comments_share_the_encoding_of_records_on_refs():
              "<!--afk:turn instance=fl-1 at=200 batch=fl-1-200 members=1:10,2:20 phase=gating-->"),
             ({"instance": "fl-1", "at": 300, "unbatched": "left_out", "of": "fl-1-200",
               "released": True},
-             "<!--afk:turn instance=fl-1 at=300 unbatched=left_out of=fl-1-200 released=1-->")]),
+             "<!--afk:turn instance=fl-1 at=300 unbatched=left_out of=fl-1-200 released=1-->"),
+            ({"instance": "fl-1", "at": 400, "restarted": 400},
+             "<!--afk:turn instance=fl-1 at=400 restarted=400-->")]),
         (d.VERDICT_RECORD, [
             ({"n": 7, "phase": "already-satisfied"}, "<!--afk:verdict n=7 phase=already-satisfied-->"),
             ({"n": 12, "phase": "blocked", "blocked_by": [3, 4], "reason": "needs pages from #3"},
@@ -598,8 +615,8 @@ def test_each_record_in_a_comment_round_trips_through_its_own_reader():
         "comment_url": "u"}
 
     no_turn = {"verified": None, "allow_no_checks": False, "stopped": None, "head": None,
-               "batch": None, "members": [], "phase": None, "unbatched": None, "of": None,
-               "released": False, "comment_id": 5}
+               "restarted": None, "batch": None, "members": [], "phase": None, "unbatched": None,
+               "of": None, "released": False, "comment_id": 5}
     literals = {
         "<!--afk:turn instance=fl-7fbd5e at=1759676212-->\n**afk-fleet: this PR holds the landing turn**":
             {"instance": "fl-7fbd5e", "at": 1759676212},
@@ -615,6 +632,8 @@ def test_each_record_in_a_comment_round_trips_through_its_own_reader():
         "of=fl-7fbd5e-1759676400 released=1-->\n…":
             {"instance": "fl-7fbd5e", "at": 1759676500, "unbatched": "dissolved",
              "of": "fl-7fbd5e-1759676400", "released": True},
+        "<!--afk:turn instance=fl-7fbd5e at=1759676600 restarted=1759676600-->\n…":
+            {"instance": "fl-7fbd5e", "at": 1759676600, "restarted": 1759676600},
     }
     for body, said in literals.items():
         assert d.latest_turn([{"id": 5, "body": body}]) == {**no_turn, **said}, body
@@ -1078,15 +1097,32 @@ def test_classification_nudges_a_silent_worker_once_before_failing_it():
     assert routed(None, terminal="none") == ("dead", "orphan")
 
     # a landing turn is the same kind of sign of life (ADR-0027): one grace period
-    # to start on it, then the same nudge → failure path — never a parked queue
-    def turn(idle, at, stopped=None, **more):
+    # to start on it, then the same nudge — and silent after THAT, the worker is
+    # restarted onto the turn, not failed (ADR-0035): the PR was judged ready, and
+    # what did not happen is the landing. Never a parked queue either way
+    def turn(idle, at, stopped=None, restarted=None, **more):
         r = _classify({**ZERO, "commits_ahead": 3}, "idle", idle,
-                      turn={"at": at, "stopped": stopped}, **more)
+                      turn={"at": at, "stopped": stopped, "restarted": restarted}, **more)
         return r["outcome"], r["action"], r["idle_seconds"]
     assert turn(9000, NOW - 10) == ("coding", "leave", 10)
     assert turn(9000, NOW - GRACE) == ("idle_stalled", "nudge", GRACE)
     assert turn(9000, NOW - 2 * GRACE, nudged_at=NOW - GRACE) == \
+        ("idle_stalled", "restart", GRACE)
+    assert _classify({**ZERO, "commits_ahead": 3}, "idle", 9000, nudged_at=NOW - GRACE,
+                     turn={"at": NOW - 2 * GRACE, "stopped": None})["cause"] == "silent_on_turn"
+    # ONE restart per turn: the restarted worker is told anew (`at` moves), nudged
+    # once like any worker, and silent again after that it takes the failure path
+    assert turn(9000, NOW - 10, restarted=NOW - 10) == ("coding", "leave", 10)
+    assert turn(9000, NOW - GRACE, restarted=NOW - GRACE) == ("idle_stalled", "nudge", GRACE)
+    assert turn(9000, NOW - 2 * GRACE, restarted=NOW - 2 * GRACE, nudged_at=NOW - GRACE) == \
         ("idle_failed", "next_attempt", GRACE)
+    # a turn that is not one PR's — a merge batch's, or a marker that holds no turn
+    # — is never restarted; nor is a claim that has no turn (a no_pr claim)
+    for held in ({"at": NOW - 2 * GRACE, "batch": "b1"}, {"at": NOW - 2 * GRACE, "released": True},
+                 {}, None):
+        r = _classify(ZERO, "idle", 9000, nudged_at=NOW - GRACE, turn=held)
+        assert (r["cause"], r["action"]) == ("silent_after_nudge", "next_attempt"), held
+    assert d.restartable_turn({"at": 1}) and not d.restartable_turn({"at": 1, "restarted": 2})
     r = _classify(ZERO, "none", None, turn={"at": NOW - 10})
     assert (r["outcome"], r["action"]) == ("dead", "orphan")      # a gone terminal is still dead
     # a worker whose landing stopped FOR THE TICK (CI, a verify, absent checks) is
@@ -1095,9 +1131,12 @@ def test_classification_nudges_a_silent_worker_once_before_failing_it():
         assert turn(9000, NOW - 5 * GRACE, stopped=stopped)[:2] == ("coding", "leave"), stopped
         assert turn(9000, NOW - 5 * GRACE, stopped=stopped, nudged_at=NOW - 3 * GRACE)[:2] == \
             ("coding", "leave")
-    # …while one that stopped on something that is ITS to fix is silent like any other
+    # …while one that stopped on something that is ITS to fix is silent like any other,
+    # and is restarted onto the turn the same way when the nudge goes unanswered
     for stopped in ("conflict", "gate_red"):
         assert turn(9000, NOW - GRACE, stopped=stopped)[:2] == ("idle_stalled", "nudge")
+        assert turn(9000, NOW - 2 * GRACE, stopped=stopped, nudged_at=NOW - GRACE)[:2] == \
+            ("idle_stalled", "restart")
     # what the worker declared still wins, and so does a gone terminal
     r = _classify(ZERO, "idle", 9000, _verdict("giving-up"),
                   turn={"at": NOW - 9000, "stopped": "awaiting_ci"})
@@ -1849,6 +1888,19 @@ def test_turn_step_routes_every_outcome_or_returns_the_judgment():
     assert j["kind"] == "adversarial_verify" and "only gate" in j["question"]
     assert _argv(j["if_yes"])[1][-3:] == ["--allow-no-checks", "--verified", "abc123"]
 
+    # a restart's result (ADR-0035): a judgment's yes restarts, so an answered
+    # verify or a waived check does not fall back to `landing` and change nothing
+    told = d.turn_step(CALL, {"issue": 4, "pr": 30, "head": "abc123", "outcome": "needs_verify"},
+                       verify, restart=True)
+    assert told[0] == "judge" and _argv(told[1]["if_yes"])[1][-3:] == ["--restart", "--verified",
+                                                                        "abc123"]
+    told = d.turn_step(CALL, {"issue": 4, "pr": 30, "head": "abc123", "outcome": "no_checks"},
+                       cfg, restart=True)
+    assert _argv(told[1]["if_yes"])[1][-2:] == ["--restart", "--allow-no-checks"]
+    assert "--restart" not in _argv(told[1]["if_no"])[1]
+    assert d.turn_step(CALL, {"issue": 4, "pr": 30, "head": "abc123", "outcome": "granted"},
+                       cfg, restart=True) == ("granted", None)
+
     # red checks: the transition is fixed, its wording is not — and lives in a CI log
     do, j = step("gate_red")
     assert (do, j["kind"], j["bulky"]) == ("judge", "reason", True)
@@ -1883,6 +1935,9 @@ def test_worker_step_routes_every_cause_or_returns_the_judgment():
             assert do == "fail", cause
             assert ("cut short" in reason) == (d.WORKER_CAUSES[cause][1] != "next_attempt"), cause
     assert step("blockers_waiting") == ("park", None) and step("silent") == ("nudge", None)
+    # a landing worker silent after its nudge is RESTARTED onto its turn — `afk turn
+    # --restart` — not failed: nothing is closed, deleted or counted (ADR-0035)
+    assert step("silent_on_turn", _mine(4, "landing", pr=30)) == ("restart", None)
     # a claim with no worker left is CONTINUED, with no judgment asked: an unattended
     # run never releases it back to the frontier
     assert step("gone") == step("blockers_closed") == ("dispatch", None)
@@ -1907,7 +1962,7 @@ def test_worker_step_routes_every_cause_or_returns_the_judgment():
     # error — never a reason worded for some other cause
     for cause in d.WORKER_CAUSES:
         assert step(cause, worker_verdict=_declared())[0] in \
-            ("leave", "dispatch", "park", "nudge", "escalate", "fail", "judge"), cause
+            ("leave", "dispatch", "park", "nudge", "restart", "escalate", "fail", "judge"), cause
     for route in (lambda: step("on-holiday"), lambda: d.batch_step({"cause": "gave_up"})):
         try:
             route()
@@ -1917,7 +1972,8 @@ def test_worker_step_routes_every_cause_or_returns_the_judgment():
             raise AssertionError("a cause with no route was routed")
     assert {c for c in d.WORKER_CAUSES if c not in d._BATCH_STEPS} == {
         "satisfied", "satisfied_refuted", "blockers_closed", "blockers_waiting", "blocker_unmet",
-        "no_blocker_named", "gave_up", "unknown_phase"}          # a batch worker declares nothing
+        "no_blocker_named", "gave_up", "unknown_phase",         # a batch worker declares nothing
+        "silent_on_turn"}                                       # …and is abandoned, never restarted
 
 
 # Every failure and escalation reason a tick words by itself, pinned to the cause
@@ -1945,7 +2001,10 @@ REASONS = (
      "idle with no PR and no verdict a grace period after its nudge"),
     ("silent_unnudgeable", "fail", {"can_nudge": False}, "no_pr",
      "idle with no PR and no verdict, and no worktree here to nudge it in"),
-    ("silent_after_nudge", "fail", {"nudged_at": NOW - GRACE, "stopped": "conflict"}, "landing",
+    # a landing worker silent after its nudge is failed only once its turn had its
+    # restart (ADR-0035); with no worktree here there is nothing to restart in
+    ("silent_after_nudge", "fail",
+     {"nudged_at": NOW - GRACE, "stopped": "conflict", "restarted": NOW - 2 * GRACE}, "landing",
      "given the landing turn and never landed: conflict"),
     ("silent_unnudgeable", "fail", {"can_nudge": False}, "landing",
      "given the landing turn and never landed: no `afk land` outcome"),
@@ -1962,7 +2021,8 @@ def test_every_reason_a_tick_words_is_pinned_to_the_cause_it_is_worded_for():
     cfg = d.resolve_config({})
     for cause, do, got, status, reason in REASONS:
         verdict, blockers = got.get("verdict", _declared()), got.get("blockers", [])
-        turn = {"at": NOW - 9000, "stopped": got.get("stopped")} if status == "landing" else None
+        turn = {"at": NOW - 9000, "stopped": got.get("stopped"),
+                "restarted": got.get("restarted")} if status == "landing" else None
         seen = d.classify_stopped(got.get("progress", ZERO), 9000, verdict,
                                   {b["number"]: b["standing"] for b in blockers}, NOW, GRACE,
                                   nudged_at=got.get("nudged_at"),
@@ -2375,7 +2435,7 @@ def test_a_tick_runs_its_stages_in_one_order_and_writes_each_board_once():
     assert done["did"] == {
         "granted": [5], "dispatched": [2, 30, 31, 32], "reclaimed": [20], "cleared": [7, 21],
         "escalated": [], "parked": [3], "abandoned": [], "retried": [9], "nudged": [1],
-        "in_flight": 11, "frontier_remaining": 0}
+        "restarted": [], "in_flight": 11, "frontier_remaining": 0}
     # a board is written for a claim only where no transition of this tick wrote it
     assert steps[-2] == {"do": "status", "issue": 6, "phase": "ci_failed", "pr": 60, "attempt": 1}
     # the judgments, in the order the tick met them: red checks, then the workers'
@@ -2385,6 +2445,36 @@ def test_a_tick_runs_its_stages_in_one_order_and_writes_each_board_once():
     # `progress_comment: false` writes none
     quiet = d.resolve_config({"progress_comment": False})
     assert not [s for s in _play(ws, causes=causes, config=quiet)[0] if s["do"] == "status"]
+
+
+def test_a_landing_worker_silent_after_its_nudge_is_restarted_onto_its_turn():
+    """ADR-0035: the pass restarts the worker (`afk turn --restart`) where it used
+    to fail the claim — in the nudge / fail stage, after the turn stage, which
+    grants nothing while the PR holds the turn. The restart writes the board
+    (it starts a worker), spends nothing, and a result that is not `granted` is
+    routed as any `afk turn` result: a judgment whose yes restarts."""
+    row = _row(5, "landing", pr=50, stopped="conflict", board_phase="landing")
+    ws = _working_set(mine=[row, _row(6, "awaiting_turn", pr=60, board_phase="awaiting_turn")])
+    granted = {"issue": 5, "pr": 50, "head": "abc", "outcome": "granted",
+               "delivery": "continuation", "restarted": NOW}
+    steps, done = _play(ws, {("restart", 5): granted}, causes={5: "silent_on_turn"})
+    assert _brief(steps) == [("no-pr", [5]), ("restart", 5), ("heartbeat",), ("status", 6)]
+    assert done["did"] == _nothing_done(restarted=[5], in_flight=2)
+    assert done["judgments"] == [] and done["held"] == {5, 6}
+    # the restart answered with a judgment: asked, with the restart as its yes
+    owed = {"issue": 5, "pr": 50, "head": "abc", "outcome": "no_checks"}
+    steps, done = _play(ws, {("restart", 5): owed}, causes={5: "silent_on_turn"})
+    assert done["did"]["restarted"] == [] and [j["kind"] for j in done["judgments"]] == ["no_checks"]
+    assert _argv(done["judgments"][0]["if_yes"])[1][-2:] == ["--restart", "--allow-no-checks"]
+    # the restart failed: an error of the turn step, the claim still held, the board written
+    steps, done = _play(ws, {("restart", 5): _Raises("orca is down")}, causes={5: "silent_on_turn"})
+    assert done["errors"] == [{"step": "turn", "issue": 5, "error": "orca is down"}]
+    assert ("status", 5) in _brief(steps) and done["held"] == {5, 6}
+    # past its one restart the same silence is a failure, with the turn's reason
+    steps, done = _play(ws, causes={5: "silent_after_nudge"})
+    assert ("fail", 5) in _brief(steps) and done["did"]["retried"] == [5]
+    assert steps[_brief(steps).index(("fail", 5))]["reason"] == \
+        "given the landing turn and never landed: conflict"
 
 
 def test_a_plan_names_only_steps_the_table_lists_and_refuses_an_unknown_cause():
