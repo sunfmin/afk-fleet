@@ -4,7 +4,7 @@ Integration tests for afk-fleet's EFFECTFUL ref ops — the half `test_afk_decid
 cannot reach. Offline by construction: a bare git repo on local disk stands in for
 GitHub, so there is no gh, no network, and no token anywhere in this file.
 
-Run: python3 test_afk_refs.py   (or under pytest, beside test_afk_decide.py)
+Run: under pytest — the command is `gate.local_command` in docs/agents/afk-fleet.md
 
 The pure decision core is fixture-tested; these ops are the *other* correctness
 risk (ADR-0003, ADR-0004): a claim that two fleets both win double-works an issue,
@@ -737,15 +737,3 @@ def test_recovery_reads_pushed_progress_from_the_remote_alone():
         err = afk_error(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg,
                         "--set", "base_branch=no-such-base")
         assert "no-such-base" in err
-
-
-def run():
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    for t in tests:
-        t()
-        print(f"ok  {t.__name__}")
-    print(f"\n{len(tests)} passed")
-
-
-if __name__ == "__main__":
-    run()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Fixture tests for the afk-fleet decision core — pure, no git/gh/network.
-Run: python3 test_afk_decide.py   (plain asserts, no test-framework dependency)
+Run: under pytest — the command is `gate.local_command` in docs/agents/afk-fleet.md
 
 These cover the correctness-critical verdicts (esp. classify_claims: the
 mine/peer_live/stale partition whose wrong answer silently corrupts state).
@@ -446,7 +446,6 @@ def test_turns_are_granted_in_one_order_a_held_turn_first_then_pr_number():
     assert d.turn_order(rows) == [4, 3, 1]
     assert d.turn_order(reversed(rows)) == [4, 3, 1]                # not input order
     assert d.turn_order([]) == [] and d.turn_order(rows[1:2]) == []
-
 
 
 def test_validate_config():
@@ -3194,15 +3193,3 @@ def test_launch_candidates_stays_claude_only():
     assert "cc" in got
     assert "qc" not in got
     assert "unrelated" not in got
-
-
-def run():
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    for t in tests:
-        t()
-        print(f"ok  {t.__name__}")
-    print(f"\n{len(tests)} passed")
-
-
-if __name__ == "__main__":
-    run()

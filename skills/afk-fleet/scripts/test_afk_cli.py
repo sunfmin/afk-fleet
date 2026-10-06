@@ -3,7 +3,7 @@
 Integration tests for the afk-fleet subcommands that talk to GitHub's API, orca
 and the login shell — run through the real CLI, end to end, and still offline.
 
-Run: python3 test_afk_cli.py   (or under pytest, beside the other two suites)
+Run: under pytest — the command is `gate.local_command` in docs/agents/afk-fleet.md
 
 `test_afk_decide.py` pins the pure verdicts and `test_afk_refs.py` the ref races;
 what neither reaches is the seam between them: that `afk rebuild` asks gh for the
@@ -5007,19 +5007,6 @@ def test_every_flow_anchor_still_names_something():
     for path, symbol in anchors:
         with open(os.path.join(root, path)) as f:
             assert re.search(r"(?<!\w)%s(?!\w)" % re.escape(symbol), f.read()), f"{path}:{symbol}"
-
-
-def run_all():
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    for t in tests:
-        t()
-        print(f"ok  {t.__name__}")
-    print(f"\n{len(tests)} passed")
-
-
-if __name__ == "__main__":
-    run_all()
-
 
 
 def test_a_batchs_members_are_read_from_the_turn_markers_on_its_prs():
