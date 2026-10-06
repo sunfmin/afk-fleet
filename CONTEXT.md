@@ -283,7 +283,8 @@ stale reclaim (that is the unattended, lease-gated path)
 What a failed attempt costs and gets: the failure is counted on the issue — its `afk-attempt/<n>`
 label goes up by one — the failed attempt is discarded (its PR closed, its branch deleted, its
 worktree removed) and a fresh **worker** starts from the base under the same **claim**, told why the
-last attempt failed. Config `retry` is how many an issue gets; the failure after the last one is
+last attempt failed — the branch is never handed on as-is (ADR-0017; the sentence of ADR-0013 that
+said otherwise is superseded). Config `retry` is how many an issue gets; the failure after the last one is
 escalated to a human instead. One **transition** (`afk fail`), and its one writer. A failure is
 counted **once**: the edit that raises the number also adds `afk-attempt/starting` — this failure is
 counted, its fresh worker has not started — and starting a worker removes it, so an `afk fail` that
@@ -291,7 +292,9 @@ was cut short after counting and runs again (by hand, or from the next **tick**,
 label as the row's `starting`) finishes the same retry instead of spending another. A new failure
 of the fresh attempt finds no such label and is counted.
 _Avoid_: re-dispatch (that is a **continuation**: nothing discarded, nothing counted), nudge,
-attempt (the attempt is the thing that failed; the retry is what replaces it)
+restart (a silent worker on a **landing turn** is restarted onto it by continuation — nothing
+discarded, nothing counted; ADR-0035), attempt (the attempt is the thing that failed; the retry is
+what replaces it)
 
 **Nudge**:
 The one line the fleet types at a live **worker** that went idle past the grace period with no PR and
@@ -299,9 +302,12 @@ no verdict — the `idle_stalled` **outcome** of `afk no-pr`. Such a worker has 
 without an outcome, usually to ask a question nobody will answer. A nudge tells it to carry on, is
 sent **once per worker** (recorded in the worktree's git dir), spends no **retry** and discards
 nothing; a worker still silent a grace period later is a failure, and the last screen of its terminal
-travels in the failure reason. That screen is the only thing the fleet ever reads from a worker's
+travels in the failure reason — except on a **landing turn**, where that second silence restarts the
+worker onto the turn once (ADR-0035), and only the restarted worker's own unanswered nudge is the
+failure. That screen is the only thing the fleet ever reads from a worker's
 terminal, and it is read for *where the worker stopped*, never for its result (ADR-0018).
-_Avoid_: ping, poke, retry (a retry discards the attempt; a nudge keeps it), reminder
+_Avoid_: ping, poke, retry (a retry discards the attempt; a nudge keeps it), reminder, restart (a
+restart replaces the worker; a nudge keeps it)
 
 **Park**:
 What the fleet does with a dependency a **worker** discovered — a `blocked` verdict naming issues
@@ -338,8 +344,12 @@ comment on the PR naming the instance that granted it — so it dies with the PR
 a **takeover** — and it carries the tick's judgments made *before* the grant (the head an adversarial
 verify passed, a PR with no checks waived) and where the worker's last `afk land` stopped. While its
 PR holds the turn the claim is `landing`, and its worker is watched like a PR-less one: silent past
-grace it is **nudged**, then failed, which closes the PR and frees the turn. A worker whose terminal
-is gone is replaced by **continuation** in the same worktree, briefed only to land the PR. The check
+grace it is **nudged**; silent again it is **restarted onto the turn** — the idle session closed, a
+worker started by **continuation** in the same worktree (or one recreated at the PR's head, never
+from base), briefed only to land the PR, with the PR, branch, worktree and attempt untouched and the
+restart recorded on the turn marker — once per turn; the restarted worker's own unanswered nudge is
+then the failure that closes the PR and frees the turn (ADR-0035). A worker whose terminal is gone
+gets that same continuation at once, unbounded. The check
 guards against a worker that strays, not a malicious one — worker and launcher share one `gh`
 credential (ADR-0027).
 _Avoid_: lock, merge lock (nothing is held on the target; the turn is a record on the PR), token,

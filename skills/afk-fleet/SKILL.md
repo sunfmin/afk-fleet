@@ -310,8 +310,9 @@ In this order, each step the same `afk` transition you could type yourself
    when two or more may land together, to a merge batch of them. See
    [Landing](#landing--the-worker-lands-its-own-pr-on-its-turn).
 4. **Settle what a stopped worker left** where the reason is on record: a worker idle with no
-   outcome is nudged once (`afk nudge`, ADR-0018); a `giving-up` verdict, a refuted
-   `already-satisfied`, a silence that outlasted its nudge is failed (`afk fail`); a `blocked`
+   outcome is nudged once (`afk nudge`, ADR-0018), and one on a landing turn that stays silent is
+   then restarted onto the turn once (`afk turn --restart`, ADR-0035); a `giving-up` verdict, a
+   refuted `already-satisfied`, a silence that outlasted its nudge is failed (`afk fail`); a `blocked`
    verdict is parked while the backlog will resolve its blockers (`afk park`, ADR-0022) and
    escalated when nothing will (`afk escalate`).
 5. **Release** every claim that outlived its issue — a PR its worker landed — and delete every dead
@@ -424,9 +425,15 @@ this one's PR has **landed** (its claim is released) or been **failed** (`afk fa
 stopped on the PR:
 
 - a `conflict` or a `gate_red` is the worker's own, fixed in place. The pass watches it like a
-  PR-less worker: nudged once when it goes silent, failed a grace period later — which closes the
-  PR and frees the turn — and replaced by continuation onto the turn when its terminal is gone.
-  That ladder is what bounds a turn.
+  PR-less worker: nudged once when it goes silent, and replaced by continuation onto the turn when
+  its terminal is gone. Silent a grace period after its nudge it is **restarted onto the turn**
+  (`afk turn --restart`), not failed: the PR was judged ready, and what did not happen is the
+  landing — so the idle session is closed and a worker is started by continuation in the same
+  worktree, briefed only to land, with the PR, the branch, the worktree and the attempt untouched
+  and the restart written on the turn marker
+  ([ADR-0035](../../docs/adr/0035-a-silent-landing-worker-is-restarted-onto-its-turn.md)). Once
+  per turn: the restarted worker, silent again after its own nudge, is failed — which closes the
+  PR and frees the turn. That ladder is what bounds a turn.
 - checks that must run on the head its sync pushed are waited for by `afk land` itself, in the
   same run: green and it merges, red and it is `gate_red`. No cycle is involved.
 - `awaiting_ci`, `needs_verify` or `no_checks` means the next move is the fleet's — the checks were
@@ -465,10 +472,10 @@ human-gated step — never done here.
 
 A claim **fails** on any of: red checks on its PR; an adversarial refute; a `giving-up` verdict; an
 `already-satisfied` refuted by work on the branch; a worker still idle with **no verdict at all** a
-grace period after its one nudge (for a claim holding the turn: a turn it never landed). A **sync
-conflict or a red gate at landing is not on this list** — the worker fixes it in place on its
-[landing turn](#landing--the-worker-lands-its-own-pr-on-its-turn), and it costs an attempt only if
-the worker goes silent.
+grace period after its one nudge (for a claim holding the turn: a turn it never landed, after the
+one restart onto it). A **sync conflict or a red gate at landing is not on this list** — the worker
+fixes it in place on its [landing turn](#landing--the-worker-lands-its-own-pr-on-its-turn), and
+its silence there costs a restart first (ADR-0035) and an attempt only after that.
 
 ```bash
 <skill>/scripts/afk.py fail --issue <n> --instance <id> --worker-command '<worker_command>' \
@@ -506,7 +513,8 @@ frontier contract does the waiting — no label changes, no human, no attempt sp
 park` re-reads the blockers and refuses (exit 3, nothing changed) a claim that is not parkable now.
 
 Not everything a stopped worker leaves is a failure: one idle with no outcome is **nudged** first,
-which costs no attempt; a `blocked` verdict skips retry accounting entirely — re-dispatched when its
+which costs no attempt, and one that holds the landing turn is then **restarted onto it** once,
+which costs none either; a `blocked` verdict skips retry accounting entirely — re-dispatched when its
 blockers have closed, parked while the open ones are workable backlog; and an `already-satisfied`
 one with nothing on its branch closes the issue once you confirm the empty diff.
 

@@ -1,6 +1,8 @@
 # ADR-0013 — Liveness is recency, not accumulated work
 
-**Status:** accepted — the terminal reading it takes is made in code since [ADR-0021](0021-worker-state-is-mechanics.md)
+**Status:** accepted — the terminal reading it takes is made in code since [ADR-0021](0021-worker-state-is-mechanics.md).
+Its last consequence is **superseded** by the retry of [ADR-0017](0017-the-act-half-is-transitions.md)
+(decision 5: a fresh start discards the previous attempt) — marked below.
 **Supersedes:** the `classify_no_pr` "real progress beats idle+verdict" rule (unrecorded; it lived
 only in `afk_decide.classify_no_pr`, its unit test, and the SKILL.md bullet).
 
@@ -63,8 +65,13 @@ the tick would then fail to verify as empty.
   raise it for tickets whose workers go quiet for long stretches.
 - A worker that commits, goes idle past grace, and *does* leave an honest `giving-up` or `blocked`
   verdict is routed on the verdict, as originally intended — that path was simply dead before.
-- The retry keeps the claim and hands the fresh worker the branch as-is, so the accumulated commits
-  are not lost; the new worker continues from them.
+- ~~The retry keeps the claim and hands the fresh worker the branch as-is, so the accumulated commits
+  are not lost; the new worker continues from them.~~ **Superseded** by the retry of
+  [ADR-0017](0017-the-act-half-is-transitions.md): a retry keeps the claim but *discards* the failed
+  attempt — closes its PR, deletes its branch, removes its worktree — and starts the fresh worker from
+  base. What keeps accumulated work is **continuation** (ADR-0011), which recovers a claim whose
+  worker *died*; and on a landing turn a silent worker is restarted by continuation before any retry
+  ([ADR-0035](0035-a-silent-landing-worker-is-restarted-onto-its-turn.md)).
 
 ## Alternatives rejected
 

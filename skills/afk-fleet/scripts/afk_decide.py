@@ -926,6 +926,7 @@ WORKER_CAUSES = {
     "blocker_unmet":      ("idle_blocked", "escalate"),
     "no_blocker_named":   ("idle_blocked", "escalate"),
     "silent":             ("idle_stalled", "nudge"),
+    "silent_on_turn":     ("idle_stalled", "restart"),       # silent after its nudge, on a landing turn
     "gave_up":            ("idle_failed", "next_attempt"),
     "unknown_phase":      ("idle_failed", "next_attempt"),
     "silent_after_nudge": ("idle_failed", "next_attempt"),
@@ -1213,6 +1214,16 @@ def settled_by_worker_state(reading, now, grace_seconds, nudged_at=None):
     return None
 
 
+def restartable_turn(turn):
+    """Is `turn` (`latest_turn`, or {} / None) one PR's landing turn whose silent
+    worker may still be restarted onto it? A turn that is held (`at` set, not
+    `released`), is no merge batch's, and has not had its one restart
+    (`restarted`) — ADR-0035. A no_pr claim has no turn, so never."""
+    turn = turn or {}
+    return bool(turn.get("at") is not None and not turn.get("released")
+                and not turn.get("batch") and not turn.get("restarted"))
+
+
 def classify_stopped(progress, terminal_idle_seconds, worker_verdict, blocker_states,
                      now, grace_seconds, nudged_at=None, can_nudge=True, turn=None):
     """
@@ -1236,12 +1247,17 @@ def classify_stopped(progress, terminal_idle_seconds, worker_verdict, blocker_st
                        has none. `at` — when the worker was last told to land
                        (`afk turn`), or its `afk land` last stopped — is a sign of
                        life like the nudge: a whole grace period to start on it, and
-                       after that the same nudge → failure path as any other
-                       silence. `stopped` is the LAND_OUTCOMES word its `afk land`
-                       last stopped with: one of LAND_WAITS means the worker is idle
-                       because the next move is the tick's — its quiet is not a
-                       silence, and is never nudged or failed here (`afk turn` is
-                       what moves it).
+                       after that the same nudge as any other silence. Silent again
+                       after it, a worker on ONE PR's turn is restarted onto the
+                       turn rather than failed — once per turn: `restarted` says the
+                       turn already had its restart, and the next silence after a
+                       nudge takes the failure path (ADR-0035). `stopped` is the
+                       LAND_OUTCOMES word its `afk land` last stopped with: one of
+                       LAND_WAITS means the worker is idle because the next move is
+                       the tick's — its quiet is not a silence, and is never nudged
+                       or failed here (`afk turn` is what moves it). A merge
+                       batch's turn (`batch`) is its batch worker's, which is
+                       abandoned, never restarted (`batch_step`).
 
     Returns {"cause", "outcome", "action", "idle_seconds", "pending_blockers"}.
     `cause` — one of WORKER_CAUSES — is the decision, and what the tick routes on;
@@ -1271,6 +1287,14 @@ def classify_stopped(progress, terminal_idle_seconds, worker_verdict, blocker_st
                                                       question nobody will answer.
                                                       `afk nudge` tells it to carry on;
                                                       no attempt is spent (ADR-0018).
+      silent_on_turn     idle_stalled restart       — no verdict even after a nudge,
+                                                      on a landing turn not yet
+                                                      restarted: the PR was judged
+                                                      ready, only the landing did not
+                                                      happen. `afk turn --restart`
+                                                      puts a new worker on the turn;
+                                                      nothing is closed or counted
+                                                      (ADR-0035).
       gave_up            idle_failed  next_attempt  — `giving-up`.
       unknown_phase      idle_failed  next_attempt  — a verdict naming no phase the
                                                       fleet knows.
@@ -1300,6 +1324,8 @@ def classify_stopped(progress, terminal_idle_seconds, worker_verdict, blocker_st
         if turn.get("stopped") in LAND_WAITS:
             return _seen("awaiting_tick", idle_seconds)
         if nudged_at is not None:
+            if restartable_turn(turn):
+                return _seen("silent_on_turn", idle_seconds)
             return _seen("silent_after_nudge", idle_seconds)
         return _seen("silent" if can_nudge else "silent_unnudgeable", idle_seconds)
     phase = verdict.get("phase")
@@ -1430,7 +1456,7 @@ _MEMBERS = FieldType(lambda members: ",".join(f"{m['issue']}:{m['pr']}" for m in
 # instance is not a record — nobody could hold it.
 TURN_RECORD = RecordKind("afk:turn", {
     "instance": str, "at": int, "verified": str, "allow_no_checks": FLAG,
-    "stopped": one_of(LAND_OUTCOMES), "head": str,
+    "stopped": one_of(LAND_OUTCOMES), "head": str, "restarted": int,
     "batch": str, "members": _MEMBERS, "phase": one_of(BATCH_PHASES),
     "unbatched": one_of(UNBATCHED), "of": str, "released": FLAG}, ("instance",))
 
@@ -1461,8 +1487,8 @@ def batch_outcome(outcome):
 # The record of a PR that was never granted a turn: every field `latest_turn`
 # gives back, at the value that says nothing.
 _NO_TURN = {"instance": None, "at": None, "verified": None, "allow_no_checks": False,
-            "stopped": None, "head": None, "batch": None, "members": [], "phase": None,
-            "unbatched": None, "of": None, "released": False, "comment_id": None}
+            "stopped": None, "head": None, "restarted": None, "batch": None, "members": [],
+            "phase": None, "unbatched": None, "of": None, "released": False, "comment_id": None}
 
 
 def _whole_turn(fields):
@@ -1487,7 +1513,7 @@ def next_turn(prev, **changed):
     return turn
 
 
-def single_turn(prev, instance, at, verified=None, allow_no_checks=False):
+def single_turn(prev, instance, at, verified=None, allow_no_checks=False, restarted=None):
     """The record of ONE PR's landing turn, granted now (or granted again) over
     `prev`: the worker is told to land, so it has not stopped, and the turn is
     no batch's.
@@ -1497,10 +1523,15 @@ def single_turn(prev, instance, at, verified=None, allow_no_checks=False):
                        life its silence is timed from
       verified:        the head an adversarial verify passed, if one did
       allow_no_checks: the tick judged a PR with no checks at all may land
+      restarted:       when a silent worker was restarted onto this turn
+                       (`afk turn --restart`, ADR-0035) — the one the turn had,
+                       carried over by a re-delivery of the same turn; None on a
+                       turn that never had one. Named every time, so a restart
+                       recorded by another instance's turn does not outlive it.
     """
     return next_turn(prev, instance=instance, at=at, verified=verified,
                      allow_no_checks=bool(allow_no_checks), stopped=None, head=None,
-                     batch=None, members=[], phase=None, released=False)
+                     restarted=restarted, batch=None, members=[], phase=None, released=False)
 
 
 def batch_turn(prev, instance, at, batch, members, phase):
@@ -1559,10 +1590,12 @@ def turn_comment(turn):
     else:
         state = (f"Its last `afk land` stopped with `{stopped}` on `{(turn['head'] or '')[:12]}`."
                  if stopped else "The worker has been told to land it.")
+        again = (" Its worker went silent on the turn and a new one was started onto it, in the "
+                 "same worktree; a second silence fails the attempt." if turn["restarted"] else "")
         text = (f"**afk-fleet: this PR holds the landing turn** of fleet instance `{instance}`. "
                 f"The worker that wrote the branch lands it with `afk land` — sync with the target, "
                 f"gate, merge — and the next PR's turn comes when this one has landed or failed. "
-                f"{state}")
+                f"{state}{again}")
     fields = _whole_turn({name: turn[name] for name in TURN_RECORD.fields})
     return record_comment(TURN_RECORD, fields, text)
 
@@ -1571,8 +1604,10 @@ def latest_turn(comments):
     """
     The landing turn recorded on a PR, from its comments ([{"id", "body"}...],
     oldest first) → {"instance", "at", "verified", "allow_no_checks", "stopped",
-    "head", "batch", "members", "phase", "unbatched", "of", "released",
-    "comment_id"}, or None when the PR was never granted one — `latest_record`'s.
+    "head", "restarted", "batch", "members", "phase", "unbatched", "of",
+    "released", "comment_id"}, or None when the PR was never granted one —
+    `latest_record`'s. `restarted` is when a silent worker was restarted onto
+    the turn (ADR-0035), None while none was.
     `batch` / `members` / `phase` are a merge batch's turn (None / [] / None on a
     single one); `unbatched` is the UNBATCHED word of a PR that left a batch and
     `of` the batch it left; `released` says the marker holds no turn at all.
@@ -2574,7 +2609,7 @@ TICK_WORK = {
     "parked": "parked",
     "abandoned": "abandoned the batch of",
 }
-TICK_DID = {**TICK_WORK, "retried": "retried", "nudged": "nudged"}
+TICK_DID = {**TICK_WORK, "retried": "retried", "nudged": "nudged", "restarted": "restarted"}
 TICK_COUNTS = ("in_flight", "frontier_remaining")
 
 
@@ -2794,7 +2829,7 @@ def failure_judgment(call, row):
                            f"the failing checks of PR #{row['pr']}", {"pr": row["pr"]}, bulky=True)
 
 
-def turn_step(call, result, config):
+def turn_step(call, result, config, restart=False):
     """
     What a tick does with `afk turn`'s result → (do, judgment):
 
@@ -2807,11 +2842,15 @@ def turn_step(call, result, config):
     judgments, and `afk turn` records neither until both are in: they are asked
     as ONE `adversarial_verify` whose yes carries both flags — a head that
     survives the verify is one whose acceptance criteria are met.
+
+    `restart`: the result is `afk turn --restart`'s (a silent worker restarted
+    onto its turn, ADR-0035), so a judgment's yes runs the restart, not a grant.
     """
     number, pr, head, outcome = result["issue"], result["pr"], result["head"], result["outcome"]
     if outcome == "granted":
         return "granted", None
     context = {"pr": pr, "head": head}
+    again = ["--restart"] if restart else []
     if outcome == "gate_red":
         return "judge", reason_judgment(call, number, "fail", f"the checks of PR #{pr} are red",
                                         f"the failing checks of PR #{pr}", context, bulky=True)
@@ -2824,14 +2863,14 @@ def turn_step(call, result, config):
             "adversarial_verify", number,
             f"Does head {head} of PR #{pr} survive the adversarial verify?{bare}",
             {**context, "prompt": config["gate"]["adversarial_verify_prompt"]},
-            afk_command(call, "turn", number, *flags),
+            afk_command(call, "turn", number, *again, *flags),
             afk_command(call, "fail", number, "--reason",
                         f"the adversarial verify refuted head {head} of PR #{pr}"), bulky=True)
     if outcome == "no_checks":
         return "judge", judgment(
             "no_checks", number,
             f"PR #{pr} has no checks at all — are issue #{number}'s acceptance criteria met?",
-            context, afk_command(call, "turn", number, "--allow-no-checks"),
+            context, afk_command(call, "turn", number, *again, "--allow-no-checks"),
             afk_command(call, "fail", number, "--reason",
                         f"PR #{pr} has no checks, and it does not meet the issue's acceptance "
                         f"criteria"))
@@ -2850,6 +2889,8 @@ def worker_step(call, row, worker, config):
                             never released back
       ("park", None)        blockers_waiting: `afk park`
       ("nudge", None)       silent: `afk nudge`
+      ("restart", None)     silent_on_turn: `afk turn --restart` — a new worker
+                            onto the landing turn, nothing closed or counted
       ("escalate", reason)  `afk escalate`: the reason is on record
       ("fail", reason)      `afk fail`: the reason is on record — or the row is
                             `starting`, and whatever its worker is, short of at
@@ -2877,6 +2918,8 @@ def worker_step(call, row, worker, config):
         return "park", None
     if cause == "silent":
         return "nudge", None
+    if cause == "silent_on_turn":
+        return "restart", None
     if cause == "satisfied":
         base = config["base_branch"]
         return "judge", judgment(
@@ -2938,6 +2981,7 @@ TICK_STEPS = {
     "turn": "turn",             # {issue}: `afk turn`
     "batch-turn": "turn",       # `afk turn --batch`: form a merge batch, or continue mine
     "abandon": "turn",          # {batch}: `afk turn --abandon`
+    "restart": "turn",          # {issue}: `afk turn --restart`
     "nudge": "nudge",           # {issue} | {batch}
     "park": "park",             # {issue}
     "fail": "fail",             # {issue, reason}
@@ -2966,7 +3010,7 @@ class TickBooks:
     (`account`) is kept twice."""
 
     SETTLES = ("parked", "escalated", "cleared")       # these release the claim
-    WRITES_BOARD = ("granted", "abandoned", "retried", "dispatched", "reclaimed")
+    WRITES_BOARD = ("granted", "abandoned", "retried", "dispatched", "reclaimed", "restarted")
 
     def __init__(self, ws):
         self.ws = ws
@@ -3075,8 +3119,8 @@ def tick_plan(ws, call, config):
     is still mine to remember}.
 
     In order: `no-pr` for the claims waiting on a worker → the landing turn, to
-    one PR or to one merge batch (`_turn_plan`) → nudge / fail / park / escalate
-    where the reason is on record, or the judgment that stands in for one →
+    one PR or to one merge batch (`_turn_plan`) → nudge / restart / fail / park /
+    escalate where the reason is on record, or the judgment that stands in for one →
     release `closed` rows and `stale_closed` phantom locks → begin the starts:
     continuations of claims already held, each `stale` claim reclaimed, then the
     frontier into the free slots → finish every start begun, at once → heartbeat
@@ -3102,7 +3146,7 @@ def tick_plan(ws, call, config):
     # --- the landing turn: at most one grant a tick, to one PR or to one merge batch ---
     live = yield from _turn_plan(tick, call, config)
 
-    # --- nudge / fail / park / escalate, or the judgment that stands in for one ---
+    # --- nudge / restart / fail / park / escalate, or the judgment that stands in for one ---
     tick.judgments += [failure_judgment(call, r) for r in ws["mine"] if r["status"] == "failure"]
     for number, do, detail in routes:
         if do == "judge":
@@ -3110,6 +3154,14 @@ def tick_plan(ws, call, config):
         elif do == "nudge":
             if (yield from run("nudge", issue=number)):
                 tick.did("nudged", number)
+        elif do == "restart":
+            again = yield from run("restart", issue=number)
+            if again:
+                told, asks = turn_step(call, again, config, restart=True)
+                if told == "granted":
+                    tick.did("restarted", number)
+                elif told == "judge":
+                    tick.judgments.append(asks)
         elif do == "park":
             if (yield from run("park", issue=number)):
                 tick.did("parked", number)

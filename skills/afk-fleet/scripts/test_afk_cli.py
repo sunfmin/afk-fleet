@@ -3176,52 +3176,144 @@ def test_a_ref_afk_did_not_write_is_not_a_recorded_gate_run():
 # a turn nobody lands, and a turn whose worker is gone                         #
 # --------------------------------------------------------------------------- #
 
-def test_a_worker_silent_on_its_turn_is_nudged_once_then_failed_and_the_turn_moves_on():
+def test_a_worker_silent_on_its_turn_is_nudged_once_then_restarted_onto_it_once_then_failed():
     """A turn can never park the queue: a worker that goes silent on it — idle past
-    grace, nothing landed — is nudged once and then failed, like any other
-    silence. Only THEN is an attempt spent; its PR closes, and the next PR gets
+    grace, nothing landed — is nudged once, like any other silence. Silent after
+    that it is not failed but RESTARTED onto the turn (ADR-0035): its PR was
+    judged ready, and what did not happen is the landing. `afk turn --restart`
+    closes the idle session and starts a worker by continuation in the same
+    worktree, briefed only to land; the PR, the branch, the worktree and the
+    attempt label are untouched, and the restart is written on the turn marker.
+    Once per turn: the restarted worker, silent again after its own nudge, is
+    failed — only THEN is an attempt spent, its PR closes, and the next PR gets
     the turn."""
     gate = local_gate("true")
     with world(issues=[issue(5, "ready-for-agent"), issue(6, "ready-for-agent")]) as w:
-        d, _ = with_pr(w, 5, 50)
+        d, pr_head = with_pr(w, 5, 50)
         with_pr(w, 6, 60)
+        wt, branch = d["worktree"], d["branch"]
         t0 = int(time.time()) + 5000
         cfg = ("--config", json.dumps({"base_branch": w.sb.base, "worker_idle_grace_seconds": 300}))
+        nudge = ("nudge", "--issue", "5", *ME, *R, *cfg)
 
         def no_pr(at):
             r = w.no_pr("--issue", "5", *R, *cfg, "--now", str(at))
             return r["outcome"], r["action"], r["turn_at"]
 
+        def worker(n):
+            return next(t for t in w.terminals() if t["handle"] == n)
+
         # a worker nudged BEFORE its turn is under a new instruction now: nudgeable again
-        w.afk("nudge", "--issue", "5", *ME, *R, *cfg, "--now", str(t0 - 9000))
+        w.afk(*nudge, "--now", str(t0 - 9000))
         assert w.afk(*_turn(5, *gate, now=t0))["outcome"] == "granted"
         # the turn is a sign of life: one grace period to start on it
         assert no_pr(t0 + 299) == ("coding", "leave", t0)
         assert no_pr(t0 + 300) == ("idle_stalled", "nudge", t0)
-        w.afk("nudge", "--issue", "5", *ME, *R, *cfg, "--now", str(t0 + 300))
+        w.afk(*nudge, "--now", str(t0 + 300))
         # the nudge points at the brief the turn wrote, not the original task
-        said = w.terminals()[0]["sent"][-1]["text"]
+        said = worker(d["terminal"])["sent"][-1]["text"]
         with open(re.search(r"\((\S+)\)", said).group(1)) as f:
             assert " land --issue 5 " in f.read()
         assert no_pr(t0 + 599)[:2] == ("coding", "leave")
-        assert no_pr(t0 + 600)[:2] == ("idle_failed", "next_attempt")
-        assert _mine(w, gate, 5)[0] == "landing" and w.issue(5)["labels"] == ["ready-for-agent"]
+        # silent after its nudge: a restart onto the turn, never `next_attempt`
+        assert no_pr(t0 + 600) == ("idle_stalled", "restart", t0)
+        assert _mine(w, gate, 5) == ("landing", "landing", None)
+        assert w.issue(5)["labels"] == ["ready-for-agent"]
         assert w.afk(*_turn(6, *gate))["outcome"] == "waiting"
+        # only a PR that holds my turn has a worker to restart onto it
+        assert "does not hold this fleet's landing turn" in w.error(*_turn(6, *gate, "--restart"))
+        assert "takes --issue" in w.error("turn", "--batch", "--restart", *ME, "--worker-command",
+                                          WORKER, *R, *NOW, *gate)
+
+        w.orca_calls()
+        r = w.afk(*_turn(5, *gate, "--restart", now=t0 + 600))
+        assert (r["outcome"], r["delivery"], r["again"], r["restarted"], r["worktree"]) == \
+            ("granted", "continuation", True, t0 + 600, wt), r
+        # the idle session is closed and a worker started in the SAME worktree — the
+        # delivery a gone terminal gets — told only to land, not the task
+        assert w.orca_calls() == ["terminal list", "terminal close", "terminal create",
+                                  "terminal wait", "terminal send"]
+        new = w.terminals()[-1]
+        assert worker(d["terminal"])["open"] is False and new["open"] is True
+        assert (new["handle"], new["command"], new["worktreePath"]) == (r["terminal"], WORKER, wt)
+        told = _told(new)
+        assert told == _landing_brief(w, 5, d, 50, branch, *gate)
+        assert told.startswith("## Your PR holds the landing turn") and "Closes #5" not in told
+        # nothing is closed, deleted or counted: the PR is open, the branch and the
+        # worktree are where they were, no attempt label moved, the claim is mine
+        assert "state" not in w.pr(50) and w.issue(5)["labels"] == ["ready-for-agent"]
+        assert git(wt, "rev-parse", "HEAD") == pr_head and git(wt, "status", "--porcelain") == ""
+        assert w.sb.remote_ref(f"refs/heads/{branch}") == pr_head and len(w.worktrees()) == 2
+        assert w.claimed_by(5) == "me"
+        # the turn stays with the PR, the claim reads `landing` throughout, and the
+        # restart is on the PR's ONE turn marker
+        assert _mine(w, gate, 5) == ("landing", "landing", None) and "已轮到落地" in w.board(5)
+        [marker] = _turns(w, 50)
+        assert f" at={t0 + 600} restarted={t0 + 600}-->" in marker.split("\n")[0]
+        assert "a new one was started onto it" in marker
+        assert w.afk(*_turn(6, *gate))["outcome"] == "waiting"
+
+        # the restarted worker is a new worker: one grace period to start, then its
+        # own nudge (the old one's record went with the brief) — and silent after
+        # THAT it takes the failure path: one restart per turn
+        assert no_pr(t0 + 899) == ("coding", "leave", t0 + 600)
+        assert no_pr(t0 + 900) == ("idle_stalled", "nudge", t0 + 600)
+        assert "already restarted" in w.error(*_turn(5, *gate, "--restart", now=t0 + 900))
+        w.afk(*nudge, "--now", str(t0 + 900))
+        assert no_pr(t0 + 1199)[:2] == ("coding", "leave")
+        assert no_pr(t0 + 1200) == ("idle_failed", "next_attempt", t0 + 600)
+        assert "already restarted" in w.error(*_turn(5, *gate, "--restart", now=t0 + 1200))
+        assert _mine(w, gate, 5)[0] == "landing" and "state" not in w.pr(50)
 
         # a worker still AT its landing is busy, and is left alone however long ago
         # the turn was (busy is settled from orca alone, so the turn was not read)
-        w.worker(output=t0 + 900, state="working", since=t0 + 800, n=0)
-        np = w.no_pr("--issue", "5", *R, *cfg, "--now", str(t0 + 910))
+        w.worker(output=t0 + 1500, state="working", since=t0 + 1400)
+        np = w.no_pr("--issue", "5", *R, *cfg, "--now", str(t0 + 1510))
         assert (np["outcome"], np["worker_state"], np["turn_at"]) == ("coding", "working", None)
-        w.worker(output=t0, state="done", since=t0, n=0)
+        w.worker(output=t0 + 600, state="done", since=t0 + 600)
 
         r = w.afk(*_fail(5, "given the landing turn and never landed", *gate))
         assert (r["action"], r["attempt"]) == ("retry", 1)
         assert w.issue(5)["labels"] == ["ready-for-agent", "afk-attempt/1"]
         assert w.pr(50)["state"] == "closed"
-        # the retry is a new attempt with no PR: the old turn went with the PR
+        # the retry is a new attempt with no PR: the old turn, restart and all, went with the PR
         assert _mine(w, gate, 5) == ("no_pr", "claimed", None)
         assert w.afk(*_turn(6, *gate))["outcome"] == "granted"
+
+    # the pass does it by itself: a cycle whose landing worker is silent after its
+    # nudge restarts it — one `afk turn --restart` — and counts it as `restarted`
+    with world(issues=[issue(8, "ready-for-agent")]) as w:
+        d, pr_head = with_pr(w, 8, 80)
+        wt = d["worktree"]
+        t0 = int(time.time()) + 5000
+        cfg = {"base_branch": w.sb.base, "worker_idle_grace_seconds": 300, "concurrency": 1,
+               "gate": {"ci": "local", "local_command": "true"}, "fingerprint_gate": False}
+
+        def cycle(at, state=None):
+            return w.afk("cycle", *ME, "--worker-command", WORKER, *R, "--now", str(at),
+                         "--config", json.dumps(cfg), *(("--state", json.dumps(state)) if state
+                                                       else ()))
+
+        c = cycle(t0)
+        assert "landing turn to #8" in c["progress"], c
+        c = cycle(t0 + 300, c["state"])
+        assert c["progress"].startswith("nudged #8"), c
+        w.orca_calls()
+        c = cycle(t0 + 600, c["state"])
+        assert c["progress"].startswith("restarted #8") and "errors" not in c, c
+        assert "terminal close" in w.orca_calls() and w.terminals()[-1]["worktreePath"] == wt
+        assert _told(w.terminals()[-1]).startswith("## Your PR holds the landing turn")
+        assert "state" not in w.pr(80) and w.issue(8)["labels"] == ["ready-for-agent"]
+        assert git(wt, "rev-parse", "HEAD") == pr_head
+        [marker] = _turns(w, 80)
+        assert f"restarted={t0 + 600}" in marker.split("\n")[0]
+        # …and the restarted worker's second silence is the retry it was before
+        c = cycle(t0 + 900, c["state"])
+        assert c["progress"].startswith("nudged #8"), c
+        c = cycle(t0 + 1200, c["state"])
+        assert c["progress"].startswith("retried #8") and "errors" not in c, c
+        assert w.pr(80)["state"] == "closed" and w.issue(8)["labels"] == ["ready-for-agent",
+                                                                            "afk-attempt/1"]
 
 
 def test_a_turn_with_no_terminal_is_delivered_by_continuation_never_from_base():
