@@ -3,7 +3,7 @@
 Integration tests for the afk-fleet subcommands that talk to GitHub's API, orca
 and the login shell — run through the real CLI, end to end, and still offline.
 
-Run: python3 test_afk_cli.py   (or under pytest, beside the other two suites)
+Run: under pytest — the command is `gate.local_command` in docs/agents/afk-fleet.md
 
 `test_afk_decide.py` pins the pure verdicts and `test_afk_refs.py` the ref races;
 what neither reaches is the seam between them: that `afk rebuild` asks gh for the
@@ -4994,6 +4994,58 @@ def test_the_docs_describe_a_recorded_gate_run_as_the_code_keeps_it():
         assert f"run red, or after {day}." in context
 
 
+def _repo_config():
+    """This repo's own fleet config, docs/agents/afk-fleet.md → its text, or None
+    in an installed skill, which ships without it."""
+    path = os.path.join(SKILL, "..", "..", "docs", "agents", "afk-fleet.md")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return f.read()
+
+
+def test_the_docs_spell_a_claim_ref_as_the_code_lays_it_out():
+    """Where a claim and a heartbeat live has one home, `CLAIM_NAMESPACES`. A
+    document that names a ref under `refs/afk/` names one the code writes, and
+    the short `afk-claim/…` form is a branch's name — the `refs/heads` layout —
+    never the ref in the hidden namespace."""
+    docs = _skill_docs()
+    if _repo_config() is not None:
+        docs["docs/agents/afk-fleet.md"] = _repo_config()
+    hidden, branches = (afk_decide.CLAIM_NAMESPACES[ns] for ns in ("refs/afk", "refs/heads"))
+    kinds = {p.rpartition("/")[2] for p in (*hidden, afk_decide.GATE_RECORD_NAMESPACE)}
+    short = [p[len(afk_decide.BRANCH_NAMESPACE) + 1:] for p in branches]
+    assert kinds == {"claim", "heartbeat", "gate"} and short == ["afk-claim", "afk-heartbeat"]
+
+    named = set()
+    for name, text in docs.items():
+        for kind in re.findall(r"refs/afk/([a-z-]+)/", text):
+            assert kind in kinds, f"{name}: refs/afk/{kind}/ is not a ref the fleet writes"
+            named.add(kind)
+        for line in text.splitlines():
+            for m in re.finditer(r"(?<![\w/])(%s)/" % "|".join(short), line):
+                assert "branch" in line, f"{name}: `{m.group(1)}/…` is a branch name: {line.strip()}"
+    assert named == kinds, named          # the scan really found each of them
+
+
+def test_this_repos_own_config_loads_and_restates_no_default():
+    """docs/agents/afk-fleet.md is read at every bootstrap of the fleet on this
+    repo: it must load, and a key it sets to the default is a copy of
+    CONFIG_DEFAULTS that stops following it."""
+    text = _repo_config()
+    if text is None:                      # an installed skill ships without it
+        return
+    partial = afk_decide.parse_config_yaml(text)
+    afk_decide.validate_config(afk_decide.resolve_config(partial))
+    defaults = afk_decide.CONFIG_DEFAULTS
+    restated = [k if not isinstance(v, dict) else f"{k}.{sk}"
+                for k, v in partial.items()
+                for sk in (v if isinstance(v, dict) else [None])
+                if (v[sk] == defaults[k][sk] if isinstance(v, dict) else v == defaults[k])]
+    assert not restated, restated
+    assert partial["gate"]["ci"] == "local" and partial["merge"]["target"] == "master"
+
+
 def test_every_flow_anchor_still_names_something():
     """docs/flows.md anchors each step to `path:Symbol`. A renamed function leaves
     the doc pointing at nothing — and reading as if it still held."""
@@ -5007,19 +5059,6 @@ def test_every_flow_anchor_still_names_something():
     for path, symbol in anchors:
         with open(os.path.join(root, path)) as f:
             assert re.search(r"(?<!\w)%s(?!\w)" % re.escape(symbol), f.read()), f"{path}:{symbol}"
-
-
-def run_all():
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    for t in tests:
-        t()
-        print(f"ok  {t.__name__}")
-    print(f"\n{len(tests)} passed")
-
-
-if __name__ == "__main__":
-    run_all()
-
 
 
 def test_a_batchs_members_are_read_from_the_turn_markers_on_its_prs():

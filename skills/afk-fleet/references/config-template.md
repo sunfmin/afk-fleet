@@ -149,8 +149,8 @@ force_tick_after_skips: 6              # safety net: a full tick at least every 
 - **Deploy is out of scope.** The fleet's mandate ends at a green merge to `merge.target`. Deploying
   (secrets, live infra) is never done by the fleet.
 - **Reserved labels, refs & the status comment.** The fleet manages, durably in GitHub, the
-  `afk-attempt/<n>` labels (retry count) and `afk-attempt/starting` (a retry under way), the hidden `refs/afk/*` ref namespace — `afk-claim/<n>` (the
-  claim, one per owned issue) and `afk-heartbeat/<id>` (per-instance liveness) — and, when
+  `afk-attempt/<n>` labels (retry count) and `afk-attempt/starting` (a retry under way), the hidden `refs/afk/*` ref namespace — `refs/afk/claim/<n>` (the
+  claim, one per owned issue) and `refs/afk/heartbeat/<id>` (per-instance liveness) — and, when
   `progress_comment` is on, the single status-board comment tagged `<!--afk:status-->` (found and
   overwritten by that marker each tick). This is what keeps ticks stateless and lets fleets cooperate
   (see the skill's "Why it runs forever" and ADR-0003). Don't hand-edit them or reuse the
