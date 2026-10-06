@@ -303,9 +303,10 @@ without an outcome, usually to ask a question nobody will answer. A nudge tells 
 sent **once per worker** (recorded in the worktree's git dir), spends no **retry** and discards
 nothing; a worker still silent a grace period later is a failure, and the last screen of its terminal
 travels in the failure reason — except on a **landing turn**, where that second silence restarts the
-worker onto the turn once (ADR-0035), and only the restarted worker's own unanswered nudge is the
-failure. That screen is the only thing the fleet ever reads from a worker's
-terminal, and it is read for *where the worker stopped*, never for its result (ADR-0018).
+worker onto the turn once, and the restarted worker's own unanswered nudge escalates the claim with
+its PR kept, the screen travelling in the escalation's reason instead (ADR-0035). That screen is the
+only thing the fleet ever reads from a worker's terminal, and it is read for *where the worker
+stopped*, never for its result (ADR-0018).
 _Avoid_: ping, poke, retry (a retry discards the attempt; a nudge keeps it), reminder, restart (a
 restart replaces the worker; a nudge keeps it)
 
@@ -347,9 +348,13 @@ PR holds the turn the claim is `landing`, and its worker is watched like a PR-le
 grace it is **nudged**; silent again it is **restarted onto the turn** — the idle session closed, a
 worker started by **continuation** in the same worktree (or one recreated at the PR's head, never
 from base), briefed only to land the PR, with the PR, branch, worktree and attempt untouched and the
-restart recorded on the turn marker — once per turn; the restarted worker's own unanswered nudge is
-then the failure that closes the PR and frees the turn (ADR-0035). A worker whose terminal is gone
-gets that same continuation at once, unbounded. The check
+restart recorded on the turn marker — once per turn; silent again after the restarted worker's own
+nudge, the claim is **escalated**: the PR stays open, the branch and worktree stay, no attempt is
+spent, and the released claim holds no turn — so the next PR gets it (ADR-0035). That is the whole
+bound of a turn — told → grace → nudge → grace → restart → grace → nudge → grace → escalate — and
+nothing is discarded at any step: `afk fail` reaches a landing claim only by the tick's own
+judgments (red checks in `required`, a refuted verify), never by silence. A worker whose terminal
+is gone gets that same continuation at once, unbounded. The check
 guards against a worker that strays, not a malicious one — worker and launcher share one `gh`
 credential (ADR-0027).
 _Avoid_: lock, merge lock (nothing is held on the target; the turn is a record on the PR), token,
