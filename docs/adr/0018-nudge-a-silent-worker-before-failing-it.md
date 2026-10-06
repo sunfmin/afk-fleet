@@ -3,7 +3,11 @@
 **Status:** accepted — narrows one clause of the "read workers through GitHub, never their
 transcripts" guardrail ([ADR-0001](0001-disposable-coordinator-context.md)), and adds an outcome to
 `classify_no_pr` beside [ADR-0013](0013-liveness-is-recency-not-accumulated-work.md). The "liveness
-probe" it mentions is read in code since [ADR-0021](0021-worker-state-is-mechanics.md).
+probe" it mentions is read in code since [ADR-0021](0021-worker-state-is-mechanics.md). Where the
+claim holds a **landing turn**, the silence past the nudge climbs the ladder of
+[ADR-0035](0035-a-silent-landing-worker-is-restarted-onto-its-turn.md) instead — a restart, then
+an escalation that keeps the PR — and never reaches `afk fail`; the failure below is a PR-less
+claim's.
 
 ## Context
 

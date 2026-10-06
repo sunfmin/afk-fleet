@@ -2818,9 +2818,10 @@ def test_turns_are_granted_one_at_a_time_in_merge_order():
         assert _land(w, 2, d[2]["worktree"], *gate)["outcome"] == "conflict"
         assert w.afk(*_turn(3, *gate))["outcome"] == "waiting"
 
-        # #2 is FAILED instead (its worker never resolved it): its PR closes, and
-        # that frees the turn — #3 spent no attempt of its own waiting
-        assert w.afk(*_fail(2, "landing turn never landed", *gate))["action"] == "retry"
+        # #2 is FAILED instead, on the tick's own judgment (a landing turn's silence
+        # never is one — ADR-0035): its PR closes, and that frees the turn — #3 spent
+        # no attempt of its own waiting
+        assert w.afk(*_fail(2, "the adversarial verify refuted head of PR #20", *gate))["action"] == "retry"
         assert w.pr(20)["state"] == "closed"
         state, order = rows()
         assert (state[2], state[3], order) == ("no_pr", "awaiting_turn", [3])
@@ -3176,7 +3177,7 @@ def test_a_ref_afk_did_not_write_is_not_a_recorded_gate_run():
 # a turn nobody lands, and a turn whose worker is gone                         #
 # --------------------------------------------------------------------------- #
 
-def test_a_worker_silent_on_its_turn_is_nudged_once_then_restarted_onto_it_once_then_failed():
+def test_a_worker_silent_on_its_turn_is_nudged_once_then_restarted_onto_it_once_then_escalated():
     """A turn can never park the queue: a worker that goes silent on it — idle past
     grace, nothing landed — is nudged once, like any other silence. Silent after
     that it is not failed but RESTARTED onto the turn (ADR-0035): its PR was
@@ -3185,8 +3186,10 @@ def test_a_worker_silent_on_its_turn_is_nudged_once_then_restarted_onto_it_once_
     worktree, briefed only to land; the PR, the branch, the worktree and the
     attempt label are untouched, and the restart is written on the turn marker.
     Once per turn: the restarted worker, silent again after its own nudge, is
-    failed — only THEN is an attempt spent, its PR closes, and the next PR gets
-    the turn."""
+    ESCALATED (#91) — the PR stays open, the branch and the worktree stay, no
+    attempt is spent, the human gets the reason and the worker's last screen,
+    and the released claim holds no turn, so the next PR gets it. No silence of
+    a landing claim ever reaches `afk fail`."""
     gate = local_gate("true")
     with world(issues=[issue(5, "ready-for-agent"), issue(6, "ready-for-agent")]) as w:
         d, pr_head = with_pr(w, 5, 50)
@@ -3255,13 +3258,16 @@ def test_a_worker_silent_on_its_turn_is_nudged_once_then_restarted_onto_it_once_
 
         # the restarted worker is a new worker: one grace period to start, then its
         # own nudge (the old one's record went with the brief) — and silent after
-        # THAT it takes the failure path: one restart per turn
+        # THAT it is escalated: never restarted again, and never failed
         assert no_pr(t0 + 899) == ("coding", "leave", t0 + 600)
         assert no_pr(t0 + 900) == ("idle_stalled", "nudge", t0 + 600)
         assert "already restarted" in w.error(*_turn(5, *gate, "--restart", now=t0 + 900))
+        terms = w.terminals()
+        terms[-1]["screen"] = ["● 要我先确认一下再合并吗？", "❯ "]
+        w.orca(terminals=terms)
         w.afk(*nudge, "--now", str(t0 + 900))
         assert no_pr(t0 + 1199)[:2] == ("coding", "leave")
-        assert no_pr(t0 + 1200) == ("idle_failed", "next_attempt", t0 + 600)
+        assert no_pr(t0 + 1200) == ("idle_stalled", "escalate", t0 + 600)
         assert "already restarted" in w.error(*_turn(5, *gate, "--restart", now=t0 + 1200))
         assert _mine(w, gate, 5)[0] == "landing" and "state" not in w.pr(50)
 
@@ -3272,17 +3278,36 @@ def test_a_worker_silent_on_its_turn_is_nudged_once_then_restarted_onto_it_once_
         assert (np["outcome"], np["worker_state"], np["turn_at"]) == ("coding", "working", None)
         w.worker(output=t0 + 600, state="done", since=t0 + 600)
 
-        r = w.afk(*_fail(5, "given the landing turn and never landed", *gate))
-        assert (r["action"], r["attempt"]) == ("retry", 1)
-        assert w.issue(5)["labels"] == ["ready-for-agent", "afk-attempt/1"]
-        assert w.pr(50)["state"] == "closed"
-        # the retry is a new attempt with no PR: the old turn, restart and all, went with the PR
-        assert _mine(w, gate, 5) == ("no_pr", "claimed", None)
+        # the escalation keeps everything: the PR is open, the branch and the
+        # worktree are where they were, no attempt label moved and none counted —
+        # and the hand-off says the PR was ready, the landing was restarted once,
+        # and where the worker stopped
+        reason = ("PR #50 was judged ready and given the landing turn, its worker was restarted "
+                  "onto the turn once, and the landing still did not happen")
+        r = w.afk("escalate", "--issue", "5", *ME, *R, "--now", str(t0 + 1200),
+                  "--reason", reason, *cfg)
+        assert (r["action"], r["attempt"], r["pr"], r["released"]) == ("escalate", 0, 50, True)
+        assert "state" not in w.pr(50) and w.issue(5)["labels"] == ["ready-for-human"]
+        assert git(wt, "rev-parse", "HEAD") == pr_head and git(wt, "status", "--porcelain") == ""
+        assert w.sb.remote_ref(f"refs/heads/{branch}") == pr_head and len(w.worktrees()) == 2
+        assert w.claimed_by(5) is None and "已升级给人处理" in w.board(5)
+        handoff = w.comments(5)[-1]
+        assert "escalated to a human** (without a retry). Last PR: #50." in handoff
+        assert reason in handoff and "● 要我先确认一下再合并吗？" in handoff
+        # a released claim holds no turn: the marker stays on the PR for the human
+        # to read, the claim is nobody's, and #6 gets the turn — while the worker
+        # left on #5 can no longer land it
+        [marker] = _turns(w, 50)
+        assert f"restarted={t0 + 600}" in marker.split("\n")[0]
+        assert [m["number"] for m in w.afk("rebuild", *ME, *R, *NOW, *gate)["mine"]] == [6]
         assert w.afk(*_turn(6, *gate))["outcome"] == "granted"
+        assert "does not hold the landing turn" in _land_error(w, 5, wt, *gate)
 
     # the pass does it by itself: a cycle whose landing worker is silent after its
-    # nudge restarts it — one `afk turn --restart` — and counts it as `restarted`
-    with world(issues=[issue(8, "ready-for-agent")]) as w:
+    # nudge restarts it — one `afk turn --restart` — and counts it as `restarted`;
+    # silent again past that, the cycle escalates it with everything kept, and the
+    # next ready PR of this instance gets the turn on the cycle after
+    with world(issues=[issue(8, "ready-for-agent"), issue(9)]) as w:
         d, pr_head = with_pr(w, 8, 80)
         wt = d["worktree"]
         t0 = int(time.time()) + 5000
@@ -3307,13 +3332,24 @@ def test_a_worker_silent_on_its_turn_is_nudged_once_then_restarted_onto_it_once_
         assert git(wt, "rev-parse", "HEAD") == pr_head
         [marker] = _turns(w, 80)
         assert f"restarted={t0 + 600}" in marker.split("\n")[0]
-        # …and the restarted worker's second silence is the retry it was before
+        # …and the restarted worker's second silence is an escalation, not the
+        # retry it used to be: the PR open, the branch and the worktree kept, no
+        # attempt spent, the claim released, the reason on the issue
         c = cycle(t0 + 900, c["state"])
         assert c["progress"].startswith("nudged #8"), c
         c = cycle(t0 + 1200, c["state"])
-        assert c["progress"].startswith("retried #8") and "errors" not in c, c
-        assert w.pr(80)["state"] == "closed" and w.issue(8)["labels"] == ["ready-for-agent",
-                                                                            "afk-attempt/1"]
+        assert c["progress"].startswith("escalated #8") and "errors" not in c, c
+        assert "state" not in w.pr(80) and w.issue(8)["labels"] == ["ready-for-human"]
+        assert git(wt, "rev-parse", "HEAD") == pr_head and len(w.worktrees()) == 1
+        assert w.sb.remote_ref(f"refs/heads/{d['branch']}") == pr_head
+        assert w.claimed_by(8) is None and "已升级给人处理" in w.board(8)
+        assert "restarted onto the turn once" in w.comments(8)[-1]
+        # the escalated PR's marker holds no turn once its claim is released: the
+        # next ready PR of this instance is granted the turn on the next cycle
+        with_pr(w, 9, 90)
+        c = cycle(t0 + 1500, c["state"])
+        assert c["progress"].startswith("landing turn to #9") and "errors" not in c, c
+        assert _mine(w, ("--config", json.dumps(cfg)), 9) == ("landing", "landing", None)
 
 
 def test_a_turn_with_no_terminal_is_delivered_by_continuation_never_from_base():

@@ -927,6 +927,7 @@ WORKER_CAUSES = {
     "no_blocker_named":   ("idle_blocked", "escalate"),
     "silent":             ("idle_stalled", "nudge"),
     "silent_on_turn":     ("idle_stalled", "restart"),       # silent after its nudge, on a landing turn
+    "silent_past_restart": ("idle_stalled", "escalate"),     # …and again, after the turn's one restart
     "gave_up":            ("idle_failed", "next_attempt"),
     "unknown_phase":      ("idle_failed", "next_attempt"),
     "silent_after_nudge": ("idle_failed", "next_attempt"),
@@ -1214,14 +1215,20 @@ def settled_by_worker_state(reading, now, grace_seconds, nudged_at=None):
     return None
 
 
-def restartable_turn(turn):
-    """Is `turn` (`latest_turn`, or {} / None) one PR's landing turn whose silent
-    worker may still be restarted onto it? A turn that is held (`at` set, not
-    `released`), is no merge batch's, and has not had its one restart
-    (`restarted`) — ADR-0035. A no_pr claim has no turn, so never."""
+def single_turn_held(turn):
+    """Is `turn` (`latest_turn`, or {} / None) ONE PR's landing turn, held — `at`
+    set, not `released`, no merge batch's? A no_pr claim has no turn, so never."""
     turn = turn or {}
     return bool(turn.get("at") is not None and not turn.get("released")
-                and not turn.get("batch") and not turn.get("restarted"))
+                and not turn.get("batch"))
+
+
+def restartable_turn(turn):
+    """Is `turn` one PR's held landing turn whose silent worker may still be
+    restarted onto it — one that has not had its one restart (`restarted`)?
+    ADR-0035. Past the restart the same silence escalates the claim with
+    everything kept (`silent_past_restart`)."""
+    return single_turn_held(turn) and not (turn or {}).get("restarted")
 
 
 def classify_stopped(progress, terminal_idle_seconds, worker_verdict, blocker_states,
@@ -1240,9 +1247,12 @@ def classify_stopped(progress, terminal_idle_seconds, worker_verdict, blocker_st
                        blocked_by (`blocker_standings`). Anything else is `unmet`.
       now, grace_seconds: epoch seconds / `worker_idle_grace_seconds`.
       nudged_at:       epoch seconds this worker was nudged (`afk nudge`), None if
-                       it never was. A nudge is spent once: the second silence fails.
+                       it never was. A nudge is spent once: the second silence
+                       fails a PR-less claim, and moves a landing one up its own
+                       ladder (below).
       can_nudge:       False when there is nowhere to record a nudge (no worktree
-                       on this machine) — the silence then fails at once.
+                       on this machine) — a PR-less claim's silence then fails at
+                       once, and a landing claim's takes its next rung at once.
       turn:            the landing turn its PR carries (`latest_turn`), None when it
                        has none. `at` — when the worker was last told to land
                        (`afk turn`), or its `afk land` last stopped — is a sign of
@@ -1251,13 +1261,15 @@ def classify_stopped(progress, terminal_idle_seconds, worker_verdict, blocker_st
                        after it, a worker on ONE PR's turn is restarted onto the
                        turn rather than failed — once per turn: `restarted` says the
                        turn already had its restart, and the next silence after a
-                       nudge takes the failure path (ADR-0035). `stopped` is the
-                       LAND_OUTCOMES word its `afk land` last stopped with: one of
-                       LAND_WAITS means the worker is idle because the next move is
-                       the tick's — its quiet is not a silence, and is never nudged
-                       or failed here (`afk turn` is what moves it). A merge
-                       batch's turn (`batch`) is its batch worker's, which is
-                       abandoned, never restarted (`batch_step`).
+                       nudge ESCALATES the claim with its PR, branch and worktree
+                       kept — a landing turn's silence never reaches `afk fail`
+                       (ADR-0035). `stopped` is the LAND_OUTCOMES word its `afk
+                       land` last stopped with: one of LAND_WAITS means the worker
+                       is idle because the next move is the tick's — its quiet is
+                       not a silence, and is never nudged, restarted or escalated
+                       here (`afk turn` is what moves it). A merge batch's turn
+                       (`batch`) is its batch worker's, which is abandoned, never
+                       restarted (`batch_step`).
 
     Returns {"cause", "outcome", "action", "idle_seconds", "pending_blockers"}.
     `cause` — one of WORKER_CAUSES — is the decision, and what the tick routes on;
@@ -1287,21 +1299,33 @@ def classify_stopped(progress, terminal_idle_seconds, worker_verdict, blocker_st
                                                       question nobody will answer.
                                                       `afk nudge` tells it to carry on;
                                                       no attempt is spent (ADR-0018).
-      silent_on_turn     idle_stalled restart       — no verdict even after a nudge,
-                                                      on a landing turn not yet
-                                                      restarted: the PR was judged
-                                                      ready, only the landing did not
-                                                      happen. `afk turn --restart`
-                                                      puts a new worker on the turn;
-                                                      nothing is closed or counted
-                                                      (ADR-0035).
+      silent_on_turn     idle_stalled restart       — no verdict even after a nudge
+                                                      (or with nowhere to record
+                                                      one), on a landing turn not
+                                                      yet restarted: the PR was
+                                                      judged ready, only the landing
+                                                      did not happen. `afk turn
+                                                      --restart` puts a new worker on
+                                                      the turn; nothing is closed or
+                                                      counted (ADR-0035).
+      silent_past_restart idle_stalled escalate     — the same silence on a landing
+                                                      turn that already had its one
+                                                      restart: nobody could get a
+                                                      worker to land a PR the tick
+                                                      judged ready, so `afk escalate`
+                                                      hands it to a human with the
+                                                      PR, branch and worktree kept;
+                                                      no attempt is spent (ADR-0035).
       gave_up            idle_failed  next_attempt  — `giving-up`.
       unknown_phase      idle_failed  next_attempt  — a verdict naming no phase the
                                                       fleet knows.
-      silent_after_nudge idle_failed  next_attempt  — no verdict even after a nudge.
+      silent_after_nudge idle_failed  next_attempt  — no verdict even after a nudge,
+                                                      and no landing turn of one PR
+                                                      to climb instead.
       silent_unnudgeable idle_failed  next_attempt  — no verdict, and nowhere to
                                                       record a nudge.
-    Every `next_attempt` is failure handling (`afk fail`).
+    Every `next_attempt` is failure handling (`afk fail`); a landing turn's
+    silence never comes to one.
 
     `idle_seconds` is the time since the MOST RECENT sign of life (last commit,
     newest file mtime, terminal activity, the nudge, the landing turn — a nudged
@@ -1323,9 +1347,11 @@ def classify_stopped(progress, terminal_idle_seconds, worker_verdict, blocker_st
         # …or, having declared nothing, why it is quiet
         if turn.get("stopped") in LAND_WAITS:
             return _seen("awaiting_tick", idle_seconds)
+        if single_turn_held(turn) and (nudged_at is not None or not can_nudge):
+            # one PR's landing turn climbs its own ladder: restart, then escalate
+            return _seen("silent_on_turn" if restartable_turn(turn) else "silent_past_restart",
+                         idle_seconds)
         if nudged_at is not None:
-            if restartable_turn(turn):
-                return _seen("silent_on_turn", idle_seconds)
             return _seen("silent_after_nudge", idle_seconds)
         return _seen("silent" if can_nudge else "silent_unnudgeable", idle_seconds)
     phase = verdict.get("phase")
@@ -1365,13 +1391,14 @@ def stall_tail(lines, limit=STALL_TAIL_LINES):
 
 
 def stall_reason(reason, tail):
-    """A failure reason with the stalled worker's last screen appended, so the retry
-    (or the human it escalates to) reads WHERE it stopped, not just that it did."""
+    """A failure or escalation reason with the stalled worker's last screen
+    appended, so the retry (or the human it escalates to) reads WHERE it stopped,
+    not just that it did."""
     tail = stall_tail(tail)
     if not tail:
         return reason
-    return (f"{reason.rstrip()}\n\nThe previous worker stopped without an outcome and stayed "
-            f"silent after one nudge. Its terminal ended with:\n\n```\n" + "\n".join(tail) + "\n```")
+    return (f"{reason.rstrip()}\n\nThe worker stopped without an outcome and stayed silent "
+            f"after one nudge. Its terminal ended with:\n\n```\n" + "\n".join(tail) + "\n```")
 
 
 # --------------------------------------------------------------------------- #
@@ -1591,10 +1618,11 @@ def turn_comment(turn):
         state = (f"Its last `afk land` stopped with `{stopped}` on `{(turn['head'] or '')[:12]}`."
                  if stopped else "The worker has been told to land it.")
         again = (" Its worker went silent on the turn and a new one was started onto it, in the "
-                 "same worktree; a second silence fails the attempt." if turn["restarted"] else "")
+                 "same worktree; a second silence hands the PR to a human as it is, with the "
+                 "branch and worktree kept." if turn["restarted"] else "")
         text = (f"**afk-fleet: this PR holds the landing turn** of fleet instance `{instance}`. "
                 f"The worker that wrote the branch lands it with `afk land` — sync with the target, "
-                f"gate, merge — and the next PR's turn comes when this one has landed or failed. "
+                f"gate, merge — and the next PR's turn comes when this one has landed, failed or been escalated. "
                 f"{state}{again}")
     fields = _whole_turn({name: turn[name] for name in TURN_RECORD.fields})
     return record_comment(TURN_RECORD, fields, text)
@@ -2891,10 +2919,17 @@ def worker_step(call, row, worker, config):
       ("nudge", None)       silent: `afk nudge`
       ("restart", None)     silent_on_turn: `afk turn --restart` — a new worker
                             onto the landing turn, nothing closed or counted
-      ("escalate", reason)  `afk escalate`: the reason is on record
+      ("escalate", reason)  `afk escalate`: the reason is on record — a blocker
+                            nothing will resolve, or a landing turn silent
+                            past its one restart (silent_past_restart): the PR,
+                            branch and worktree go to the human as they are,
+                            and no attempt is spent (ADR-0035)
       ("fail", reason)      `afk fail`: the reason is on record — or the row is
                             `starting`, and whatever its worker is, short of at
-                            work, the retry already counted is finished
+                            work, the retry already counted is finished. A
+                            landing claim's silence never comes here: the two
+                            silence causes that fail a PR-less claim are an
+                            error on a `landing` row
       ("judge", {...})      satisfied → `empty_diff`; a failure or an escalation
                             whose reason is NOT on record → `reason`
 
@@ -2920,6 +2955,11 @@ def worker_step(call, row, worker, config):
         return "nudge", None
     if cause == "silent_on_turn":
         return "restart", None
+    if cause == "silent_past_restart":
+        return "escalate", (f"PR #{row['pr']} was judged ready and given the landing turn, its "
+                            f"worker was restarted onto the turn once, and the landing still did "
+                            f"not happen: {row.get('stopped') or 'no `afk land` outcome'}. The "
+                            f"PR, its branch and its worktree are kept as they are")
     if cause == "satisfied":
         base = config["base_branch"]
         return "judge", judgment(
@@ -2953,8 +2993,9 @@ def worker_step(call, row, worker, config):
                         f"({verdict.get('phase')!r})")
     if cause in ("silent_after_nudge", "silent_unnudgeable"):
         if row["status"] == "landing":
-            return "fail", (f"given the landing turn and never landed: "
-                            f"{row.get('stopped') or 'no `afk land` outcome'}")
+            raise ValueError(f"issue #{number}: a landing claim's silence is never a failure — "
+                             f"its turn is restarted onto, then escalated (ADR-0035); a "
+                             f"`landing` row classified {cause!r} holds no turn of one PR")
         if cause == "silent_after_nudge":
             return "fail", "idle with no PR and no verdict a grace period after its nudge"
         return "fail", "idle with no PR and no verdict, and no worktree here to nudge it in"

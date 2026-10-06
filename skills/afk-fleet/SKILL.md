@@ -311,10 +311,11 @@ In this order, each step the same `afk` transition you could type yourself
    [Landing](#landing--the-worker-lands-its-own-pr-on-its-turn).
 4. **Settle what a stopped worker left** where the reason is on record: a worker idle with no
    outcome is nudged once (`afk nudge`, ADR-0018), and one on a landing turn that stays silent is
-   then restarted onto the turn once (`afk turn --restart`, ADR-0035); a `giving-up` verdict, a
-   refuted `already-satisfied`, a silence that outlasted its nudge is failed (`afk fail`); a `blocked`
-   verdict is parked while the backlog will resolve its blockers (`afk park`, ADR-0022) and
-   escalated when nothing will (`afk escalate`).
+   then restarted onto the turn once (`afk turn --restart`) and, silent again past that, escalated
+   with its PR kept (`afk escalate`, ADR-0035); a `giving-up` verdict, a refuted
+   `already-satisfied`, a PR-less silence that outlasted its nudge is failed (`afk fail`); a
+   `blocked` verdict is parked while the backlog will resolve its blockers (`afk park`, ADR-0022)
+   and escalated when nothing will (`afk escalate`).
 5. **Release** every claim that outlived its issue — a PR its worker landed — and delete every dead
    peer's phantom lock, under the sha it was read at.
 6. **Start workers** (`afk dispatch`): first by [continuation](references/recovery.md) for claims
@@ -419,7 +420,8 @@ still owed each come back as a [judgment](#judgments).
 
 **Every other finished PR waits** — not synced, not told anything, never nudged or failed for
 waiting, spending no attempt, its status board saying so. The next turn is granted the cycle after
-this one's PR has **landed** (its claim is released) or been **failed** (`afk fail` closes its PR).
+this one's PR has **landed** (its claim is released), been **escalated** (its claim is released,
+and a released claim holds no turn) or been **failed** on a tick judgment (`afk fail` closes its PR).
 
 **While a PR holds the turn, its worker does everything**, and says where its last `afk land`
 stopped on the PR:
@@ -432,8 +434,11 @@ stopped on the PR:
   worktree, briefed only to land, with the PR, the branch, the worktree and the attempt untouched
   and the restart written on the turn marker
   ([ADR-0035](../../docs/adr/0035-a-silent-landing-worker-is-restarted-onto-its-turn.md)). Once
-  per turn: the restarted worker, silent again after its own nudge, is failed — which closes the
-  PR and frees the turn. That ladder is what bounds a turn.
+  per turn: the restarted worker, silent again after its own nudge, is **escalated** — `afk
+  escalate`, with the PR open, the branch and the worktree kept, no attempt spent, the reason and
+  the worker's last screen on the issue, and the claim released, which frees the turn. That ladder
+  — told → grace → nudge → grace → restart → grace → nudge → grace → escalate — is what bounds a
+  turn, and nothing is discarded at any step of it.
 - checks that must run on the head its sync pushed are waited for by `afk land` itself, in the
   same run: green and it merges, red and it is `gate_red`. No cycle is involved.
 - `awaiting_ci`, `needs_verify` or `no_checks` means the next move is the fleet's — the checks were
@@ -443,8 +448,9 @@ stopped on the PR:
 
 The invariant every path keeps: **what lands on the target was gated in the form it lands.** A sync
 that moved the head invalidates checks and verifications of the old one, and gh refuses the merge if
-the branch moved after the gate. No landing outcome spends an attempt or closes the PR; only
-`afk fail` does.
+the branch moved after the gate. No landing outcome spends an attempt or closes the PR, and neither
+does a landing worker's silence; only `afk fail` does, and it reaches a landing claim only by your
+own judgments — red checks in `required` mode, a refuted verify — never by silence.
 
 **A merge batch — several PRs on one turn** (`gate.ci: local` with `gate.adversarial_verify` off;
 there is no switch —
@@ -471,11 +477,12 @@ human-gated step — never done here.
 ## Failure handling — bounded retry → escalate, never silently drop
 
 A claim **fails** on any of: red checks on its PR; an adversarial refute; a `giving-up` verdict; an
-`already-satisfied` refuted by work on the branch; a worker still idle with **no verdict at all** a
-grace period after its one nudge (for a claim holding the turn: a turn it never landed, after the
-one restart onto it). A **sync conflict or a red gate at landing is not on this list** — the worker
-fixes it in place on its [landing turn](#landing--the-worker-lands-its-own-pr-on-its-turn), and
-its silence there costs a restart first (ADR-0035) and an attempt only after that.
+`already-satisfied` refuted by work on the branch; a PR-less worker still idle with **no verdict at
+all** a grace period after its one nudge. A **sync conflict, a red gate at landing, or a silence on
+the landing turn is not on this list** — the worker fixes the first two in place on its
+[landing turn](#landing--the-worker-lands-its-own-pr-on-its-turn), and its silence there costs a
+restart, then an escalation that keeps the PR (ADR-0035) — never an attempt. `afk fail` reaches a
+landing claim only by your own judgments: red checks in `required` mode, a refuted verify.
 
 ```bash
 <skill>/scripts/afk.py fail --issue <n> --instance <id> --worker-command '<worker_command>' \
@@ -501,11 +508,14 @@ the call does the rest and reports which way it went:
   (add `escalate_label`, remove `ready_label` and the attempt label) → comment the reason (if
   `escalate_comment`) → release the claim. The PR and the worktree are left for the human.
 
-An issue that should go to a human **without** consuming a retry — a `blocked` verdict naming a
-dependency nothing will resolve: it does not exist, was closed as not planned, is an epic, is open
-with no fleet to work it, or waiting on it would close a dependency cycle — takes the same ordered
-transition directly: `afk escalate --issue <n> --instance <id> --reason "<…>"`. Never silently drop
-or silently land bad work.
+An issue that should go to a human **without** consuming a retry takes the same ordered transition
+directly: `afk escalate --issue <n> --instance <id> --reason "<…>"`. Two cases: a `blocked` verdict
+naming a dependency nothing will resolve — it does not exist, was closed as not planned, is an
+epic, is open with no fleet to work it, or waiting on it would close a dependency cycle — and a
+**landing turn nobody could get a worker to perform**: silent again after its one restart, the PR
+the pass judged ready goes to the human as it is, open, with its branch and worktree, the reason
+and the worker's last screen (ADR-0035). The pass runs both itself. Never silently drop or silently
+land bad work.
 
 A dependency a worker *discovered* is not such a gap while the backlog will resolve it: `afk park
 --issue <n> --instance <id>` records it as a native `blocked_by` edge and releases the claim, and the
@@ -513,8 +523,9 @@ frontier contract does the waiting — no label changes, no human, no attempt sp
 park` re-reads the blockers and refuses (exit 3, nothing changed) a claim that is not parkable now.
 
 Not everything a stopped worker leaves is a failure: one idle with no outcome is **nudged** first,
-which costs no attempt, and one that holds the landing turn is then **restarted onto it** once,
-which costs none either; a `blocked` verdict skips retry accounting entirely — re-dispatched when its
+which costs no attempt, and one that holds the landing turn is then **restarted onto it** once and
+**escalated** after that, neither of which costs one — a landing turn never spends an attempt; a
+`blocked` verdict skips retry accounting entirely — re-dispatched when its
 blockers have closed, parked while the open ones are workable backlog; and an `already-satisfied`
 one with nothing on its branch closes the issue once you confirm the empty diff.
 
@@ -547,12 +558,12 @@ touch shared root config are naturally throttled by the DAG — chain them with 
   worker is busy is its **worker state** — what its runtime reported to orca, read by `afk no-pr`,
   never from its screen — and a stopped worker is combined with the worktree's git progress and its
   verdict marker (see In-flight — *stopped* alone is never *finished*). A full transcript never enters the launcher; the one terminal read is
-  `afk nudge` / `afk fail` taking the last screen of a worker that went silent, to say *where* it
-  stopped — never its result (ADR-0018).
+  `afk nudge` / `afk fail` / `afk escalate` taking the last screen of a worker that went silent, to
+  say *where* it stopped — never its result (ADR-0018).
 - **Never merge a PR yourself.** No `gh pr merge`, no push to `merge.target`: a PR lands only through
   its worker's `afk land`, on the turn `afk turn` gave it — or, in a merge batch, through the batch
-  worker's `afk land --batch`. A turn nobody lands is failed, and a batch nobody lands abandoned, not
-  merged around (ADR-0027, ADR-0029).
+  worker's `afk land --batch`. A turn nobody lands is escalated with its PR kept, and a batch nobody
+  lands abandoned, not merged around (ADR-0027, ADR-0029, ADR-0035).
 - **Claim before work; release on every terminal transition.** `afk dispatch` creates the
   `afk-claim/<n>` ref first — if the create is rejected, a peer owns it and nothing is started.
   `afk escalate`, `afk park` and `afk close` each delete it as their last step; a claim that outlived

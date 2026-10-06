@@ -20,8 +20,9 @@ worker behind a single gate run.
 [the amendment](#amendment-51--a-landing-waits-for-its-own-checks) at the end. Where the text below
 has `awaiting_ci` send the worker round the launcher, read it as what happens only once that wait
 has run out.
-**Amended by [ADR-0035](0035-a-silent-landing-worker-is-restarted-onto-its-turn.md) (#90):** a
-worker still silent after its nudge on the turn is restarted onto the turn once, not failed — see
+**Amended by [ADR-0035](0035-a-silent-landing-worker-is-restarted-onto-its-turn.md) (#90, #91):** a
+worker still silent after its nudge on the turn is restarted onto the turn once, not failed, and
+silent again past that restart it is escalated with the PR kept — see
 [What bounds a turn](#what-bounds-a-turn).
 
 ## Context
@@ -113,12 +114,15 @@ is asked after with `afk no-pr`, like a PR-less one: busy or within grace of the
 silent past grace it is nudged once (ADR-0018); silent again it is **restarted onto the turn** —
 `afk turn --restart`: the delivery below for a gone terminal, applied to an idle one, recorded on
 the turn marker and made once per turn; and silent again after the restarted worker's own nudge it
-is failed — `afk fail` closes the PR, which frees the turn, and the next PR gets it. (As first
-written, the unanswered nudge failed the attempt outright: a PR the tick had judged ready was
-closed and redone from base because one line to an idle session was not acted on.) A worker with
-no terminal is an orphan, and its continuation (`afk dispatch`) is started on the turn. A worker
-whose landing stopped *for the tick* is waiting, not silent, and is never nudged, restarted or
-failed for it.
+is **escalated** (ADR-0035 as amended by #91) — `afk escalate` keeps the PR, the branch and the
+worktree, spends no attempt and releases the claim, which frees the turn: the next PR gets it. A
+landing turn's silence never reaches `afk fail`; `afk fail` on a landing claim is the tick's own
+judgment (red checks in `required`, a refuted verify), and closing the PR is what frees the turn
+then. (As first written, the unanswered nudge failed the attempt outright: a PR the tick had judged
+ready was closed and redone from base because one line to an idle session was not acted on; the
+first form of ADR-0035 moved that failure one restart later.) A worker with no terminal is an
+orphan, and its continuation (`afk dispatch`) is started on the turn. A worker whose landing
+stopped *for the tick* is waiting, not silent, and is never nudged, restarted or escalated for it.
 
 ### What the landing does not do
 
