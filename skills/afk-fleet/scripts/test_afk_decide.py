@@ -92,36 +92,37 @@ def test_classify_claims_my_own_expired_stays_mine():
     assert r == {"mine": [9], "peer_live": [], "stale": []}, r
 
 
-def test_subclassify_pr():
-    # → (status, board_phase): what the tick does next, and what the board shows
-    assert d.subclassify_pr(False, None, "required") == ("no_pr", "claimed")
-    assert d.subclassify_pr(True, "green", "required") == ("awaiting_turn", "awaiting_turn")
-    assert d.subclassify_pr(True, "red", "required") == ("failure", "ci_failed")
-    assert d.subclassify_pr(True, "pending", "required") == ("awaiting_ci", "pr_open")
+def test_claim_status():
+    # → the status: what the tick does next. What the board shows is BOARD_PHASE_OF's
+    assert d.claim_status(False, None, "required") == "no_pr"
+    assert d.claim_status(True, "green", "required") == "awaiting_turn"
+    assert d.claim_status(True, "red", "required") == "failure"
+    assert d.claim_status(True, "pending", "required") == "awaiting_ci"
     # no checks at all is not "checks pending": nothing is running, so waiting
     # would park the claim forever in a repo with no CI. It goes to `afk turn`,
     # whose `no_checks` outcome asks the tick
-    assert d.subclassify_pr(True, None, "required") == ("awaiting_turn", "awaiting_turn")
+    assert d.claim_status(True, None, "required") == "awaiting_turn"
     # with no PR the checks are nobody's: stale rollup data cannot invent a status
-    assert d.subclassify_pr(False, "green", "required") == ("no_pr", "claimed")
+    assert d.claim_status(False, "green", "required") == "no_pr"
 
     # gate.ci: local — there are no checks to WAIT on, because gating is an action
     # the landing takes (ADR-0012). Any open PR is awaiting its turn, and a red
     # remote run (the repo's own on:push CI, which the fleet does not gate on)
     # must never park the claim in `failure` forever.
     for checks in ("green", "red", "pending", None):
-        assert d.subclassify_pr(True, checks, "local") == ("awaiting_turn", "awaiting_turn"), checks
-    assert d.subclassify_pr(False, None, "local") == ("no_pr", "claimed")
+        assert d.claim_status(True, checks, "local") == "awaiting_turn", checks
+    assert d.claim_status(False, None, "local") == "no_pr"
 
-    # every board phase it can produce is one the board renders — the tick never translates
-    for ci in d.GATE_CI_MODES:
-        for has_pr in (True, False):
-            for checks in ("green", "red", "pending", None):
-                assert d.subclassify_pr(has_pr, checks, ci)[1] in d.STATUS_PHASES
+    # every board phase a status is shown as is one the board renders — the tick
+    # never translates — and only a `closed` row has none
+    assert {st for st, phase in d.BOARD_PHASE_OF.items() if phase is None} == {"closed"}
+    assert {p for p in d.BOARD_PHASE_OF.values() if p} <= set(d.STATUS_PHASES)
+    assert (d.BOARD_PHASE_OF["failure"], d.BOARD_PHASE_OF["awaiting_ci"],
+            d.BOARD_PHASE_OF["no_pr"]) == ("ci_failed", "pr_open", "claimed")
 
     # CLAIM_STATUSES is exactly what it can return: no status the docs were never
     # held to, and none listed that cannot happen
-    seen = {d.subclassify_pr(has_pr, checks, ci, closed=closed, landing=landing)[0]
+    seen = {d.claim_status(has_pr, checks, ci, closed=closed, landing=landing)
             for ci in d.GATE_CI_MODES for has_pr in (True, False)
             for checks in ("green", "red", "pending", None)
             for closed in (True, False) for landing in (True, False)}
@@ -132,17 +133,16 @@ def test_subclassify_pr():
     # there is no board to write: the only thing left to do is release.
     for ci in d.GATE_CI_MODES:
         for has_pr in (True, False):
-            assert d.subclassify_pr(has_pr, "red", ci, closed=True) == ("closed", None)
+            assert d.claim_status(has_pr, "red", ci, closed=True) == "closed"
 
     # a PR that holds the landing turn: whatever the checks say, in either mode, the
     # claim is `landing` — its worker is at it, and red or pending checks on a head
     # the sync just pushed are the landing's own to wait out (ADR-0027)
     for ci in d.GATE_CI_MODES:
         for checks in ("green", "red", "pending", None):
-            assert d.subclassify_pr(True, checks, ci, landing=True) == \
-                ("landing", "landing"), (ci, checks)
-        assert d.subclassify_pr(True, "green", ci, closed=True, landing=True)[0] == "closed"
-        assert d.subclassify_pr(False, None, ci, landing=True)[0] == "no_pr"
+            assert d.claim_status(True, checks, ci, landing=True) == "landing", (ci, checks)
+        assert d.claim_status(True, "green", ci, closed=True, landing=True) == "closed"
+        assert d.claim_status(False, None, ci, landing=True) == "no_pr"
     assert {"landing", "awaiting_turn"} <= set(d.STATUS_PHASES)
 
 

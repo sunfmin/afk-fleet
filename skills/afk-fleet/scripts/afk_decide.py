@@ -609,16 +609,21 @@ def classify_claims(claims, heartbeats, me, now, ttl):
     return {"mine": sorted(mine), "peer_live": sorted(peer_live), "stale": sorted(stale)}
 
 
-# Every `status` a `mine` row can carry — what `subclassify_pr` returns, and the
-# vocabulary the tick's instructions route on (a test holds the docs to it).
-CLAIM_STATUSES = ("awaiting_turn", "landing", "awaiting_ci", "failure", "no_pr", "closed")
+# Every `status` a `mine` row can carry (`claim_status`) → the status-board
+# phase a human is shown meanwhile; None for a row whose board is not
+# re-rendered. The keys are the vocabulary the tick's instructions route on (a
+# test holds the docs to it). `merged` / `escalated` / `parked`, the board's
+# terminal phases, are written by the transitions that reach them.
+BOARD_PHASE_OF = {"awaiting_turn": "awaiting_turn", "landing": "landing",
+                  "awaiting_ci": "pr_open", "failure": "ci_failed", "no_pr": "claimed",
+                  "closed": None}
+CLAIM_STATUSES = tuple(BOARD_PHASE_OF)
 
 
-def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, landing=False):
+def claim_status(has_pr, checks_state, ci_mode, closed=False, landing=False):
     """
-    Classify one of MY in-flight claims from its PR + checks → `(status,
-    board_phase)`: what the tick does next, and what the status board shows a human
-    meanwhile. Decided together because `gate.ci` bends both, in different ways.
+    Classify one of MY in-flight claims from its PR + checks → its `status`, one
+    of CLAIM_STATUSES: what the tick does next.
 
       has_pr:       an open PR closes the issue
       checks_state: "green" | "red" | "pending" | None  (`pr_checks_state`)
@@ -628,50 +633,37 @@ def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, landing=False):
                     by hand
       landing:      the PR holds this fleet instance's landing turn (`held_turn`)
 
-      status           the tick…                                board_phase
-      closed           releases the leftover claim (and its      None (not re-rendered)
-                       worktree)
-      no_pr            asks `afk no-pr` why                      claimed
-      landing          asks `afk no-pr` whether its worker is    landing
-                       still at it — or, when the landing
-                       stopped for the tick, `afk turn` again
-      awaiting_ci      leaves it: checks exist and are still     pr_open
-                       running
-      failure          runs `afk fail`                           ci_failed
-      awaiting_turn    grants it the landing turn (`afk turn`)   awaiting_turn
-                       when it is first in `merge_order` and
-                       no claim of mine is `landing`
+      closed         its leftover claim (and worktree) is released
+      no_pr          `afk no-pr` is asked why
+      landing        `afk no-pr` is asked whether its worker is still at it — or,
+                     when the landing stopped for the tick, `afk turn` again
+      awaiting_ci    left: checks exist and are still running
+      failure        `afk fail`
+      awaiting_turn  granted the landing turn (`afk turn`) when it is first in
+                     `merge_order` and no claim of mine is `landing`
 
-    A PR that holds the turn is `landing` whatever its checks say: its worker is
-    syncing, gating and pushing, so a pending or red run on the way is the
-    landing's own business (`afk land` answers `awaiting_ci` / `gate_red`), never
-    a second route into `afk fail`.
+    Three cases a first guess gets wrong:
 
-    In `local` mode (ADR-0012) there are no checks to wait on: gating is an
-    **action `afk land` takes** (sync → the local gate → merge), not an
-    observation the tick waits for. So every open PR without the turn is
-    `awaiting_turn` — a red remote run, the repo's own `on: push` workflow the
-    fleet does not gate on, must not park the claim in `failure` forever.
-
-    A PR with **no checks at all** (`checks_state` None) is `awaiting_turn` in
-    `required` mode too. Nothing is running, so nothing will ever arrive to wait
-    for: `awaiting_ci` would park the claim forever in a repo that has no CI. What
-    such a PR needs is the tick's judgment, and `afk turn` is where that is asked
-    for (its `no_checks` outcome, answered with `--allow-no-checks`).
-    (`merged` / `escalated`, the two terminal board phases, are set by `afk land`
-    and the escalate step themselves.)
+    - A PR that holds the turn is `landing` whatever its checks say: a pending
+      or red run on the way is the landing's own business (`afk land` answers
+      `awaiting_ci` / `gate_red`), never a second route into `afk fail`.
+    - In `local` mode (ADR-0012) every open PR without the turn is
+      `awaiting_turn`: gating is an action `afk land` takes, not an observation
+      the tick waits for, so a red remote run the fleet does not gate on must
+      not park the claim in `failure`.
+    - A PR with NO checks at all is `awaiting_turn` in `required` mode too:
+      nothing is running, so `awaiting_ci` would park it forever. `afk turn` is
+      where the tick's judgment is asked for (`no_checks`).
     """
     if closed:
-        return "closed", None
+        return "closed"
     if not has_pr:
-        return "no_pr", "claimed"
+        return "no_pr"
     if landing:
-        return "landing", "landing"
+        return "landing"
     if ci_mode == "local" or checks_state in ("green", None):
-        return "awaiting_turn", "awaiting_turn"
-    if checks_state == "red":
-        return "failure", "ci_failed"
-    return "awaiting_ci", "pr_open"
+        return "awaiting_turn"
+    return "failure" if checks_state == "red" else "awaiting_ci"
 
 
 # --------------------------------------------------------------------------- #
@@ -881,7 +873,7 @@ def gate_comment(verdict, command):
 # no_pr reconciliation — disambiguating a FINISHED worker from a CODING one    #
 # --------------------------------------------------------------------------- #
 #
-# `subclassify_pr` only says a claim has no PR yet — or that its PR holds the
+# `claim_status` only says a claim has no PR yet — or that its PR holds the
 # landing turn and has not landed. Either way a worker that finished and went
 # idle looks identical, to a terminal probe, to one still working, so three
 # signals disambiguate (all gathered by `afk no-pr`):
@@ -1488,34 +1480,23 @@ TURN_RECORD = RecordKind("afk:turn", {
     "unbatched": one_of(UNBATCHED), "of": str, "released": FLAG}, ("instance",))
 
 
-def land_outcome(outcome):
-    """`outcome`, refused unless it is one of LAND_OUTCOMES: `afk land` cannot
-    stop with a word the worker was never told how to act on."""
-    if outcome not in LAND_OUTCOMES:
-        raise ValueError(f"not a landing outcome: {outcome!r}")
-    return outcome
+def _refusing(vocabulary, what):
+    """`outcome → outcome`, refused (ValueError) unless it is a word of
+    `vocabulary`: a subcommand cannot stop with a word its caller was never told
+    how to act on."""
+    def check(outcome):
+        if outcome not in vocabulary:
+            raise ValueError(f"not {what}: {outcome!r}")
+        return outcome
+    return check
 
 
-def turn_outcome(outcome):
-    """`outcome`, refused unless it is one of TURN_OUTCOMES: one PR's turn
-    cannot stop with a word only a merge batch's is routed on (ADR-0036)."""
-    if outcome not in TURN_OUTCOMES:
-        raise ValueError(f"not a turn outcome: {outcome!r}")
-    return outcome
-
-
-def batch_turn_outcome(outcome):
-    """`outcome`, refused unless it is one of BATCH_TURN_OUTCOMES."""
-    if outcome not in BATCH_TURN_OUTCOMES:
-        raise ValueError(f"not a batch turn outcome: {outcome!r}")
-    return outcome
-
-
-def batch_outcome(outcome):
-    """`outcome`, refused unless it is one of BATCH_OUTCOMES."""
-    if outcome not in BATCH_OUTCOMES:
-        raise ValueError(f"not a batch outcome: {outcome!r}")
-    return outcome
+# One guard per vocabulary: one PR's turn cannot stop with a word only a merge
+# batch's is routed on, nor the other way round (ADR-0036).
+land_outcome = _refusing(LAND_OUTCOMES, "a landing outcome")
+turn_outcome = _refusing(TURN_OUTCOMES, "a turn outcome")
+batch_turn_outcome = _refusing(BATCH_TURN_OUTCOMES, "a batch turn outcome")
+batch_outcome = _refusing(BATCH_OUTCOMES, "a batch outcome")
 
 
 # The record of a PR that was never granted a turn: every field `latest_turn`
@@ -3672,7 +3653,7 @@ def assemble_working_set(issues, prs, claims, heartbeats, me, now, config,
        "fingerprint": <digest of the same observables the gate hashes>,
        "now": now}
 
-    `status` and `board_phase` are `subclassify_pr`'s pair; `attempt` is
+    `status` is `claim_status`'s and `board_phase` what BOARD_PHASE_OF shows for it; `attempt` is
     `current_attempt` — the number `afk status` takes; `starting` is
     `attempt_starting` — a retry cut short, for `afk fail` to finish; `stopped` is the
     LAND_OUTCOMES word a `landing` row's `afk land` last stopped with, None while
@@ -3716,8 +3697,8 @@ def assemble_working_set(issues, prs, claims, heartbeats, me, now, config,
         issue = by_num.get(n, {})
         turn = turns.get(n) or {}
         held = held_turn(turn, me) or {}
-        status, board_phase = subclassify_pr(pr is not None, checks, ci_mode,
-                                             closed=n in closed, landing=bool(held))
+        status = claim_status(pr is not None, checks, ci_mode,
+                              closed=n in closed, landing=bool(held))
         batch = held.get("batch") if status == "landing" else None
         if turn.get("batch") and not turn.get("released") and n not in closed:
             seen = batches.setdefault(turn["batch"], {
@@ -3725,7 +3706,7 @@ def assemble_working_set(issues, prs, claims, heartbeats, me, now, config,
                 "phase": turn["phase"], "at": turn["at"]})
             seen["at"] = max(seen["at"] or 0, turn["at"] or 0) or None
         mine.append({"number": n, "title": issue.get("title"),
-                     "status": status, "board_phase": None if batch else board_phase,
+                     "status": status, "board_phase": None if batch else BOARD_PHASE_OF[status],
                      "pr": pr.get("number") if pr else None, "checks": checks,
                      "attempt": current_attempt(issue.get("labels")),
                      "starting": attempt_starting(issue.get("labels")),
