@@ -2552,7 +2552,7 @@ def _turn_batch(run, instance, agent, working_set=None):
     ws = working_set or _rebuild(run, instance)
 
     def stop(outcome, **more):
-        return {"outcome": afk_decide.turn_outcome(outcome), **more}
+        return {"outcome": afk_decide.batch_turn_outcome(outcome), **more}
 
     mine = next((b for b in ws["batches"] if b["instance"] == instance), None)
     if mine:
@@ -2616,7 +2616,7 @@ def _start_batch_worker(run, instance, agent, batch, members, phase, again):
             "config": json.dumps(cfg, ensure_ascii=False), "worktree_path": path,
             "launcher_terminal": os.environ.get("ORCA_TERMINAL_HANDLE", "")})
     handle = wt.put(agent, prompt)()
-    return {"outcome": afk_decide.turn_outcome("granted"), "batch": batch,
+    return {"outcome": afk_decide.batch_turn_outcome("granted"), "batch": batch,
             "issues": [m["issue"] for m in members], "prs": [m["pr"] for m in members],
             "again": again, "delivery": delivery, "terminal": handle, "worktree": path}
 
@@ -2647,7 +2647,7 @@ def _abandon_batch(run, instance, batch):
     deleted = _delete_batch_branches(rem, batch)
     wt = _Worktree.of_batch(run.repo, batch)
     cleanup = wt.remove() if wt.path else None
-    return {"outcome": afk_decide.turn_outcome("abandoned"), "batch": batch,
+    return {"outcome": afk_decide.batch_turn_outcome("abandoned"), "batch": batch,
             "issues": [m["issue"] for m in left], "prs": [m["pr"] for m in left],
             "deleted_branches": deleted, **({"cleanup": cleanup} if cleanup else {})}
 

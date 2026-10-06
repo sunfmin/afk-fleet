@@ -1497,10 +1497,17 @@ def land_outcome(outcome):
 
 
 def turn_outcome(outcome):
-    """`outcome`, refused unless it is one of TURN_OUTCOMES or — for a merge
-    batch's turn — BATCH_TURN_OUTCOMES."""
-    if outcome not in (*TURN_OUTCOMES, *BATCH_TURN_OUTCOMES):
+    """`outcome`, refused unless it is one of TURN_OUTCOMES: one PR's turn
+    cannot stop with a word only a merge batch's is routed on (ADR-0036)."""
+    if outcome not in TURN_OUTCOMES:
         raise ValueError(f"not a turn outcome: {outcome!r}")
+    return outcome
+
+
+def batch_turn_outcome(outcome):
+    """`outcome`, refused unless it is one of BATCH_TURN_OUTCOMES."""
+    if outcome not in BATCH_TURN_OUTCOMES:
+        raise ValueError(f"not a batch turn outcome: {outcome!r}")
     return outcome
 
 
