@@ -3203,3 +3203,21 @@ def test_a_key_that_named_the_only_way_there_is_is_refused_with_its_note():
                 assert False, f"expected ValueError for the removed {key} key"
             except ValueError as e:
                 assert f"{key!r} was removed" in str(e) and "Delete the key" in str(e)
+
+
+def test_a_record_that_states_nothing_reads_as_its_kinds_blank():
+    """What a reader gives back for a field the marker does not state is the
+    field type's `empty`, declared with the type — so a field added to a kind
+    is in every record read of it, with no second list to add it to."""
+    assert d.blank_record(d.VERDICT_RECORD) == {"n": None, "phase": None, "blocked_by": [],
+                                                "reason": None}
+    blank = d.blank_record(d.TURN_RECORD)
+    assert set(blank) == set(d.TURN_RECORD.fields)
+    assert (blank["allow_no_checks"], blank["released"], blank["members"]) == (False, False, [])
+    assert all(v is None for k, v in blank.items()
+               if k not in ("allow_no_checks", "released", "members"))
+    # each read gets its own list: one record's members are never another's
+    assert d.blank_record(d.TURN_RECORD)["members"] is not blank["members"]
+    bare = d.latest_turn([{"id": 3, "body": "<!--afk:turn instance=fl-1-->"}])
+    assert bare == {**blank, "instance": "fl-1", "comment_id": 3}
+    assert d.latest_verdict([{"body": "<!--afk:verdict-->", "url": "u"}])["blocked_by"] == []

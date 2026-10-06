@@ -133,6 +133,7 @@ class FieldType(NamedTuple):
     themselves; the rest are below, or beside the one kind that needs them."""
     write: object       # value → its text; "" when there is nothing to write
     read: object        # text (never empty) → value; None when it is no such value
+    empty: object = None    # what a record that does not state the field reads as
 
 
 def _digits(raw):
@@ -143,12 +144,13 @@ _FIELD_TYPES = {str: FieldType(str, lambda raw: raw),
                 int: FieldType(lambda value: str(int(value)), _digits)}
 
 # A fact that is either so or not: written `=1` when so, left out when not.
-FLAG = FieldType(lambda value: "1" if value else "", lambda raw: True if raw == "1" else None)
+FLAG = FieldType(lambda value: "1" if value else "", lambda raw: True if raw == "1" else None,
+                 empty=False)
 
 # Whole numbers, comma-separated; anything else in the list is dropped.
 INTS = FieldType(lambda values: ",".join(str(int(v)) for v in values),
                  lambda raw: [int(x) for x in re.split(r"[,\s]+", raw) if _digits(x) is not None]
-                 or None)
+                 or None, empty=())
 
 
 def one_of(vocabulary):
@@ -172,6 +174,19 @@ HEARTBEAT_RECORD = RecordKind("afk-heartbeat", {"instance": str, "ts": int}, ("t
 GATE_RUN_RECORD = RecordKind("afk-gate", {"tree": str, "command": str, "at": int}, ("at",))
 # What the bootstrap probe pushes to learn whether a namespace takes a push.
 PROBE_RECORD = RecordKind("afk-probe", {"ts": int}, ("ts",))
+
+def _field_type(kind, name):
+    declared = kind.fields[name]
+    return _FIELD_TYPES.get(declared, declared)
+
+
+def blank_record(kind):
+    """Every field of `kind` at the value that says nothing (its type's
+    `empty`) — what a reader lays a record over, so a field the marker does not
+    state is still there to be asked for."""
+    blank = {name: _field_type(kind, name).empty for name in kind.fields}
+    return {name: [] if value == () else value for name, value in blank.items()}
+
 
 _RECORD_SAFE = "!\"#$&'()*+,/:;<=>?@[\\]^`{|}~"
 
@@ -200,7 +215,7 @@ def record_message(kind, record):
     does not declare, or a required one left out, is a defect in the caller and
     raises."""
     def spell(name, value):
-        text = _FIELD_TYPES.get(kind.fields[name], kind.fields[name]).write(value)
+        text = _field_type(kind, name).write(value)
         return text if name == kind.tail else urllib.parse.quote(text, safe=_RECORD_SAFE)
     return " ".join([kind.word, *_field_words(kind, record, spell)])
 
@@ -216,10 +231,9 @@ def _read_fields(kind, text):
             record[kind.tail] = tail.group(1).strip()
     for word in re.sub(r",\s+", ",", text).split():
         name, _, raw = word.partition("=")
-        type_ = kind.fields.get(name)
-        if type_ is None or not raw:
+        if name not in kind.fields or not raw:
             continue
-        value = _FIELD_TYPES.get(type_, type_).read(urllib.parse.unquote(raw))
+        value = _field_type(kind, name).read(urllib.parse.unquote(raw))
         if value is not None:
             record[name] = value
     return record if all(name in record for name in kind.required) else None
@@ -950,8 +964,7 @@ VERDICT_RECORD = RecordKind("afk:verdict",
                             {"n": int, "phase": str, "blocked_by": INTS, "reason": str},
                             (), tail="reason")
 
-# Every field a verdict gives back, at the value that says nothing.
-_NO_VERDICT = {"n": None, "phase": None, "blocked_by": [], "reason": None}
+_NO_VERDICT = blank_record(VERDICT_RECORD)
 
 
 def verdict_marker(n, phase, blocked_by=(), reason=None):
@@ -1475,7 +1488,7 @@ def _batch_members(raw):
 
 # The PRs a merge batch holds, in stack order, each with the issue it closes.
 _MEMBERS = FieldType(lambda members: ",".join(f"{m['issue']}:{m['pr']}" for m in members),
-                     lambda raw: _batch_members(raw) or None)
+                     lambda raw: _batch_members(raw) or None, empty=())
 
 # The landing turn, as the marker of one comment on a PR. A marker that names no
 # instance is not a record — nobody could hold it.
@@ -1505,11 +1518,10 @@ batch_turn_outcome = _refusing(BATCH_TURN_OUTCOMES, "a batch turn outcome")
 batch_outcome = _refusing(BATCH_OUTCOMES, "a batch outcome")
 
 
-# The record of a PR that was never granted a turn: every field `latest_turn`
-# gives back, at the value that says nothing.
-_NO_TURN = {"instance": None, "at": None, "verified": None, "allow_no_checks": False,
-            "stopped": None, "head": None, "restarted": None, "batch": None, "members": [],
-            "phase": None, "unbatched": None, "of": None, "released": False, "comment_id": None}
+# The record of a PR that was never granted a turn: every field of TURN_RECORD
+# saying nothing, plus the comment a record was read from — which is where its
+# rewrite goes.
+_NO_TURN = {**blank_record(TURN_RECORD), "comment_id": None}
 
 
 def _whole_turn(fields):
@@ -1625,15 +1637,12 @@ def turn_comment(turn):
 def latest_turn(comments):
     """
     The landing turn recorded on a PR, from its comments ([{"id", "body"}...],
-    oldest first) → {"instance", "at", "verified", "allow_no_checks", "stopped",
-    "head", "restarted", "batch", "members", "phase", "unbatched", "of",
-    "released", "comment_id"}, or None when the PR was never granted one —
-    `latest_record`'s. `restarted` is when a silent worker was restarted onto
-    the turn (ADR-0035), None while none was.
-    `batch` / `members` / `phase` are a merge batch's turn (None / [] / None on a
-    single one); `unbatched` is the UNBATCHED word of a PR that left a batch and
-    `of` the batch it left; `released` says the marker holds no turn at all.
-    `turn_comment` renders the record back: the two are a round trip.
+    oldest first) → every field of TURN_RECORD — one the marker does not state
+    at its type's `empty` — plus `comment_id`; or None when the PR was never
+    granted one (`latest_record`'s). `batch` / `members` / `phase` are set on a
+    merge batch's turn only, `stopped` / `head` once an `afk land` stopped;
+    `released` says the marker holds no turn at all. `turn_comment` renders the
+    record back: the two are a round trip.
     """
     record, comment = latest_record(TURN_RECORD, comments)
     if record is None:
