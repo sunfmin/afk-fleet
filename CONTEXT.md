@@ -3,8 +3,8 @@
 An unattended fleet that works a GitHub-issue backlog on its own, for days, in one session that can
 be compacted at any point and lose nothing: a **launcher** runs one cycle after another, and each
 cycle's **tick** — one reconciliation pass, run in code — dispatches worktree-isolated **workers** per ready issue and gives each finished PR its
-**landing turn**, on which its worker gates it and lands it on the target branch — one PR at a time, or, where a
-repo opts in, several as one **merge batch** behind a single gate run.
+**landing turn**, on which its worker gates it and lands it on the target branch — one PR at a time, or, where
+several may land together, as one **merge batch** behind a single gate run.
 
 ## Language
 
@@ -340,7 +340,8 @@ is the PR or the verdict, not this), **nudge** (that is fleet → worker; a wake
 **Landing turn**:
 The fleet's permission for one finished PR to land, granted by the **tick** in one **transition**
 (`afk turn`) and held by one PR of a **fleet instance** at a time — or by
-the several PRs of one **merge batch** at once (ADR-0029). It is recorded as a single marker
+the several PRs of one **merge batch** at once (ADR-0029): one turn, two kinds of holder, which land
+in different ways and are deliberately not one abstraction (ADR-0036). It is recorded as a single marker
 comment on the PR naming the instance that granted it — so it dies with the PR, and does not survive
 a **takeover** — and it carries the tick's judgments made *before* the grant (the head an adversarial
 verify passed, a PR with no checks waived) and where the worker's last `afk land` stopped. While its
