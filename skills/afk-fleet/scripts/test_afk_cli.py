@@ -291,11 +291,11 @@ if parts == ["issues"]:                  # the list: issues AND pull requests, a
     rows = [r for r in st["issues"] if r.get("state", "open") == "open"]
     if "--paginate" not in argv:
         rows = rows[:int(query.get("per_page", 30))]
-    assert jq == (".[] | select(.pull_request == null) | {number, title, "
+    assert jq == (".[] | select(.pull_request == null) | {number, id, title, "
                   "labels: [.labels[].name], updatedAt: .updated_at, "
                   "blocked_by: (.issue_dependencies_summary.blocked_by // 0)}"), \
         "fake gh: unsupported jq %%r" %% jq
-    finish("\n".join(json.dumps({"number": r["number"], "title": r["title"],
+    finish("\n".join(json.dumps({"number": r["number"], "id": issue_id(r), "title": r["title"],
                                   "labels": [lb["name"] for lb in r["labels"]],
                                   "updatedAt": r["updatedAt"],
                                   "blocked_by": open_blockers(r) or 0})
@@ -318,19 +318,13 @@ if parts[0] == "issues" and parts[2:] == ["dependencies", "blocked_by"]:
 
 if parts[0] == "issues" and len(parts) == 2:
     row = issue_row(parts[1])
-    if jq == ".state":
-        finish(row.get("state", "open"))
-    if jq == ".id":
-        finish(str(issue_id(row)))
-    if jq == ("{state, state_reason, labels: [.labels[].name], "
+    if jq == ("{id, title, state, state_reason, labels: [.labels[].name], "
               "pull_request: (.pull_request != null)}"):
-        finish(json.dumps({"state": row.get("state", "open"),
+        finish(json.dumps({"id": issue_id(row), "title": row["title"],
+                           "state": row.get("state", "open"),
                            "state_reason": row.get("state_reason"),
                            "labels": [lb["name"] for lb in row["labels"]],
                            "pull_request": "pull_request" in row}))
-    if jq == "{title, state, labels: [.labels[].name]}":
-        finish(json.dumps({"title": row["title"], "state": row.get("state", "open"),
-                           "labels": [lb["name"] for lb in row["labels"]]}))
     assert False, "fake gh: unsupported jq %%r" %% jq
 
 if parts[0] == "branches" and parts[2:] == ["protection"]:
@@ -866,7 +860,9 @@ def test_rebuild_reports_free_slots_and_a_claim_whose_issue_is_closed():
         assert rows == {2: ("closed", None, None), 3: ("no_pr", "claimed", "issue 3")}
         assert ws["free_slots"] == 1 and ws["frontier"]["dispatch"] == [{"number": 1, "title": "issue 1"}]
         # the state read is paid only by a claim missing from the open list
-        assert [c[1] for c in w.calls() if ".state" in c] == [f"repos/{REPO}/issues/2"]
+        one = f"repos/{REPO}/issues/"
+        assert [c[1] for c in w.calls() if c[1].startswith(one) and c[1][len(one):].isdigit()] \
+            == [one + "2"]
         assert w.afk("rebuild", *ME, *R, *NOW, "--set", "concurrency=1")["free_slots"] == 0
 
         # the one thing left to do for it

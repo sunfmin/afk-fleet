@@ -77,12 +77,16 @@ _FAILURES = (OSError, ValueError, RuntimeError)
 @dataclasses.dataclass(frozen=True)
 class _Run:
     """What a subcommand runs on, the same for every transition of a tick: the
-    target repo, the config, and the clock. Every field is set by every caller
-    (`_run`)."""
+    target repo, the config, and the clock — each set by every caller (`_run`)
+    — and what the run has learned of the status boards."""
     repo: str           # owner/name — None only for a git-ref op given `--remote`
     rem: str            # the git push/fetch target (`_remote`)
     cfg: dict           # the effective config (`_cfg`)
     clock: int          # `--now`, None outside tests: the time is read when asked
+    # {issue number: `afk_decide.board_key`} of the status board each issue is
+    # known to carry: what a cycle's state remembered from the last tick, and
+    # every one written or found in place since (`_upsert_board`).
+    boards: dict = dataclasses.field(default_factory=dict)
 
     def now(self):
         return self.clock if self.clock is not None else int(time.time())
@@ -263,28 +267,48 @@ def _orca(args, timeout=60):
     return doc.get("result") or {}
 
 
-def _issue(repo, number):
-    """One issue as {"number", "title", "state", "labels": [name...]}. Raises when
-    it cannot be read. An open issue the gather listed is not read again."""
+# One issue is one read, whoever asks and for whichever of its fields: the
+# claim's issue (`_issue`), whether it is closed (`_issue_state`), a blocker a
+# verdict names (`_blocker`), the id an edge is recorded with (`_add_blocker`).
+_ISSUE_JQ = ("{id, title, state, state_reason, labels: [.labels[].name], "
+             "pull_request: (.pull_request != null)}")
+
+
+def _read_issue(repo, number):
+    """One issue as {"number", "id", "title", "state", "state_reason",
+    "labels": [name...], "pull_request": bool} — or, when it could not be read,
+    the error that says why: a caller either raises it (`_issue`) or takes it
+    for "unknown". An open issue the gather listed is not read again."""
     def read():
-        p = _gh(["api", f"repos/{repo}/issues/{number}",
-                 "--jq", "{title, state, labels: [.labels[].name]}"])
-        return {"number": number, **json.loads(p.stdout)}
+        try:
+            p = _gh(["api", f"repos/{repo}/issues/{number}", "--jq", _ISSUE_JQ])
+            return {"number": number, **json.loads(p.stdout)}
+        except (RuntimeError, ValueError) as e:
+            return RuntimeError(str(e))
     return _once(("issue", repo, number), read)
+
+
+def _issue(repo, number):
+    """One issue (`_read_issue`). Raises when it cannot be read."""
+    issue = _read_issue(repo, number)
+    if isinstance(issue, Exception):
+        raise issue
+    return issue
 
 
 # Every open issue with what the frontier and the fingerprint read, one object a
 # line. GitHub's REST issue list carries the open-blocker count on every row, and
 # lists pull requests among the issues — which are left out here.
-_ISSUES_JQ = (".[] | select(.pull_request == null) | {number, title, "
+_ISSUES_JQ = (".[] | select(.pull_request == null) | {number, id, title, "
               "labels: [.labels[].name], updatedAt: .updated_at, "
               "blocked_by: (.issue_dependencies_summary.blocked_by // 0)}")
 
 
 def _open_issues(repo):
-    """Every open issue — all of them, page after page — as {"number", "title",
-    "labels": [name...], "updatedAt", "blocked_by": <open blocker count>}: the
-    one shape afk_decide reads. Each is also what `_issue` would say of it."""
+    """Every open issue — all of them, page after page — as {"number", "id",
+    "title", "labels": [name...], "updatedAt", "blocked_by": <open blocker
+    count>}: the one shape afk_decide reads. Each is also what `_read_issue`
+    would say of it."""
     def read():
         p = _gh(["api", "--paginate", f"repos/{repo}/issues?state=open&per_page=100",
                  "--jq", _ISSUES_JQ])
@@ -292,8 +316,9 @@ def _open_issues(repo):
     issues = _once(("issues", repo), read)
     for i in issues:
         _READS.setdefault(("issue", repo, i["number"]),
-                          {"number": i["number"], "title": i["title"], "state": "open",
-                           "labels": i["labels"]})
+                          {"number": i["number"], "id": i["id"], "title": i["title"],
+                           "state": "open", "state_reason": None, "labels": i["labels"],
+                           "pull_request": False})
     return issues
 
 
@@ -341,16 +366,14 @@ def _comment(repo, number, body, comment_id=None):
 
 def _issue_state(repo, number):
     """"open" | "closed", or None if the issue could not be read."""
-    def read():
-        p = _gh(["api", f"repos/{repo}/issues/{number}", "--jq", ".state"], check=False)
-        return p.stdout.strip() or None if p.returncode == 0 else None
-    return _once(("state", repo, number), read)
+    issue = _read_issue(repo, number)
+    return None if isinstance(issue, Exception) else issue["state"]
 
 
 def _issue_written(repo, number):
-    """Drop what this process read of an issue it just wrote to: the issue, its
-    state, and the list of open issues that carries its labels and blockers."""
-    _forget(("issue", repo, number), ("state", repo, number), ("issues", repo))
+    """Drop what this process read of an issue it just wrote to: the issue, and
+    the list of open issues that carries its labels and blockers."""
+    _forget(("issue", repo, number), ("issues", repo))
 
 
 def _edit_labels(repo, number, add, remove):
@@ -368,7 +391,7 @@ def _close_issue(repo, number):
 
 def _add_blocker(repo, number, blocker):
     """Record issue <number> as blocked by <blocker> — a native dependency edge."""
-    blocker_id = _gh(["api", f"repos/{repo}/issues/{blocker}", "--jq", ".id"]).stdout.strip()
+    blocker_id = _issue(repo, blocker)["id"]
     _gh(["api", "--method", "POST", f"repos/{repo}/issues/{number}/dependencies/blocked_by",
          "-F", f"issue_id={blocker_id}"])
     _issue_written(repo, number)
@@ -404,10 +427,8 @@ def _blocker(repo, number):
     """One issue a `blocked` verdict names, as `afk_decide.blocker_standings` reads
     it: {"state", "state_reason", "labels": [name...], "pull_request"}. None
     when it cannot be read — which is never "closed"."""
-    p = _gh(["api", f"repos/{repo}/issues/{number}", "--jq",
-             "{state, state_reason, labels: [.labels[].name], "
-             "pull_request: (.pull_request != null)}"], check=False)
-    return json.loads(p.stdout) if p.returncode == 0 and p.stdout.strip() else None
+    issue = _read_issue(repo, number)
+    return None if isinstance(issue, Exception) else issue
 
 
 def _blocked_by(repo, number):
@@ -1060,7 +1081,7 @@ def cmd_cycle(a):
             return {**woke, "judgments": []}
         return {**woke, "judgments": [],
                 "heartbeat": _beat(run, instance)}
-    _BOARDS.update({int(n): key for n, key in state["boards"].items()})
+    run.boards.update({int(n): key for n, key in state["boards"].items()})
     ws = _rebuild(run, instance, gathered)
     did, judgments, errors = _tick(run, instance, a.host, agent, ws)
     left, unseen = None, []
@@ -1073,7 +1094,7 @@ def cmd_cycle(a):
             pass        # keep the opening digest: the next cycle reads `changed`, and ticks
     return {"action": "tick", "reason": woke["reason"],
             **afk_decide.cycle_ticked(woke["state"], did, cfg, len(judgments), len(errors),
-                                      left=left, boards=dict(_BOARDS), unseen=len(unseen)),
+                                      left=left, boards=dict(run.boards), unseen=len(unseen)),
             "judgments": judgments, **({"errors": errors} if errors else {})}
 
 
@@ -1106,6 +1127,7 @@ def _tick(run, instance, host, agent, ws):
     ended, and this carries each one out — the table below is every step a plan
     can name and the transition that performs it. No rule about what comes
     next, no slot count and no tally lives on this side.
+    `run.boards` is left remembering only the claims the tick ended holding.
 
     Each transition is the function its subcommand calls, so the tick and a
     human typing `afk park` run one code path. One that fails — whatever it
@@ -1164,8 +1186,8 @@ def _tick(run, instance, host, agent, ws):
     call = {"afk_path": os.path.abspath(__file__), "repo": run.repo, "instance": instance,
             "worker_command": agent.command, "config": json.dumps(cfg, ensure_ascii=False)}
     done = afk_decide.follow(afk_decide.tick_plan(ws, call, cfg), carry_out)
-    for number in set(_BOARDS) - done["held"]:
-        del _BOARDS[number]
+    for number in set(run.boards) - done["held"]:
+        del run.boards[number]
     return done["did"], done["judgments"], done["errors"]
 
 
@@ -1949,19 +1971,13 @@ def _begin_dispatch(run, instance, host, agent, number, start="auto"):
 # act: the landing turn, and settling a claim — fail / escalate / park / close #
 # --------------------------------------------------------------------------- #
 
-# {issue number: `afk_decide.board_key`} of the status board each issue is known
-# to carry: the ones the cycle state remembered from the last tick, and every
-# one this process has written or found in place since.
-_BOARDS = {}
-
-
 def _upsert_board(run, number, phase, instance=None, pr=None, attempt=0, blocked_by=(),
                   batch=None):
     """Upsert the human-facing progress status board comment (idempotent, ADR-0006).
     Renders the body from the given phase (pure), then find-or-create by marker
     and write ONLY when the body changed — so re-entrant/disposable ticks and
     retry re-dispatches never spam the issue. A body that is the one the issue is
-    already known to carry (`_BOARDS`) is not even read for: `known`. With
+    already known to carry (`run.boards`) is not even read for: `known`. With
     `progress_comment` off there is no board, and nothing is read or written:
     `off` — the one place that switch is read, so no caller asks first."""
     repo, cfg = run.repo, run.cfg
@@ -1971,7 +1987,7 @@ def _upsert_board(run, number, phase, instance=None, pr=None, attempt=0, blocked
                                           instance=instance, pr=pr, attempt=attempt,
                                           blocked_by=blocked_by, batch=batch)
     key = afk_decide.board_key(body)
-    if _BOARDS.get(number) == key:
+    if run.boards.get(number) == key:
         return {"action": "known", "issue": number}
     _, board = afk_decide.latest_record(afk_decide.STATUS_RECORD, _issue_comments(repo, number))
     if board is None:
@@ -1980,7 +1996,7 @@ def _upsert_board(run, number, phase, instance=None, pr=None, attempt=0, blocked
         done = {"action": "unchanged", "comment_id": board["id"]}
     else:
         done = {"action": "updated", "comment_id": _comment(repo, number, body, board["id"])}
-    _BOARDS[number] = key
+    run.boards[number] = key
     return {"issue": number, **done}
 
 
