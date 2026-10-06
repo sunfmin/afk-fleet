@@ -50,10 +50,10 @@ is safe because **nothing the launcher must remember lives only in its context**
   (pure code) proves the no-op, refreshes the lease and returns the sleep; a forced full pass every
   `force_tick_after_skips` cycles backstops what a state hash can't see (ADR-0007).
 - **All durable state lives in GitHub**, so any tick reconstructs the exact working set:
-  `afk-claim/<n>` ref = claim (owned by a **fleet instance**) · PR (`Closes #n`) = result · an
+  `refs/afk/claim/<n>` ref = claim (owned by a **fleet instance**) · PR (`Closes #n`) = result · an
   `afk:verdict` marker comment = a worker's machine-readable reason for opening **no** PR
   (already-satisfied / blocked / giving-up) · `afk-attempt/<n>` label = retry count ·
-  `afk-heartbeat/<id>` ref = owner liveness. Nothing is remembered between ticks. (The human-facing **status board** comment is a
+  `refs/afk/heartbeat/<id>` ref = owner liveness. Nothing is remembered between ticks. (The human-facing **status board** comment is a
   *derived projection* of this state onto the issue surface, re-rendered each tick — never itself a
   source of truth, and never read back by a tick.)
 
@@ -565,7 +565,7 @@ touch shared root config are naturally throttled by the DAG — chain them with 
   worker's `afk land --batch`. A turn nobody lands is escalated with its PR kept, and a batch nobody
   lands abandoned, not merged around (ADR-0027, ADR-0029, ADR-0035).
 - **Claim before work; release on every terminal transition.** `afk dispatch` creates the
-  `afk-claim/<n>` ref first — if the create is rejected, a peer owns it and nothing is started.
+  `refs/afk/claim/<n>` ref first — if the create is rejected, a peer owns it and nothing is started.
   `afk escalate`, `afk park` and `afk close` each delete it as their last step; a claim that outlived
   its issue — every landed PR leaves one — is released by the next pass (`afk release`). A leaked ref is a phantom lock. Reconcile only your own claims, and take a peer's
   only when its heartbeat is expired (a **stale claim**) — the single exception is an explicit human

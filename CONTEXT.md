@@ -202,13 +202,13 @@ _Avoid_: coordinator memory, session state
 
 **Frontier**:
 The set of currently-dispatchable issues — `open` + `ready_label` + not an epic + **unclaimed** (no
-`afk-claim` ref) + **no open linked PR** + zero open `blocked_by`. Recomputed from GitHub every tick, over
+claim ref) + **no open linked PR** + zero open `blocked_by`. Recomputed from GitHub every tick, over
 every open issue: the issue list carries each one's open-blocker count, and the pull requests GitHub lists among them are left out.
 It is also what does the waiting for a **parked** issue: nothing else remembers that one is parked.
 _Avoid_: queue, backlog (the backlog is the whole issue set; the frontier is only the ready edge)
 
 **Claim**:
-The atomic lock that marks one issue as owned by one **fleet instance**: a git ref `afk-claim/<n>` in
+The atomic lock that marks one issue as owned by one **fleet instance**: a git ref `refs/afk/claim/<n>` in
 the hidden `refs/afk/*` namespace, whose creation the server accepts for exactly one fleet and rejects
 for every other (that rejection is the compare-and-swap; a push that fails for any *other* reason is
 an error, never a lost race — ADR-0015). Where the refs live is the config key `claim_namespace`,
@@ -221,7 +221,7 @@ that silently starves an issue.
 _Avoid_: assignee (dropped as a claim signal), assignment, lock (too generic)
 
 **Heartbeat** (and its lease):
-The liveness signal a **fleet instance** publishes for itself — one ref `afk-heartbeat/<id>` carrying
+The liveness signal a **fleet instance** publishes for itself — one ref `refs/afk/heartbeat/<id>` carrying
 a timestamp, refreshed while it holds any claim (per instance, not per claim; roughly once per
 `claim_lease_ttl_seconds`/3, not once per tick). A claim is leased-live while its owner's heartbeat is within
 `claim_lease_ttl_seconds`; its freshness is the only thing that lets a peer tell a live owner from a dead one.
@@ -230,7 +230,7 @@ different thing, at a different granularity)
 
 **Rebuild**:
 The bounded pass, run at the top of every tick, that re-derives the whole working set from fleet
-state: recompute the frontier, and reconstruct the in-flight set (the `afk-claim/<n>` refs owned by
+state: recompute the frontier, and reconstruct the in-flight set (the claim refs owned by
 this instance, sub-classified from each issue's PR + checks). Any tick — a fresh one or a later one — produces the
 same working set from the same GitHub; this equivalence is the re-entrancy invariant that makes
 a killed tick, and a launcher that forgot the last one, safe. Its deterministic half is one read-only tool call — `afk rebuild`, which
@@ -243,7 +243,7 @@ first and gathers nothing more for a worker that is busy (ADR-0008, ADR-0015, AD
 _Avoid_: refresh, resync, reload
 
 **Orphaned claim**:
-One of **my own** claims (an `afk-claim/<n>` owned by this instance) with no PR and no live worker — a
+One of **my own** claims (a claim ref owned by this instance) with no PR and no live worker — a
 claim whose worker crashed or never started. Reconciled *locally* on every rebuild by **continuation**
 — recovered from its durable progress (the local worktree if still present, else the pushed branch)
 and only re-dispatched fresh when nothing survives — never assumed still-running, and never released
