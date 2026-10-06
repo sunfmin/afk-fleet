@@ -183,9 +183,16 @@ def test_turn_record_round_trips_and_is_held_only_by_the_claims_owner():
     # each vocabulary is closed: neither subcommand can stop with a word nobody routes
     assert all(d.land_outcome(o) == o for o in d.LAND_OUTCOMES)
     assert all(d.turn_outcome(o) == o for o in d.TURN_OUTCOMES)
+    assert all(d.batch_turn_outcome(o) == o for o in d.BATCH_TURN_OUTCOMES)
     assert set(d.LAND_WAITS) < set(d.LAND_OUTCOMES) and "merged" not in d.LAND_WAITS
+    # one PR's turn and a merge batch's are two holders with a vocabulary each
+    # (ADR-0036): neither stops with a word only the other is routed on
     for check, word in ((d.land_outcome, "granted"), (d.turn_outcome, "merged"),
-                        (d.land_outcome, "handed_back")):
+                        (d.land_outcome, "handed_back"),
+                        (d.turn_outcome, "too_few"), (d.turn_outcome, "abandoned"),
+                        (d.batch_turn_outcome, "gate_red"),
+                        (d.batch_turn_outcome, "needs_verify"),
+                        (d.batch_turn_outcome, "merged")):
         try:
             check(word)
             raise AssertionError(word)
