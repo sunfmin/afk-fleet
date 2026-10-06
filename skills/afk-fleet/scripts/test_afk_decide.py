@@ -2011,7 +2011,7 @@ def test_worker_step_routes_every_cause_or_returns_the_judgment():
             assert "classified" in str(e)
         else:
             raise AssertionError("a cause with no route was routed")
-    assert {c for c in d.WORKER_CAUSES if c not in d._BATCH_STEPS} == {
+    assert {c for c, row in d.WORKER_CAUSES.items() if row.batch_step is None} == {
         "satisfied", "satisfied_refuted", "blockers_closed", "blockers_waiting", "blocker_unmet",
         "no_blocker_named", "gave_up", "unknown_phase",         # a batch worker declares nothing
         "silent_on_turn", "silent_past_restart"}                # …and is abandoned, never restarted
@@ -2084,8 +2084,8 @@ def test_every_reason_a_tick_words_is_pinned_to_the_cause_it_is_worded_for():
         assert d.worker_step(CALL, row, {**worker, "outcome": "coding", "action": "leave"},
                              cfg) == (do, reason), cause
     # every cause that ends in a failure or an escalation is pinned above
-    assert {c for c, (_, action) in d.WORKER_CAUSES.items()
-            if action in ("next_attempt", "escalate")} == {r[0] for r in REASONS}
+    assert {c for c, row in d.WORKER_CAUSES.items()
+            if row.step in ("fail", "escalate")} == {r[0] for r in REASONS}
 
 
 def test_a_worker_state_settles_a_busy_or_gone_worker_and_nothing_else():
@@ -2105,7 +2105,7 @@ def test_a_worker_state_settles_a_busy_or_gone_worker_and_nothing_else():
     assert settled(_ps("working", 900, GRACE)) is None                # a lost stop report
     assert settled(_ps("done", 9000, 1), NOW - GRACE) is None
     # every cause comes to a pair `afk no-pr` may print
-    assert set(d.WORKER_CAUSES.values()) == set(d.NO_PR_ROUTES)
+    assert {(row.outcome, row.action) for row in d.WORKER_CAUSES.values()} == set(d.NO_PR_ROUTES)
 
 
 def test_checks_gate_and_gate_comment():
@@ -3221,3 +3221,22 @@ def test_a_record_that_states_nothing_reads_as_its_kinds_blank():
     bare = d.latest_turn([{"id": 3, "body": "<!--afk:turn instance=fl-1-->"}])
     assert bare == {**blank, "instance": "fl-1", "comment_id": 3}
     assert d.latest_verdict([{"body": "<!--afk:verdict-->", "url": "u"}])["blocked_by"] == []
+
+
+def test_a_cause_names_its_own_step_in_the_one_table():
+    """What a tick does about a classified worker is the cause's row of
+    WORKER_CAUSES: `worker_step` and `batch_step` read it, and neither keeps a
+    second mapping to fall out of step with it."""
+    cfg = d.resolve_config({})
+    for cause, row in d.WORKER_CAUSES.items():
+        assert row.step in ("leave", "dispatch", "park", "nudge", "restart", "escalate",
+                            "fail", "judge"), cause
+        assert row.batch_step in (None, "leave", "continue", "nudge", "abandon"), cause
+        # the words a human reads and the step the tick takes cannot disagree
+        # about whether an attempt is spent, or whether anything happens at all
+        assert (row.step == "fail") == (row.action == "next_attempt"), cause
+        assert (row.step == "leave") == (row.action == "leave"), cause
+        if row.batch_step:
+            assert d.batch_step({"cause": cause}) == row.batch_step
+        if row.step in ("leave", "dispatch", "park", "nudge", "restart"):
+            assert d.worker_step(CALL, _mine(4), {"cause": cause}, cfg) == (row.step, None)
