@@ -92,36 +92,37 @@ def test_classify_claims_my_own_expired_stays_mine():
     assert r == {"mine": [9], "peer_live": [], "stale": []}, r
 
 
-def test_subclassify_pr():
-    # → (status, board_phase): what the tick does next, and what the board shows
-    assert d.subclassify_pr(False, None, "required") == ("no_pr", "claimed")
-    assert d.subclassify_pr(True, "green", "required") == ("awaiting_turn", "awaiting_turn")
-    assert d.subclassify_pr(True, "red", "required") == ("failure", "ci_failed")
-    assert d.subclassify_pr(True, "pending", "required") == ("awaiting_ci", "pr_open")
+def test_claim_status():
+    # → the status: what the tick does next. What the board shows is BOARD_PHASE_OF's
+    assert d.claim_status(False, None, "required") == "no_pr"
+    assert d.claim_status(True, "green", "required") == "awaiting_turn"
+    assert d.claim_status(True, "red", "required") == "failure"
+    assert d.claim_status(True, "pending", "required") == "awaiting_ci"
     # no checks at all is not "checks pending": nothing is running, so waiting
     # would park the claim forever in a repo with no CI. It goes to `afk turn`,
     # whose `no_checks` outcome asks the tick
-    assert d.subclassify_pr(True, None, "required") == ("awaiting_turn", "awaiting_turn")
+    assert d.claim_status(True, None, "required") == "awaiting_turn"
     # with no PR the checks are nobody's: stale rollup data cannot invent a status
-    assert d.subclassify_pr(False, "green", "required") == ("no_pr", "claimed")
+    assert d.claim_status(False, "green", "required") == "no_pr"
 
     # gate.ci: local — there are no checks to WAIT on, because gating is an action
     # the landing takes (ADR-0012). Any open PR is awaiting its turn, and a red
     # remote run (the repo's own on:push CI, which the fleet does not gate on)
     # must never park the claim in `failure` forever.
     for checks in ("green", "red", "pending", None):
-        assert d.subclassify_pr(True, checks, "local") == ("awaiting_turn", "awaiting_turn"), checks
-    assert d.subclassify_pr(False, None, "local") == ("no_pr", "claimed")
+        assert d.claim_status(True, checks, "local") == "awaiting_turn", checks
+    assert d.claim_status(False, None, "local") == "no_pr"
 
-    # every board phase it can produce is one the board renders — the tick never translates
-    for ci in d.GATE_CI_MODES:
-        for has_pr in (True, False):
-            for checks in ("green", "red", "pending", None):
-                assert d.subclassify_pr(has_pr, checks, ci)[1] in d.STATUS_PHASES
+    # every board phase a status is shown as is one the board renders — the tick
+    # never translates — and only a `closed` row has none
+    assert {st for st, phase in d.BOARD_PHASE_OF.items() if phase is None} == {"closed"}
+    assert {p for p in d.BOARD_PHASE_OF.values() if p} <= set(d.STATUS_PHASES)
+    assert (d.BOARD_PHASE_OF["failure"], d.BOARD_PHASE_OF["awaiting_ci"],
+            d.BOARD_PHASE_OF["no_pr"]) == ("ci_failed", "pr_open", "claimed")
 
     # CLAIM_STATUSES is exactly what it can return: no status the docs were never
     # held to, and none listed that cannot happen
-    seen = {d.subclassify_pr(has_pr, checks, ci, closed=closed, landing=landing)[0]
+    seen = {d.claim_status(has_pr, checks, ci, closed=closed, landing=landing)
             for ci in d.GATE_CI_MODES for has_pr in (True, False)
             for checks in ("green", "red", "pending", None)
             for closed in (True, False) for landing in (True, False)}
@@ -132,17 +133,16 @@ def test_subclassify_pr():
     # there is no board to write: the only thing left to do is release.
     for ci in d.GATE_CI_MODES:
         for has_pr in (True, False):
-            assert d.subclassify_pr(has_pr, "red", ci, closed=True) == ("closed", None)
+            assert d.claim_status(has_pr, "red", ci, closed=True) == "closed"
 
     # a PR that holds the landing turn: whatever the checks say, in either mode, the
     # claim is `landing` — its worker is at it, and red or pending checks on a head
     # the sync just pushed are the landing's own to wait out (ADR-0027)
     for ci in d.GATE_CI_MODES:
         for checks in ("green", "red", "pending", None):
-            assert d.subclassify_pr(True, checks, ci, landing=True) == \
-                ("landing", "landing"), (ci, checks)
-        assert d.subclassify_pr(True, "green", ci, closed=True, landing=True)[0] == "closed"
-        assert d.subclassify_pr(False, None, ci, landing=True)[0] == "no_pr"
+            assert d.claim_status(True, checks, ci, landing=True) == "landing", (ci, checks)
+        assert d.claim_status(True, "green", ci, closed=True, landing=True) == "closed"
+        assert d.claim_status(False, None, ci, landing=True) == "no_pr"
     assert {"landing", "awaiting_turn"} <= set(d.STATUS_PHASES)
 
 
@@ -655,7 +655,7 @@ def test_each_record_in_a_comment_round_trips_through_its_own_reader():
             ("blocked", [71], "no record mechanism yet"),
     }
     for body, (phase, blocked_by, reason) in verdicts.items():
-        assert d.parse_verdict_marker(body) == {"found": True, "n": 72, "phase": phase,
+        assert _verdict_in(body) == {"found": True, "n": 72, "phase": phase,
                                                 "blocked_by": blocked_by, "reason": reason}, body
     assert d.STATUS_MARKER == "<!--afk:status-->"
 
@@ -874,13 +874,19 @@ def test_protection_verdict():
     assert d.protection_verdict("required", None, unavailable="boom")["verdict"] == "ok"
 
 
-def test_the_verdict_marker_round_trips_through_its_parser():
+def _verdict_in(body):
+    """The verdict one comment body carries, blanks filled in, or None."""
+    record = d.read_marker(d.VERDICT_RECORD, body)
+    return None if record is None else {"found": True, **d.blank_record(d.VERDICT_RECORD), **record}
+
+
+def test_the_verdict_marker_round_trips_through_its_reader():
     # one writer, one reader: whatever `verdict_marker` spells, the parser reads back
     for phase in d.VERDICT_PHASES:
-        got = d.parse_verdict_marker(d.verdict_marker(12, phase, [3, 4], "needs pages from #3"))
+        got = _verdict_in(d.verdict_marker(12, phase, [3, 4], "needs pages from #3"))
         assert got == {"found": True, "n": 12, "phase": phase, "blocked_by": [3, 4],
                        "reason": "needs pages from #3"}, phase
-        bare = d.parse_verdict_marker(d.verdict_marker(7, phase))
+        bare = _verdict_in(d.verdict_marker(7, phase))
         assert (bare["n"], bare["phase"], bare["blocked_by"], bare["reason"]) == (7, phase, [], None)
     # what the worker is shown is that same spelling, with placeholders
     shown = d.verdict_marker_format(31)
@@ -888,31 +894,31 @@ def test_the_verdict_marker_round_trips_through_its_parser():
                      "[blocked_by=<csv of issue numbers>] [reason=<short>]-->")
 
 
-def test_parse_verdict_marker():
+def test_a_verdict_marker_is_read_leniently():
     # valid, every field; reason (last) keeps its spaces
     body = ("<!--afk:verdict n=12 phase=blocked blocked_by=3,4 reason=needs pages from #3-->\n"
             "Blocked on #3 and #4 — no PRs there yet.")
-    p = d.parse_verdict_marker(body)
+    p = _verdict_in(body)
     assert p["found"] is True and p["n"] == 12 and p["phase"] == "blocked"
     assert p["blocked_by"] == [3, 4]
     assert p["reason"] == "needs pages from #3"
 
     # already-satisfied, no blocked_by / reason
-    p = d.parse_verdict_marker("<!--afk:verdict n=7 phase=already-satisfied-->\nEmpty diff vs base.")
+    p = _verdict_in("<!--afk:verdict n=7 phase=already-satisfied-->\nEmpty diff vs base.")
     assert p["phase"] == "already-satisfied" and p["blocked_by"] == [] and p["reason"] is None
 
     # giving-up, tolerant of extra whitespace around the marker + tokens
-    assert d.parse_verdict_marker("<!--  afk:verdict   phase=giving-up  -->")["phase"] == "giving-up"
+    assert _verdict_in("<!--  afk:verdict   phase=giving-up  -->")["phase"] == "giving-up"
 
     # missing marker → None (a plain human comment is not a verdict)
-    assert d.parse_verdict_marker("just a normal comment, no marker") is None
-    assert d.parse_verdict_marker("") is None
-    assert d.parse_verdict_marker(None) is None
+    assert _verdict_in("just a normal comment, no marker") is None
+    assert _verdict_in("") is None
+    assert _verdict_in(None) is None
 
     # malformed: marker present but no phase → found True, phase None. Parse is
     # lenient by design; classify_stopped treats a None/unknown phase as failed, and
     # whether to trust the marker at all stays the tick's call.
-    p = d.parse_verdict_marker("<!--afk:verdict n=9-->")
+    p = _verdict_in("<!--afk:verdict n=9-->")
     assert p["found"] is True and p["phase"] is None and p["blocked_by"] == []
 
 
@@ -1509,6 +1515,34 @@ def test_select_recovery():
     assert d.select_recovery({"present": False}, {"name": "b", "commits_ahead": None})["tier"] == 3
 
 
+def test_select_recovery_knows_a_retry_and_a_held_landing_turn():
+    here = {"present": True, "commits_ahead": 3, "dirty": False}
+    pushed = {"name": "b", "commits_ahead": 4}
+    # a retry discarded the attempt: from base, whatever is still lying around
+    r = d.select_recovery(here, pushed, fresh=True)
+    assert (r["tier"], r["action"], r["prompt"]) == (3, "dispatch_fresh", "fresh")
+    assert "discarded" in r["reason"]
+    # a PR that holds the turn: its worker is started on the landing brief …
+    r = d.select_recovery(here, pushed, landing_pr=30)
+    assert (r["tier"], r["action"], r["prompt"]) == (1, "reuse_worktree", "landing")
+    # … and with no worktree here, at the PR's head — never from base, pushed or not
+    for br in (pushed, {"name": "b", "commits_ahead": 0}, None):
+        r = d.select_recovery({"present": False}, br, landing_pr=30)
+        assert (r["tier"], r["action"], r["prompt"]) == (2, "recreate_at_tip", "landing"), br
+        assert "PR #30" in r["reason"]
+
+
+def test_turn_holder_reads_one_precedence():
+    mine_b = {"id": "m", "instance": "me", "members": [], "phase": None}
+    dead_b = {"id": "x", "instance": "gone", "members": [], "phase": None}
+    rows = [_mine(1, "landing", pr=10), _mine(2, "awaiting_turn", pr=20)]
+    ws = lambda batches, mine=(): {"batches": batches, "mine": list(mine)}
+    assert d.turn_holder(ws([mine_b, dead_b], rows), "me") == ("dead", [dead_b])
+    assert d.turn_holder(ws([mine_b], rows), "me") == ("mine", mine_b)
+    assert d.turn_holder(ws([], rows), "me") == ("single", 1)
+    assert d.turn_holder(ws([], rows[1:]), "me") == (None, None)
+
+
 def test_current_attempt_is_the_one_reader_of_the_label():
     assert d.current_attempt([]) == 0 and d.current_attempt(None) == 0
     assert d.current_attempt(["ready-for-agent"]) == 0          # never retried
@@ -2011,7 +2045,7 @@ def test_worker_step_routes_every_cause_or_returns_the_judgment():
             assert "classified" in str(e)
         else:
             raise AssertionError("a cause with no route was routed")
-    assert {c for c in d.WORKER_CAUSES if c not in d._BATCH_STEPS} == {
+    assert {c for c, row in d.WORKER_CAUSES.items() if row.batch_step is None} == {
         "satisfied", "satisfied_refuted", "blockers_closed", "blockers_waiting", "blocker_unmet",
         "no_blocker_named", "gave_up", "unknown_phase",         # a batch worker declares nothing
         "silent_on_turn", "silent_past_restart"}                # …and is abandoned, never restarted
@@ -2084,8 +2118,8 @@ def test_every_reason_a_tick_words_is_pinned_to_the_cause_it_is_worded_for():
         assert d.worker_step(CALL, row, {**worker, "outcome": "coding", "action": "leave"},
                              cfg) == (do, reason), cause
     # every cause that ends in a failure or an escalation is pinned above
-    assert {c for c, (_, action) in d.WORKER_CAUSES.items()
-            if action in ("next_attempt", "escalate")} == {r[0] for r in REASONS}
+    assert {c for c, row in d.WORKER_CAUSES.items()
+            if row.step in ("fail", "escalate")} == {r[0] for r in REASONS}
 
 
 def test_a_worker_state_settles_a_busy_or_gone_worker_and_nothing_else():
@@ -2105,7 +2139,7 @@ def test_a_worker_state_settles_a_busy_or_gone_worker_and_nothing_else():
     assert settled(_ps("working", 900, GRACE)) is None                # a lost stop report
     assert settled(_ps("done", 9000, 1), NOW - GRACE) is None
     # every cause comes to a pair `afk no-pr` may print
-    assert set(d.WORKER_CAUSES.values()) == set(d.NO_PR_ROUTES)
+    assert {(row.outcome, row.action) for row in d.WORKER_CAUSES.values()} == set(d.NO_PR_ROUTES)
 
 
 def test_checks_gate_and_gate_comment():
@@ -2230,7 +2264,7 @@ def _play(ws, answers=None, causes=None, config=None):
         do = step["do"]
         assert do in d.TICK_STEPS, step
         if do == "finish":
-            return [said(do, n) for n in step["issues"]]
+            return [said(do, n) for n in step["issues"]], None
         key = step.get("issue", step.get("batch"))
         if do == "no-pr" and ("no-pr", key) not in answers and "no-pr" not in answers:
             asked = step.get("issues") or [step["batch"]]
@@ -3030,7 +3064,7 @@ def test_override_config_types_every_key_like_the_file_does():
         (other[section] if section else other)[key] = want
         assert cfg == other, dotted
         seen += 1
-    assert seen == len(list(_leaves(d.CONFIG_DEFAULTS))) > 25
+    assert seen == len(list(_leaves(d.CONFIG_DEFAULTS))) > 20
 
     cfg = d.resolve_config({})
     assert d.override_config(cfg, None) == d.resolve_config({}) == d.override_config(cfg, [])
@@ -3188,3 +3222,55 @@ def test_launch_candidates_stays_claude_only():
     assert "cc" in got
     assert "qc" not in got
     assert "unrelated" not in got
+
+
+def test_a_key_that_named_the_only_way_there_is_is_refused_with_its_note():
+    """`claim`, `dependencies` and `worker` each had one legal value and no
+    reader, so any other value was accepted and changed nothing. They are gone,
+    and a file or a `--set` still carrying one is told to delete it."""
+    for key, value in (("claim", "ref"), ("dependencies", "native"), ("worker", "orca")):
+        assert key not in d.CONFIG_DEFAULTS
+        for attempt in (lambda: d.parse_config_yaml(f"{key}: {value}"),
+                        lambda: d.override_config(d.resolve_config({}), [f"{key}={value}"])):
+            try:
+                attempt()
+                assert False, f"expected ValueError for the removed {key} key"
+            except ValueError as e:
+                assert f"{key!r} was removed" in str(e) and "Delete the key" in str(e)
+
+
+def test_a_record_that_states_nothing_reads_as_its_kinds_blank():
+    """What a reader gives back for a field the marker does not state is the
+    field type's `empty`, declared with the type — so a field added to a kind
+    is in every record read of it, with no second list to add it to."""
+    assert d.blank_record(d.VERDICT_RECORD) == {"n": None, "phase": None, "blocked_by": [],
+                                                "reason": None}
+    blank = d.blank_record(d.TURN_RECORD)
+    assert set(blank) == set(d.TURN_RECORD.fields)
+    assert (blank["allow_no_checks"], blank["released"], blank["members"]) == (False, False, [])
+    assert all(v is None for k, v in blank.items()
+               if k not in ("allow_no_checks", "released", "members"))
+    # each read gets its own list: one record's members are never another's
+    assert d.blank_record(d.TURN_RECORD)["members"] is not blank["members"]
+    bare = d.latest_turn([{"id": 3, "body": "<!--afk:turn instance=fl-1-->"}])
+    assert bare == {**blank, "instance": "fl-1", "comment_id": 3}
+    assert d.latest_verdict([{"body": "<!--afk:verdict-->", "url": "u"}])["blocked_by"] == []
+
+
+def test_a_cause_names_its_own_step_in_the_one_table():
+    """What a tick does about a classified worker is the cause's row of
+    WORKER_CAUSES: `worker_step` and `batch_step` read it, and neither keeps a
+    second mapping to fall out of step with it."""
+    cfg = d.resolve_config({})
+    for cause, row in d.WORKER_CAUSES.items():
+        assert row.step in ("leave", "dispatch", "park", "nudge", "restart", "escalate",
+                            "fail", "judge"), cause
+        assert row.batch_step in (None, "leave", "continue", "nudge", "abandon"), cause
+        # the words a human reads and the step the tick takes cannot disagree
+        # about whether an attempt is spent, or whether anything happens at all
+        assert (row.step == "fail") == (row.action == "next_attempt"), cause
+        assert (row.step == "leave") == (row.action == "leave"), cause
+        if row.batch_step:
+            assert d.batch_step({"cause": cause}) == row.batch_step
+        if row.step in ("leave", "dispatch", "park", "nudge", "restart"):
+            assert d.worker_step(CALL, _mine(4), {"cause": cause}, cfg) == (row.step, None)

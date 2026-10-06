@@ -77,15 +77,26 @@ _FAILURES = (OSError, ValueError, RuntimeError)
 @dataclasses.dataclass(frozen=True)
 class _Run:
     """What a subcommand runs on, the same for every transition of a tick: the
-    target repo, the config, and the clock. Every field is set by every caller
-    (`_run`)."""
+    target repo, the config, and the clock — each set by every caller (`_run`)
+    — and what the run has learned of the status boards."""
     repo: str           # owner/name — None only for a git-ref op given `--remote`
     rem: str            # the git push/fetch target (`_remote`)
     cfg: dict           # the effective config (`_cfg`)
     clock: int          # `--now`, None outside tests: the time is read when asked
+    # {issue number: `afk_decide.board_key`} of the status board each issue is
+    # known to carry: what a cycle's state remembered from the last tick, and
+    # every one written or found in place since (`_upsert_board`).
+    boards: dict = dataclasses.field(default_factory=dict)
 
     def now(self):
         return self.clock if self.clock is not None else int(time.time())
+
+
+@dataclasses.dataclass(frozen=True)
+class _GateLimits:
+    """What one run of the local gate is held to."""
+    timeout: int            # seconds before the run is called red
+    excerpt_lines: int      # trailing log lines a red run's excerpt keeps; 0: none
 
 
 @dataclasses.dataclass(frozen=True)
@@ -256,28 +267,48 @@ def _orca(args, timeout=60):
     return doc.get("result") or {}
 
 
-def _issue(repo, number):
-    """One issue as {"number", "title", "state", "labels": [name...]}. Raises when
-    it cannot be read. An open issue the gather listed is not read again."""
+# One issue is one read, whoever asks and for whichever of its fields: the
+# claim's issue (`_issue`), whether it is closed (`_issue_state`), a blocker a
+# verdict names (`_blocker`), the id an edge is recorded with (`_add_blocker`).
+_ISSUE_JQ = ("{id, title, state, state_reason, labels: [.labels[].name], "
+             "pull_request: (.pull_request != null)}")
+
+
+def _read_issue(repo, number):
+    """One issue as {"number", "id", "title", "state", "state_reason",
+    "labels": [name...], "pull_request": bool} — or, when it could not be read,
+    the error that says why: a caller either raises it (`_issue`) or takes it
+    for "unknown". An open issue the gather listed is not read again."""
     def read():
-        p = _gh(["api", f"repos/{repo}/issues/{number}",
-                 "--jq", "{title, state, labels: [.labels[].name]}"])
-        return {"number": number, **json.loads(p.stdout)}
+        try:
+            p = _gh(["api", f"repos/{repo}/issues/{number}", "--jq", _ISSUE_JQ])
+            return {"number": number, **json.loads(p.stdout)}
+        except (RuntimeError, ValueError) as e:
+            return RuntimeError(str(e))
     return _once(("issue", repo, number), read)
+
+
+def _issue(repo, number):
+    """One issue (`_read_issue`). Raises when it cannot be read."""
+    issue = _read_issue(repo, number)
+    if isinstance(issue, Exception):
+        raise issue
+    return issue
 
 
 # Every open issue with what the frontier and the fingerprint read, one object a
 # line. GitHub's REST issue list carries the open-blocker count on every row, and
 # lists pull requests among the issues — which are left out here.
-_ISSUES_JQ = (".[] | select(.pull_request == null) | {number, title, "
+_ISSUES_JQ = (".[] | select(.pull_request == null) | {number, id, title, "
               "labels: [.labels[].name], updatedAt: .updated_at, "
               "blocked_by: (.issue_dependencies_summary.blocked_by // 0)}")
 
 
 def _open_issues(repo):
-    """Every open issue — all of them, page after page — as {"number", "title",
-    "labels": [name...], "updatedAt", "blocked_by": <open blocker count>}: the
-    one shape afk_decide reads. Each is also what `_issue` would say of it."""
+    """Every open issue — all of them, page after page — as {"number", "id",
+    "title", "labels": [name...], "updatedAt", "blocked_by": <open blocker
+    count>}: the one shape afk_decide reads. Each is also what `_read_issue`
+    would say of it."""
     def read():
         p = _gh(["api", "--paginate", f"repos/{repo}/issues?state=open&per_page=100",
                  "--jq", _ISSUES_JQ])
@@ -285,8 +316,9 @@ def _open_issues(repo):
     issues = _once(("issues", repo), read)
     for i in issues:
         _READS.setdefault(("issue", repo, i["number"]),
-                          {"number": i["number"], "title": i["title"], "state": "open",
-                           "labels": i["labels"]})
+                          {"number": i["number"], "id": i["id"], "title": i["title"],
+                           "state": "open", "state_reason": None, "labels": i["labels"],
+                           "pull_request": False})
     return issues
 
 
@@ -334,16 +366,14 @@ def _comment(repo, number, body, comment_id=None):
 
 def _issue_state(repo, number):
     """"open" | "closed", or None if the issue could not be read."""
-    def read():
-        p = _gh(["api", f"repos/{repo}/issues/{number}", "--jq", ".state"], check=False)
-        return p.stdout.strip() or None if p.returncode == 0 else None
-    return _once(("state", repo, number), read)
+    issue = _read_issue(repo, number)
+    return None if isinstance(issue, Exception) else issue["state"]
 
 
 def _issue_written(repo, number):
-    """Drop what this process read of an issue it just wrote to: the issue, its
-    state, and the list of open issues that carries its labels and blockers."""
-    _forget(("issue", repo, number), ("state", repo, number), ("issues", repo))
+    """Drop what this process read of an issue it just wrote to: the issue, and
+    the list of open issues that carries its labels and blockers."""
+    _forget(("issue", repo, number), ("issues", repo))
 
 
 def _edit_labels(repo, number, add, remove):
@@ -361,7 +391,7 @@ def _close_issue(repo, number):
 
 def _add_blocker(repo, number, blocker):
     """Record issue <number> as blocked by <blocker> — a native dependency edge."""
-    blocker_id = _gh(["api", f"repos/{repo}/issues/{blocker}", "--jq", ".id"]).stdout.strip()
+    blocker_id = _issue(repo, blocker)["id"]
     _gh(["api", "--method", "POST", f"repos/{repo}/issues/{number}/dependencies/blocked_by",
          "-F", f"issue_id={blocker_id}"])
     _issue_written(repo, number)
@@ -397,10 +427,8 @@ def _blocker(repo, number):
     """One issue a `blocked` verdict names, as `afk_decide.blocker_standings` reads
     it: {"state", "state_reason", "labels": [name...], "pull_request"}. None
     when it cannot be read — which is never "closed"."""
-    p = _gh(["api", f"repos/{repo}/issues/{number}", "--jq",
-             "{state, state_reason, labels: [.labels[].name], "
-             "pull_request: (.pull_request != null)}"], check=False)
-    return json.loads(p.stdout) if p.returncode == 0 and p.stdout.strip() else None
+    issue = _read_issue(repo, number)
+    return None if isinstance(issue, Exception) else issue
 
 
 def _blocked_by(repo, number):
@@ -547,13 +575,17 @@ def _claim_row(number, sha, record):
             "ts": record.get("ts"), "sha": sha}
 
 
-def _scan(remote, ns):
+def _scan_key(run):
+    return ("scan", run.rem, run.cfg["claim_namespace"])
+
+
+def _scan(run):
     """Mirror the remote claim+heartbeat refs into a disposable local namespace and
     read every record. Returns (claims, heartbeats). Raises when the remote cannot
     be read: a fleet whose claims are unreadable must not look like one holding none."""
     def read():
-        claim_ns, hb_ns = afk_decide.CLAIM_NAMESPACES[ns]
-        _git(["fetch", "--prune", remote,
+        claim_ns, hb_ns = afk_decide.CLAIM_NAMESPACES[run.cfg["claim_namespace"]]
+        _git(["fetch", "--prune", run.rem,
               f"+{claim_ns}/*:{_LOCAL_SCAN}/claim/*",
               f"+{hb_ns}/*:{_LOCAL_SCAN}/heartbeat/*"])
         claims = [_claim_row(int(name), sha, record) for name, sha, record
@@ -563,43 +595,43 @@ def _scan(remote, ns):
                       in _mirrored_records(afk_decide.HEARTBEAT_RECORD, f"{_LOCAL_SCAN}/heartbeat")
                       if record}
         return claims, heartbeats
-    return _once(("scan", remote, ns), read)
+    return _once(_scan_key(run), read)
 
 
-def _claim_written(rem, cfg, number, row=None):
+def _claim_written(run, number, row=None):
     """Carry a claim ref this process just wrote into the scan it has made, if it
     made one: `row` is the claim now on issue <number>, None when it was deleted."""
-    scan = _READS.get(("scan", rem, cfg["claim_namespace"]))
+    scan = _READS.get(_scan_key(run))
     if scan:
         scan[0][:] = [c for c in scan[0] if c["number"] != number] + ([row] if row else [])
 
 
 def cmd_scan(a):
     run = _run(a)
-    claims, heartbeats = _scan(run.rem, run.cfg["claim_namespace"])
+    claims, heartbeats = _scan(run)
     return {"claims": claims, "heartbeats": heartbeats}
 
 
 def cmd_classify_claims(a):
     run = _run(a)
     cfg, now = run.cfg, run.now()
-    claims, heartbeats = _scan(run.rem, cfg["claim_namespace"])
+    claims, heartbeats = _scan(run)
     return {**afk_decide.classify_claims(claims, heartbeats, a.instance, now,
                                          cfg["claim_lease_ttl_seconds"]),
             "now": now}
 
 
-def _claim(rem, cfg, number, instance, now, host):
+def _claim(run, number, instance, host):
     """Atomically create one claim ref → {"won", …}; `won: false` names the `owner`."""
-    ref = _claim_ref(cfg, number)
-    record = {"instance": instance, "host": host, "ts": int(now)}
+    rem, ref = run.rem, _claim_ref(run.cfg, number)
+    record = {"instance": instance, "host": host, "ts": int(run.now())}
     sha = _record_commit(afk_decide.CLAIM_RECORD, record)
     # Create-only: the server rejects a ref that already exists → that is the CAS.
     p = _git(["push", rem, f"{sha}:{ref}"], check=False)
     if p.returncode == 0:
-        _claim_written(rem, cfg, number, {"number": number, **record, "sha": sha})
+        _claim_written(run, number, {"number": number, **record, "sha": sha})
         return {"won": True, "issue": number, "ref": ref, "sha": sha, "instance": instance}
-    _forget(("scan", rem, cfg["claim_namespace"]))      # it did not show this claim
+    _forget(_scan_key(run))      # it did not show this claim
     if _git(["fetch", rem, ref], check=False).returncode != 0:
         raise RuntimeError(f"claim push to {ref} failed and no such claim exists on the "
                            f"remote, so this is not a lost race: {p.stderr.strip()}")
@@ -610,23 +642,23 @@ def _claim(rem, cfg, number, instance, now, host):
 
 def cmd_claim(a):
     run = _run(a)
-    return _claim(run.rem, run.cfg, a.number, a.instance, run.now(), a.host)
+    return _claim(run, a.number, a.instance, a.host)
 
 
-def _force_take(rem, cfg, number, expect_sha, instance, now, host):
+def _force_take(run, number, expect_sha, instance, host):
     """The atomic re-stamp of ONE existing claim ref to `instance`: rejected unless
     the ref still points at the sha we read. The single mechanism behind both an
     unattended stale reclaim and a human-authorized takeover — they differ only in
     what gates the *choice* of claim (an expired lease vs a present human), never
     in the push, so a takeover is exactly as safe against a live peer."""
-    ref = _claim_ref(cfg, number)
-    record = {"instance": instance, "host": host, "ts": int(now)}
+    rem, ref = run.rem, _claim_ref(run.cfg, number)
+    record = {"instance": instance, "host": host, "ts": int(run.now())}
     sha = _record_commit(afk_decide.CLAIM_RECORD, record)
     p = _git(["push", rem, f"--force-with-lease={ref}:{expect_sha}", f"{sha}:{ref}"], check=False)
     if p.returncode == 0:
-        _claim_written(rem, cfg, number, {"number": number, **record, "sha": sha})
+        _claim_written(run, number, {"number": number, **record, "sha": sha})
         return {"won": True, "issue": number, "ref": ref, "sha": sha, "instance": instance}
-    _forget(("scan", rem, cfg["claim_namespace"]))      # the claim is not where it showed it
+    _forget(_scan_key(run))      # the claim is not where it showed it
     if _remote_sha(rem, ref) == expect_sha:
         raise RuntimeError(f"reclaim push to {ref} failed although the claim has not moved, "
                            f"so this is not a lost race: {p.stderr.strip()}")
@@ -635,8 +667,7 @@ def _force_take(rem, cfg, number, expect_sha, instance, now, host):
 
 def cmd_reclaim(a):
     run = _run(a)
-    return _force_take(run.rem, run.cfg, a.number, a.expect_sha,
-                       a.instance, run.now(), a.host)
+    return _force_take(run, a.number, a.expect_sha, a.instance, a.host)
 
 
 def cmd_takeover(a):
@@ -657,9 +688,9 @@ def cmd_takeover(a):
     fleet die?", not "is this work failing?". What each taken claim then *does* is
     continuation (`afk recovery`), not a fresh re-dispatch."""
     run = _run(a)
-    cfg, rem, now = run.cfg, run.rem, run.now()
+    cfg, now = run.cfg, run.now()
     ttl = cfg["claim_lease_ttl_seconds"]
-    claims, heartbeats = _scan(rem, cfg["claim_namespace"])
+    claims, heartbeats = _scan(run)
 
     if a.list:
         return {"instances": afk_decide.group_instances(claims, heartbeats, a.instance, now, ttl),
@@ -673,7 +704,7 @@ def cmd_takeover(a):
 
     taken, lost = [], []
     for c in plan["claims"]:
-        r = _force_take(rem, cfg, c["number"], c["sha"], a.instance, now, a.host)
+        r = _force_take(run, c["number"], c["sha"], a.instance, a.host)
         (taken if r["won"] else lost).append(r)
     return {**plan, "action": "taken", "as": a.instance,
             "taken": [t["issue"] for t in taken], "lost": lost,
@@ -682,25 +713,25 @@ def cmd_takeover(a):
                          if lost else "")}
 
 
-def _release(rem, cfg, number):
+def _release(run, number):
     """Delete one claim ref. Already gone counts as released — idempotent cleanup.
     A delete that failed with the claim still there is a phantom lock in the
     making, so it raises."""
-    ref = _claim_ref(cfg, number)
+    rem, ref = run.rem, _claim_ref(run.cfg, number)
     p = _git(["push", rem, "--delete", ref], check=False)
     if p.returncode != 0 and _remote_sha(rem, ref):
         raise RuntimeError(f"release failed and {ref} is still on the remote: "
                            f"{p.stderr.strip()}")
-    _claim_written(rem, cfg, number)
+    _claim_written(run, number)
     return {"released": True, "issue": number, "ref": ref}
 
 
-def _clear(rem, cfg, number, expect_sha):
+def _clear(run, number, expect_sha):
     """Delete one claim ref that is NOT mine — a `stale_closed` row — only while it
     still points at the sha rebuild read: the same lease a reclaim takes it under,
     so a claim somebody took meanwhile is never deleted from under them. Already
     gone counts as released; a claim that moved raises."""
-    ref = _claim_ref(cfg, number)
+    rem, ref = run.rem, _claim_ref(run.cfg, number)
     p = _git(["push", rem, f"--force-with-lease={ref}:{expect_sha}", f":{ref}"], check=False)
     now_at = "" if p.returncode == 0 else _remote_sha(rem, ref)
     if now_at == expect_sha:
@@ -709,7 +740,7 @@ def _clear(rem, cfg, number, expect_sha):
     if now_at:
         raise RuntimeError(f"{ref} moved since it was read (expected {expect_sha}, now "
                            f"{now_at}): somebody took the claim; nothing was changed")
-    _claim_written(rem, cfg, number)
+    _claim_written(run, number)
     return {"released": True, "issue": number, "ref": ref}
 
 
@@ -732,54 +763,73 @@ def cmd_release(a):
 
 
 def _release_claim(run, instance, number, expect_sha=None):
-    """`afk release` — of `instance`'s claim on issue <number>, or, with
-    `expect_sha`, of a `stale_closed` row read at that sha."""
-    cfg, rem = run.cfg, run.rem
+    """`afk release` — of `instance`'s own claim on issue <number>
+    (`_release_mine`), or, with `expect_sha`, of a dead peer's `stale_closed`
+    row read at that sha (`_clear`). Two operations behind one subcommand: only
+    the first asks whose the claim is, and only it cleans up after a landing."""
     if expect_sha:
-        return _clear(rem, cfg, number, expect_sha)
-    ref = _claim_ref(cfg, number)
-    owner = _claim_owner(rem, cfg, number)
+        return _clear(run, number, expect_sha)
+    return _release_mine(run, instance, number)
+
+
+def _release_mine(run, instance, number):
+    """Release `instance`'s claim on issue <number> — refused for a claim
+    another instance holds — and, when the issue is CLOSED, settle what its
+    landing left behind (`_settle_landed`)."""
+    owner = _claim_owner(run, number)
     if owner not in (None, instance):
-        raise RuntimeError(f"issue #{number} is not this fleet's claim ({ref} is held by "
-                           f"{owner!r}); nothing was changed. A dead peer's "
-                           f"claim on a closed issue — a `stale_closed` row — is released "
-                           f"with --expect-sha <the sha rebuild reported>")
-    released = _release(rem, cfg, number)
+        raise RuntimeError(f"issue #{number} is not this fleet's claim "
+                           f"({_claim_ref(run.cfg, number)} is held by {owner!r}); nothing was "
+                           f"changed. A dead peer's claim on a closed issue — a `stale_closed` "
+                           f"row — is released with --expect-sha <the sha rebuild reported>")
+    released = _release(run, number)
     if run.repo and _issue_state(run.repo, number) == "closed":
-        closed_pr = _close_landed_pr(run, number)
-        if closed_pr:
-            released["closed_pr"] = closed_pr
-        worktree = _Worktree.of_issue(run.repo, number)
-        if worktree.remembered and cfg["worktree_cleanup"]:
-            released["cleanup"] = worktree.remove()
+        released.update(_settle_landed(run, number))
     return released
 
 
-def _claim_owner(rem, cfg, number):
+def _settle_landed(run, number):
+    """What only the tick can do for a claim whose issue is closed — `afk land`
+    runs inside the worktree and holds no instance id → {"closed_pr"?,
+    "cleanup"?}: close the PR a merge batch landed that GitHub still shows open
+    (`_close_landed_pr`), and remove the worktree (when `worktree_cleanup`). An
+    open issue's worktree is never touched: it may hold work."""
+    settled = {}
+    closed_pr = _close_landed_pr(run, number)
+    if closed_pr:
+        settled["closed_pr"] = closed_pr
+    worktree = _Worktree.of_issue(run.repo, number)
+    if worktree.remembered and run.cfg["worktree_cleanup"]:
+        settled["cleanup"] = worktree.remove()
+    return settled
+
+
+def _claim_owner(run, number):
     """The instance id issue <number>'s claim is stamped with, as the scan has
     it: None when there is no such claim, "" when there is one whose marker names
     nobody — which is never mine."""
-    claim = next((c for c in _scan(rem, cfg["claim_namespace"])[0] if c["number"] == number),
+    claim = next((c for c in _scan(run)[0] if c["number"] == number),
                  None)
     return None if claim is None else claim["instance"] or ""
 
 
-def _require_mine(rem, cfg, number, instance):
+def _require_mine(run, number, instance):
     """Refuse to settle a claim this fleet does not hold: every transition that
     merges, relabels or releases an issue acts on MY claim only (ADR-0003)."""
-    ref = _claim_ref(cfg, number)
-    owner = _claim_owner(rem, cfg, number)
+    ref = _claim_ref(run.cfg, number)
+    owner = _claim_owner(run, number)
     if owner != instance:
         held = "not claimed at all" if owner is None else f"held by {owner!r}"
         raise RuntimeError(f"issue #{number} is not this fleet's claim ({ref} is {held}); "
                            f"nothing was changed")
 
 
-def _beat(rem, cfg, instance, now):
+def _beat(run, instance):
     """Refresh my heartbeat ref if it is due (stateless: the old ts is read from
     the refs, in the scan)."""
+    rem, cfg, now = run.rem, run.cfg, run.now()
     ref = _heartbeat_ref(cfg, instance)
-    heartbeats = _scan(rem, cfg["claim_namespace"])[1]
+    heartbeats = _scan(run)[1]
     last = heartbeats.get(instance)
     if not afk_decide.heartbeat_due(last, now, cfg["claim_lease_ttl_seconds"]):
         return {"refreshed": False, "reason": "not due", "ts": last, "ref": ref}
@@ -791,7 +841,7 @@ def _beat(rem, cfg, instance, now):
 
 def cmd_heartbeat(a):
     run = _run(a)
-    return _beat(run.rem, run.cfg, a.instance, run.now())
+    return _beat(run, a.instance)
 
 
 # --------------------------------------------------------------------------- #
@@ -980,7 +1030,7 @@ def _gather(run, fresh=False):
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         issues = pool.submit(_open_issues, run.repo)
         prs = pool.submit(_open_prs, run.repo)
-        scan = pool.submit(_scan, run.rem, run.cfg["claim_namespace"])
+        scan = pool.submit(_scan, run)
         return issues.result(), prs.result(), *scan.result()
 
 
@@ -1030,8 +1080,8 @@ def cmd_cycle(a):
         if not woke.pop("heartbeat"):
             return {**woke, "judgments": []}
         return {**woke, "judgments": [],
-                "heartbeat": _beat(run.rem, cfg, instance, run.now())}
-    _BOARDS.update({int(n): key for n, key in state["boards"].items()})
+                "heartbeat": _beat(run, instance)}
+    run.boards.update({int(n): key for n, key in state["boards"].items()})
     ws = _rebuild(run, instance, gathered)
     did, judgments, errors = _tick(run, instance, a.host, agent, ws)
     left, unseen = None, []
@@ -1044,7 +1094,7 @@ def cmd_cycle(a):
             pass        # keep the opening digest: the next cycle reads `changed`, and ticks
     return {"action": "tick", "reason": woke["reason"],
             **afk_decide.cycle_ticked(woke["state"], did, cfg, len(judgments), len(errors),
-                                      left=left, boards=dict(_BOARDS), unseen=len(unseen)),
+                                      left=left, boards=dict(run.boards), unseen=len(unseen)),
             "judgments": judgments, **({"errors": errors} if errors else {})}
 
 
@@ -1062,7 +1112,7 @@ def _drain(run, instance, ws):
             kept.append(row["number"])
             continue
         try:
-            _release_claim(run, instance, row["number"])
+            _release_mine(run, instance, row["number"])
             released.append(row["number"])
         except _FAILURES as e:
             errors.append({"step": "release", "issue": row["number"], "error": str(e)})
@@ -1077,6 +1127,7 @@ def _tick(run, instance, host, agent, ws):
     ended, and this carries each one out — the table below is every step a plan
     can name and the transition that performs it. No rule about what comes
     next, no slot count and no tally lives on this side.
+    `run.boards` is left remembering only the claims the tick ended holding.
 
     Each transition is the function its subcommand calls, so the tick and a
     human typing `afk park` run one code path. One that fails — whatever it
@@ -1088,7 +1139,7 @@ def _tick(run, instance, host, agent, ws):
     and handed its prompt together (`finish`), so filling N slots takes about
     as long as filling one. Re-entrant like any tick: killed at any point, the
     next one rebuilds from GitHub."""
-    cfg, rem = run.cfg, run.rem
+    cfg = run.cfg
     finish = {}                         # issue → the rest of the start begun for it
 
     def answered(fn, **args):
@@ -1104,6 +1155,7 @@ def _tick(run, instance, host, agent, ws):
         return start.outcome
 
     def finish_all(issues):
+        """Each start's own answer, in order: one may fail where the others ran."""
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(issues)) as pool:
             return list(pool.map(lambda n: answered(finish[n]), issues))
 
@@ -1120,25 +1172,22 @@ def _tick(run, instance, host, agent, ws):
         "escalate": lambda issue, reason: _escalate_claim(run, instance, issue, reason=reason),
         "release": lambda issue, expect_sha=None: _release_claim(run, instance, issue,
                                                                  expect_sha=expect_sha),
-        "reclaim": lambda issue, sha: _force_take(rem, cfg, issue, sha, instance, run.now(), host),
+        "reclaim": lambda issue, sha: _force_take(run, issue, sha, instance, host),
         "begin": begin,
         "finish": finish_all,
-        "heartbeat": lambda: _beat(rem, cfg, instance, run.now()),
-        "status": lambda issue, phase, pr, attempt: _upsert_board(
-            run.repo, issue, cfg, phase, instance=instance, pr=pr, attempt=attempt),
+        "heartbeat": lambda: _beat(run, instance),
+        "status": lambda issue, phase, pr, attempt: _upsert_board(run, issue, phase, instance=instance, pr=pr, attempt=attempt),
         "sweep": lambda live: _sweep_batches(run, instance, live),
     }
 
     def carry_out(step):
-        fn, args = steps[step["do"]], {k: v for k, v in step.items() if k != "do"}
-        # `finish` answers per start itself: one may fail, and the others ran
-        return fn(**args) if step["do"] == "finish" else answered(fn, **args)
+        return answered(steps[step["do"]], **{k: v for k, v in step.items() if k != "do"})
 
     call = {"afk_path": os.path.abspath(__file__), "repo": run.repo, "instance": instance,
             "worker_command": agent.command, "config": json.dumps(cfg, ensure_ascii=False)}
     done = afk_decide.follow(afk_decide.tick_plan(ws, call, cfg), carry_out)
-    for number in set(_BOARDS) - done["held"]:
-        del _BOARDS[number]
+    for number in set(run.boards) - done["held"]:
+        del run.boards[number]
     return done["did"], done["judgments"], done["errors"]
 
 
@@ -1613,7 +1662,7 @@ def _blocker_standings(run, number, named, prs):
         return []
     cfg = run.cfg
     blockers = {n: _blocker(run.repo, n) for n in named}
-    claims, _ = _scan(run.rem, cfg["claim_namespace"])
+    claims, _ = _scan(run)
     edges = {}
     todo = [n for n, b in blockers.items()
             if b and b["state"] == "open" and not b["pull_request"]]
@@ -1649,14 +1698,13 @@ def cmd_nudge(a):
 def _nudge_worker(run, instance, number=None, batch_id=None, worktree=None):
     """`afk nudge` — of the worker on `instance`'s claim on issue <number>, or of
     the one on merge batch `batch_id`; `worktree` overrides where orca says it is."""
-    cfg, rem = run.cfg, run.rem
     if (number is None) == (batch_id is None):
         raise ValueError("afk nudge takes exactly one of --issue <n>, --batch <batch>")
     if batch_id:
         _require_my_batch(run, instance, batch_id)
         who, found = f"merge batch {batch_id}", _Worktree.of_batch
     else:
-        _require_mine(rem, cfg, number, instance)
+        _require_mine(run, number, instance)
         who, found = f"issue #{number}", _Worktree.of_issue
     wt = _Worktree.at(worktree) if worktree else found(run.repo, batch_id or number)
     if not wt.path:
@@ -1691,7 +1739,7 @@ def _stalled_reason(repo, number, reason):
     return afk_decide.stall_reason(reason, tail or nudge.get("tail"))
 
 
-def _recovery(cfg, rem, repo, number, path=None, branch=None, no_worktree=False):
+def _recovery(run, number, path=None, branch=None, no_worktree=False, landing_pr=None):
     """What survived a dead worker, and the tier it selects (ADR-0011).
 
     Two signals, both mechanics: (1) is a worktree for this issue still on THIS
@@ -1704,6 +1752,7 @@ def _recovery(cfg, rem, repo, number, path=None, branch=None, no_worktree=False)
     Both signals are always gathered, even when the worktree already settles the
     tier: a *pristine* worktree over a branch that carries pushed commits still has
     something to continue, and the honest prompt depends on knowing that."""
+    cfg, rem, repo = run.cfg, run.rem, run.repo
     base = cfg["base_branch"]
 
     # --- tier-1 signal: a worktree for this issue, still on this machine ---
@@ -1725,7 +1774,7 @@ def _recovery(cfg, rem, repo, number, path=None, branch=None, no_worktree=False)
     branch_sig = {"name": branch, "commits_ahead": ahead.get(branch), "candidates": candidates}
 
     return {"issue": number, "base": base, "worktree": worktree, "branch": branch_sig,
-            **afk_decide.select_recovery(worktree, branch_sig)}
+            **afk_decide.select_recovery(worktree, branch_sig, landing_pr=landing_pr)}
 
 
 def cmd_recovery(a):
@@ -1733,9 +1782,8 @@ def cmd_recovery(a):
     continuation verdict (ADR-0011), read-only. `afk dispatch` makes this same read
     and acts on it; call this one first only to inspect what it would continue
     from — the tick's "is this state sane to build on" judgment."""
-    run = _run(a)
-    return _recovery(run.cfg, run.rem, run.repo, a.number,
-                     path=a.worktree, branch=a.branch, no_worktree=a.no_worktree)
+    return _recovery(_run(a), a.number, path=a.worktree, branch=a.branch,
+                     no_worktree=a.no_worktree)
 
 
 # --------------------------------------------------------------------------- #
@@ -1811,7 +1859,7 @@ def _begin_worker(run, instance, agent, issue, start, reason=None):
     the worktree still here, else one recreated at the PR's head, never from base
     (ADR-0027). The callable returns the tier taken plus where the worker now
     is: {tier, action, prompt, reason, worktree, branch, terminal}."""
-    cfg, rem = run.cfg, run.rem
+    cfg = run.cfg
     number = issue["number"]
     if issue["state"] != "open":
         raise RuntimeError(f"issue #{number} is {issue['state']}, not open — there is nothing "
@@ -1819,27 +1867,23 @@ def _begin_worker(run, instance, agent, issue, start, reason=None):
     discarded, pr, turn = None, None, None
     if start == "fresh":
         discarded = _discard_attempt(run, number)
-        plan = {"tier": 3, "action": "dispatch_fresh", "prompt": "fresh",
-                "reason": "fresh start: the previous attempt was discarded"}
+        plan = afk_decide.select_recovery(None, None, fresh=True)
     else:
-        rec = _recovery(cfg, rem, run.repo, number)
-        plan = {k: rec[k] for k in ("tier", "action", "prompt", "reason")}
         pr = afk_decide.closing_pr(_open_prs(run.repo), number)
         turn = afk_decide.held_turn(_turn(run.repo, pr["number"]), instance) if pr else None
         if turn and turn["batch"]:       # a merge batch's turn is its batch worker's
             turn = None
+        rec = _recovery(run, number, landing_pr=pr["number"] if turn else None)
+        plan = {k: rec[k] for k in ("tier", "action", "prompt", "reason")}
 
     if plan["action"] == "reuse_worktree":
         wt = _Worktree.at(rec["worktree"]["path"])
         branch = wt.checked_out()
-    elif turn:
-        plan = {"tier": 2, "action": "recreate_at_tip", "prompt": "continue",
-                "reason": f"no local worktree; PR #{pr['number']} holds the landing turn — "
-                          f"recreate at its head"}
-        wt = _Worktree.cut(run, pr["headRefName"], issue=issue)
-        branch = wt.branch
     else:
-        tip = rec["branch"]["name"] if plan["action"] == "recreate_at_tip" else cfg["base_branch"]
+        if plan["action"] == "dispatch_fresh":
+            tip = cfg["base_branch"]
+        else:                            # recreate_at_tip: the PR's head, else the pushed branch
+            tip = pr["headRefName"] if turn else rec["branch"]["name"]
         wt = _Worktree.cut(run, tip, issue=issue)
         branch = wt.branch
 
@@ -1847,7 +1891,6 @@ def _begin_worker(run, instance, agent, issue, start, reason=None):
     fields = _prompt_fields(run, issue, path, branch)
     with open(_WORKER_PROMPT) as f:
         if turn:
-            plan["prompt"] = "landing"
             prompt = afk_decide.render_landing(f.read(), fields, _landing_fields(cfg, pr))
         else:
             prompt = afk_decide.render_worker_prompt(f.read(), plan["prompt"], fields,
@@ -1858,12 +1901,10 @@ def _begin_worker(run, instance, agent, issue, start, reason=None):
         handle = submit()
         if afk_decide.attempt_starting(issue["labels"]):    # the counted attempt has its worker
             _edit_labels(run.repo, number, [], [afk_decide.ATTEMPT_STARTING])
-        if cfg["progress_comment"]:
-            if turn:
-                _upsert_board(run.repo, number, cfg, "landing", instance=instance,
-                              pr=pr["number"])
-            else:
-                _upsert_board(run.repo, number, cfg, "claimed", instance=instance)
+        if turn:
+            _upsert_board(run, number, "landing", instance=instance, pr=pr["number"])
+        else:
+            _upsert_board(run, number, "claimed", instance=instance)
         return {**plan, "worktree": path, "branch": branch, "terminal": handle,
                 **({"landing": pr["number"]} if turn else {}),
                 **({"discarded": discarded} if discarded else {})}
@@ -1906,13 +1947,12 @@ def _begin_dispatch(run, instance, host, agent, number, start="auto"):
     when a peer holds the issue, with that result itself. A start that fails
     raises. A claim the scan already shows as `instance`'s is not pushed again;
     one that is pushed is stamped with `host`."""
-    cfg, rem = run.cfg, run.rem
     issue = _issue(run.repo, number)
     if issue["state"] != "open":           # before the claim: never lock a closed issue
         raise RuntimeError(f"issue #{number} is {issue['state']}, not open — nothing to dispatch")
     won = False
-    if _claim_owner(rem, cfg, number) != instance:
-        claim = _claim(rem, cfg, number, instance, run.now(), host)
+    if _claim_owner(run, number) != instance:
+        claim = _claim(run, number, instance, host)
         won = claim["won"]
         if not won and claim["owner"].get("instance") != instance:
             return _Start(afk_decide.LOST, result={"issue": number, "started": False,
@@ -1926,24 +1966,23 @@ def _begin_dispatch(run, instance, host, agent, number, start="auto"):
 # act: the landing turn, and settling a claim — fail / escalate / park / close #
 # --------------------------------------------------------------------------- #
 
-# {issue number: `afk_decide.board_key`} of the status board each issue is known
-# to carry: the ones the cycle state remembered from the last tick, and every
-# one this process has written or found in place since.
-_BOARDS = {}
-
-
-def _upsert_board(repo, number, cfg, phase, instance=None, pr=None, attempt=0, blocked_by=(),
+def _upsert_board(run, number, phase, instance=None, pr=None, attempt=0, blocked_by=(),
                   batch=None):
     """Upsert the human-facing progress status board comment (idempotent, ADR-0006).
     Renders the body from the given phase (pure), then find-or-create by marker
     and write ONLY when the body changed — so re-entrant/disposable ticks and
     retry re-dispatches never spam the issue. A body that is the one the issue is
-    already known to carry (`_BOARDS`) is not even read for: `known`."""
+    already known to carry (`run.boards`) is not even read for: `known`. With
+    `progress_comment` off there is no board, and nothing is read or written:
+    `off` — the one place that switch is read, so no caller asks first."""
+    repo, cfg = run.repo, run.cfg
+    if not cfg["progress_comment"]:
+        return {"action": "off", "issue": number}
     body = afk_decide.render_status_board(phase, cfg["gate"]["ci"], cfg["retry"],
                                           instance=instance, pr=pr, attempt=attempt,
                                           blocked_by=blocked_by, batch=batch)
     key = afk_decide.board_key(body)
-    if _BOARDS.get(number) == key:
+    if run.boards.get(number) == key:
         return {"action": "known", "issue": number}
     _, board = afk_decide.latest_record(afk_decide.STATUS_RECORD, _issue_comments(repo, number))
     if board is None:
@@ -1952,7 +1991,7 @@ def _upsert_board(repo, number, cfg, phase, instance=None, pr=None, attempt=0, b
         done = {"action": "unchanged", "comment_id": board["id"]}
     else:
         done = {"action": "updated", "comment_id": _comment(repo, number, body, board["id"])}
-    _BOARDS[number] = key
+    run.boards[number] = key
     return {"issue": number, **done}
 
 
@@ -1961,11 +2000,11 @@ def cmd_status(a):
     `board_phase`. The terminal phases are written by the transition that reaches
     them (`afk land`, `afk escalate`, `afk park`, `afk close`)."""
     run = _run(a)
-    return _upsert_board(run.repo, a.number, run.cfg, a.phase,
+    return _upsert_board(run, a.number, a.phase,
                          instance=a.instance, pr=a.pr, attempt=a.attempt)
 
 
-def _run_gate(cfg, worktree, timeout, excerpt_lines, live=False):
+def _run_gate_command(cfg, worktree, limits, live=False):
     """Run the configured local gate in a worktree → `afk_decide.gate_verdict` —
     the completion gate itself in `gate.ci: local` mode, run by `afk land` against
     the exact tree that lands (ADR-0012). *What* to run is config, *where* is the
@@ -1974,7 +2013,7 @@ def _run_gate(cfg, worktree, timeout, excerpt_lines, live=False):
     bounded excerpt, never a raw log. `live` is `afk gate`'s run: the log goes
     straight to the worker's terminal — on stderr, the JSON stays alone on stdout —
     and the excerpt is empty, since the worker has the whole of it."""
-    cmd = cfg["gate"]["local_command"]
+    cmd, timeout = cfg["gate"]["local_command"], limits.timeout
 
     def _text(s):
         return s.decode("utf-8", "replace") if isinstance(s, bytes) else (s or "")
@@ -1990,10 +2029,10 @@ def _run_gate(cfg, worktree, timeout, excerpt_lines, live=False):
         timed_out, rc = True, 124
     if live and timed_out:
         print(out.strip(), file=sys.stderr)
-    return {**afk_decide.gate_verdict(rc, out, excerpt_lines, timed_out), "command": cmd}
+    return {**afk_decide.gate_verdict(rc, out, limits.excerpt_lines, timed_out), "command": cmd}
 
 
-def _gate_record(rem, path, tree, command):
+def _read_gate_record(rem, path, tree, command):
     """The `afk_decide.gate_record` the remote holds for a tree and a command,
     None when it holds none — or could not be asked, or holds at that name a
     commit that is not a recorded gate run, which are all the same answer: the
@@ -2004,7 +2043,7 @@ def _gate_record(rem, path, tree, command):
     return _read_record(afk_decide.GATE_RUN_RECORD, "FETCH_HEAD", path)
 
 
-def _record_gate(rem, path, tree, command, now):
+def _write_gate_record(rem, path, tree, command, now):
     """Put a green run on record on the remote → None, or why it could not be
     written. The record is a parentless commit OF the tested tree, at the ref
     named for the tree and the command (`afk_decide.gate_record_ref`). Soft: a
@@ -2023,48 +2062,49 @@ def _drop_gate_record(rem, path, tree, command):
           afk_decide.gate_record_ref(tree, command)], check=False)
 
 
-def _gate_run(cfg, rem, path, timeout, excerpt_lines, now, live=False):
+def _run_and_record_gate(run, path, limits, live=False):
     """One run of the local gate in a worktree, put on record when green →
-    (`_run_gate`'s verdict, the head it ran on, the uncommitted paths, why the
-    run is NOT on record — None when it is). Only a green run on a committed tree
+    (`_run_gate_command`'s verdict, the head it ran on, the uncommitted paths,
+    why the run is NOT on record — None when it is). Only a green run on a committed tree
     is recorded: over uncommitted or untracked files it tested a tree no commit
     holds. A red or timed-out run on a committed tree takes that tree's record
     away — the latest run of a tree is the one believed. The record is `afk`'s,
     made from an exit code it saw (ADR-0030)."""
+    rem = run.rem
     head = _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip()
     tree = _git(["-C", path, "rev-parse", "HEAD^{tree}"]).stdout.strip()
     dirty = _git(["-C", path, "status", "--porcelain"]).stdout.splitlines()
-    gate = _run_gate(cfg, path, timeout, excerpt_lines, live=live)
+    gate = _run_gate_command(run.cfg, path, limits, live=live)
     if gate["status"] != "green":
         if not dirty:
             _drop_gate_record(rem, path, tree, gate["command"])
         return gate, head, dirty, "the gate is red"
     if dirty or _git(["-C", path, "rev-parse", "HEAD"], check=False).stdout.strip() != head:
         return gate, head, dirty, "the run was not on a committed tree"
-    return gate, head, dirty, _record_gate(rem, path, tree, gate["command"], now)
+    return gate, head, dirty, _write_gate_record(rem, path, tree, gate["command"], run.now())
 
 
-def _gated(cfg, rem, path, timeout, excerpt_lines, now):
+def _gated(run, path, limits):
     """Is the committed tree of a worktree gated green by the configured local
     gate? — the one question a landing asks of it, a single PR's and a merge
     batch's alike. Answered from the recorded gate run the remote holds for that
     tree and that command, else by a run made now, which is put on record in its
-    turn (`_gate_run`, ADR-0030):
+    turn (`_run_and_record_gate`, ADR-0030):
 
       {"status": "green", "source": "recorded", "head", "command", "recorded_at"}
       {"status": "green", "source": "run", "head", "command", "not_trusted"}
-      {**`_run_gate`'s red verdict, "source": "run", "head", "not_trusted"}
+      {**`_run_gate_command`'s red verdict, "source": "run", "head", "not_trusted"}
 
     `head` is the commit that was asked about; `not_trusted` is why no record
     stood in for the run."""
-    command = cfg["gate"]["local_command"]
+    command = run.cfg["gate"]["local_command"]
     head, tree = _git(["-C", path, "rev-parse", "HEAD", "HEAD^{tree}"]).stdout.split()
-    record = _gate_record(rem, path, tree, command)
-    void = afk_decide.gate_record_void(record, now)
+    record = _read_gate_record(run.rem, path, tree, command)
+    void = afk_decide.gate_record_void(record, run.now())
     if void is None:
         return {"status": "green", "source": "recorded", "head": head, "command": command,
                 "recorded_at": record["at"]}
-    gate, *_ = _gate_run(cfg, rem, path, timeout, excerpt_lines, now)
+    gate, *_ = _run_and_record_gate(run, path, limits)
     if gate["status"] != "green":
         return {**gate, "source": "run", "head": head, "not_trusted": void}
     return {"status": "green", "source": "run", "head": head, "command": command,
@@ -2087,8 +2127,8 @@ def cmd_gate(a):
     if not cfg["gate"]["local_command"].strip():
         raise ValueError("gate.local_command is empty — there is no local gate to run")
     path = _git(["rev-parse", "--show-toplevel"]).stdout.strip()
-    gate, head, dirty, unrecorded = _gate_run(cfg, run.rem, path, a.gate_timeout, 0, run.now(),
-                                              live=True)
+    gate, head, dirty, unrecorded = _run_and_record_gate(
+        run, path, _GateLimits(a.gate_timeout, excerpt_lines=0), live=True)
     out = {k: gate[k] for k in ("status", "exit_code", "timed_out", "command")}
     if gate["status"] != "green":
         return {**out, "head": head, "recorded": False,
@@ -2168,17 +2208,12 @@ def cmd_turn(a):
     paths repair — the nudge points at the brief, and a dead worker's
     continuation (`afk dispatch`) is started on the turn.
 
-    `--restart` is for a PR that holds the turn and whose worker is still silent
-    after its nudge (`afk no-pr` → `idle_stalled` / `restart`, ADR-0035): the
-    turn is not failed, its worker is replaced — the idle session is closed and a
-    worker is started by continuation in the same worktree (or one recreated at
-    the PR's head, never from base), briefed only to land, exactly as for a
-    terminal that is gone. The PR, the branch, the worktree and the attempt label
-    are not touched; the restart is written on the turn marker (`restarted`), and
-    it happens ONCE per turn — a second call is refused, and a restarted worker
-    that goes silent again after its own nudge is escalated (`afk escalate`) with
-    the PR, the branch and the worktree kept: a landing turn never spends an
-    attempt.
+    `--restart` replaces the worker of a PR that holds the turn (`afk no-pr` →
+    `restart`, ADR-0035): the idle session is closed and the delivery is made
+    again as for a terminal that is gone. Nothing else is touched; the restart
+    is written on the turn marker (`restarted`), and a second one on the same
+    turn is refused. When it is asked for, and what follows a second silence,
+    are `afk_decide.WORKER_CAUSES`'s rows.
 
       granted       the worker was told (`delivery`: "terminal" | "continuation").
                     `again` is true when the PR already held the turn and its
@@ -2222,8 +2257,8 @@ def _grant_turn(run, instance, agent, number, allow_no_checks=False, verified=No
     claim on it. `allow_no_checks` and `verified` are the tick's two judgments,
     when it has made them; `restart` replaces the silent worker of a PR that
     already holds the turn (`--restart`)."""
-    cfg, rem = run.cfg, run.rem
-    _require_mine(rem, cfg, number, instance)
+    cfg = run.cfg
+    _require_mine(run, number, instance)
     issue = _issue(run.repo, number)
     prs = _open_prs(run.repo)
     pr = afk_decide.closing_pr(prs, number)
@@ -2235,16 +2270,16 @@ def _grant_turn(run, instance, agent, number, allow_no_checks=False, verified=No
     def stop(outcome, **more):
         return {**out, "outcome": afk_decide.turn_outcome(outcome), **more}
 
-    turns = _claim_turns(run.repo, prs, _scan(rem, cfg["claim_namespace"])[0], instance)
+    turns = _claim_turns(run.repo, prs, _scan(run)[0], instance)
     held = {n: t for n, t in turns.items() if afk_decide.held_turn(t, instance)}
     others = sorted(n for n in held if n != number)
-    mine = held.get(number)
+    held_here = held.get(number)
     if restart:
-        if not mine:
+        if not held_here:
             raise RuntimeError(f"PR #{pr['number']} does not hold this fleet's landing turn — "
                                f"there is no turn to restart issue #{number}'s worker onto "
                                f"(`afk turn --issue {number}` grants one)")
-        if mine["restarted"]:
+        if held_here["restarted"]:
             raise RuntimeError(f"the worker on issue #{number} was already restarted onto this "
                                f"turn once — a second silence is escalated (`afk escalate`), "
                                f"with the PR kept, not restarted again")
@@ -2253,13 +2288,13 @@ def _grant_turn(run, instance, agent, number, allow_no_checks=False, verified=No
                     detail=f"issue #{others[0]}'s PR holds this fleet's landing turn; nothing was "
                            f"touched — this PR's turn comes when that one has landed, failed or been escalated")
     prev = _turn(run.repo, pr["number"])
-    if not restart and mine and mine["stopped"] not in afk_decide.LAND_WAITS:
+    if not restart and held_here and held_here["stopped"] not in afk_decide.LAND_WAITS:
         return stop("landing",
                     detail="this PR already holds the landing turn and its worker has not "
                            "stopped for you; nothing was touched — `afk no-pr` watches it")
     # a judgment made about this PR stands: a re-delivery need not repeat it
-    allow = allow_no_checks or bool(mine and mine["allow_no_checks"])
-    verified = verified or (mine or {}).get("verified")
+    allow = allow_no_checks or bool(held_here and held_here["allow_no_checks"])
+    verified = verified or (held_here or {}).get("verified")
     checks = afk_decide.pr_checks_state(pr.get("statusCheckRollup"))
     ready = afk_decide.turn_gate(cfg["gate"]["ci"], checks, allow,
                                  cfg["gate"]["adversarial_verify"], verified, head)
@@ -2275,10 +2310,10 @@ def _grant_turn(run, instance, agent, number, allow_no_checks=False, verified=No
                 f.read(), _prompt_fields(run, issue, wt.path, wt.checked_out()),
                 _landing_fields(cfg, pr)))
     now = run.now()
-    restarted = now if restart else (mine or {}).get("restarted")
+    restarted = now if restart else (held_here or {}).get("restarted")
     out["comment_id"] = _record_turn(run.repo, pr["number"], afk_decide.single_turn(
         prev, instance, now, verified=verified, allow_no_checks=allow, restarted=restarted))
-    out["again"] = bool(mine)
+    out["again"] = bool(held_here)
     if restart:
         out["restarted"] = now
     if not there:           # the worker is gone (or replaced): its continuation is started on the turn
@@ -2286,8 +2321,7 @@ def _grant_turn(run, instance, agent, number, allow_no_checks=False, verified=No
         return stop("granted", delivery="continuation", terminal=worker["terminal"],
                     worktree=worker["worktree"])
     handle = wt.tell(_TURN_POINTER.format(brief=brief), "the landing turn")
-    if cfg["progress_comment"]:
-        _upsert_board(run.repo, number, cfg, "landing", instance=instance, pr=pr["number"])
+    _upsert_board(run, number, "landing", instance=instance, pr=pr["number"])
     return stop("granted", delivery="terminal", terminal=handle, worktree=wt.path)
 
 
@@ -2359,14 +2393,15 @@ def cmd_land(a):
     cfg, rem = run.cfg, run.rem
     if (a.number is None) == (a.batch_id is None):
         raise ValueError("afk land takes exactly one of --issue <n>, --batch <batch>")
+    limits = _GateLimits(a.gate_timeout, a.excerpt_lines)
     if a.batch_id:
-        return _land_batch(run, a.batch_id, a.gate_timeout, a.excerpt_lines, a.merged_timeout)
+        return _land_batch(run, a.batch_id, limits, a.merged_timeout)
     path = _git(["rev-parse", "--show-toplevel"]).stdout.strip()
     pr = afk_decide.closing_pr(_open_prs(run.repo), a.number)
     if pr is None:
         raise RuntimeError(f"no open PR closes issue #{a.number} — there is nothing to land (if "
                            f"it has already merged, send your wake and stop)")
-    owner = _claim_owner(rem, cfg, a.number)
+    owner = _claim_owner(run, a.number)
     turn = afk_decide.held_turn(_turn(run.repo, pr["number"]), owner)
     if turn is None or turn["batch"]:
         raise RuntimeError(f"PR #{pr['number']} does not hold the landing turn of the fleet "
@@ -2408,7 +2443,7 @@ def cmd_land(a):
 
     # --- the machine gate, against exactly `head` ---
     if cfg["gate"]["ci"] == "local":
-        gate = _gated(cfg, rem, path, a.gate_timeout, a.excerpt_lines, run.now())
+        gate = _gated(run, path, limits)
         if gate["status"] != "green":
             _pr_comment(run.repo, pr["number"], afk_decide.gate_comment(gate, gate["command"]))
             return stop("gate_red", gate=gate,
@@ -2420,17 +2455,17 @@ def cmd_land(a):
         if pushed or checks == "pending":
             checks = _await_checks(run.repo, pr["number"], head, had_checks=checks is not None,
                                    timeout=a.checks_timeout, poll=a.checks_poll)
-        verdict = afk_decide.checks_gate(checks, turn["allow_no_checks"])
-        if verdict == "gate_red":
-            return stop(verdict, checks=checks,
+        checks_say = afk_decide.checks_gate(checks, turn["allow_no_checks"])
+        if checks_say == "gate_red":
+            return stop(checks_say, checks=checks,
                         detail="the PR's checks are red — fix the code, commit, and run this again")
-        if verdict == "awaiting_ci":
-            return stop(verdict, checks=checks,
+        if checks_say == "awaiting_ci":
+            return stop(checks_say, checks=checks,
                         detail=f"the checks on this head were still running after "
                                f"{a.checks_timeout}s — send your wake and stop; you are told to "
                                f"run this again once they are in")
-        if verdict != "green":
-            return stop(verdict, checks=checks,
+        if checks_say != "green":
+            return stop(checks_say, checks=checks,
                         detail="send your wake and stop — you are told to run this again once "
                                "that is settled")
     if cfg["gate"]["adversarial_verify"] and turn["verified"] != head:
@@ -2440,8 +2475,7 @@ def cmd_land(a):
 
     # --- land it. The claim and this worktree are the next cycle's to settle ---
     _merge_pr(run.repo, rem, pr, head, cfg["merge"]["delete_branch"])
-    if cfg["progress_comment"]:
-        _upsert_board(run.repo, a.number, cfg, "merged", instance=owner, pr=pr["number"])
+    _upsert_board(run, a.number, "merged", instance=owner, pr=pr["number"])
     return {**out, "outcome": afk_decide.land_outcome("merged"),
             "detail": "landed — send your wake and stop"}
 
@@ -2455,10 +2489,10 @@ def cmd_land(a):
 # turn marker on every member PR; its stack is that worktree's branch — read
 # back from git every time, never from a file. The worktree keeps nothing of its
 # batch: which batch it is the worktree of is its branch's name, and which PRs
-# the batch holds is read off the markers (`_batch_members`).
+# the batch holds is read off the markers (`_members_of_batch`).
 
 
-def _batch_members(run, batch, landed_pr=lambda issue: None):
+def _members_of_batch(run, batch, landed_pr=lambda issue: None):
     """The PRs merge batch `batch` holds, in stack order → [{"issue", "pr"}...],
     read from the turn marker they carry — the one home of a batch's membership
     (ADR-0029); [] when no PR carries it. Any member's marker names them all, so
@@ -2466,7 +2500,7 @@ def _batch_members(run, batch, landed_pr=lambda issue: None):
     claim whose PR the batch already closed — the one `landed_pr(issue)` names.
     The claims of the instance that formed the batch are asked first: one
     comments read per PR asked, and usually the first is a member."""
-    claims = sorted(_scan(run.rem, run.cfg["claim_namespace"])[0],
+    claims = sorted(_scan(run)[0],
                     key=lambda c: not afk_decide.batch_formed_by(batch, c["instance"]))
     prs = _open_prs(run.repo)
     for c in claims:
@@ -2483,7 +2517,7 @@ def _require_my_batch(run, instance, batch):
     Raises when no PR of mine carries it: a batch is only ever moved by the
     fleet that holds its members' claims."""
     turns = _claim_turns(run.repo, _open_prs(run.repo),
-                         _scan(run.rem, run.cfg["claim_namespace"])[0], instance)
+                         _scan(run)[0], instance)
     found = next((t for t in turns.values() if t["batch"] == batch and not t["released"]), None)
     if found is None:
         raise RuntimeError(f"no PR of this fleet's claims holds a turn in merge batch "
@@ -2491,25 +2525,24 @@ def _require_my_batch(run, instance, batch):
     return found
 
 
-def _record_batch(repo, cfg, instance, now, batch, members, phase):
+def _record_batch(run, instance, batch, members, phase):
     """Write the batch's turn on every member PR — ONE marker each, rewritten in
     place — and say so on each member's status board."""
+    repo, now = run.repo, run.now()
     board = {"prs": [m["pr"] for m in members], "phase": phase}
     for m in members:
         _record_turn(repo, m["pr"], afk_decide.batch_turn(
             _turn(repo, m["pr"]), instance, now, batch, members, phase))
-        if cfg["progress_comment"]:
-            _upsert_board(repo, m["issue"], cfg, "landing", instance=instance, pr=m["pr"],
-                          batch=board)
+        _upsert_board(run, m["issue"], "landing", instance=instance, pr=m["pr"], batch=board)
 
 
-def _unbatch(repo, cfg, instance, now, batch, member, why, board=True):
+def _unbatch(run, instance, batch, member, why, board=True):
     """Replace a member PR's batch marker by the one that says it left the batch:
     it holds no turn, waits for a single one, and is never batched again."""
-    _record_turn(repo, member["pr"], afk_decide.unbatched_turn(
-        _turn(repo, member["pr"]), instance, now, batch, why))
-    if board and cfg["progress_comment"]:
-        _upsert_board(repo, member["issue"], cfg, "awaiting_turn", instance=instance,
+    _record_turn(run.repo, member["pr"], afk_decide.unbatched_turn(
+        _turn(run.repo, member["pr"]), instance, run.now(), batch, why))
+    if board:
+        _upsert_board(run, member["issue"], "awaiting_turn", instance=instance,
                       pr=member["pr"])
 
 
@@ -2554,8 +2587,15 @@ def _turn_batch(run, instance, agent, working_set=None):
     def stop(outcome, **more):
         return {"outcome": afk_decide.batch_turn_outcome(outcome), **more}
 
-    mine = next((b for b in ws["batches"] if b["instance"] == instance), None)
-    if mine:
+    who, what = afk_decide.turn_holder(ws, instance)
+    if who == "dead":
+        dead = what[0]
+        return stop("waiting", batch=dead["id"],
+                    detail=f"merge batch {dead['id']} of fleet instance {dead['instance']} is "
+                           f"still on record on PRs of claims this fleet took; nothing was "
+                           f"touched — abandon it first (`afk turn --abandon`)")
+    if who == "mine":
+        mine = what
         if _Worktree.of_batch(run.repo, mine["id"]).terminal:
             return stop("landing", batch=mine["id"],
                         detail="this batch already holds the landing turn and its worker is "
@@ -2565,14 +2605,8 @@ def _turn_batch(run, instance, agent, working_set=None):
                    if ((_turn(run.repo, m["pr"]) or {}).get("batch") == mine["id"])]
         return _start_batch_worker(run, instance, agent, mine["id"], members,
                                    mine["phase"] or afk_decide.BATCH_PHASES[0], again=True)
-    dead = next((b for b in ws["batches"] if b["instance"] != instance), None)
-    if dead:
-        return stop("waiting", batch=dead["id"],
-                    detail=f"merge batch {dead['id']} of fleet instance {dead['instance']} is "
-                           f"still on record on PRs of claims this fleet took; nothing was "
-                           f"touched — abandon it first (`afk turn --abandon`)")
-    holder = next((r["number"] for r in ws["mine"] if r["status"] == "landing"), None)
-    if holder is not None:
+    if who == "single":
+        holder = what
         return stop("waiting", holder=holder,
                     detail=f"issue #{holder}'s PR holds this fleet's landing turn; nothing was "
                            f"touched — no batch is formed while a turn is out")
@@ -2597,7 +2631,7 @@ def _start_batch_worker(run, instance, agent, batch, members, phase, again):
     whose worker has no terminal, which the next cycle continues."""
     cfg, rem = run.cfg, run.rem
     target = cfg["merge"]["target"]
-    _record_batch(run.repo, cfg, instance, run.now(), batch, members, phase)
+    _record_batch(run, instance, batch, members, phase)
     wt = _Worktree.of_batch(run.repo, batch)
     if wt.path:
         delivery, branch = "worktree", wt.checked_out()
@@ -2632,9 +2666,9 @@ def _abandon_batch(run, instance, batch):
     `afk land --batch` checks before it pushes anything.
 
       {"outcome": "abandoned", "batch", "issues", "prs", "deleted_branches", "cleanup"}"""
-    cfg, rem, now = run.cfg, run.rem, run.now()
+    rem = run.rem
     found = _require_my_batch(run, instance, batch)
-    claims = _scan(rem, cfg["claim_namespace"])[0]
+    claims = _scan(run)[0]
     mine = {c["number"] for c in claims if c["instance"] == instance}
     still_open = {p["number"] for p in _open_prs(run.repo)}
     left = []
@@ -2642,7 +2676,7 @@ def _abandon_batch(run, instance, batch):
         turn = _turn(run.repo, m["pr"]) if m["pr"] in still_open else None
         if not turn or turn["batch"] != batch or turn["released"]:
             continue
-        _unbatch(run.repo, cfg, instance, now, batch, m, "abandoned", board=m["issue"] in mine)
+        _unbatch(run, instance, batch, m, "abandoned", board=m["issue"] in mine)
         left.append(m)
     deleted = _delete_batch_branches(rem, batch)
     wt = _Worktree.of_batch(run.repo, batch)
@@ -2665,7 +2699,7 @@ def _batch_worker(run, batch, worker):
     if not seen:
         now, grace = worker.now, worker.grace
         told = [(_turn(run.repo, m["pr"]) or {}).get("at")
-                for m in _batch_members(run, batch)]
+                for m in _members_of_batch(run, batch)]
         turn_at = max((t for t in told if t), default=None)
         progress = _worktree_progress(path, run.rem, cfg["merge"]["target"])
         # a batch's worker declares no verdict and names no blocker — and a batch's
@@ -2763,7 +2797,7 @@ def _batch_turns(run, batch, listed):
         turn = _turn(run.repo, m["pr"])
         if turn and turn["released"]:
             continue
-        owner = _claim_owner(run.rem, run.cfg, m["issue"])
+        owner = _claim_owner(run, m["issue"])
         if not turn or turn["batch"] != batch or afk_decide.held_turn(turn, owner) is None:
             raise RuntimeError(f"PR #{m['pr']} does not hold the landing turn of merge batch "
                                f"{batch} for the fleet instance that holds issue "
@@ -2774,7 +2808,7 @@ def _batch_turns(run, batch, listed):
     return members, instance
 
 
-def _land_batch(run, batch, gate_timeout, excerpt_lines, merged_timeout):
+def _land_batch(run, batch, limits, merged_timeout):
     """`afk land --batch <batch>` — a BATCH WORKER stacks, gates and lands its
     merge batch, in the batch's worktree (ADR-0029). Refused (exit 3, nothing
     changed) unless every member PR carries the batch's turn marker, naming the
@@ -2812,16 +2846,16 @@ def _land_batch(run, batch, gate_timeout, excerpt_lines, merged_timeout):
     settles each member from its closed issue, and removes the batch's worktree.
 
     Which PRs the batch holds is read from their turn markers on every run
-    (`_batch_members`): the worktree keeps no list, so one recreated from the
+    (`_members_of_batch`): the worktree keeps no list, so one recreated from the
     batch's pushed branch lands the same members."""
     cfg, rem = run.cfg, run.rem
-    now, target = run.now(), cfg["merge"]["target"]
+    target = cfg["merge"]["target"]
     path = _git(["rev-parse", "--show-toplevel"]).stdout.strip()
     branch = _git(["-C", path, "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
     if not afk_decide.batch_branches([branch], batch):
         raise RuntimeError(f"this worktree is not merge batch {batch}'s; nothing was changed")
     tip = _fetch_tip(rem, target, cwd=path)
-    listed = _batch_members(run, batch, lambda issue: _landed_pr(path, tip, issue))
+    listed = _members_of_batch(run, batch, lambda issue: _landed_pr(path, tip, issue))
     if not listed:
         raise RuntimeError(f"no PR carries the turn marker of merge batch {batch}: it does not "
                            f"hold the landing turn; nothing was changed. Do not land anything "
@@ -2847,9 +2881,9 @@ def _land_batch(run, batch, gate_timeout, excerpt_lines, merged_timeout):
                            f"files — what would be gated is not what would land. Commit your "
                            f"fix (or discard it) and run this again:\n{dirty}")
     prs = {p["number"]: p for p in _open_prs(run.repo)}
-    gone = [m["pr"] for m in members if m["pr"] not in prs]
-    if gone:
-        raise RuntimeError(f"PR(s) {gone} of merge batch {batch} are no longer open; nothing "
+    closed = [m["pr"] for m in members if m["pr"] not in prs]
+    if closed:
+        raise RuntimeError(f"PR(s) {closed} of merge batch {batch} are no longer open; nothing "
                            f"was changed — send your wake and stop")
 
     # --- stack: every member on the target's tip, then the fixes carried so far ---
@@ -2864,11 +2898,11 @@ def _land_batch(run, batch, gate_timeout, excerpt_lines, merged_timeout):
         if commit:
             stacked.append({**m, "commit": commit})
             continue
-        _unbatch(run.repo, cfg, instance, now, batch, m, "left_out")
+        _unbatch(run, instance, batch, m, "left_out")
         left_out.append({**m, "reason": why, "files": files})
     if len(stacked) < 2:
         for m in stacked:
-            _unbatch(run.repo, cfg, instance, now, batch, m, "dissolved")
+            _unbatch(run, instance, batch, m, "dissolved")
         _git(["-C", path, "reset", "-q", "--hard", tip])
         _delete_batch_branches(rem, batch)
         return result("too_small", [],
@@ -2888,19 +2922,19 @@ def _land_batch(run, batch, gate_timeout, excerpt_lines, merged_timeout):
     more = {"head": head, "target": target, "fix_commits": len(kept)}
 
     # --- the gate, once, on the stack ---
-    _record_batch(run.repo, cfg, instance, now, batch, stacked, "gating")
-    gate = _gated(cfg, rem, path, gate_timeout, excerpt_lines, run.now())
-    gone = not os.path.isdir(path)       # a gate run is long: an abandon removes the worktree
+    _record_batch(run, instance, batch, stacked, "gating")
+    gate = _gated(run, path, limits)
+    abandoned = not os.path.isdir(path)  # a gate run is long: an abandon removes the worktree
     if gate["status"] != "green":
-        _record_batch(run.repo, cfg, instance, run.now(), batch, stacked, "fixing")
-        verdict = {k: v for k, v in gate.items() if k not in ("source", "head", "not_trusted")}
-        return result("gate_red", stacked, gate=verdict, **more,
+        _record_batch(run, instance, batch, stacked, "fixing")
+        red = {k: v for k, v in gate.items() if k not in ("source", "head", "not_trusted")}
+        return result("gate_red", stacked, gate=red, **more,
                       detail="the gate is red on the stack and nothing landed — fix the stack "
                              "with one more commit on top (do not hunt for the PR at fault), "
                              "and run this again")
 
     # --- land: a gate run is long, so the turn is checked again; then the fast-forward ---
-    still = [] if gone else _batch_turns(run, batch, stacked)[0]
+    still = [] if abandoned else _batch_turns(run, batch, stacked)[0]
     if len(still) != len(stacked):
         raise RuntimeError(f"merge batch {batch} no longer holds the landing turn (it was "
                            f"abandoned while the gate ran); nothing landed — send your wake "
@@ -2910,7 +2944,7 @@ def _land_batch(run, batch, gate_timeout, excerpt_lines, merged_timeout):
         if _remote_sha(rem, f"refs/heads/{target}") == tip:
             raise RuntimeError(f"the push of the batch to {target} failed although {target} "
                                f"has not moved: {p.stderr.strip()}")
-        _record_batch(run.repo, cfg, instance, run.now(), batch, stacked, "stacking")
+        _record_batch(run, instance, batch, stacked, "stacking")
         return result("target_moved", stacked, **more,
                       detail=f"{target} moved while the batch was gating: the fast-forward was "
                              f"refused and nothing landed — run this again; the batch is "
@@ -2946,8 +2980,7 @@ def _finish_batch(run, batch, landed, result, merged_timeout, branches, **more):
     cfg, rem = run.cfg, run.rem
     instance = (_turn(run.repo, landed[0]["pr"]) or {}).get("instance")
     for m in landed:
-        if cfg["progress_comment"]:
-            _upsert_board(run.repo, m["issue"], cfg, "merged", instance=instance, pr=m["pr"])
+        _upsert_board(run, m["issue"], "merged", instance=instance, pr=m["pr"])
         if _issue_state(run.repo, m["issue"]) == "open":
             _close_issue(run.repo, m["issue"])
     _delete_batch_branches(rem, batch)
@@ -2989,13 +3022,12 @@ def _escalate(run, instance, issue, attempt, reason):
     → labels → comment → release. The claim is released LAST: released first, a
     PR-less issue still carrying `ready_label` is back on the frontier for a peer
     to dispatch before the relabel lands."""
-    cfg, rem = run.cfg, run.rem
+    cfg = run.cfg
     number = issue["number"]
     pr = afk_decide.closing_pr(_open_prs(run.repo), number)
     pr_number = pr["number"] if pr else None
-    if cfg["progress_comment"]:
-        _upsert_board(run.repo, number, cfg, "escalated", instance=instance,
-                      pr=pr_number, attempt=attempt)
+    _upsert_board(run, number, "escalated", instance=instance,
+                  pr=pr_number, attempt=attempt)
     add, remove = afk_decide.escalation_labels(issue["labels"], cfg)
     _ensure_label(run.repo, add[0])
     _edit_labels(run.repo, number, add, remove)
@@ -3003,7 +3035,7 @@ def _escalate(run, instance, issue, attempt, reason):
     if cfg["escalate_comment"]:
         comment_id = _comment(run.repo, number,
                               afk_decide.escalation_comment(reason, attempt, pr_number))
-    _release(rem, cfg, number)
+    _release(run, number)
     return {"issue": number, "action": "escalate", "attempt": attempt, "pr": pr_number,
             "labels": {"added": add, "removed": remove}, "comment_id": comment_id,
             "released": True}
@@ -3018,12 +3050,10 @@ def _ensure_label(repo, name):
 
 def cmd_fail(a):
     """One of my claims FAILED — its checks are red, a verifier refuted it, or its
-    worker gave up or went quiet with no PR and no outcome. A failed PR is closed,
-    which is also what frees its landing turn — but a landing turn's silence never
-    comes here: it is restarted onto, then escalated with the PR kept (ADR-0035),
-    and `afk fail` reaches a landing claim only by the tick's own judgments (red
-    checks in `required`, a refuted verify). The retry ladder, as one
-    transition (ADR-0017): read the attempt off the issue's `afk-attempt/<n>`
+    worker gave up or went quiet with no PR and no outcome (which silences come
+    here is `afk_decide.WORKER_CAUSES`'s to say: a landing turn's never does).
+    A failed PR is closed, which is also what frees its landing turn. The retry
+    ladder, as one transition (ADR-0017): read the attempt off the issue's `afk-attempt/<n>`
     label, then either
 
       retry     swap the label up by one, discard the failed attempt (close its PR,
@@ -3052,8 +3082,8 @@ def cmd_fail(a):
 def _fail_claim(run, instance, agent, number, reason):
     """`afk fail` — of `instance`'s claim on issue <number>, for `reason`; a retry's
     worker is started as `agent`."""
-    cfg, rem = run.cfg, run.rem
-    _require_mine(rem, cfg, number, instance)
+    cfg = run.cfg
+    _require_mine(run, number, instance)
     issue = _issue(run.repo, number)
     reason = _stalled_reason(run.repo, number, reason)     # before the worktree is discarded
     labels = issue["labels"]
@@ -3073,11 +3103,9 @@ def _fail_claim(run, instance, agent, number, reason):
 
 
 def cmd_escalate(a):
-    """Hand one of my claims straight to a human, outside the retry ladder — a DAG
-    gap (`afk no-pr` → `idle_blocked` / `escalate`: a blocker nothing will resolve,
-    or none named), or a landing turn nobody could get a worker to perform
-    (`afk no-pr` → `idle_stalled` / `escalate`: silent again after its one restart,
-    ADR-0035). Same ordered transition `afk fail` ends in; the attempt count is
+    """Hand one of my claims straight to a human, outside the retry ladder — where
+    `afk no-pr` says `escalate` (`afk_decide.WORKER_CAUSES`: a DAG gap, or a
+    landing turn nobody could get a worker to perform). Same ordered transition `afk fail` ends in; the attempt count is
     reported, not consulted, and no attempt is spent: the PR stays open, the
     branch and the worktree stay. After an unanswered nudge the worker's last
     screen is appended to the reason, as `afk fail` appends it."""
@@ -3086,8 +3114,7 @@ def cmd_escalate(a):
 
 def _escalate_claim(run, instance, number, reason):
     """`afk escalate` — of `instance`'s claim on issue <number>, for `reason`."""
-    cfg, rem = run.cfg, run.rem
-    _require_mine(rem, cfg, number, instance)
+    _require_mine(run, number, instance)
     issue = _issue(run.repo, number)
     return _escalate(run, instance, issue, afk_decide.current_attempt(issue["labels"]),
                      _stalled_reason(run.repo, number, reason))
@@ -3110,7 +3137,7 @@ def cmd_park(a):
 def _park_claim(run, instance, number):
     """`afk park` — of `instance`'s claim on issue <number>."""
     cfg, rem = run.cfg, run.rem
-    _require_mine(rem, cfg, number, instance)
+    _require_mine(run, number, instance)
     declared = afk_decide.latest_verdict(_issue_comments(run.repo, number))
     standings = _blocker_standings(run, number, declared["blocked_by"], _open_prs(run.repo))
     refusal = afk_decide.park_refusal(declared, standings)
@@ -3125,9 +3152,8 @@ def _park_claim(run, instance, number):
     added = [n for n in waiting if n not in recorded]
     for n in added:
         _add_blocker(run.repo, number, n)
-    if cfg["progress_comment"]:
-        _upsert_board(run.repo, number, cfg, "parked", blocked_by=waiting)
-    _release(rem, cfg, number)
+    _upsert_board(run, number, "parked", blocked_by=waiting)
+    _release(run, number)
     empty = progress.get("commits_ahead") == 0 and not progress.get("dirty")
     cleanup = wt.remove() if (path and empty and cfg["worktree_cleanup"]) else None
     return {"issue": number, "action": "parked", "blocked_by": waiting, "edges_added": added,
@@ -3139,12 +3165,11 @@ def cmd_close(a):
     `idle_done`), after the tick has verified the empty diff against base: status
     board → close the issue → release the claim → remove the worktree."""
     run = _run(a)
-    cfg, rem = run.cfg, run.rem
-    _require_mine(rem, cfg, a.number, a.instance)
-    if cfg["progress_comment"]:
-        _upsert_board(run.repo, a.number, cfg, "closed", instance=a.instance)
+    cfg = run.cfg
+    _require_mine(run, a.number, a.instance)
+    _upsert_board(run, a.number, "closed", instance=a.instance)
     _close_issue(run.repo, a.number)
-    _release(rem, cfg, a.number)
+    _release(run, a.number)
     wt = _Worktree.of_issue(run.repo, a.number)
     cleanup = wt.remove() if (wt.remembered and cfg["worktree_cleanup"]) else None
     return {"issue": a.number, "action": "closed", "released": True,
@@ -3208,7 +3233,10 @@ def build_parser():
                        metavar="n")
 
     def starts_worker(p):
-        """The flags of a subcommand that may start a worker (dispatch, turn, fail)."""
+        """The flags of a subcommand that may start a worker — one of
+        `afk_decide.STARTS_WORKER`, which is what a judgment's command is
+        written from."""
+        assert p.prog.split()[-1] in afk_decide.STARTS_WORKER, p.prog
         stamp(p)
         p.add_argument("--worker-command", required=True, metavar="cmd",
                        help="the run's worker launch command, verbatim (ADR-0010)")

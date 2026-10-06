@@ -40,13 +40,10 @@ CONFIG_DEFAULTS = {
     # dispatch contract
     "ready_label": "ready-for-agent",
     "epic_labels": ["epic", "prd", "wayfinder:map"],
-    "claim": "ref",
     "claim_namespace": "refs/afk",
-    "dependencies": "native",
     # workers
     "base_branch": "main",
     "branch_pattern": "issue-{number}-{slug}",
-    "worker": "orca",
     "concurrency": 3,
     "worktree_cleanup": True,
     "worker_idle_grace_seconds": 300,
@@ -136,6 +133,7 @@ class FieldType(NamedTuple):
     themselves; the rest are below, or beside the one kind that needs them."""
     write: object       # value → its text; "" when there is nothing to write
     read: object        # text (never empty) → value; None when it is no such value
+    empty: object = None    # what a record that does not state the field reads as
 
 
 def _digits(raw):
@@ -146,12 +144,13 @@ _FIELD_TYPES = {str: FieldType(str, lambda raw: raw),
                 int: FieldType(lambda value: str(int(value)), _digits)}
 
 # A fact that is either so or not: written `=1` when so, left out when not.
-FLAG = FieldType(lambda value: "1" if value else "", lambda raw: True if raw == "1" else None)
+FLAG = FieldType(lambda value: "1" if value else "", lambda raw: True if raw == "1" else None,
+                 empty=False)
 
 # Whole numbers, comma-separated; anything else in the list is dropped.
 INTS = FieldType(lambda values: ",".join(str(int(v)) for v in values),
                  lambda raw: [int(x) for x in re.split(r"[,\s]+", raw) if _digits(x) is not None]
-                 or None)
+                 or None, empty=())
 
 
 def one_of(vocabulary):
@@ -175,6 +174,19 @@ HEARTBEAT_RECORD = RecordKind("afk-heartbeat", {"instance": str, "ts": int}, ("t
 GATE_RUN_RECORD = RecordKind("afk-gate", {"tree": str, "command": str, "at": int}, ("at",))
 # What the bootstrap probe pushes to learn whether a namespace takes a push.
 PROBE_RECORD = RecordKind("afk-probe", {"ts": int}, ("ts",))
+
+def _field_type(kind, name):
+    declared = kind.fields[name]
+    return _FIELD_TYPES.get(declared, declared)
+
+
+def blank_record(kind):
+    """Every field of `kind` at the value that says nothing (its type's
+    `empty`) — what a reader lays a record over, so a field the marker does not
+    state is still there to be asked for."""
+    blank = {name: _field_type(kind, name).empty for name in kind.fields}
+    return {name: [] if value == () else value for name, value in blank.items()}
+
 
 _RECORD_SAFE = "!\"#$&'()*+,/:;<=>?@[\\]^`{|}~"
 
@@ -203,7 +215,7 @@ def record_message(kind, record):
     does not declare, or a required one left out, is a defect in the caller and
     raises."""
     def spell(name, value):
-        text = _FIELD_TYPES.get(kind.fields[name], kind.fields[name]).write(value)
+        text = _field_type(kind, name).write(value)
         return text if name == kind.tail else urllib.parse.quote(text, safe=_RECORD_SAFE)
     return " ".join([kind.word, *_field_words(kind, record, spell)])
 
@@ -219,10 +231,9 @@ def _read_fields(kind, text):
             record[kind.tail] = tail.group(1).strip()
     for word in re.sub(r",\s+", ",", text).split():
         name, _, raw = word.partition("=")
-        type_ = kind.fields.get(name)
-        if type_ is None or not raw:
+        if name not in kind.fields or not raw:
             continue
-        value = _FIELD_TYPES.get(type_, type_).read(urllib.parse.unquote(raw))
+        value = _field_type(kind, name).read(urllib.parse.unquote(raw))
         if value is not None:
             record[name] = value
     return record if all(name in record for name in kind.required) else None
@@ -304,6 +315,15 @@ CONFIG_REMOVED = {
         "every PR lands as a merge commit now (ADR-0034): a PR's own head reaches the target, so "
         "GitHub shows it merged whether it landed alone or in a merge batch. There is no squash "
         "and no rebase. Delete the key."),
+    "claim": (
+        "an issue is always claimed by its claim ref (ADR-0003): the key named the one way "
+        "there is, and nothing read it. Delete the key."),
+    "dependencies": (
+        "an issue's open blockers are always GitHub's native blocked_by edges: the key named the "
+        "one way there is, and nothing read it. Delete the key."),
+    "worker": (
+        "a worker is always started through orca (ADR-0005): the key named the one backend "
+        "there is, and nothing read it. Delete the key."),
     "merge.batch": (
         "merge batches are no longer an option (ADR-0034): with gate.ci 'local' and "
         "gate.adversarial_verify off, two or more PRs that are ready together always land as "
@@ -609,16 +629,21 @@ def classify_claims(claims, heartbeats, me, now, ttl):
     return {"mine": sorted(mine), "peer_live": sorted(peer_live), "stale": sorted(stale)}
 
 
-# Every `status` a `mine` row can carry — what `subclassify_pr` returns, and the
-# vocabulary the tick's instructions route on (a test holds the docs to it).
-CLAIM_STATUSES = ("awaiting_turn", "landing", "awaiting_ci", "failure", "no_pr", "closed")
+# Every `status` a `mine` row can carry (`claim_status`) → the status-board
+# phase a human is shown meanwhile; None for a row whose board is not
+# re-rendered. The keys are the vocabulary the tick's instructions route on (a
+# test holds the docs to it). `merged` / `escalated` / `parked`, the board's
+# terminal phases, are written by the transitions that reach them.
+BOARD_PHASE_OF = {"awaiting_turn": "awaiting_turn", "landing": "landing",
+                  "awaiting_ci": "pr_open", "failure": "ci_failed", "no_pr": "claimed",
+                  "closed": None}
+CLAIM_STATUSES = tuple(BOARD_PHASE_OF)
 
 
-def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, landing=False):
+def claim_status(has_pr, checks_state, ci_mode, closed=False, landing=False):
     """
-    Classify one of MY in-flight claims from its PR + checks → `(status,
-    board_phase)`: what the tick does next, and what the status board shows a human
-    meanwhile. Decided together because `gate.ci` bends both, in different ways.
+    Classify one of MY in-flight claims from its PR + checks → its `status`, one
+    of CLAIM_STATUSES: what the tick does next.
 
       has_pr:       an open PR closes the issue
       checks_state: "green" | "red" | "pending" | None  (`pr_checks_state`)
@@ -628,50 +653,37 @@ def subclassify_pr(has_pr, checks_state, ci_mode, closed=False, landing=False):
                     by hand
       landing:      the PR holds this fleet instance's landing turn (`held_turn`)
 
-      status           the tick…                                board_phase
-      closed           releases the leftover claim (and its      None (not re-rendered)
-                       worktree)
-      no_pr            asks `afk no-pr` why                      claimed
-      landing          asks `afk no-pr` whether its worker is    landing
-                       still at it — or, when the landing
-                       stopped for the tick, `afk turn` again
-      awaiting_ci      leaves it: checks exist and are still     pr_open
-                       running
-      failure          runs `afk fail`                           ci_failed
-      awaiting_turn    grants it the landing turn (`afk turn`)   awaiting_turn
-                       when it is first in `merge_order` and
-                       no claim of mine is `landing`
+      closed         its leftover claim (and worktree) is released
+      no_pr          `afk no-pr` is asked why
+      landing        `afk no-pr` is asked whether its worker is still at it — or,
+                     when the landing stopped for the tick, `afk turn` again
+      awaiting_ci    left: checks exist and are still running
+      failure        `afk fail`
+      awaiting_turn  granted the landing turn (`afk turn`) when it is first in
+                     `merge_order` and no claim of mine is `landing`
 
-    A PR that holds the turn is `landing` whatever its checks say: its worker is
-    syncing, gating and pushing, so a pending or red run on the way is the
-    landing's own business (`afk land` answers `awaiting_ci` / `gate_red`), never
-    a second route into `afk fail`.
+    Three cases a first guess gets wrong:
 
-    In `local` mode (ADR-0012) there are no checks to wait on: gating is an
-    **action `afk land` takes** (sync → the local gate → merge), not an
-    observation the tick waits for. So every open PR without the turn is
-    `awaiting_turn` — a red remote run, the repo's own `on: push` workflow the
-    fleet does not gate on, must not park the claim in `failure` forever.
-
-    A PR with **no checks at all** (`checks_state` None) is `awaiting_turn` in
-    `required` mode too. Nothing is running, so nothing will ever arrive to wait
-    for: `awaiting_ci` would park the claim forever in a repo that has no CI. What
-    such a PR needs is the tick's judgment, and `afk turn` is where that is asked
-    for (its `no_checks` outcome, answered with `--allow-no-checks`).
-    (`merged` / `escalated`, the two terminal board phases, are set by `afk land`
-    and the escalate step themselves.)
+    - A PR that holds the turn is `landing` whatever its checks say: a pending
+      or red run on the way is the landing's own business (`afk land` answers
+      `awaiting_ci` / `gate_red`), never a second route into `afk fail`.
+    - In `local` mode (ADR-0012) every open PR without the turn is
+      `awaiting_turn`: gating is an action `afk land` takes, not an observation
+      the tick waits for, so a red remote run the fleet does not gate on must
+      not park the claim in `failure`.
+    - A PR with NO checks at all is `awaiting_turn` in `required` mode too:
+      nothing is running, so `awaiting_ci` would park it forever. `afk turn` is
+      where the tick's judgment is asked for (`no_checks`).
     """
     if closed:
-        return "closed", None
+        return "closed"
     if not has_pr:
-        return "no_pr", "claimed"
+        return "no_pr"
     if landing:
-        return "landing", "landing"
+        return "landing"
     if ci_mode == "local" or checks_state in ("green", None):
-        return "awaiting_turn", "awaiting_turn"
-    if checks_state == "red":
-        return "failure", "ci_failed"
-    return "awaiting_ci", "pr_open"
+        return "awaiting_turn"
+    return "failure" if checks_state == "red" else "awaiting_ci"
 
 
 # --------------------------------------------------------------------------- #
@@ -881,7 +893,7 @@ def gate_comment(verdict, command):
 # no_pr reconciliation — disambiguating a FINISHED worker from a CODING one    #
 # --------------------------------------------------------------------------- #
 #
-# `subclassify_pr` only says a claim has no PR yet — or that its PR holds the
+# `claim_status` only says a claim has no PR yet — or that its PR holds the
 # landing turn and has not landed. Either way a worker that finished and went
 # idle looks identical, to a terminal probe, to one still working, so three
 # signals disambiguate (all gathered by `afk no-pr`):
@@ -895,9 +907,10 @@ def gate_comment(verdict, command):
 # — does signal 3 alone settle it (busy, gone)? — and, only when it does not,
 # `classify_stopped` over all three. Each answers with a CAUSE, one of
 # `WORKER_CAUSES`: the one thing decided here, and the one thing the tick routes
-# on (`worker_step`, `batch_step`). Two words are kept apart throughout: the
-# VERDICT is what the worker declared in its marker (an input); the OUTCOME is
-# what this code concludes from all three signals. Whether to TRUST the marker
+# on (`worker_step`, `batch_step`). Of a WORKER, two words are kept apart: its
+# VERDICT is what it declared in its marker (an input); its OUTCOME is what
+# this code concludes from all three signals. (A gate's verdict, or branch
+# protection's, is another thing: what one run or one read came to.) Whether to TRUST the marker
 # stays the tick's call.
 
 # The phases a worker may declare in its marker (worker-prompt.md asks for exactly
@@ -905,38 +918,63 @@ def gate_comment(verdict, command):
 VERDICT_PHASES = ("already-satisfied", "blocked", "giving-up")
 _SATISFIED, _BLOCKED, _GIVING_UP = VERDICT_PHASES
 
-# What the orca liveness probe can say about a worker's terminal.
-TERMINAL_STATES = ("busy", "idle", "none")
+class Cause(NamedTuple):
+    """One reason a claim waiting on its worker is where it is — the row of
+    WORKER_CAUSES it is declared in is everything that follows from it."""
+    outcome: str            # } how `afk no-pr` prints it for a human; the tick
+    action: str             # } routes on neither
+    step: str               # what a tick does about an ISSUE's worker (`worker_step`)
+    batch_step: str = None  # …about a MERGE BATCH's worker (`batch_step`); None:
+    #                         a batch's worker is never classified so
 
-# Why a claim waiting on its worker is where it is → the (outcome, action)
-# `afk no-pr` prints for it. The cause is what the classification decides and
-# what the tick routes on; the pair is only how a row reads to a human.
+
+# Every cause a classification can name. The cause is the one thing
+# `settled_by_worker_state` and `classify_stopped` decide; what the tick then
+# does is this table's, read by `worker_step` and `batch_step` and re-derived
+# by neither.
+#
+#   step        leave | dispatch | park | nudge | restart   run as it stands
+#               escalate | fail    with the reason `worker_step` words — or, when
+#                                  the reason is not on record, the `reason`
+#                                  judgment that asks for it
+#               judge              the tick's own judgment (`empty_diff`)
+#   batch_step  leave | continue (a new batch worker, in its worktree or from
+#               its pushed branch) | nudge | abandon (nothing landed; its PRs
+#               take single turns)
+#
+# The silence ladder is the `silent*` rows: a worker that stopped with no
+# verdict is nudged once (`silent`, no attempt spent — ADR-0018); silent again
+# a grace period later, a PR-less claim fails (`silent_after_nudge`), while ONE
+# PR's landing turn is restarted onto once (`silent_on_turn`) and after that
+# escalated with its PR, branch and worktree kept (`silent_past_restart`) — a
+# landing turn's silence never spends an attempt (ADR-0035). A batch has
+# nothing to restart onto: its second silence abandons it.
 WORKER_CAUSES = {
     # settled by the worker state alone (`settled_by_worker_state`)
-    "working":            ("coding", "leave"),            # its runtime says so
-    "just_stopped":       ("coding", "leave"),            # stopped, or nudged, within grace
-    "gone":               ("dead", "orphan"),             # no live terminal
+    "working":             Cause("coding", "leave", "leave", "leave"),        # its runtime says so
+    "just_stopped":        Cause("coding", "leave", "leave", "leave"),        # stopped, or nudged, within grace
+    "gone":                Cause("dead", "orphan", "dispatch", "continue"),   # no live terminal: continued, never released
     # a stopped worker (`classify_stopped`)
-    "within_grace":       ("coding", "leave"),            # a sign of life within grace
-    "awaiting_tick":      ("coding", "leave"),            # its landing stopped for the tick
-    "satisfied":          ("idle_done", "close_release"),
-    "satisfied_refuted":  ("idle_failed", "next_attempt"),   # …by work on the branch
-    "blockers_closed":    ("idle_blocked", "redispatch"),
-    "blockers_waiting":   ("idle_blocked", "park"),
-    "blocker_unmet":      ("idle_blocked", "escalate"),
-    "no_blocker_named":   ("idle_blocked", "escalate"),
-    "silent":             ("idle_stalled", "nudge"),
-    "silent_on_turn":     ("idle_stalled", "restart"),       # silent after its nudge, on a landing turn
-    "silent_past_restart": ("idle_stalled", "escalate"),     # …and again, after the turn's one restart
-    "gave_up":            ("idle_failed", "next_attempt"),
-    "unknown_phase":      ("idle_failed", "next_attempt"),
-    "silent_after_nudge": ("idle_failed", "next_attempt"),
-    "silent_unnudgeable": ("idle_failed", "next_attempt"),   # no worktree here to nudge it in
+    "within_grace":        Cause("coding", "leave", "leave", "leave"),        # a sign of life within grace
+    "awaiting_tick":       Cause("coding", "leave", "leave", "leave"),        # its landing stopped for the tick
+    "satisfied":           Cause("idle_done", "close_release", "judge"),      # `already-satisfied`, nothing on the branch
+    "satisfied_refuted":   Cause("idle_failed", "next_attempt", "fail"),      # …refuted by work on the branch
+    "blockers_closed":     Cause("idle_blocked", "redispatch", "dispatch"),   # `blocked`, every blocker now closed
+    "blockers_waiting":    Cause("idle_blocked", "park", "park"),             # …the open ones will resolve (ADR-0022)
+    "blocker_unmet":       Cause("idle_blocked", "escalate", "escalate"),     # …one never will
+    "no_blocker_named":    Cause("idle_blocked", "escalate", "escalate"),     # `blocked`, naming none
+    "silent":              Cause("idle_stalled", "nudge", "nudge", "nudge"),  # no verdict, never nudged
+    "silent_on_turn":      Cause("idle_stalled", "restart", "restart"),       # silent after its nudge, on a landing turn
+    "silent_past_restart": Cause("idle_stalled", "escalate", "escalate"),     # …and again, after the turn's one restart
+    "gave_up":             Cause("idle_failed", "next_attempt", "fail"),      # `giving-up`
+    "unknown_phase":       Cause("idle_failed", "next_attempt", "fail"),      # a verdict naming no phase the fleet knows
+    "silent_after_nudge":  Cause("idle_failed", "next_attempt", "fail", "abandon"),
+    "silent_unnudgeable":  Cause("idle_failed", "next_attempt", "fail", "abandon"),  # no worktree here to nudge it in
 }
 
 # Every (outcome, action) a `afk no-pr` row can carry — the vocabulary the
 # reference lists for a human reading one (a test holds the docs to it).
-NO_PR_ROUTES = tuple(dict.fromkeys(WORKER_CAUSES.values()))
+NO_PR_ROUTES = tuple(dict.fromkeys((c.outcome, c.action) for c in WORKER_CAUSES.values()))
 
 
 # A worker's verdict, kept as a marker leading a comment on its issue:
@@ -952,13 +990,12 @@ VERDICT_RECORD = RecordKind("afk:verdict",
                             {"n": int, "phase": str, "blocked_by": INTS, "reason": str},
                             (), tail="reason")
 
-# Every field a verdict gives back, at the value that says nothing.
-_NO_VERDICT = {"n": None, "phase": None, "blocked_by": [], "reason": None}
+_NO_VERDICT = blank_record(VERDICT_RECORD)
 
 
 def verdict_marker(n, phase, blocked_by=(), reason=None):
-    """The marker a worker posts for one verdict — what `parse_verdict_marker`
-    reads back (a test round-trips every phase)."""
+    """The marker a worker posts for one verdict — what `latest_verdict` reads
+    back (a test round-trips every phase)."""
     return record_marker(VERDICT_RECORD, {"n": n, "phase": phase, "blocked_by": list(blocked_by),
                                           "reason": reason})
 
@@ -970,16 +1007,6 @@ def verdict_marker_format(n):
                          {"n": n, "phase": f"<{'|'.join(VERDICT_PHASES)}>",
                           "blocked_by": "<csv of issue numbers>", "reason": "<short>"},
                          optional=("blocked_by", "reason"))
-
-
-def parse_verdict_marker(body):
-    """
-    The verdict one comment body carries (`VERDICT_RECORD`), or None if the body
-    carries no marker. Returns:
-      {"found": True, "n": int|None, "phase": str|None, "blocked_by": [int], "reason": str|None}
-    """
-    record = read_marker(VERDICT_RECORD, body)
-    return None if record is None else {"found": True, **_NO_VERDICT, **record}
 
 
 def latest_verdict(comments):
@@ -1173,8 +1200,9 @@ def read_worker_state(row, now, grace_seconds, tui_idle=None):
 
 def _seen(cause, idle_seconds, pending_blockers=()):
     """One worker's classification: its cause, and the row words it comes to."""
-    outcome, action = WORKER_CAUSES[cause]
-    return {"cause": cause, "outcome": outcome, "action": action, "idle_seconds": idle_seconds,
+    row = WORKER_CAUSES[cause]
+    return {"cause": cause, "outcome": row.outcome, "action": row.action,
+            "idle_seconds": idle_seconds,
             "pending_blockers": list(pending_blockers)}
 
 
@@ -1197,13 +1225,11 @@ def settled_by_worker_state(reading, now, grace_seconds, nudged_at=None):
       reading:   `read_worker_state`'s.
       nudged_at: epoch seconds this worker was nudged (`afk nudge`), None if never.
 
-    Returns the classification (`classify_stopped`'s shape), or None for a worker
-    that stopped and whose reasons must be gathered:
-      gone          dead / orphan   — no live terminal: it cannot be at work,
-                                      whatever it left behind → continuation.
-      working       coding / leave  — its runtime says it is busy.
-      just_stopped  coding / leave  — it stopped, or was nudged, within grace: more
-                                      signs of life could only say the same.
+    Returns the classification (`classify_stopped`'s shape) with the cause
+    `gone` (no live terminal), `working` (its runtime says so) or `just_stopped`
+    (it stopped, or was nudged, within grace: more signs of life could only say
+    the same) — or None for a worker that stopped and whose reasons must be
+    gathered.
     """
     idle_seconds = _idle_seconds(now, reading["terminal_idle_seconds"], nudged_at)
     if reading["terminal"] == "none":
@@ -1247,91 +1273,28 @@ def classify_stopped(progress, terminal_idle_seconds, worker_verdict, blocker_st
                        blocked_by (`blocker_standings`). Anything else is `unmet`.
       now, grace_seconds: epoch seconds / `worker_idle_grace_seconds`.
       nudged_at:       epoch seconds this worker was nudged (`afk nudge`), None if
-                       it never was. A nudge is spent once: the second silence
-                       fails a PR-less claim, and moves a landing one up its own
-                       ladder (below).
+                       it never was. A nudge is spent once.
       can_nudge:       False when there is nowhere to record a nudge (no worktree
-                       on this machine) — a PR-less claim's silence then fails at
-                       once, and a landing claim's takes its next rung at once.
-      turn:            the landing turn its PR carries (`latest_turn`), None when it
-                       has none. `at` — when the worker was last told to land
-                       (`afk turn`), or its `afk land` last stopped — is a sign of
-                       life like the nudge: a whole grace period to start on it, and
-                       after that the same nudge as any other silence. Silent again
-                       after it, a worker on ONE PR's turn is restarted onto the
-                       turn rather than failed — once per turn: `restarted` says the
-                       turn already had its restart, and the next silence after a
-                       nudge ESCALATES the claim with its PR, branch and worktree
-                       kept — a landing turn's silence never reaches `afk fail`
-                       (ADR-0035). `stopped` is the LAND_OUTCOMES word its `afk
-                       land` last stopped with: one of LAND_WAITS means the worker
-                       is idle because the next move is the tick's — its quiet is
-                       not a silence, and is never nudged, restarted or escalated
-                       here (`afk turn` is what moves it). A merge batch's turn
-                       (`batch`) is its batch worker's, which is abandoned, never
-                       restarted (`batch_step`).
+                       on this machine): a silence then takes its next rung at once.
+      turn:            the landing turn its PR carries (`latest_turn`), None when
+                       it has none. Three of its fields are read: `at`, a sign of
+                       life like the nudge; `stopped` — one of LAND_WAITS means
+                       the worker is idle because the next move is the tick's,
+                       which is not a silence; and whether it is ONE PR's held
+                       turn, restarted yet or not (`single_turn_held`,
+                       `restartable_turn`), which picks the rung of the silence
+                       ladder. A merge batch's turn (`batch`) has no rungs of its
+                       own: its worker is classified like a PR-less claim's.
 
     Returns {"cause", "outcome", "action", "idle_seconds", "pending_blockers"}.
-    `cause` — one of WORKER_CAUSES — is the decision, and what the tick routes on;
-    `outcome` / `action` are how `afk no-pr` prints it:
-      within_grace       coding       leave         — a sign of life within grace.
-      awaiting_tick      coding       leave         — no verdict, and its landing
-                                                      stopped for the tick.
-      satisfied          idle_done    close_release — `already-satisfied` + NO changes
-                                                      on the branch: the tick verifies
-                                                      the empty diff, closes + releases.
-      satisfied_refuted  idle_failed  next_attempt  — `already-satisfied`, refuted by
-                                                      work on the branch.
-      blockers_closed    idle_blocked redispatch    — `blocked`, and every blocked_by
-                                                      is now closed.
-      blockers_waiting   idle_blocked park          — `blocked`, and every blocked_by
-                                                      still open is one the backlog
-                                                      will resolve: `afk park` records
-                                                      the dependency and waits for it
-                                                      (ADR-0022).
-      blocker_unmet      idle_blocked escalate      — `blocked`, and a blocked_by is
-                                                      one nothing will resolve.
-      no_blocker_named   idle_blocked escalate      — `blocked`, naming none, so
-                                                      nothing can ever clear.
-      silent             idle_stalled nudge         — NO verdict at all, never nudged:
-                                                      the worker stopped without an
-                                                      outcome — typically waiting on a
-                                                      question nobody will answer.
-                                                      `afk nudge` tells it to carry on;
-                                                      no attempt is spent (ADR-0018).
-      silent_on_turn     idle_stalled restart       — no verdict even after a nudge
-                                                      (or with nowhere to record
-                                                      one), on a landing turn not
-                                                      yet restarted: the PR was
-                                                      judged ready, only the landing
-                                                      did not happen. `afk turn
-                                                      --restart` puts a new worker on
-                                                      the turn; nothing is closed or
-                                                      counted (ADR-0035).
-      silent_past_restart idle_stalled escalate     — the same silence on a landing
-                                                      turn that already had its one
-                                                      restart: nobody could get a
-                                                      worker to land a PR the tick
-                                                      judged ready, so `afk escalate`
-                                                      hands it to a human with the
-                                                      PR, branch and worktree kept;
-                                                      no attempt is spent (ADR-0035).
-      gave_up            idle_failed  next_attempt  — `giving-up`.
-      unknown_phase      idle_failed  next_attempt  — a verdict naming no phase the
-                                                      fleet knows.
-      silent_after_nudge idle_failed  next_attempt  — no verdict even after a nudge,
-                                                      and no landing turn of one PR
-                                                      to climb instead.
-      silent_unnudgeable idle_failed  next_attempt  — no verdict, and nowhere to
-                                                      record a nudge.
-    Every `next_attempt` is failure handling (`afk fail`); a landing turn's
-    silence never comes to one.
+    `cause` is the decision — one of the `classify_stopped` rows of WORKER_CAUSES,
+    which says what each means and what the tick does about it; `outcome` /
+    `action` are that row's words for a human.
 
     `idle_seconds` is the time since the MOST RECENT sign of life (last commit,
-    newest file mtime, terminal activity, the nudge, the landing turn — a nudged
-    worker, or one just given its turn, gets a whole grace period to answer); None
-    when none is known, which is never "within grace". Commits ahead / a dirty tree
-    are standing facts — true until the branch merges — never signs of life
+    newest file mtime, terminal activity, the nudge, the landing turn); None
+    when none is known, which is never "within grace". Commits ahead / a dirty
+    tree are standing facts — true until the branch merges — never signs of life
     (ADR-0013). `pending_blockers` is `blocked_route`'s: the blocked_by not yet
     done, [] for any other verdict.
     """
@@ -1437,7 +1400,8 @@ def stall_reason(reason, tail):
 # is made of.
 
 # Every `outcome` `afk land` can stop with — the vocabulary the worker's prompt
-# routes on (a test holds the prompt and the docs to it).
+# routes on (a test holds the prompt and the docs to it). What each means is
+# `afk.cmd_land`'s docstring, and nowhere else in the code.
 LAND_OUTCOMES = ("merged", "conflict", "gate_red", "awaiting_ci", "needs_verify", "no_checks")
 
 # The landing outcomes where the next move is the TICK's, not the worker's: the
@@ -1445,7 +1409,8 @@ LAND_OUTCOMES = ("merged", "conflict", "gate_red", "awaiting_ci", "needs_verify"
 LAND_WAITS = ("awaiting_ci", "needs_verify", "no_checks")
 
 # Every `outcome` `afk turn` can stop with — the vocabulary the tick's
-# instructions route on (a test holds the docs to it).
+# instructions route on (a test holds the docs to it). What each means is
+# `afk.cmd_turn`'s docstring; what the tick does next with it is `turn_step`.
 TURN_OUTCOMES = ("granted", "waiting", "landing", "awaiting_ci", "gate_red", "no_checks",
                  "needs_verify")
 
@@ -1477,7 +1442,7 @@ def _batch_members(raw):
 
 # The PRs a merge batch holds, in stack order, each with the issue it closes.
 _MEMBERS = FieldType(lambda members: ",".join(f"{m['issue']}:{m['pr']}" for m in members),
-                     lambda raw: _batch_members(raw) or None)
+                     lambda raw: _batch_members(raw) or None, empty=())
 
 # The landing turn, as the marker of one comment on a PR. A marker that names no
 # instance is not a record — nobody could hold it.
@@ -1488,41 +1453,29 @@ TURN_RECORD = RecordKind("afk:turn", {
     "unbatched": one_of(UNBATCHED), "of": str, "released": FLAG}, ("instance",))
 
 
-def land_outcome(outcome):
-    """`outcome`, refused unless it is one of LAND_OUTCOMES: `afk land` cannot
-    stop with a word the worker was never told how to act on."""
-    if outcome not in LAND_OUTCOMES:
-        raise ValueError(f"not a landing outcome: {outcome!r}")
-    return outcome
+def _refusing(vocabulary, what):
+    """`outcome → outcome`, refused (ValueError) unless it is a word of
+    `vocabulary`: a subcommand cannot stop with a word its caller was never told
+    how to act on."""
+    def check(outcome):
+        if outcome not in vocabulary:
+            raise ValueError(f"not {what}: {outcome!r}")
+        return outcome
+    return check
 
 
-def turn_outcome(outcome):
-    """`outcome`, refused unless it is one of TURN_OUTCOMES: one PR's turn
-    cannot stop with a word only a merge batch's is routed on (ADR-0036)."""
-    if outcome not in TURN_OUTCOMES:
-        raise ValueError(f"not a turn outcome: {outcome!r}")
-    return outcome
+# One guard per vocabulary: one PR's turn cannot stop with a word only a merge
+# batch's is routed on, nor the other way round (ADR-0036).
+land_outcome = _refusing(LAND_OUTCOMES, "a landing outcome")
+turn_outcome = _refusing(TURN_OUTCOMES, "a turn outcome")
+batch_turn_outcome = _refusing(BATCH_TURN_OUTCOMES, "a batch turn outcome")
+batch_outcome = _refusing(BATCH_OUTCOMES, "a batch outcome")
 
 
-def batch_turn_outcome(outcome):
-    """`outcome`, refused unless it is one of BATCH_TURN_OUTCOMES."""
-    if outcome not in BATCH_TURN_OUTCOMES:
-        raise ValueError(f"not a batch turn outcome: {outcome!r}")
-    return outcome
-
-
-def batch_outcome(outcome):
-    """`outcome`, refused unless it is one of BATCH_OUTCOMES."""
-    if outcome not in BATCH_OUTCOMES:
-        raise ValueError(f"not a batch outcome: {outcome!r}")
-    return outcome
-
-
-# The record of a PR that was never granted a turn: every field `latest_turn`
-# gives back, at the value that says nothing.
-_NO_TURN = {"instance": None, "at": None, "verified": None, "allow_no_checks": False,
-            "stopped": None, "head": None, "restarted": None, "batch": None, "members": [],
-            "phase": None, "unbatched": None, "of": None, "released": False, "comment_id": None}
+# The record of a PR that was never granted a turn: every field of TURN_RECORD
+# saying nothing, plus the comment a record was read from — which is where its
+# rewrite goes.
+_NO_TURN = {**blank_record(TURN_RECORD), "comment_id": None}
 
 
 def _whole_turn(fields):
@@ -1638,15 +1591,12 @@ def turn_comment(turn):
 def latest_turn(comments):
     """
     The landing turn recorded on a PR, from its comments ([{"id", "body"}...],
-    oldest first) → {"instance", "at", "verified", "allow_no_checks", "stopped",
-    "head", "restarted", "batch", "members", "phase", "unbatched", "of",
-    "released", "comment_id"}, or None when the PR was never granted one —
-    `latest_record`'s. `restarted` is when a silent worker was restarted onto
-    the turn (ADR-0035), None while none was.
-    `batch` / `members` / `phase` are a merge batch's turn (None / [] / None on a
-    single one); `unbatched` is the UNBATCHED word of a PR that left a batch and
-    `of` the batch it left; `released` says the marker holds no turn at all.
-    `turn_comment` renders the record back: the two are a round trip.
+    oldest first) → every field of TURN_RECORD — one the marker does not state
+    at its type's `empty` — plus `comment_id`; or None when the PR was never
+    granted one (`latest_record`'s). `batch` / `members` / `phase` are set on a
+    merge batch's turn only, `stopped` / `head` once an `afk land` stopped;
+    `released` says the marker holds no turn at all. `turn_comment` renders the
+    record back: the two are a round trip.
     """
     record, comment = latest_record(TURN_RECORD, comments)
     if record is None:
@@ -1810,6 +1760,26 @@ def batch_candidates(mine, merge_order, config, busy=()):
     return picked if len(picked) >= 2 else []
 
 
+def turn_holder(ws, instance):
+    """Who holds this fleet's landing turn, as far as a merge batch goes → (who,
+    what), the first of these that is so — the one precedence `tick_plan` and
+    `afk turn --batch` both read:
+
+      "dead"    the merge batches of other (dead) fleet instances still on record
+                on claims I took — nothing is granted until they are abandoned
+      "mine"    my own batch
+      "single"  the issue number of the one PR that holds the turn
+      None      no turn is out (what is None too)"""
+    dead = [b for b in ws["batches"] if b["instance"] != instance]
+    if dead:
+        return "dead", dead
+    mine = next((b for b in ws["batches"] if b["instance"] == instance), None)
+    if mine:
+        return "mine", mine
+    single = next((r["number"] for r in ws["mine"] if r["status"] == "landing"), None)
+    return ("single", single) if single is not None else (None, None)
+
+
 def stack_message(title, pr, issue):
     """The message of the merge commit a batched PR is stacked with: the PR's
     title, `(#<pr>)`, and the closing keyword. The `(#<pr>)` is also how the
@@ -1859,23 +1829,15 @@ def batch_landed_comment(commit, target, batch, prs):
             f"is on `{target}`.")
 
 
-# What a tick does about the batch that holds the turn, for each cause its
-# worker's row can carry — it holds no claim and declares no verdict.
-_BATCH_STEPS = {"working": "leave", "just_stopped": "leave", "within_grace": "leave",
-                "awaiting_tick": "leave", "gone": "continue", "silent": "nudge",
-                "silent_after_nudge": "abandon", "silent_unnudgeable": "abandon"}
-
-
 def batch_step(worker):
     """What a tick does about the batch that holds the turn, from the cause its
-    worker was classified with → "leave" (it is at it) | "continue" (no terminal:
-    a new batch worker is started in its worktree, else from its pushed branch)
-    | "nudge" (silent past grace, once) | "abandon" (still silent a grace period
-    later: nothing landed, its PRs take single turns). A cause with no step here
+    worker was classified with → that cause's `batch_step` in WORKER_CAUSES. A
+    batch's worker holds no claim and declares no verdict, so a cause with none
     is an error."""
-    if worker["cause"] not in _BATCH_STEPS:
+    step = getattr(WORKER_CAUSES.get(worker["cause"]), "batch_step", None)
+    if step is None:
         raise ValueError(f"no step for a batch worker classified {worker['cause']!r}")
-    return _BATCH_STEPS[worker["cause"]]
+    return step
 
 
 # --------------------------------------------------------------------------- #
@@ -2097,7 +2059,7 @@ def furthest_ahead(ahead_by_branch):
     return max(names, key=lambda b: ahead_by_branch[b] or 0) if names else None
 
 
-def select_recovery(worktree, branch):
+def select_recovery(worktree, branch, fresh=False, landing_pr=None):
     """
     How to recover ONE claim whose worker has died — the continue-vs-fresh
     selection of ADR-0011, tiered by what survived. Pure: `afk recovery` gathers
@@ -2107,6 +2069,13 @@ def select_recovery(worktree, branch):
                 {"present": bool, "commits_ahead": int|None, "dirty": bool}
       branch:   the issue's branch on the remote (None / {} if unknown)
                 {"name": str|None, "commits_ahead": int|None}   (ahead of base)
+      fresh:    the previous attempt was discarded — a retry. Nothing is read:
+                tier 3, whatever the signals say.
+      landing_pr: the number of the issue's PR when it holds this fleet's landing
+                turn on its own (not in a merge batch), else None. The worker is
+                then started ON the turn (ADR-0027): `prompt` is "landing", and
+                with no worktree here one is recreated at the PR's head — never
+                from base.
 
     Returns {"tier", "action", "prompt", "reason"}:
       1  reuse_worktree   a worktree is still HERE → spawn the new worker inside
@@ -2118,16 +2087,21 @@ def select_recovery(worktree, branch):
       3  dispatch_fresh   nothing survived → re-dispatch from base. The ONLY
                           tier that tears down.
 
-    `prompt` picks the worker-prompt variant: `continue` (inspect the existing
-    progress first) or `fresh`. A surviving worktree that is *provably* pristine
+    `prompt` picks the brief: a worker-prompt variant — `continue` (inspect the
+    existing progress first) or `fresh` — or `landing`, the landing brief
+    (`render_landing`). A surviving worktree that is *provably* pristine
     — zero commits ahead, a clean tree, and nothing pushed on its branch either —
     gets the fresh prompt: there is nothing to continue, and telling a worker
     otherwise sends it looking for work that isn't there. Unreadable progress
     (`commits_ahead: None`) is NOT pristine: we never hand out a fresh prompt over
     a worktree we could not read.
     """
+    if fresh:
+        return {"tier": 3, "action": "dispatch_fresh", "prompt": "fresh",
+                "reason": "fresh start: the previous attempt was discarded"}
     wt, br = worktree or {}, branch or {}
     pushed = int(br.get("commits_ahead") or 0)
+    held = "landing" if landing_pr else None
     if wt.get("present"):
         ahead = wt.get("commits_ahead")
         known = ahead is not None
@@ -2143,7 +2117,11 @@ def select_recovery(worktree, branch):
             reason = (f"local worktree present with {int(ahead)} commit(s) ahead"
                       + (" and uncommitted changes" if wt.get("dirty") else ""))
         return {"tier": 1, "action": "reuse_worktree",
-                "prompt": "fresh" if pristine else "continue", "reason": reason}
+                "prompt": held or ("fresh" if pristine else "continue"), "reason": reason}
+    if held:
+        return {"tier": 2, "action": "recreate_at_tip", "prompt": held,
+                "reason": f"no local worktree; PR #{landing_pr} holds the landing turn — "
+                          f"recreate at its head"}
 
     name, ahead = br.get("name"), br.get("commits_ahead")
     if name and ahead is not None and int(ahead) > 0:
@@ -2812,6 +2790,10 @@ def _standing(state):
 
 JUDGMENT_KINDS = ("empty_diff", "no_checks", "adversarial_verify", "reason")
 
+# The subcommands that may start a worker, and so take `--worker-command`: the
+# parser adds the flag to exactly these, and `afk_command` writes it for them.
+STARTS_WORKER = ("dispatch", "turn", "fail")
+
 
 def afk_command(call, sub, number, *flags):
     """One runnable `afk` transition on issue <number>, as a shell line.
@@ -2821,7 +2803,7 @@ def afk_command(call, sub, number, *flags):
       flags: the transition's own, last — a `--reason` is the final argument
     """
     argv = [call["afk_path"], sub, "--issue", str(number), "--instance", call["instance"]]
-    if sub in ("dispatch", "turn", "fail"):
+    if sub in STARTS_WORKER:
         argv += ["--worker-command", call["worker_command"]]
     return shlex.join([*argv, "--repo", call["repo"], "--config", call["config"], *flags])
 
@@ -2923,62 +2905,76 @@ def turn_step(call, result, config, restart=False):
     return "leave", None
 
 
+def _reason_on_record(cause, row, worker):
+    """The words a tick fails or escalates a claim with, for a cause that ends
+    in one → (the reason, None when it is not on record and must be asked for;
+    what stands in for it meanwhile). The cause picks the wording; what the
+    verdict declared is read only for the words quoted."""
+    verdict = worker.get("worker_verdict") or {}
+    if cause == "silent_past_restart":
+        return (f"PR #{row['pr']} was judged ready and given the landing turn, its worker was "
+                f"restarted onto the turn once, and the landing still did not happen: "
+                f"{row.get('stopped') or 'no `afk land` outcome'}. The PR, its branch and its "
+                f"worktree are kept as they are"), None
+    if cause == "blocker_unmet":
+        unmet = [f"#{b['number']} {b['reason']}" for b in worker.get("blockers") or []
+                 if b["standing"] == "unmet"]
+        return f"blocked by a dependency nothing will resolve: {'; '.join(unmet)}", None
+    if cause == "no_blocker_named":
+        said = verdict.get("reason")
+        return (f"its worker reported blocked, naming no blocker: {said}" if said else None,
+                "its worker reported blocked without naming a blocker")
+    if cause == "satisfied_refuted":
+        return "its worker declared `already-satisfied`, but the branch holds changes", None
+    if cause == "gave_up":
+        said = verdict.get("reason")
+        return f"its worker gave up: {said}" if said else None, "its worker gave up"
+    if cause == "unknown_phase":
+        return (f"its worker's verdict names no phase the fleet knows "
+                f"({verdict.get('phase')!r})"), None
+    if cause == "silent_after_nudge":
+        return "idle with no PR and no verdict a grace period after its nudge", None
+    if cause == "silent_unnudgeable":
+        return "idle with no PR and no verdict, and no worktree here to nudge it in", None
+    raise ValueError(f"issue #{row['number']}: no reason is worded for a worker classified "
+                     f"{cause!r}")
+
+
 def worker_step(call, row, worker, config):
     """
-    What a tick does about one claim it asked after, from the cause its worker
-    was classified with (WORKER_CAUSES) → (do, detail):
+    What a tick does about one claim it asked after → (do, detail). `do` is the
+    `step` of the cause its worker was classified with (WORKER_CAUSES), which
+    is mapped and never re-derived:
 
-      ("leave", None)       working, just_stopped, within_grace, awaiting_tick:
-                            the worker is at it, or the next move is not its
-      ("dispatch", None)    blockers_closed, or gone (no worker left):
-                            `afk dispatch` — an orphaned claim is ALWAYS continued,
-                            never released back
-      ("park", None)        blockers_waiting: `afk park`
-      ("nudge", None)       silent: `afk nudge`
-      ("restart", None)     silent_on_turn: `afk turn --restart` — a new worker
-                            onto the landing turn, nothing closed or counted
-      ("escalate", reason)  `afk escalate`: the reason is on record — a blocker
-                            nothing will resolve, or a landing turn silent
-                            past its one restart (silent_past_restart): the PR,
-                            branch and worktree go to the human as they are,
-                            and no attempt is spent (ADR-0035)
-      ("fail", reason)      `afk fail`: the reason is on record — or the row is
-                            `starting`, and whatever its worker is, short of at
-                            work, the retry already counted is finished. A
-                            landing claim's silence never comes here: the two
-                            silence causes that fail a PR-less claim are an
-                            error on a `landing` row
-      ("judge", {...})      satisfied → `empty_diff`; a failure or an escalation
-                            whose reason is NOT on record → `reason`
+      ("leave" | "dispatch" | "park" | "nudge" | "restart", None)
+      ("escalate" | "fail", reason)   the reason is on record (`_reason_on_record`)
+      ("judge", {...})                `satisfied` → `empty_diff`; a failure or an
+                                      escalation whose reason is NOT on record →
+                                      `reason`
 
       row:    the claim's `mine` row      worker: its classification plus what
                                           `afk no-pr` gathered for it
 
-    The cause is mapped, never re-derived: what the verdict declared is read here
-    only for the words a reason quotes. A cause with no route is an error.
+    Two rules sit on top of the table. A `starting` row — a retry already
+    counted, cut short before its fresh worker started — is failed whatever its
+    worker is, short of at work: the retry is finished, and nothing is counted
+    again. And a `landing` row is never failed for silence: classified with one
+    of the two causes that fail a PR-less claim, it holds no turn of one PR,
+    which is an error (ADR-0035). A cause with no row is an error too.
     """
     number, cause = row["number"], worker["cause"]
-    verdict = worker.get("worker_verdict") or {}
-    said = {"verdict": verdict.get("comment_url")}
-    if cause in ("working", "just_stopped", "within_grace", "awaiting_tick"):
+    if cause not in WORKER_CAUSES:
+        raise ValueError(f"issue #{number}: no route for a worker classified {cause!r}")
+    step = WORKER_CAUSES[cause].step
+    said = {"verdict": (worker.get("worker_verdict") or {}).get("comment_url")}
+    if step == "leave":
         return "leave", None
-    if row.get("starting") and WORKER_CAUSES[cause][1] != "next_attempt":
+    if row.get("starting") and step != "fail":
         # a retry cut short: whatever is here is the attempt it was discarding
         return "fail", "the retry of its failed attempt was cut short before a fresh worker started"
-    if cause in ("blockers_closed", "gone"):
-        return "dispatch", None
-    if cause == "blockers_waiting":
-        return "park", None
-    if cause == "silent":
-        return "nudge", None
-    if cause == "silent_on_turn":
-        return "restart", None
-    if cause == "silent_past_restart":
-        return "escalate", (f"PR #{row['pr']} was judged ready and given the landing turn, its "
-                            f"worker was restarted onto the turn once, and the landing still did "
-                            f"not happen: {row.get('stopped') or 'no `afk land` outcome'}. The "
-                            f"PR, its branch and its worktree are kept as they are")
-    if cause == "satisfied":
+    if step in ("dispatch", "park", "nudge", "restart"):
+        return step, None
+    if step == "judge":
         base = config["base_branch"]
         return "judge", judgment(
             "empty_diff", number,
@@ -2989,35 +2985,15 @@ def worker_step(call, row, worker, config):
             afk_command(call, "fail", number, "--reason",
                         f"its worker declared `already-satisfied`, but the branch's diff "
                         f"against {base} is not empty"))
-    if cause == "blocker_unmet":
-        unmet = [f"#{b['number']} {b['reason']}" for b in worker.get("blockers") or []
-                 if b["standing"] == "unmet"]
-        return "escalate", f"blocked by a dependency nothing will resolve: {'; '.join(unmet)}"
-    if cause == "no_blocker_named":
-        if verdict.get("reason"):
-            return "escalate", f"its worker reported blocked, naming no blocker: {verdict['reason']}"
-        return "judge", reason_judgment(
-            call, number, "escalate", "its worker reported blocked without naming a blocker",
-            "its worker's verdict comment", said)
-    if cause == "satisfied_refuted":
-        return "fail", "its worker declared `already-satisfied`, but the branch holds changes"
-    if cause == "gave_up":
-        if verdict.get("reason"):
-            return "fail", f"its worker gave up: {verdict['reason']}"
-        return "judge", reason_judgment(call, number, "fail", "its worker gave up",
-                                        "its worker's verdict comment", said)
-    if cause == "unknown_phase":
-        return "fail", (f"its worker's verdict names no phase the fleet knows "
-                        f"({verdict.get('phase')!r})")
-    if cause in ("silent_after_nudge", "silent_unnudgeable"):
-        if row["status"] == "landing":
-            raise ValueError(f"issue #{number}: a landing claim's silence is never a failure — "
-                             f"its turn is restarted onto, then escalated (ADR-0035); a "
-                             f"`landing` row classified {cause!r} holds no turn of one PR")
-        if cause == "silent_after_nudge":
-            return "fail", "idle with no PR and no verdict a grace period after its nudge"
-        return "fail", "idle with no PR and no verdict, and no worktree here to nudge it in"
-    raise ValueError(f"issue #{number}: no route for a worker classified {cause!r}")
+    if row["status"] == "landing" and cause in ("silent_after_nudge", "silent_unnudgeable"):
+        raise ValueError(f"issue #{number}: a landing claim's silence is never a failure — "
+                         f"its turn is restarted onto, then escalated (ADR-0035); a "
+                         f"`landing` row classified {cause!r} holds no turn of one PR")
+    reason, default = _reason_on_record(cause, row, worker)
+    if reason:
+        return step, reason
+    return "judge", reason_judgment(call, number, step, default, "its worker's verdict comment",
+                                    said)
 
 
 # --------------------------------------------------------------------------- #
@@ -3170,8 +3146,9 @@ def tick_plan(ws, call, config):
 
       answer: (result, None) when the step was carried out — `result` is what
               its transition returned, a START_OUTCOMES word for `begin` — or
-              (None, "<what it raised>") when it failed. `finish` is answered
-              with a list of such pairs, one per issue, in the order given
+              (None, "<what it raised>") when it failed. `finish`'s result is
+              itself a list of such pairs, one per issue, in the order given:
+              one start may fail where the others ran
 
     Returns (as the generator's value) {"did": the tick's account for
     `cycle_ticked`, "judgments", "errors", "held": the claims whose status board
@@ -3257,8 +3234,8 @@ def tick_plan(ws, call, config):
             break
         yield from begin(issue["number"], "dispatched", frontier=True)
     if tick.begun:      # every agent is waited for and handed its prompt at once
-        workers = yield {"do": "finish", "issues": [n for _, n in tick.begun]}
-        for (counted, number), (worker, error) in zip(tick.begun, workers):
+        workers = yield from run("finish", issues=[n for _, n in tick.begun])
+        for (counted, number), (worker, error) in zip(tick.begun, workers or []):
             if error is not None:
                 tick.failed("finish", number, error)
             elif worker:
@@ -3301,15 +3278,15 @@ def _turn_plan(tick, call, config):
             tick.did("abandoned", *gone["issues"])
         return gone
 
-    dead = [b for b in ws["batches"] if b["instance"] != instance]
-    mine = next((b for b in ws["batches"] if b["instance"] == instance), None)
-    live = {mine["id"]} if mine else set()
-    if dead:
-        for batch in dead:
+    who, what = turn_holder(ws, instance)
+    live = {b["id"] for b in ws["batches"] if b["instance"] == instance}
+    if who == "dead":
+        for batch in what:
             if not (yield from abandon(batch)):
                 live.add(batch["id"])
         return live
-    if mine:
+    if who == "mine":
+        mine = what
         seen = yield from run("no-pr", batch=mine["id"])
         do = batch_step(seen["workers"][0]) if seen else "leave"
         if do == "continue":
@@ -3672,7 +3649,7 @@ def assemble_working_set(issues, prs, claims, heartbeats, me, now, config,
        "fingerprint": <digest of the same observables the gate hashes>,
        "now": now}
 
-    `status` and `board_phase` are `subclassify_pr`'s pair; `attempt` is
+    `status` is `claim_status`'s and `board_phase` what BOARD_PHASE_OF shows for it; `attempt` is
     `current_attempt` — the number `afk status` takes; `starting` is
     `attempt_starting` — a retry cut short, for `afk fail` to finish; `stopped` is the
     LAND_OUTCOMES word a `landing` row's `afk land` last stopped with, None while
@@ -3716,8 +3693,8 @@ def assemble_working_set(issues, prs, claims, heartbeats, me, now, config,
         issue = by_num.get(n, {})
         turn = turns.get(n) or {}
         held = held_turn(turn, me) or {}
-        status, board_phase = subclassify_pr(pr is not None, checks, ci_mode,
-                                             closed=n in closed, landing=bool(held))
+        status = claim_status(pr is not None, checks, ci_mode,
+                              closed=n in closed, landing=bool(held))
         batch = held.get("batch") if status == "landing" else None
         if turn.get("batch") and not turn.get("released") and n not in closed:
             seen = batches.setdefault(turn["batch"], {
@@ -3725,7 +3702,7 @@ def assemble_working_set(issues, prs, claims, heartbeats, me, now, config,
                 "phase": turn["phase"], "at": turn["at"]})
             seen["at"] = max(seen["at"] or 0, turn["at"] or 0) or None
         mine.append({"number": n, "title": issue.get("title"),
-                     "status": status, "board_phase": None if batch else board_phase,
+                     "status": status, "board_phase": None if batch else BOARD_PHASE_OF[status],
                      "pr": pr.get("number") if pr else None, "checks": checks,
                      "attempt": current_attempt(issue.get("labels")),
                      "starting": attempt_starting(issue.get("labels")),

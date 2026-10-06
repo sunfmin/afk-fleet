@@ -19,22 +19,16 @@ authorization, ADR-0023):
 ready_label: ready-for-agent          # a child issue is dispatchable when it carries this
                                       #   (a human reserves an issue by REMOVING this label)
 epic_labels: [epic, prd, wayfinder:map]   # never dispatched (a PRD is not a worker task)
-claim: ref                            # atomic lock ref refs/afk/claim/<n> marks an issue as taken —
-                                      #   replaces assignee; required for cooperating multi-fleet (ADR-0003)
 claim_namespace: refs/afk             # where claim + heartbeat refs live: refs/afk | refs/heads, nothing
                                       #   else. Leave it: bootstrap's `afk probe`
                                       #   switches the run to refs/heads (ordinary afk-claim/* branches, so
                                       #   `on: push` CI fires) when an org ruleset forbids non-branch refs.
                                       #   Set refs/heads here only to skip that probe-and-warn every run.
-dependencies: native                   # GitHub native blocked_by (open blockers gate dispatch)
 
 # --- workers ---
 base_branch: main
 branch_pattern: "issue-{number}-{slug}"   # worktree-NAME hint passed to `orca worktree create --name`;
                                       #   orca sets the real branch (prefixed <user>/…) — ADR-0005
-worker: orca                           # the only supported backend: orca creates the worktree + branch
-                                      #   (ADR-0005), then the fleet starts a real Claude Code in it with
-                                      #   the run's worker launch command — NOT a key here (ADR-0010)
 concurrency: 3                         # max workers running at once
 worktree_cleanup: true                 # after a landing or a close, remove the worker's worktree (via orca).
                                       #   An escalated issue's worktree is always left for the human.

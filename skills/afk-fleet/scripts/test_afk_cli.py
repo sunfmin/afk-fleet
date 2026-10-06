@@ -291,11 +291,11 @@ if parts == ["issues"]:                  # the list: issues AND pull requests, a
     rows = [r for r in st["issues"] if r.get("state", "open") == "open"]
     if "--paginate" not in argv:
         rows = rows[:int(query.get("per_page", 30))]
-    assert jq == (".[] | select(.pull_request == null) | {number, title, "
+    assert jq == (".[] | select(.pull_request == null) | {number, id, title, "
                   "labels: [.labels[].name], updatedAt: .updated_at, "
                   "blocked_by: (.issue_dependencies_summary.blocked_by // 0)}"), \
         "fake gh: unsupported jq %%r" %% jq
-    finish("\n".join(json.dumps({"number": r["number"], "title": r["title"],
+    finish("\n".join(json.dumps({"number": r["number"], "id": issue_id(r), "title": r["title"],
                                   "labels": [lb["name"] for lb in r["labels"]],
                                   "updatedAt": r["updatedAt"],
                                   "blocked_by": open_blockers(r) or 0})
@@ -318,19 +318,13 @@ if parts[0] == "issues" and parts[2:] == ["dependencies", "blocked_by"]:
 
 if parts[0] == "issues" and len(parts) == 2:
     row = issue_row(parts[1])
-    if jq == ".state":
-        finish(row.get("state", "open"))
-    if jq == ".id":
-        finish(str(issue_id(row)))
-    if jq == ("{state, state_reason, labels: [.labels[].name], "
+    if jq == ("{id, title, state, state_reason, labels: [.labels[].name], "
               "pull_request: (.pull_request != null)}"):
-        finish(json.dumps({"state": row.get("state", "open"),
+        finish(json.dumps({"id": issue_id(row), "title": row["title"],
+                           "state": row.get("state", "open"),
                            "state_reason": row.get("state_reason"),
                            "labels": [lb["name"] for lb in row["labels"]],
                            "pull_request": "pull_request" in row}))
-    if jq == "{title, state, labels: [.labels[].name]}":
-        finish(json.dumps({"title": row["title"], "state": row.get("state", "open"),
-                           "labels": [lb["name"] for lb in row["labels"]]}))
     assert False, "fake gh: unsupported jq %%r" %% jq
 
 if parts[0] == "branches" and parts[2:] == ["protection"]:
@@ -866,7 +860,9 @@ def test_rebuild_reports_free_slots_and_a_claim_whose_issue_is_closed():
         assert rows == {2: ("closed", None, None), 3: ("no_pr", "claimed", "issue 3")}
         assert ws["free_slots"] == 1 and ws["frontier"]["dispatch"] == [{"number": 1, "title": "issue 1"}]
         # the state read is paid only by a claim missing from the open list
-        assert [c[1] for c in w.calls() if ".state" in c] == [f"repos/{REPO}/issues/2"]
+        one = f"repos/{REPO}/issues/"
+        assert [c[1] for c in w.calls() if c[1].startswith(one) and c[1][len(one):].isdigit()] \
+            == [one + "2"]
         assert w.afk("rebuild", *ME, *R, *NOW, "--set", "concurrency=1")["free_slots"] == 0
 
         # the one thing left to do for it
@@ -1330,28 +1326,27 @@ def test_a_claim_ref_write_is_in_the_scan_made_before_it():
     with world(issues=[issue(1, "ready-for-agent")]) as w:
         w.afk("claim", "2", "--instance", "peer", *NOW, *R)
         with inside(w) as rem:
-            cfg = afk_decide.resolve_config({})
-            ns = cfg["claim_namespace"]
+            run = afk._Run(repo=REPO, rem=rem, cfg=afk_decide.resolve_config({}), clock=T0)
 
             def owners():
-                return {c["number"]: c["instance"] for c in afk._scan(rem, ns)[0]}
+                return {c["number"]: c["instance"] for c in afk._scan(run)[0]}
 
-            scan = afk._scan(rem, ns)
+            scan = afk._scan(run)
             assert owners() == {2: "peer"} and scan[1] == {}
-            assert afk._claim(rem, cfg, 1, "me", T0, "host")["won"]
+            assert afk._claim(run, 1, "me", "host")["won"]
             assert owners() == {1: "me", 2: "peer"}
             peer = next(c["sha"] for c in scan[0] if c["number"] == 2)
-            assert afk._force_take(rem, cfg, 2, peer, "me", T0 + 1, "host")["won"]
+            assert afk._force_take(run, 2, peer, "me", "host")["won"]
             assert owners() == {1: "me", 2: "me"}
-            assert afk._beat(rem, cfg, "me", T0)["refreshed"]
-            assert afk._scan(rem, ns)[1] == {"me": T0}
-            afk._release(rem, cfg, 1)
+            assert afk._beat(run, "me")["refreshed"]
+            assert afk._scan(run)[1] == {"me": T0}
+            afk._release(run, 1)
             mine = next(c["sha"] for c in scan[0] if c["number"] == 2)
-            afk._clear(rem, cfg, 2, mine)
-            assert owners() == {} and afk._scan(rem, ns) is scan          # one scan, kept in step
+            afk._clear(run, 2, mine)
+            assert owners() == {} and afk._scan(run) is scan          # one scan, kept in step
             # a claim it lost was not in the scan: that one is made again
             w.afk("claim", "3", "--instance", "peer", *NOW, *R)
-            assert not afk._claim(rem, cfg, 3, "me", T0, "host")["won"]
+            assert not afk._claim(run, 3, "me", "host")["won"]
             assert owners() == {3: "peer"}
 
 
@@ -1387,7 +1382,7 @@ _WRITES = {
     ("gh", "--method"): {"_comment", "_add_blocker"},
     ("git", "push"): {"_push_branch", "_delete_branch", "_claim", "_force_take", "_release",
                       "_clear", "_beat", "_usable_namespace", "_probe_gate_records",
-                      "_record_gate", "_drop_gate_record"},
+                      "_write_gate_record", "_drop_gate_record"},
 }
 
 
@@ -4623,6 +4618,15 @@ def _minimal_argv(name, sub):
         if act.required and act.option_strings and act.option_strings[0] != "--config":
             argv += [act.option_strings[0], required[act.option_strings[0]]]
     return argv
+
+
+def test_the_subcommands_that_start_a_worker_are_the_ones_a_judgment_writes_the_flag_for():
+    """A judgment's command carries `--worker-command` for exactly the
+    subcommands whose parser requires it: both read `STARTS_WORKER`."""
+    requires = {name for name, sub in afk.build_parser().subcommands.items()
+                if any(act.required and "--worker-command" in act.option_strings
+                       for act in sub._actions)}
+    assert requires == set(afk_decide.STARTS_WORKER)
 
 
 def test_config_is_required_and_resolves_one_way_on_every_subcommand():

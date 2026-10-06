@@ -52,7 +52,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    `skills/afk-fleet/scripts/afk_decide.py:wake_command`
 10. A later tick's rebuild matches that PR to the claim and classifies it: awaiting its **landing
     turn** once its checks are green (or, with `gate.ci: local`, as soon as the PR is open).
-    `skills/afk-fleet/scripts/afk_decide.py:subclassify_pr`
+    `skills/afk-fleet/scripts/afk_decide.py:claim_status`
 11. One PR at a time, in merge order, the tick grants the **landing turn**: it records the turn as
     a marker comment on the PR and tells the worker — one submitted line pointing at a landing
     brief — to land it. The tick merges nothing.
