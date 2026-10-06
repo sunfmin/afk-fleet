@@ -1330,28 +1330,27 @@ def test_a_claim_ref_write_is_in_the_scan_made_before_it():
     with world(issues=[issue(1, "ready-for-agent")]) as w:
         w.afk("claim", "2", "--instance", "peer", *NOW, *R)
         with inside(w) as rem:
-            cfg = afk_decide.resolve_config({})
-            ns = cfg["claim_namespace"]
+            run = afk._Run(repo=REPO, rem=rem, cfg=afk_decide.resolve_config({}), clock=T0)
 
             def owners():
-                return {c["number"]: c["instance"] for c in afk._scan(rem, ns)[0]}
+                return {c["number"]: c["instance"] for c in afk._scan(run)[0]}
 
-            scan = afk._scan(rem, ns)
+            scan = afk._scan(run)
             assert owners() == {2: "peer"} and scan[1] == {}
-            assert afk._claim(rem, cfg, 1, "me", T0, "host")["won"]
+            assert afk._claim(run, 1, "me", "host")["won"]
             assert owners() == {1: "me", 2: "peer"}
             peer = next(c["sha"] for c in scan[0] if c["number"] == 2)
-            assert afk._force_take(rem, cfg, 2, peer, "me", T0 + 1, "host")["won"]
+            assert afk._force_take(run, 2, peer, "me", "host")["won"]
             assert owners() == {1: "me", 2: "me"}
-            assert afk._beat(rem, cfg, "me", T0)["refreshed"]
-            assert afk._scan(rem, ns)[1] == {"me": T0}
-            afk._release(rem, cfg, 1)
+            assert afk._beat(run, "me")["refreshed"]
+            assert afk._scan(run)[1] == {"me": T0}
+            afk._release(run, 1)
             mine = next(c["sha"] for c in scan[0] if c["number"] == 2)
-            afk._clear(rem, cfg, 2, mine)
-            assert owners() == {} and afk._scan(rem, ns) is scan          # one scan, kept in step
+            afk._clear(run, 2, mine)
+            assert owners() == {} and afk._scan(run) is scan          # one scan, kept in step
             # a claim it lost was not in the scan: that one is made again
             w.afk("claim", "3", "--instance", "peer", *NOW, *R)
-            assert not afk._claim(rem, cfg, 3, "me", T0, "host")["won"]
+            assert not afk._claim(run, 3, "me", "host")["won"]
             assert owners() == {3: "peer"}
 
 
@@ -1387,7 +1386,7 @@ _WRITES = {
     ("gh", "--method"): {"_comment", "_add_blocker"},
     ("git", "push"): {"_push_branch", "_delete_branch", "_claim", "_force_take", "_release",
                       "_clear", "_beat", "_usable_namespace", "_probe_gate_records",
-                      "_record_gate", "_drop_gate_record"},
+                      "_write_gate_record", "_drop_gate_record"},
 }
 
 
