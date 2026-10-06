@@ -1760,7 +1760,7 @@ def batch_worktrees(worktrees, repo, batch=None, instance=None):
         m = rx.match(short_branch(w.get("branch")))
         if not m or w.get("isMainWorktree") or w.get("isArchived"):
             continue
-        if repo and w.get("projectId") != f"github:{repo}":
+        if repo and not in_orca_project(w, repo):
             continue
         hits.append((int(w.get("lastActivityAt") or 0),
                      {"batch": batch or m.group(1), "path": w.get("path"),
@@ -2010,6 +2010,15 @@ def short_branch(ref):
     return ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
 
 
+def in_orca_project(worktree, repo):
+    """Whether an orca worktree row belongs to `repo` ("owner/name"): its
+    `projectId` is `github:owner/name`, which orca writes lower-cased whatever
+    the repo's own casing — so, like `find_orca_repo`, compared case-insensitively
+    (as GitHub does). Compared exactly, a repo with a capital in its name owns no
+    worktree at all: every live worker reads as dead and is dispatched again."""
+    return (worktree.get("projectId") or "").lower() == f"github:{repo}".lower()
+
+
 def find_orca_worktree(worktrees, number, repo=None):
     """
     The orca worktree belonging to issue <number> on THIS machine, from
@@ -2019,7 +2028,7 @@ def find_orca_worktree(worktrees, number, repo=None):
       worktrees: rows carrying {linkedIssue, path, branch, projectId,
                  isMainWorktree, isArchived, lastActivityAt}
       repo:      "owner/name" — when given, a row must belong to it (orca's
-                 `projectId` is `github:owner/name`), so a same-numbered issue in
+                 `projectId` is `github:owner/name`, any casing), so a same-numbered issue in
                  another repo's worktree is never mistaken for this one.
 
     Returns {"found": bool, "path": str|None, "branch": str|None}. Several
@@ -2036,7 +2045,7 @@ def find_orca_worktree(worktrees, number, repo=None):
             continue
         if w.get("isMainWorktree") or w.get("isArchived"):
             continue
-        if repo and w.get("projectId") != f"github:{repo}":
+        if repo and not in_orca_project(w, repo):
             continue
         hits.append(w)
     if not hits:

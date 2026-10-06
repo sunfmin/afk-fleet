@@ -341,6 +341,9 @@ def test_a_batch_is_known_by_its_id_wherever_orca_puts_its_branch():
     mine = d.batch_worktrees(rows, "acme/widgets", instance="fl-1")
     assert sorted({w["batch"] for w in mine}) == ["fl-1-170", "fl-1-200"]
     assert d.batch_worktrees(rows, "acme/widgets", instance="fl-3") == []
+    # orca lower-cases the project id: a repo with a capital still owns its worktrees
+    assert d.batch_worktrees(rows, "Acme/Widgets", batch="fl-1-170") == \
+        d.batch_worktrees(rows, "acme/widgets", batch="fl-1-170")
 
 
 def test_the_cycle_forms_a_batch_only_from_two_or_more_eligible_prs():
@@ -1432,6 +1435,10 @@ def test_find_orca_worktree():
 
     # a same-numbered issue in ANOTHER repo is never mistaken for this one
     assert d.find_orca_worktree(rows, 9, "o/other")["path"] == "/wt/other-repo-9"
+    # orca lower-cases the project id whatever the repo's casing: compared exactly, a
+    # repo with a capital owns no worktree and every live worker is dispatched again
+    assert d.find_orca_worktree(rows, 9, "O/R")["path"] == "/wt/new-9"
+    assert d.find_orca_worktree([{**rows[1], "projectId": None}], 9, "o/r")["found"] is False
     # no repo filter → any project may match (single-repo machines)
     assert d.find_orca_worktree(rows, 7)["path"] == "/wt/7"
     # the main worktree is never a worker's, and a missing issue is simply not found
