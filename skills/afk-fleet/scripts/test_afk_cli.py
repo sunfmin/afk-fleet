@@ -4625,6 +4625,15 @@ def _minimal_argv(name, sub):
     return argv
 
 
+def test_the_subcommands_that_start_a_worker_are_the_ones_a_judgment_writes_the_flag_for():
+    """A judgment's command carries `--worker-command` for exactly the
+    subcommands whose parser requires it: both read `STARTS_WORKER`."""
+    requires = {name for name, sub in afk.build_parser().subcommands.items()
+                if any(act.required and "--worker-command" in act.option_strings
+                       for act in sub._actions)}
+    assert requires == set(afk_decide.STARTS_WORKER)
+
+
 def test_config_is_required_and_resolves_one_way_on_every_subcommand():
     """ADR-0009's one resolution order — `--set` → `--config` → the defaults table —
     holds on EVERY subcommand that reads config, because there is one mechanism

@@ -2799,6 +2799,10 @@ def _standing(state):
 
 JUDGMENT_KINDS = ("empty_diff", "no_checks", "adversarial_verify", "reason")
 
+# The subcommands that may start a worker, and so take `--worker-command`: the
+# parser adds the flag to exactly these, and `afk_command` writes it for them.
+STARTS_WORKER = ("dispatch", "turn", "fail")
+
 
 def afk_command(call, sub, number, *flags):
     """One runnable `afk` transition on issue <number>, as a shell line.
@@ -2808,7 +2812,7 @@ def afk_command(call, sub, number, *flags):
       flags: the transition's own, last — a `--reason` is the final argument
     """
     argv = [call["afk_path"], sub, "--issue", str(number), "--instance", call["instance"]]
-    if sub in ("dispatch", "turn", "fail"):
+    if sub in STARTS_WORKER:
         argv += ["--worker-command", call["worker_command"]]
     return shlex.join([*argv, "--repo", call["repo"], "--config", call["config"], *flags])
 

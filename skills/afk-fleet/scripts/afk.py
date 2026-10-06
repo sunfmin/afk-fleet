@@ -3208,7 +3208,10 @@ def build_parser():
                        metavar="n")
 
     def starts_worker(p):
-        """The flags of a subcommand that may start a worker (dispatch, turn, fail)."""
+        """The flags of a subcommand that may start a worker — one of
+        `afk_decide.STARTS_WORKER`, which is what a judgment's command is
+        written from."""
+        assert p.prog.split()[-1] in afk_decide.STARTS_WORKER, p.prog
         stamp(p)
         p.add_argument("--worker-command", required=True, metavar="cmd",
                        help="the run's worker launch command, verbatim (ADR-0010)")
