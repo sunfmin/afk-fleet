@@ -2235,11 +2235,6 @@ def _grant_turn(run, instance, agent, number, allow_no_checks=False, verified=No
     turns = _claim_turns(run.repo, prs, _scan(rem, cfg["claim_namespace"])[0], instance)
     held = {n: t for n, t in turns.items() if afk_decide.held_turn(t, instance)}
     others = sorted(n for n in held if n != number)
-    if others:
-        return stop("waiting", holder=others[0],
-                    detail=f"issue #{others[0]}'s PR holds this fleet's landing turn; nothing was "
-                           f"touched — this PR's turn comes when that one has landed or failed")
-    prev = _turn(run.repo, pr["number"])
     mine = held.get(number)
     if restart:
         if not mine:
@@ -2250,7 +2245,12 @@ def _grant_turn(run, instance, agent, number, allow_no_checks=False, verified=No
             raise RuntimeError(f"the worker on issue #{number} was already restarted onto this "
                                f"turn once — a second silence is a failure (`afk fail`), not "
                                f"another restart")
-    elif mine and mine["stopped"] not in afk_decide.LAND_WAITS:
+    elif others:
+        return stop("waiting", holder=others[0],
+                    detail=f"issue #{others[0]}'s PR holds this fleet's landing turn; nothing was "
+                           f"touched — this PR's turn comes when that one has landed or failed")
+    prev = _turn(run.repo, pr["number"])
+    if not restart and mine and mine["stopped"] not in afk_decide.LAND_WAITS:
         return stop("landing",
                     detail="this PR already holds the landing turn and its worker has not "
                            "stopped for you; nothing was touched — `afk no-pr` watches it")
