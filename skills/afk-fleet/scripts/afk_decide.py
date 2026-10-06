@@ -2407,24 +2407,24 @@ _STATUS_STEPS = (
 )
 
 # The closed set of lifecycle phases the board renders, each with everything the
-# board says about it: how far along the happy path it has reached (the index of
-# the last DONE step) and its single ▸/✅/⚠️ 'where are we now' line. Happy path
+# board says about it: how far along the happy path it has reached (the key of
+# the last DONE step in _STATUS_STEPS) and its single ▸/✅/⚠️ 'where are we now' line. Happy path
 # plus five off-ramps that reuse the same checkboxes + an annotation: ci_failed,
 # awaiting_turn (the PR is ready and waits for the landing turn — one PR lands
 # at a time), escalated (a terminal give-up, ticked specially in
 # `render_status_board`), closed (the worker found the issue already satisfied —
 # `afk close`), and parked (the worker found an open dependency; the claim is
 # released until it closes — `afk park`).
-_NOTHING_REACHED = -1      # no step ticked: the phase is before, or outside, the happy path
+_NOTHING_REACHED = None    # no step ticked: the phase is before, or outside, the happy path
 _PHASES = {
-    "claimed":        (0, "▸ 当前:worker 实现中,尚无 PR"),
-    "pr_open":        (1, "▸ 当前:等 {gate}"),
-    "ci_failed":      (1, "▸ 当前:{gate} 失败,修复重试中({attempt}/{retry_max}) —— 见下方 {gate} 与评论"),
-    "awaiting_turn":  (1, "▸ 当前:PR 已就绪,排队等落地轮次 —— 一次只落地一个 PR,轮到后由 worker 自己合并"),
-    "landing":        (2, "▸ 当前:已轮到落地,worker 正在与目标分支同步、过门并合并 —— 见 PR 评论"),
-    "merged":         (3, "✅ 已合并,完成"),
-    "escalated":      (1, "⚠️ 已升级给人处理 —— 见下方评论"),
-    "closed":         (0, "✅ 主干已满足此需求,无需改动 —— 已关闭"),
+    "claimed":        ("claimed", "▸ 当前:worker 实现中,尚无 PR"),
+    "pr_open":        ("pr_open", "▸ 当前:等 {gate}"),
+    "ci_failed":      ("pr_open", "▸ 当前:{gate} 失败,修复重试中({attempt}/{retry_max}) —— 见下方 {gate} 与评论"),
+    "awaiting_turn":  ("pr_open", "▸ 当前:PR 已就绪,排队等落地轮次 —— 一次只落地一个 PR,轮到后由 worker 自己合并"),
+    "landing":        ("landing", "▸ 当前:已轮到落地,worker 正在与目标分支同步、过门并合并 —— 见 PR 评论"),
+    "merged":         ("merged", "✅ 已合并,完成"),
+    "escalated":      ("pr_open", "⚠️ 已升级给人处理 —— 见下方评论"),
+    "closed":         ("claimed", "✅ 主干已满足此需求,无需改动 —— 已关闭"),
     "parked":         (_NOTHING_REACHED, "⏸ 等待依赖 {blockers} 关闭 —— 关闭后自动重新派发,无需人工处理"),
 }
 STATUS_PHASES = tuple(_PHASES)
@@ -2464,18 +2464,20 @@ def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attem
         raise ValueError(f"unknown status phase: {phase!r}")
     gate = GATE_CI_MODES[gate_ci]
     reached, current = _PHASES[phase]
+    steps = [key for key, _ in _STATUS_STEPS]
+    ticked = steps[:steps.index(reached) + 1] if reached is not _NOTHING_REACHED else []
     escalated = phase == "escalated"
 
-    def done(i, key):
+    def done(key):
         if escalated:              # terminal give-up: only what truly happened stays ticked
-            return i == 0 or (key == "pr_open" and bool(pr))
-        return i <= reached
+            return key == "claimed" or (key == "pr_open" and bool(pr))
+        return key in ticked
 
     header = "**afk-fleet 进度**" + (f" · 认领方 `{instance}`" if instance else "")
     lines = [header, ""]
-    for i, (key, label) in enumerate(_STATUS_STEPS):
+    for key, label in _STATUS_STEPS:
         label = label.format(pr=f" (#{pr})" if pr else "", gate=gate)
-        lines.append(f"- [{'x' if done(i, key) else ' '}] {label}")
+        lines.append(f"- [{'x' if done(key) else ' '}] {label}")
     lines.append("")
     if batch and phase == "landing":
         current = _BATCH_LINE.format(prs="、".join(f"#{n}" for n in batch["prs"]),
@@ -3472,7 +3474,7 @@ def resolve_worker_command(base_url, supplied=None, resolved=None, runtime="clau
                 "first_word": fw or None, "yolo": yolo, "detail": detail, "runtime": runtime}
 
     if runtime == "qoderclicn":
-        fw = "qoderclicn"
+        fw = first_word(WORKER_COMMAND_DEFAULT_QODERCN)
         return out("stock", command=WORKER_COMMAND_DEFAULT_QODERCN, yolo=True)
     if supplied:
         if not resolved:

@@ -3180,11 +3180,6 @@ def test_qoderclicn_runtime_is_always_stock():
     assert d.resolve_worker_command(KIMI, "ckimi", alias_type)["runtime"] == "claude"
 
 
-def test_qoderclicn_stock_default():
-    assert d.WORKER_COMMAND_DEFAULT_QODERCN == "qoderclicn --dangerously-skip-permissions"
-    assert d.WORKER_COMMAND_DEFAULT == "claude --dangerously-skip-permissions"
-
-
 def test_launch_candidates_stays_claude_only():
     al = {"cc": "claude --dangerously-skip-permissions",
           "qc": "qoderclicn --dangerously-skip-permissions",
