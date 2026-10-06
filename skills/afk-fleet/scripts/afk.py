@@ -742,27 +742,45 @@ def cmd_release(a):
 
 
 def _release_claim(run, instance, number, expect_sha=None):
-    """`afk release` — of `instance`'s claim on issue <number>, or, with
-    `expect_sha`, of a `stale_closed` row read at that sha."""
-    cfg = run.cfg
+    """`afk release` — of `instance`'s own claim on issue <number>
+    (`_release_mine`), or, with `expect_sha`, of a dead peer's `stale_closed`
+    row read at that sha (`_clear`). Two operations behind one subcommand: only
+    the first asks whose the claim is, and only it cleans up after a landing."""
     if expect_sha:
         return _clear(run, number, expect_sha)
-    ref = _claim_ref(cfg, number)
+    return _release_mine(run, instance, number)
+
+
+def _release_mine(run, instance, number):
+    """Release `instance`'s claim on issue <number> — refused for a claim
+    another instance holds — and, when the issue is CLOSED, settle what its
+    landing left behind (`_settle_landed`)."""
     owner = _claim_owner(run, number)
     if owner not in (None, instance):
-        raise RuntimeError(f"issue #{number} is not this fleet's claim ({ref} is held by "
-                           f"{owner!r}); nothing was changed. A dead peer's "
-                           f"claim on a closed issue — a `stale_closed` row — is released "
-                           f"with --expect-sha <the sha rebuild reported>")
+        raise RuntimeError(f"issue #{number} is not this fleet's claim "
+                           f"({_claim_ref(run.cfg, number)} is held by {owner!r}); nothing was "
+                           f"changed. A dead peer's claim on a closed issue — a `stale_closed` "
+                           f"row — is released with --expect-sha <the sha rebuild reported>")
     released = _release(run, number)
     if run.repo and _issue_state(run.repo, number) == "closed":
-        closed_pr = _close_landed_pr(run, number)
-        if closed_pr:
-            released["closed_pr"] = closed_pr
-        worktree = _Worktree.of_issue(run.repo, number)
-        if worktree.remembered and cfg["worktree_cleanup"]:
-            released["cleanup"] = worktree.remove()
+        released.update(_settle_landed(run, number))
     return released
+
+
+def _settle_landed(run, number):
+    """What only the tick can do for a claim whose issue is closed — `afk land`
+    runs inside the worktree and holds no instance id → {"closed_pr"?,
+    "cleanup"?}: close the PR a merge batch landed that GitHub still shows open
+    (`_close_landed_pr`), and remove the worktree (when `worktree_cleanup`). An
+    open issue's worktree is never touched: it may hold work."""
+    settled = {}
+    closed_pr = _close_landed_pr(run, number)
+    if closed_pr:
+        settled["closed_pr"] = closed_pr
+    worktree = _Worktree.of_issue(run.repo, number)
+    if worktree.remembered and run.cfg["worktree_cleanup"]:
+        settled["cleanup"] = worktree.remove()
+    return settled
 
 
 def _claim_owner(run, number):
@@ -1073,7 +1091,7 @@ def _drain(run, instance, ws):
             kept.append(row["number"])
             continue
         try:
-            _release_claim(run, instance, row["number"])
+            _release_mine(run, instance, row["number"])
             released.append(row["number"])
         except _FAILURES as e:
             errors.append({"step": "release", "issue": row["number"], "error": str(e)})
@@ -1115,6 +1133,7 @@ def _tick(run, instance, host, agent, ws):
         return start.outcome
 
     def finish_all(issues):
+        """Each start's own answer, in order: one may fail where the others ran."""
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(issues)) as pool:
             return list(pool.map(lambda n: answered(finish[n]), issues))
 
@@ -1140,9 +1159,7 @@ def _tick(run, instance, host, agent, ws):
     }
 
     def carry_out(step):
-        fn, args = steps[step["do"]], {k: v for k, v in step.items() if k != "do"}
-        # `finish` answers per start itself: one may fail, and the others ran
-        return fn(**args) if step["do"] == "finish" else answered(fn, **args)
+        return answered(steps[step["do"]], **{k: v for k, v in step.items() if k != "do"})
 
     call = {"afk_path": os.path.abspath(__file__), "repo": run.repo, "instance": instance,
             "worker_command": agent.command, "config": json.dumps(cfg, ensure_ascii=False)}
@@ -2432,17 +2449,17 @@ def cmd_land(a):
         if pushed or checks == "pending":
             checks = _await_checks(run.repo, pr["number"], head, had_checks=checks is not None,
                                    timeout=a.checks_timeout, poll=a.checks_poll)
-        verdict = afk_decide.checks_gate(checks, turn["allow_no_checks"])
-        if verdict == "gate_red":
-            return stop(verdict, checks=checks,
+        checks_say = afk_decide.checks_gate(checks, turn["allow_no_checks"])
+        if checks_say == "gate_red":
+            return stop(checks_say, checks=checks,
                         detail="the PR's checks are red — fix the code, commit, and run this again")
-        if verdict == "awaiting_ci":
-            return stop(verdict, checks=checks,
+        if checks_say == "awaiting_ci":
+            return stop(checks_say, checks=checks,
                         detail=f"the checks on this head were still running after "
                                f"{a.checks_timeout}s — send your wake and stop; you are told to "
                                f"run this again once they are in")
-        if verdict != "green":
-            return stop(verdict, checks=checks,
+        if checks_say != "green":
+            return stop(checks_say, checks=checks,
                         detail="send your wake and stop — you are told to run this again once "
                                "that is settled")
     if cfg["gate"]["adversarial_verify"] and turn["verified"] != head:
@@ -2857,9 +2874,9 @@ def _land_batch(run, batch, limits, merged_timeout):
                            f"files — what would be gated is not what would land. Commit your "
                            f"fix (or discard it) and run this again:\n{dirty}")
     prs = {p["number"]: p for p in _open_prs(run.repo)}
-    gone = [m["pr"] for m in members if m["pr"] not in prs]
-    if gone:
-        raise RuntimeError(f"PR(s) {gone} of merge batch {batch} are no longer open; nothing "
+    closed = [m["pr"] for m in members if m["pr"] not in prs]
+    if closed:
+        raise RuntimeError(f"PR(s) {closed} of merge batch {batch} are no longer open; nothing "
                            f"was changed — send your wake and stop")
 
     # --- stack: every member on the target's tip, then the fixes carried so far ---
@@ -2900,17 +2917,17 @@ def _land_batch(run, batch, limits, merged_timeout):
     # --- the gate, once, on the stack ---
     _record_batch(run, instance, batch, stacked, "gating")
     gate = _gated(run, path, limits)
-    gone = not os.path.isdir(path)       # a gate run is long: an abandon removes the worktree
+    abandoned = not os.path.isdir(path)  # a gate run is long: an abandon removes the worktree
     if gate["status"] != "green":
         _record_batch(run, instance, batch, stacked, "fixing")
-        verdict = {k: v for k, v in gate.items() if k not in ("source", "head", "not_trusted")}
-        return result("gate_red", stacked, gate=verdict, **more,
+        red = {k: v for k, v in gate.items() if k not in ("source", "head", "not_trusted")}
+        return result("gate_red", stacked, gate=red, **more,
                       detail="the gate is red on the stack and nothing landed — fix the stack "
                              "with one more commit on top (do not hunt for the PR at fault), "
                              "and run this again")
 
     # --- land: a gate run is long, so the turn is checked again; then the fast-forward ---
-    still = [] if gone else _batch_turns(run, batch, stacked)[0]
+    still = [] if abandoned else _batch_turns(run, batch, stacked)[0]
     if len(still) != len(stacked):
         raise RuntimeError(f"merge batch {batch} no longer holds the landing turn (it was "
                            f"abandoned while the gate ran); nothing landed — send your wake "

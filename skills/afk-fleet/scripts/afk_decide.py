@@ -907,9 +907,10 @@ def gate_comment(verdict, command):
 # — does signal 3 alone settle it (busy, gone)? — and, only when it does not,
 # `classify_stopped` over all three. Each answers with a CAUSE, one of
 # `WORKER_CAUSES`: the one thing decided here, and the one thing the tick routes
-# on (`worker_step`, `batch_step`). Two words are kept apart throughout: the
-# VERDICT is what the worker declared in its marker (an input); the OUTCOME is
-# what this code concludes from all three signals. Whether to TRUST the marker
+# on (`worker_step`, `batch_step`). Of a WORKER, two words are kept apart: its
+# VERDICT is what it declared in its marker (an input); its OUTCOME is what
+# this code concludes from all three signals. (A gate's verdict, or branch
+# protection's, is another thing: what one run or one read came to.) Whether to TRUST the marker
 # stays the tick's call.
 
 # The phases a worker may declare in its marker (worker-prompt.md asks for exactly
@@ -3120,8 +3121,9 @@ def tick_plan(ws, call, config):
 
       answer: (result, None) when the step was carried out — `result` is what
               its transition returned, a START_OUTCOMES word for `begin` — or
-              (None, "<what it raised>") when it failed. `finish` is answered
-              with a list of such pairs, one per issue, in the order given
+              (None, "<what it raised>") when it failed. `finish`'s result is
+              itself a list of such pairs, one per issue, in the order given:
+              one start may fail where the others ran
 
     Returns (as the generator's value) {"did": the tick's account for
     `cycle_ticked`, "judgments", "errors", "held": the claims whose status board
@@ -3207,8 +3209,8 @@ def tick_plan(ws, call, config):
             break
         yield from begin(issue["number"], "dispatched", frontier=True)
     if tick.begun:      # every agent is waited for and handed its prompt at once
-        workers = yield {"do": "finish", "issues": [n for _, n in tick.begun]}
-        for (counted, number), (worker, error) in zip(tick.begun, workers):
+        workers = yield from run("finish", issues=[n for _, n in tick.begun])
+        for (counted, number), (worker, error) in zip(tick.begun, workers or []):
             if error is not None:
                 tick.failed("finish", number, error)
             elif worker:

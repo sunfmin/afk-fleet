@@ -2230,7 +2230,7 @@ def _play(ws, answers=None, causes=None, config=None):
         do = step["do"]
         assert do in d.TICK_STEPS, step
         if do == "finish":
-            return [said(do, n) for n in step["issues"]]
+            return [said(do, n) for n in step["issues"]], None
         key = step.get("issue", step.get("batch"))
         if do == "no-pr" and ("no-pr", key) not in answers and "no-pr" not in answers:
             asked = step.get("issues") or [step["batch"]]
