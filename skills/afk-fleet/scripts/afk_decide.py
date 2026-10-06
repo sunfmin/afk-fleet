@@ -40,13 +40,10 @@ CONFIG_DEFAULTS = {
     # dispatch contract
     "ready_label": "ready-for-agent",
     "epic_labels": ["epic", "prd", "wayfinder:map"],
-    "claim": "ref",
     "claim_namespace": "refs/afk",
-    "dependencies": "native",
     # workers
     "base_branch": "main",
     "branch_pattern": "issue-{number}-{slug}",
-    "worker": "orca",
     "concurrency": 3,
     "worktree_cleanup": True,
     "worker_idle_grace_seconds": 300,
@@ -304,6 +301,15 @@ CONFIG_REMOVED = {
         "every PR lands as a merge commit now (ADR-0034): a PR's own head reaches the target, so "
         "GitHub shows it merged whether it landed alone or in a merge batch. There is no squash "
         "and no rebase. Delete the key."),
+    "claim": (
+        "an issue is always claimed by its claim ref (ADR-0003): the key named the one way "
+        "there is, and nothing read it. Delete the key."),
+    "dependencies": (
+        "an issue's open blockers are always GitHub's native blocked_by edges: the key named the "
+        "one way there is, and nothing read it. Delete the key."),
+    "worker": (
+        "a worker is always started through orca (ADR-0005): the key named the one backend "
+        "there is, and nothing read it. Delete the key."),
     "merge.batch": (
         "merge batches are no longer an option (ADR-0034): with gate.ci 'local' and "
         "gate.adversarial_verify off, two or more PRs that are ready together always land as "

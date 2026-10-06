@@ -3030,7 +3030,7 @@ def test_override_config_types_every_key_like_the_file_does():
         (other[section] if section else other)[key] = want
         assert cfg == other, dotted
         seen += 1
-    assert seen == len(list(_leaves(d.CONFIG_DEFAULTS))) > 25
+    assert seen == len(list(_leaves(d.CONFIG_DEFAULTS))) > 20
 
     cfg = d.resolve_config({})
     assert d.override_config(cfg, None) == d.resolve_config({}) == d.override_config(cfg, [])
@@ -3188,3 +3188,18 @@ def test_launch_candidates_stays_claude_only():
     assert "cc" in got
     assert "qc" not in got
     assert "unrelated" not in got
+
+
+def test_a_key_that_named_the_only_way_there_is_is_refused_with_its_note():
+    """`claim`, `dependencies` and `worker` each had one legal value and no
+    reader, so any other value was accepted and changed nothing. They are gone,
+    and a file or a `--set` still carrying one is told to delete it."""
+    for key, value in (("claim", "ref"), ("dependencies", "native"), ("worker", "orca")):
+        assert key not in d.CONFIG_DEFAULTS
+        for attempt in (lambda: d.parse_config_yaml(f"{key}: {value}"),
+                        lambda: d.override_config(d.resolve_config({}), [f"{key}={value}"])):
+            try:
+                attempt()
+                assert False, f"expected ValueError for the removed {key} key"
+            except ValueError as e:
+                assert f"{key!r} was removed" in str(e) and "Delete the key" in str(e)
