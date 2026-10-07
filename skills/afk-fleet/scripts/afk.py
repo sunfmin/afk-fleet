@@ -1344,11 +1344,10 @@ class _Worktree:
     reporting it. `branch` is the branch orca named for it, where orca was the
     one asked; `batch` the merge batch it is the worktree of, if any."""
 
-    def __init__(self, path: str | None, branch: str | None = None, batch: str | None = None,
-                 new: bool = False) -> None:
+    def __init__(self, path: str | None, branch: str | None = None,
+                 batch: str | None = None) -> None:
         self.remembered, self.path = path, _on_disk(path)
         self.branch, self.batch = branch, batch
-        self._new = new             # just cut: no agent can be in it yet
 
     # --- where it is -------------------------------------------------------
 
@@ -1425,7 +1424,7 @@ class _Worktree:
         if _git(["-C", path, "merge-base", "--is-ancestor", sha, "HEAD"],
                 check=False).returncode != 0:
             _git(["-C", path, "merge", "--ff-only", sha])
-        return cls(path, afk_decide.short_branch(branch), batch=batch, new=True)
+        return cls(path, afk_decide.short_branch(branch), batch=batch)
 
     @property
     def _here(self) -> str:
@@ -1535,24 +1534,25 @@ class _Worktree:
         → its terminal's handle. A start is split there so that a tick opens
         every terminal it will, and then waits on them all at once.
 
-        Whatever agent was here first is closed — dead or idle, two in one
-        worktree would fight. The new one is started with the run's OPAQUE worker
+        Whatever terminal was here first is closed, so the worker's is the only
+        one in the worktree: an agent — dead or idle, two in one worktree would
+        fight — or the bare shell orca opens in every worktree it cuts, which
+        would otherwise be the tab the worktree opens on. The new one is started with the run's OPAQUE worker
         launch command (never `--agent`, ADR-0010), and the prompt goes to a
         brief FILE with only a one-line pointer for the agent — a whole prompt
         sent as text arrives as one paste, which the agent reads as quoted
         material and asks to have confirmed instead of starting."""
-        if not self._new:
-            try:
-                _orca(["terminal", "close", "--worktree", f"path:{self.path}", "--all"])
-            except RuntimeError:
-                pass
+        try:
+            _orca(["terminal", "close", "--worktree", f"path:{self.path}", "--all"])
+        except RuntimeError:
+            pass
         brief = self.write_brief(prompt)
         term = _orca(["terminal", "create", "--worktree", f"path:{self.path}",
                       "--command", agent.command]).get("terminal") or {}
         handle = term.get("handle")
         if not handle:
             raise RuntimeError("orca terminal create returned no terminal handle")
-        self.terminal, self._new = handle, False
+        self.terminal = handle
         ready_timeout = agent.ready_timeout
 
         def submit() -> str:
