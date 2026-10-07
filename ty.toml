@@ -1,0 +1,4 @@
+# Type-checked: the production scripts. The tests drive them through untyped
+# fixtures and are held to running green instead.
+[src]
+exclude = ["**/test_*.py"]

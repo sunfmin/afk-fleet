@@ -22,7 +22,7 @@ import json
 import re
 import shlex
 import urllib.parse
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 # --------------------------------------------------------------------------- #
 # Config — one home for every key and default (ADR-0009)                       #
@@ -41,7 +41,7 @@ from typing import NamedTuple
 # gate is, how often a failure is retried. What every fleet does alike is not a
 # key — it is the constants under this table, or simply what the code does.
 
-CONFIG_DEFAULTS = {
+CONFIG_DEFAULTS: dict = {
     # dispatch contract
     "ready_label": "ready-for-agent",
     "epic_labels": ["epic", "prd", "wayfinder:map"],
@@ -124,7 +124,7 @@ class RecordKind(NamedTuple):
     word: str           # the record's first word: what kind of record this is
     fields: dict        # field → its type, in the order they are written
     required: tuple     # the fields without which a commit or a marker is not this record
-    tail: str = None    # the field, declared last, whose value runs to the record's end
+    tail: Optional[str] = None    # the field, declared last, whose value runs to the record's end
 
 
 class FieldType(NamedTuple):
@@ -975,7 +975,7 @@ class Cause(NamedTuple):
     outcome: str            # } how `afk no-pr` prints it for a human; the tick
     action: str             # } routes on neither
     step: str               # what a tick does about an ISSUE's worker (`worker_step`)
-    batch_step: str = None  # …about a MERGE BATCH's worker (`batch_step`); None:
+    batch_step: Optional[str] = None  # …about a MERGE BATCH's worker (`batch_step`); None:
     #                         a batch's worker is never classified so
 
 
@@ -1243,7 +1243,7 @@ def read_worker_state(row, now, grace_seconds, tui_idle=None):
     if state == "working":
         live = output_idle is not None and output_idle < grace_seconds
         return out("busy" if live else "idle", output_idle)
-    if state is not None:
+    if lead:
         stopped = ago(lead.get("stateStartedAt"))
         return out("idle", output_idle if stopped is None else stopped)
     return out("busy" if tui_idle is False else "idle", None)
@@ -1746,7 +1746,12 @@ def batch_branch_regex(batch=None, instance=None):
     """The regex a batch's branch matches, as orca names it: `<user>/` in front,
     and `-<k>` behind when a continuation was cut under a name already taken.
     For one `batch`, or — group 1 the id — for every batch of one `instance`."""
-    which = re.escape(batch) if batch else rf"({re.escape(_BATCH_ID_UNSAFE.sub('-', instance))}-\d+)"
+    if batch:
+        which = re.escape(batch)
+    elif instance:
+        which = rf"({re.escape(_BATCH_ID_UNSAFE.sub('-', instance))}-\d+)"
+    else:
+        raise ValueError("batch_branch_regex takes a batch or an instance")
     return re.compile(rf"^(?:[^/]+/)?afk-batch-{which}(?:-\d+)?$")
 
 
@@ -1918,7 +1923,7 @@ def group_instances(claims, heartbeats, me, now, ttl):
     claim whose marker names no instance appears under `instance: null`; it needs
     no takeover, being already reclaimable as stale.
     """
-    by = {}
+    by: dict = {}
     for c in claims or []:
         inst = c.get("instance")
         row = by.setdefault(inst, {"instance": inst, "host": None, "claims": []})
@@ -1927,7 +1932,7 @@ def group_instances(claims, heartbeats, me, now, ttl):
     for inst in (heartbeats or {}):
         by.setdefault(inst, {"instance": inst, "host": None, "claims": []})
 
-    out = []
+    out: list[dict] = []
     for inst, row in by.items():
         ts = (heartbeats or {}).get(inst)
         nums = sorted(n for n in row["claims"] if n is not None)

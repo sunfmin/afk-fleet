@@ -48,6 +48,7 @@ import socket
 import subprocess
 import sys
 import time
+import typing
 
 import afk_decide
 
@@ -1651,6 +1652,7 @@ def _workers_seen(run, numbers=None, batch_id=None, worktree=None):
     (`afk_decide.worker_step`, `batch_step`)."""
     if bool(numbers) == bool(batch_id):
         raise ValueError("afk no-pr takes --issue <n> (repeatable), or --batch <batch>")
+    numbers = numbers or []
     if worktree is not None and not batch_id:
         if len(numbers) != 1:
             raise ValueError("--worktree names one worker's worktree: give it with one --issue")
@@ -1921,6 +1923,7 @@ def _begin_worker(run, instance, agent, issue, start, reason=None):
             turn = None
         rec = _recovery(run, number, landing_pr=pr["number"] if turn else None)
         plan = {k: rec[k] for k in ("tier", "action", "prompt", "reason")}
+    landing = pr if turn else None       # the PR this worker is started on the turn of
 
     if plan["action"] == "reuse_worktree":
         wt = _Worktree.at(rec["worktree"]["path"])
@@ -1929,15 +1932,15 @@ def _begin_worker(run, instance, agent, issue, start, reason=None):
         if plan["action"] == "dispatch_fresh":
             tip = cfg["base_branch"]
         else:                            # recreate_at_tip: the PR's head, else the pushed branch
-            tip = pr["headRefName"] if turn else rec["branch"]["name"]
+            tip = landing["headRefName"] if landing else rec["branch"]["name"]
         wt = _Worktree.cut(run, tip, issue=issue)
         branch = wt.branch
 
     path = wt.path
     fields = _prompt_fields(run, issue, path, branch)
     with open(_WORKER_PROMPT) as f:
-        if turn:
-            prompt = afk_decide.render_landing(f.read(), fields, _landing_fields(cfg, pr))
+        if landing:
+            prompt = afk_decide.render_landing(f.read(), fields, _landing_fields(cfg, landing))
         else:
             prompt = afk_decide.render_worker_prompt(f.read(), plan["prompt"], fields,
                                                      reason=reason)
@@ -1947,12 +1950,12 @@ def _begin_worker(run, instance, agent, issue, start, reason=None):
         handle = submit()
         if afk_decide.attempt_starting(issue["labels"]):    # the counted attempt has its worker
             _edit_labels(run.repo, number, [], [afk_decide.ATTEMPT_STARTING])
-        if turn:
-            _upsert_board(run, number, "landing", instance=instance, pr=pr["number"])
+        if landing:
+            _upsert_board(run, number, "landing", instance=instance, pr=landing["number"])
         else:
             _upsert_board(run, number, "claimed", instance=instance)
         return {**plan, "worktree": path, "branch": branch, "terminal": handle,
-                **({"landing": pr["number"]} if turn else {}),
+                **({"landing": landing["number"]} if landing else {}),
                 **({"discarded": discarded} if discarded else {})}
     return ready
 
@@ -1984,7 +1987,7 @@ class _Start:
     the other two is set."""
     outcome: str            # afk_decide.BEGUN | LOST
     finish: object = None   # BEGUN: call it for the rest of the start → `afk dispatch`'s result
-    result: dict = None     # LOST: `afk dispatch`'s result, whole
+    result: typing.Optional[dict] = None     # LOST: `afk dispatch`'s result, whole
 
 
 def _begin_dispatch(run, instance, host, agent, number, start="auto"):
@@ -2060,8 +2063,8 @@ def _run_gate_command(cfg, worktree, limits, live=False):
     def _text(s):
         return s.decode("utf-8", "replace") if isinstance(s, bytes) else (s or "")
 
-    pipes = ({"stdout": sys.stderr, "stderr": sys.stderr} if live
-             else {"capture_output": True, "text": True})
+    pipes: dict = ({"stdout": sys.stderr, "stderr": sys.stderr} if live
+                   else {"capture_output": True, "text": True})
     timed_out, rc = False, 0
     try:
         p = subprocess.run(cmd, shell=True, cwd=worktree, timeout=timeout, env=_GIT_ENV, **pipes)
@@ -3219,6 +3222,8 @@ def cmd_close(a):
 class _Parser(argparse.ArgumentParser):
     """argparse whose usage errors are the CLI's one error shape — `{"error": …}`,
     exit 3 — so a missing `--config` reads exactly like any other failure."""
+
+    subcommands: dict       # subcommand name → its parser (`build_parser`)
 
     def error(self, message):
         print(json.dumps({"error": f"{self.prog}: {message}"}, ensure_ascii=False))
