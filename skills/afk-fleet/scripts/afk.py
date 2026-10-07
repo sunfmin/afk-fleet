@@ -50,11 +50,16 @@ import socket
 import subprocess
 import sys
 import time
-from typing import Any, Callable, Iterable, Iterator, Literal, NoReturn, TypeVar
+from typing import (Any, Callable, Iterable, Iterator, Literal, Mapping, NoReturn, Sequence,
+                    TypeVar)
 
 import afk_decide
 
-Obj = afk_decide.Obj    # a JSON object: a payload of gh or orca, a config, a row, a result
+Obj = afk_decide.Obj    # a JSON object: a payload of gh or orca, a row, a result
+# The records the two scripts hand each other, declared in the core (ADR-0039).
+from afk_decide import (BatchMember, BatchWorkerRow, BoardBatch, BranchSignal, Claim, Comment,
+                        Issue, IssueRead, PullRequest, WorktreeSignal, Call, Config, Progress, Seen,  # noqa: E402
+                        Stacked, Standing, Turn, WorkerReading, WorkerRow, WorkingSet)
 Answer = afk_decide.Answer              # how a step of a tick's plan ended
 StartOutcome = afk_decide.StartOutcome  # how beginning a dispatch ended
 _T = TypeVar("_T")
@@ -63,7 +68,7 @@ _T = TypeVar("_T")
 # config + clock                                                              #
 # --------------------------------------------------------------------------- #
 
-def _cfg(a: argparse.Namespace) -> Obj:
+def _cfg(a: argparse.Namespace) -> Config:
     """The effective config for a subcommand: the `--config` JSON (canonical or
     partial) resolved through CONFIG_DEFAULTS, any `--set key=value` laid on top,
     then validated — no subcommand runs on a config `afk config` would refuse."""
@@ -89,7 +94,7 @@ class _Run:
     — and what the run has learned of the status boards."""
     repo: str           # owner/name — None only for a git-ref op given `--remote`
     rem: str            # the git push/fetch target (`_remote`)
-    cfg: Obj            # the effective config (`_cfg`)
+    cfg: Config            # the effective config (`_cfg`)
     clock: int | None   # `--now`, None outside tests: the time is read when asked
     # {issue number: `afk_decide.board_key`} of the status board each issue is
     # known to carry: what a cycle's state remembered from the last tick, and
@@ -134,11 +139,11 @@ _LOCAL_RECOVERY = "refs/afk-recovery"  # ditto for `recovery`'s branch-vs-base c
 _LOCAL_GATE = "refs/afk-gate"  # ditto for `probe`'s sweep of expired gate records
 
 
-def _claim_ref(cfg: Obj, number: int | str) -> str:
+def _claim_ref(cfg: Config, number: int | str) -> str:
     return f"{afk_decide.CLAIM_NAMESPACES[cfg['claim_namespace']][0]}/{number}"
 
 
-def _heartbeat_ref(cfg: Obj, instance: str) -> str:
+def _heartbeat_ref(cfg: Config, instance: str) -> str:
     return f"{afk_decide.CLAIM_NAMESPACES[cfg['claim_namespace']][1]}/{instance}"
 
 
@@ -283,21 +288,21 @@ _ISSUE_JQ = ("{id, title, state, state_reason, labels: [.labels[].name], "
              "pull_request: (.pull_request != null)}")
 
 
-def _read_issue(repo: str, number: int) -> Obj | RuntimeError:
+def _read_issue(repo: str, number: int) -> IssueRead | RuntimeError:
     """One issue as {"number", "id", "title", "state", "state_reason",
     "labels": [name...], "pull_request": bool} — or, when it could not be read,
     the error that says why: a caller either raises it (`_issue`) or takes it
     for "unknown". An open issue the gather listed is not read again."""
-    def read() -> Obj | RuntimeError:
+    def read() -> IssueRead | RuntimeError:
         try:
             p = _gh(["api", f"repos/{repo}/issues/{number}", "--jq", _ISSUE_JQ])
-            return {"number": number, **json.loads(p.stdout)}
+            return {"number": number, **json.loads(p.stdout)}       # `_ISSUE_JQ`'s keys
         except (RuntimeError, ValueError) as e:
             return RuntimeError(str(e))
     return _once(("issue", repo, number), read)
 
 
-def _issue(repo: str, number: int) -> Obj:
+def _issue(repo: str, number: int) -> IssueRead:
     """One issue (`_read_issue`). Raises when it cannot be read."""
     issue = _read_issue(repo, number)
     if isinstance(issue, Exception):
@@ -313,12 +318,12 @@ _ISSUES_JQ = (".[] | select(.pull_request == null) | {number, id, title, "
               "blocked_by: (.issue_dependencies_summary.blocked_by // 0)}")
 
 
-def _open_issues(repo: str) -> list[Obj]:
+def _open_issues(repo: str) -> list[Issue]:
     """Every open issue — all of them, page after page — as {"number", "id",
     "title", "labels": [name...], "updatedAt", "blocked_by": <open blocker
     count>}: the one shape afk_decide reads. Each is also what `_read_issue`
     would say of it."""
-    def read() -> list[Obj]:
+    def read() -> list[Issue]:      # the keys are `_ISSUES_JQ`'s
         p = _gh(["api", "--paginate", f"repos/{repo}/issues?state=open&per_page=100",
                  "--jq", _ISSUES_JQ])
         return [json.loads(ln) for ln in p.stdout.splitlines() if ln.strip()]
@@ -335,7 +340,7 @@ _PR_FIELDS = ("number,title,headRefName,headRefOid,updatedAt,statusCheckRollup,"
               "closingIssuesReferences")
 
 
-def _open_prs(repo: str, fresh: bool = False) -> list[Obj]:
+def _open_prs(repo: str, fresh: bool = False) -> list[PullRequest]:
     """Every open PR, with the fields the working set, the merge and a fresh
     start all read. `fresh`: read now, whatever this process read before."""
     if fresh:
@@ -344,10 +349,10 @@ def _open_prs(repo: str, fresh: bool = False) -> list[Obj]:
         _gh(["pr", "list", "--repo", repo, "--state", "open", "--json", _PR_FIELDS]).stdout))
 
 
-def _issue_comments(repo: str, number: int) -> list[Obj]:
+def _issue_comments(repo: str, number: int) -> list[Comment]:
     """An issue's comments, oldest first, as [{"id", "body", "url"}...] — a PR's
     too: its landing turn is one of them."""
-    def read() -> list[Obj]:
+    def read() -> list[Comment]:
         p = _gh(["api", "--paginate", f"repos/{repo}/issues/{number}/comments",
                  "--jq", ".[] | {id, body, url: .html_url}"])
         return [json.loads(ln) for ln in p.stdout.splitlines() if ln.strip()]
@@ -419,18 +424,18 @@ def _close_pr(repo: str, rem: str, number: int, comment: str) -> None:
     _forget(("prs", repo), ("comments", repo, number), ("heads", rem))
 
 
-def _merge_pr(repo: str, rem: str, pr: Obj, head: str) -> None:
+def _merge_pr(repo: str, rem: str, pr: PullRequest, head: str) -> None:
     """Merge an open PR — a merge commit, never a squash or a rebase — only
     while its head is still `head`, and delete its branch. The issues it closes
     are closed by GitHub with it."""
     _gh(["pr", "merge", str(pr["number"]), "--repo", repo, "--merge",
          "--match-head-commit", head, "--delete-branch"])
     _forget(("prs", repo), ("heads", rem))
-    for ref in pr.get("closingIssuesReferences") or []:
+    for ref in pr["closingIssuesReferences"] or []:
         _issue_written(repo, ref["number"])
 
 
-def _blocker(repo: str, number: int) -> Obj | None:
+def _blocker(repo: str, number: int) -> IssueRead | None:
     """One issue a `blocked` verdict names, as `afk_decide.blocker_standings` reads
     it: {"state", "state_reason", "labels": [name...], "pull_request"}. None
     when it cannot be read — which is never "closed"."""
@@ -446,20 +451,20 @@ def _blocked_by(repo: str, number: int) -> list[Obj]:
     return [json.loads(ln) for ln in p.stdout.splitlines() if ln.strip()]
 
 
-def _turn(repo: str, pr_number: int) -> Obj | None:
+def _turn(repo: str, pr_number: int) -> Turn | None:
     """The landing turn recorded on PR `pr_number` (`afk_decide.latest_turn`),
     whoever granted it; None when it has none. One comments read."""
     return afk_decide.latest_turn(_issue_comments(repo, pr_number))
 
 
-def _claim_turns(repo: str, prs: list[Obj], claims: list[Obj],
-                 instance: str) -> dict[int, Obj]:
+def _claim_turns(repo: str, prs: list[PullRequest], claims: list[Claim],
+                 instance: str) -> dict[int, Turn]:
     """{issue number: turn} for every claim of `instance` whose open PR carries a
     turn marker, whoever wrote it — `afk_decide.held_turn` says which of them
     hold its landing turn. Keyed on claims, so a PR whose claim was released
     (escalated, parked) holds nothing; one comments read per claim of
     `instance` that has a PR."""
-    turns = {}
+    turns: dict[int, Turn] = {}
     for c in claims:
         pr = afk_decide.closing_pr(prs, c["number"]) if c["instance"] == instance else None
         turn = _turn(repo, pr["number"]) if pr else None
@@ -468,7 +473,7 @@ def _claim_turns(repo: str, prs: list[Obj], claims: list[Obj],
     return turns
 
 
-def _record_turn(repo: str, pr_number: int, turn: Obj) -> int:
+def _record_turn(repo: str, pr_number: int, turn: Turn) -> int:
     """Write PR `pr_number`'s ONE landing-turn comment from its record → its id.
     `turn` is the record read from the PR (`_turn`) plus what changed
     (`afk_decide.next_turn` and its kin): the comment it was read from is
@@ -477,7 +482,7 @@ def _record_turn(repo: str, pr_number: int, turn: Obj) -> int:
     return _comment(repo, pr_number, afk_decide.turn_comment(turn), turn["comment_id"])
 
 
-def _worktree_progress(wt: str, rem: str, base: str) -> Obj:
+def _worktree_progress(wt: str, rem: str, base: str) -> Progress:
     """One worktree's git progress: commits ahead of `base`, dirty tree, last
     commit + newest file mtime. `base` is measured where it actually is — the
     REMOTE's tip, fetched here — never the local branch of that name, which a
@@ -576,7 +581,7 @@ def _mirrored_records(kind: afk_decide.RecordKind,
         yield refname.rsplit("/", 1)[-1], sha, _read_record(kind, sha)
 
 
-def _claim_row(number: int, sha: str, record: Obj | None) -> Obj:
+def _claim_row(number: int, sha: str, record: Obj | None) -> Claim:
     """The claim on issue <number> as the scan lists it. The ref is the lock, so
     a claim ref that carries no claim record is still a claim — one that names
     nobody, which is never mine and is stale to everyone."""
@@ -589,11 +594,11 @@ def _scan_key(run: _Run) -> tuple[str, str, str]:
     return ("scan", run.rem, run.cfg["claim_namespace"])
 
 
-def _scan(run: _Run) -> tuple[list[Obj], dict[str, int]]:
+def _scan(run: _Run) -> tuple[list[Claim], dict[str, int]]:
     """Mirror the remote claim+heartbeat refs into a disposable local namespace and
     read every record. Returns (claims, heartbeats). Raises when the remote cannot
     be read: a fleet whose claims are unreadable must not look like one holding none."""
-    def read() -> tuple[list[Obj], dict[str, int]]:
+    def read() -> tuple[list[Claim], dict[str, int]]:
         claim_ns, hb_ns = afk_decide.CLAIM_NAMESPACES[run.cfg["claim_namespace"]]
         _git(["fetch", "--prune", run.rem,
               f"+{claim_ns}/*:{_LOCAL_SCAN}/claim/*",
@@ -902,7 +907,7 @@ def cmd_heartbeat(a: argparse.Namespace) -> Obj:
 # bootstrap: config / probe / worker-command                                   #
 # --------------------------------------------------------------------------- #
 
-def cmd_config(a: argparse.Namespace) -> Obj:
+def cmd_config(a: argparse.Namespace) -> Config:
     """One home for config (ADR-0009): read the target repo's config file (the
     ```yaml block in docs/agents/afk-fleet.md), validate every key against the
     schema (unknown key / wrong shape → error — with the human present at
@@ -945,7 +950,7 @@ def _usable_namespace(rem: str, wanted: str, now: int) -> tuple[str, str | None]
     because that says nothing about which namespace is allowed."""
     rejection = None
     for ns in dict.fromkeys([wanted, afk_decide.BRANCH_NAMESPACE]):
-        ref = _claim_ref({"claim_namespace": ns}, "probe")
+        ref = f"{afk_decide.CLAIM_NAMESPACES[ns][0]}/probe"
         sha = _record_commit(afk_decide.PROBE_RECORD, {"ts": now})
         p = _git(["push", rem, f"{sha}:{ref}"], check=False)
         if p.returncode == 0:
@@ -1073,7 +1078,7 @@ def cmd_worker_command(a: argparse.Namespace) -> Obj:
 # --------------------------------------------------------------------------- #
 
 # What `_gather` reads: the open issues, the open PRs, the claims, the heartbeats.
-_Gathered = tuple[list[Obj], list[Obj], list[Obj], dict[str, int]]
+_Gathered = tuple[list[Issue], list[PullRequest], list[Claim], dict[str, int]]
 
 
 def _gather(run: _Run, fresh: bool = False) -> _Gathered:
@@ -1154,7 +1159,7 @@ def cmd_cycle(a: argparse.Namespace) -> Obj:
             "judgments": judgments, **({"errors": errors} if errors else {})}
 
 
-def _drain(run: _Run, instance: str, ws: Obj) -> tuple[list[int], list[int], list[Obj]]:
+def _drain(run: _Run, instance: str, ws: WorkingSet) -> tuple[list[int], list[int], list[Obj]]:
     """The stop: release every claim of mine that no open PR stands behind — a
     worker still coding, an orphan, a claim that outlived its issue — and keep
     the rest → (released, kept, errors). A kept claim's PR is landed by a peer,
@@ -1177,7 +1182,7 @@ def _drain(run: _Run, instance: str, ws: Obj) -> tuple[list[int], list[int], lis
 
 
 def _tick(run: _Run, instance: str, host: str, agent: _Agent,
-          ws: Obj) -> tuple[Obj, list[Obj], list[Obj]]:
+          ws: WorkingSet) -> tuple[Obj, list[Obj], list[Obj]]:
     """One reconciliation pass over the working set `ws`, in code → (did,
     judgments, errors). What it runs, and in what order, is not decided here:
     `afk_decide.tick_plan` hands out one step at a time and is told how each
@@ -1240,7 +1245,7 @@ def _tick(run: _Run, instance: str, host: str, agent: _Agent,
     def carry_out(step: Obj) -> Answer:
         return answered(steps[step["do"]], **{k: v for k, v in step.items() if k != "do"})
 
-    call = {"afk_path": os.path.abspath(__file__), "repo": run.repo, "instance": instance,
+    call: Call = {"afk_path": os.path.abspath(__file__), "repo": run.repo, "instance": instance,
             "worker_command": agent.command, "config": json.dumps(cfg, ensure_ascii=False)}
     done = afk_decide.follow(afk_decide.tick_plan(ws, call, cfg), carry_out)
     for number in set(run.boards) - done["held"]:
@@ -1252,7 +1257,7 @@ def _tick(run: _Run, instance: str, host: str, agent: _Agent,
 # observation: rebuild / no-pr / recovery                                      #
 # --------------------------------------------------------------------------- #
 
-def _rebuild(run: _Run, instance: str, gathered: _Gathered | None = None) -> Obj:
+def _rebuild(run: _Run, instance: str, gathered: _Gathered | None = None) -> WorkingSet:
     """The working set (`afk_decide.assemble_working_set`), from `gathered` — a
     `_gather` the caller already made — or a fresh one. The frontier costs no
     read of its own: every issue's open-blocker count came with the issue list.
@@ -1268,7 +1273,7 @@ def _rebuild(run: _Run, instance: str, gathered: _Gathered | None = None) -> Obj
         turns=_claim_turns(run.repo, prs, claims, instance))
 
 
-def cmd_rebuild(a: argparse.Namespace) -> Obj:
+def cmd_rebuild(a: argparse.Namespace) -> WorkingSet:
     """One read-only call → the tick's whole working set (ADR-0008) — what a tick
     acts on, and what `--plan` prints instead. Strictly observation: nothing here
     writes a ref, a comment, or a PR."""
@@ -1393,7 +1398,7 @@ class _Worktree:
         return afk_decide.find_orca_repo(_orca(["repo", "list"]).get("repos"), repo)
 
     @classmethod
-    def cut(cls, run: _Run, at_branch: str, issue: Obj | None = None,
+    def cut(cls, run: _Run, at_branch: str, issue: IssueRead | None = None,
             batch: str | None = None) -> _Worktree:
         """Have orca create a worktree + branch at the REMOTE's current tip of
         `at_branch` (ADR-0005: orca owns both, and names the branch) — for
@@ -1584,7 +1589,7 @@ class _Worker:
     """One worker as `_Workers` saw it: where its worktree is on this machine,
     and what it is doing."""
 
-    def __init__(self, path: str | None, reading: Obj, now: int, grace: int) -> None:
+    def __init__(self, path: str | None, reading: WorkerReading, now: int, grace: int) -> None:
         self.path = path            # its worktree, on this disk — None: none here, so no worker
         self.reading = reading      # `afk_decide.read_worker_state`: busy, idle or none
         self.now, self.grace = now, grace  # the clock and the grace period it was read with
@@ -1599,7 +1604,7 @@ class _Worker:
         return (_Worktree.at(self.path).nudge or {}).get("at")
 
     @property
-    def settled(self) -> Obj | None:
+    def settled(self) -> Seen | None:
         """Its classification when the reading alone decides it — busy, or gone
         (`afk_decide.settled_by_worker_state`) — else None: only then is anything
         in git or on GitHub worth reading for it."""
@@ -1701,29 +1706,30 @@ def _workers_seen(run: _Run, numbers: list[int] | None = None, batch_id: str | N
     return {"workers": seen}
 
 
-def _worker_outcome(run: _Run, number: int, worker: _Worker) -> Obj:
+def _worker_outcome(run: _Run, number: int, worker: _Worker) -> WorkerRow:
     """One worker's classification, gathering only what its reading leaves open:
     busy or gone is settled by the reading alone (`_Worker.settled`), so it costs
     no git and no GitHub."""
     cfg, path, nudged_at = run.cfg, worker.path, worker.nudged_at
     settled = worker.settled
     if settled:
-        return {**settled, "worktree": path, "progress": {}, "worker_verdict": None,
+        return {**settled, "worktree": path, "progress": None, "worker_verdict": None,
                 "blockers": [], "nudged_at": nudged_at, "turn_at": None}
     now, grace = worker.now, worker.grace
-    progress = _worktree_progress(path, run.rem, cfg["base_branch"]) if path else {}
+    progress = _worktree_progress(path, run.rem, cfg["base_branch"]) if path else None
     declared = afk_decide.latest_verdict(_issue_comments(run.repo, number))
     prs = _open_prs(run.repo)
     blockers = _blocker_standings(run, number, declared["blocked_by"], prs)
     pr = afk_decide.closing_pr(prs, number)
-    turn = (_turn(run.repo, pr["number"]) if pr else None) or {}
+    turn = _turn(run.repo, pr["number"]) if pr else None
     return {**afk_decide.classify_stopped(progress, worker.reading["terminal_idle_seconds"],
                                           declared,
                                           {b["number"]: b["standing"] for b in blockers},
                                           now, grace, nudged_at=nudged_at,
                                           can_nudge=path is not None, turn=turn),
             "worktree": path, "progress": progress, "worker_verdict": declared,
-            "blockers": blockers, "nudged_at": nudged_at, "turn_at": turn.get("at")}
+            "blockers": blockers, "nudged_at": nudged_at,
+            "turn_at": turn["at"] if turn else None}
 
 
 # More issues than any real dependency chain holds: a walk that gets here is an
@@ -1731,7 +1737,8 @@ def _worker_outcome(run: _Run, number: int, worker: _Worker) -> Obj:
 _DEPENDENCY_WALK_LIMIT = 200
 
 
-def _blocker_standings(run: _Run, number: int, named: list[int], prs: list[Obj]) -> list[Obj]:
+def _blocker_standings(run: _Run, number: int, named: list[int],
+                       prs: list[PullRequest]) -> list[Standing]:
     """Where each issue a `blocked` verdict names stands
     (`afk_decide.blocker_standings`), gathering what that takes: the blocker
     itself, the claim refs, the open PRs, and — from every blocker still open —
@@ -1845,8 +1852,9 @@ def _recovery(run: _Run, number: int, path: str | None = None, branch: str | Non
     else:
         wt = _Worktree.at(path)
     present = wt.path is not None
-    worktree = {"present": present, "path": wt.remembered,
-                **(_worktree_progress(wt.path, rem, base) if present else {})}
+    worktree: WorktreeSignal = {"present": present, "path": wt.remembered}
+    if wt.path is not None:
+        worktree = {**worktree, **_worktree_progress(wt.path, rem, base)}
 
     # --- tier-2 signal: the branch the dead worker pushed ---
     candidates = [] if branch else afk_decide.branch_candidates(
@@ -1854,7 +1862,8 @@ def _recovery(run: _Run, number: int, path: str | None = None, branch: str | Non
     ahead = {b: _branch_ahead(rem, b, base, number)
              for b in ([branch] if branch else candidates)}
     branch = branch or afk_decide.furthest_ahead(ahead)
-    branch_sig = {"name": branch, "commits_ahead": ahead.get(branch), "candidates": candidates}
+    branch_sig: BranchSignal = {"name": branch, "candidates": candidates,
+                                "commits_ahead": ahead.get(branch) if branch else None}
 
     return {"issue": number, "base": base, "worktree": worktree, "branch": branch_sig,
             **afk_decide.select_recovery(worktree, branch_sig, landing_pr=landing_pr)}
@@ -1902,12 +1911,12 @@ def _discard_attempt(run: _Run, number: int) -> Obj:
     return {"closed_prs": closed, "deleted_branches": deleted, "removed_worktree": path}
 
 
-def _landing_fields(cfg: Obj, pr: Obj) -> Obj:
+def _landing_fields(cfg: Config, pr: PullRequest) -> Obj:
     """The LANDING_FIELDS of a landing brief, from the config and the PR."""
     return {"pr": pr["number"], "pr_branch": pr["headRefName"], "target": cfg["base_branch"]}
 
 
-def _prompt_fields(run: _Run, issue: Obj, path: str | None, branch: str | None) -> Obj:
+def _prompt_fields(run: _Run, issue: IssueRead, path: str | None, branch: str | None) -> Obj:
     """The PROMPT_FIELDS of a worker prompt for one issue in one worktree. The
     launcher's terminal is read off the environment, never passed in: the launcher
     runs `afk cycle` itself, so the handle orca gave its terminal is the one
@@ -1926,14 +1935,14 @@ def _prompt_fields(run: _Run, issue: Obj, path: str | None, branch: str | None) 
 _StartFrom = Literal["auto", "fresh"]
 
 
-def _start_worker(run: _Run, instance: str, agent: _Agent, issue: Obj, start: _StartFrom,
+def _start_worker(run: _Run, instance: str, agent: _Agent, issue: IssueRead, start: _StartFrom,
                   reason: str | None = None) -> Obj:
     """Put a worker on an issue this fleet already holds the claim for, start to
     finish (`_begin_worker`, then the rest it returns)."""
     return _begin_worker(run, instance, agent, issue, start, reason)()
 
 
-def _begin_worker(run: _Run, instance: str, agent: _Agent, issue: Obj, start: _StartFrom,
+def _begin_worker(run: _Run, instance: str, agent: _Agent, issue: IssueRead, start: _StartFrom,
                   reason: str | None = None) -> Callable[[], Obj]:
     """Begin putting a worker on an issue `instance` already holds the claim for:
     everything up to its agent's terminal being open. Returns the rest as a
@@ -1982,8 +1991,9 @@ def _begin_worker(run: _Run, instance: str, agent: _Agent, issue: Obj, start: _S
         if landing:
             prompt = afk_decide.render_landing(f.read(), fields, _landing_fields(cfg, landing))
         else:
-            prompt = afk_decide.render_worker_prompt(f.read(), plan["prompt"], fields,
-                                                     reason=reason)
+            variant = plan["prompt"]
+            assert variant != "landing", plan       # that brief is a PR's that holds the turn
+            prompt = afk_decide.render_worker_prompt(f.read(), variant, fields, reason=reason)
     submit = wt.put(agent, prompt)
 
     def ready() -> Obj:
@@ -2059,7 +2069,7 @@ def _begin_dispatch(run: _Run, instance: str, host: str, agent: _Agent, number: 
 
 def _upsert_board(run: _Run, number: int, phase: afk_decide.StatusPhase,
                   instance: str | None = None, pr: int | None = None, attempt: int = 0,
-                  blocked_by: Iterable[int] = (), batch: Obj | None = None) -> Obj:
+                  blocked_by: Iterable[int] = (), batch: BoardBatch | None = None) -> Obj:
     """Upsert the human-facing progress status board comment (idempotent, ADR-0006).
     Renders the body from the given phase (pure), then find-or-create by marker
     and write ONLY when the body changed — so re-entrant/disposable ticks and
@@ -2092,7 +2102,7 @@ def cmd_status(a: argparse.Namespace) -> Obj:
                          instance=a.instance, pr=a.pr, attempt=a.attempt)
 
 
-def _run_gate_command(cfg: Obj, worktree: str, limits: _GateLimits, live: bool = False) -> Obj:
+def _run_gate_command(cfg: Config, worktree: str, limits: _GateLimits, live: bool = False) -> Obj:
     """Run the configured local gate in a worktree → `afk_decide.gate_verdict` —
     the completion gate itself in `gate.ci: local` mode, run by `afk land` against
     the exact tree that lands (ADR-0012). *What* to run is config, *where* is the
@@ -2384,8 +2394,8 @@ def _grant_turn(run: _Run, instance: str, agent: _Agent, number: int,
                            "stopped for you; nothing was touched — `afk no-pr` watches it")
     # a judgment made about this PR stands: a re-delivery need not repeat it
     allow = allow_no_checks or bool(held_here and held_here["allow_no_checks"])
-    verified = verified or (held_here or {}).get("verified")
-    checks = afk_decide.pr_checks_state(pr.get("statusCheckRollup"))
+    verified = verified or (held_here["verified"] if held_here else None)
+    checks = afk_decide.pr_checks_state(pr["statusCheckRollup"])
     ready = afk_decide.turn_gate(cfg["gate"]["ci"], checks, allow,
                                  afk_decide.verifies(cfg), verified, head)
     if ready != "ready":
@@ -2400,7 +2410,7 @@ def _grant_turn(run: _Run, instance: str, agent: _Agent, number: int,
                 f.read(), _prompt_fields(run, issue, wt.path, wt.checked_out()),
                 _landing_fields(cfg, pr)))
     now = run.now()
-    restarted = now if restart else (held_here or {}).get("restarted")
+    restarted = now if restart else (held_here["restarted"] if held_here else None)
     out["comment_id"] = _record_turn(run.repo, pr["number"], afk_decide.single_turn(
         prev, instance, now, verified=verified, allow_no_checks=allow, restarted=restarted))
     out["again"] = bool(held_here)
@@ -2428,7 +2438,7 @@ def _await_checks(repo: str, number: int, head: str, had_checks: bool, timeout: 
         if pr is None:
             raise RuntimeError(f"PR #{number} is no longer open — it was closed or merged while "
                                f"its checks were awaited; nothing was merged here")
-        checks = afk_decide.pr_checks_state(pr.get("statusCheckRollup"))
+        checks = afk_decide.pr_checks_state(pr["statusCheckRollup"])
         if not afk_decide.checks_owed(checks, pr["headRefOid"] == head, had_checks):
             return checks
         left = deadline - time.monotonic()
@@ -2499,12 +2509,13 @@ def cmd_land(a: argparse.Namespace) -> Obj:
                            f"instance that holds issue #{a.number}'s claim; nothing was changed. "
                            f"Do not land it any other way — you are told when its turn comes")
     branch, target = pr["headRefName"], cfg["base_branch"]
-    out = {"issue": a.number, "pr": pr["number"]}
+    pr_number: int = pr["number"]
+    out = {"issue": a.number, "pr": pr_number}
 
     def stop(outcome: afk_decide.LandOutcome, **more: Any) -> Obj:
         """Stop short of merging, and say so on the PR's turn comment."""
         at = _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip()
-        _record_turn(run.repo, pr["number"], afk_decide.next_turn(
+        _record_turn(run.repo, pr_number, afk_decide.next_turn(
             turn, at=run.now(), stopped=afk_decide.land_outcome(outcome), head=at))
         return {**out, "outcome": outcome, **more}
 
@@ -2541,7 +2552,7 @@ def cmd_land(a: argparse.Namespace) -> Obj:
                                "and run this again")
         out["gate"] = gate
     else:
-        checks = afk_decide.pr_checks_state(pr.get("statusCheckRollup"))
+        checks = afk_decide.pr_checks_state(pr["statusCheckRollup"])
         if pushed or checks == "pending":
             checks = _await_checks(run.repo, pr["number"], head, had_checks=checks is not None,
                                    timeout=a.checks_timeout, poll=a.checks_poll)
@@ -2583,7 +2594,8 @@ def cmd_land(a: argparse.Namespace) -> Obj:
 
 
 def _members_of_batch(run: _Run, batch: str,
-                      landed_pr: Callable[[int], int | None] = lambda issue: None) -> list[Obj]:
+                      landed_pr: Callable[[int], int | None] = lambda issue: None
+                      ) -> list[BatchMember]:
     """The PRs merge batch `batch` holds, in stack order → [{"issue", "pr"}...],
     read from the turn marker they carry — the one home of a batch's membership
     (ADR-0029); [] when no PR carries it. Any member's marker names them all, so
@@ -2603,7 +2615,7 @@ def _members_of_batch(run: _Run, batch: str,
     return []
 
 
-def _require_my_batch(run: _Run, instance: str, batch: str) -> Obj:
+def _require_my_batch(run: _Run, instance: str, batch: str) -> Turn:
     """The turn marker of a batch one of MY claims' PRs is in → that marker.
     Raises when no PR of mine carries it: a batch is only ever moved by the
     fleet that holds its members' claims."""
@@ -2616,19 +2628,19 @@ def _require_my_batch(run: _Run, instance: str, batch: str) -> Obj:
     return found
 
 
-def _record_batch(run: _Run, instance: str, batch: str, members: list[Obj],
+def _record_batch(run: _Run, instance: str, batch: str, members: Sequence[BatchMember],
                   phase: afk_decide.BatchPhase) -> None:
     """Write the batch's turn on every member PR — ONE marker each, rewritten in
     place — and say so on each member's status board."""
     repo, now = run.repo, run.now()
-    board = {"prs": [m["pr"] for m in members], "phase": phase}
+    board: BoardBatch = {"prs": [m["pr"] for m in members], "phase": phase}
     for m in members:
         _record_turn(repo, m["pr"], afk_decide.batch_turn(
             _turn(repo, m["pr"]), instance, now, batch, members, phase))
         _upsert_board(run, m["issue"], "landing", instance=instance, pr=m["pr"], batch=board)
 
 
-def _unbatch(run: _Run, instance: str, batch: str, member: Obj, why: afk_decide.Unbatched,
+def _unbatch(run: _Run, instance: str, batch: str, member: BatchMember, why: afk_decide.Unbatched,
              board: bool = True) -> None:
     """Replace a member PR's batch marker by the one that says it left the batch:
     it holds no turn, waits for a single one, and is never batched again."""
@@ -2648,7 +2660,7 @@ def _delete_batch_branches(rem: str, batch: str, keep: str | None = None) -> lis
     return gone
 
 
-def _turn_batch(run: _Run, instance: str, agent: _Agent, working_set: Obj | None = None) -> Obj:
+def _turn_batch(run: _Run, instance: str, agent: _Agent, working_set: WorkingSet | None = None) -> Obj:
     """`afk turn --batch` — give the landing turn to a MERGE BATCH (ADR-0029),
     read off `working_set`: the tick's, else one rebuilt here.
 
@@ -2694,8 +2706,8 @@ def _turn_batch(run: _Run, instance: str, agent: _Agent, working_set: Obj | None
                         detail="this batch already holds the landing turn and its worker is "
                                "there; nothing was touched — `afk no-pr --batch` watches it")
         # only the PRs that still carry the batch's marker: one left out since is not put back
-        members = [m for m in mine["members"]
-                   if ((_turn(run.repo, m["pr"]) or {}).get("batch") == mine["id"])]
+        marked = ((m, _turn(run.repo, m["pr"])) for m in mine["members"])
+        members = [m for m, turn in marked if turn and turn["batch"] == mine["id"]]
         return _start_batch_worker(run, instance, agent, mine["id"], members,
                                    mine["phase"] or afk_decide.BATCH_PHASES[0], again=True)
     if who == "single":
@@ -2713,12 +2725,14 @@ def _turn_batch(run: _Run, instance: str, agent: _Agent, working_set: Obj | None
                     detail="fewer than two PRs are eligible for a merge batch; nothing was "
                            "touched — the turn goes to one PR")
     rows = {r["number"]: r for r in ws["mine"]}
-    members = [{"issue": n, "pr": rows[n]["pr"]} for n in picked]
+    members: list[BatchMember] = [
+        {"issue": n, "pr": pr} for n in picked if (pr := rows[n]["pr"]) is not None]
     return _start_batch_worker(run, instance, agent, afk_decide.batch_id(instance, run.now()),
                                members, afk_decide.BATCH_PHASES[0], again=False)
 
 
-def _start_batch_worker(run: _Run, instance: str, agent: _Agent, batch: str, members: list[Obj],
+def _start_batch_worker(run: _Run, instance: str, agent: _Agent, batch: str,
+                        members: list[BatchMember],
                         phase: afk_decide.BatchPhase, again: bool) -> Obj:
     """Record a batch's turn and put a batch worker on it → `afk turn --batch`'s
     `granted`. Recorded before delivered: a start that then fails leaves a batch
@@ -2780,7 +2794,7 @@ def _abandon_batch(run: _Run, instance: str, batch: str) -> Obj:
             "deleted_branches": deleted, **({"cleanup": cleanup} if cleanup else {})}
 
 
-def _batch_worker(run: _Run, batch: str, worker: _Worker) -> Obj:
+def _batch_worker(run: _Run, batch: str, worker: _Worker) -> BatchWorkerRow:
     """`afk no-pr --batch` — is the batch's worker still at it? The same reading
     and the same ladder as any worker holding a turn (`classify_stopped`), from the
     batch's worktree: busy, or within grace of its turn or of its last
@@ -2788,19 +2802,18 @@ def _batch_worker(run: _Run, batch: str, worker: _Worker) -> Obj:
     silent past grace it is nudged once, and silent again the batch is
     abandoned (`afk_decide.batch_step`)."""
     cfg, path, nudged_at = run.cfg, worker.path, worker.nudged_at
-    turn_at, progress = None, {}
+    turn_at, progress = None, None
     seen = worker.settled
     if not seen:
         now, grace = worker.now, worker.grace
-        told = [(_turn(run.repo, m["pr"]) or {}).get("at")
-                for m in _members_of_batch(run, batch)]
-        turn_at = max((t for t in told if t), default=None)
-        progress = _worktree_progress(path, run.rem, cfg["base_branch"]) if path else {}
+        turns = (_turn(run.repo, m["pr"]) for m in _members_of_batch(run, batch))
+        turn_at = max((t["at"] for t in turns if t and t["at"]), default=None)
+        progress = _worktree_progress(path, run.rem, cfg["base_branch"]) if path else None
         # a batch's worker declares no verdict and names no blocker — and a batch's
         # turn is never restarted: its second silence abandons the batch
         seen = afk_decide.classify_stopped(progress, worker.reading["terminal_idle_seconds"],
                                            None, {}, now, grace, nudged_at=nudged_at,
-                                           turn={"at": turn_at, "batch": batch})
+                                           turn=afk_decide.next_turn(None, at=turn_at, batch=batch))
     return {"batch": batch, **seen, "worktree": path, "progress": progress,
             "nudged_at": nudged_at, "turn_at": turn_at, "worker_state": worker.reading["state"]}
 
@@ -2841,14 +2854,14 @@ def _close_landed_pr(run: _Run, number: int) -> int | None:
     return pr["number"]
 
 
-def _close_batched_pr(run: _Run, pr: Obj, commit: str, batch: str, prs: list[int]) -> None:
+def _close_batched_pr(run: _Run, pr: PullRequest, commit: str, batch: str, prs: list[int]) -> None:
     """Close one PR a batch landed, with the comment that names its commit."""
     cfg = run.cfg
     _close_pr(run.repo, run.rem, pr["number"],
               afk_decide.batch_landed_comment(commit, cfg["base_branch"], batch, prs))
 
 
-def _stack_pr(rem: str, path: str, pr: Obj,
+def _stack_pr(rem: str, path: str, pr: PullRequest,
               issue: int) -> tuple[str | None, str | None, list[str]]:
     """Stack one PR onto the batch worktree's HEAD with ONE merge commit, whose
     second parent is the PR's own head → (commit, None, []), or (None, why,
@@ -2880,7 +2893,8 @@ def _stack_pr(rem: str, path: str, pr: Obj,
     return _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip(), None, []
 
 
-def _batch_turns(run: _Run, batch: str, listed: list[Obj]) -> tuple[list[Obj], str]:
+def _batch_turns(run: _Run, batch: str, listed: Sequence[BatchMember]
+                 ) -> tuple[list[BatchMember], str]:
     """The members of `listed` that hold the batch's turn right now → (members,
     the instance that granted it — "" when there are none). A PR whose marker
     says it left the batch is simply not one of them; any other PR that does
@@ -2957,14 +2971,15 @@ def _land_batch(run: _Run, batch: str, limits: _GateLimits, merged_timeout: floa
                            f"any other way — send your wake and stop")
     left_out = []
 
-    def result(outcome: afk_decide.BatchOutcome, members: list[Obj], **more: Any) -> Obj:
+    def result(outcome: afk_decide.BatchOutcome, members: Sequence[BatchMember],
+               **more: Any) -> Obj:
         return {"outcome": afk_decide.batch_outcome(outcome), "batch": batch,
                 "issues": [m["issue"] for m in members], "prs": [m["pr"] for m in members],
                 "left_out": left_out, **more}
 
     # --- a landing whose finishing was cut short: the target already holds the stack ---
-    landed = [{**m, "commit": c} for m in listed
-              for c in [_landed_commit(path, tip, m["pr"])] if c]
+    landed: list[Stacked] = [{**m, "commit": c} for m in listed
+                                         for c in [_landed_commit(path, tip, m["pr"])] if c]
     if landed:
         return _finish_batch(run, batch, landed, result, merged_timeout,
                              {p["number"]: p["headRefName"] for p in _open_prs(run.repo)})
@@ -2988,7 +3003,7 @@ def _land_batch(run: _Run, batch: str, limits: _GateLimits, merged_timeout: floa
                in (ln.partition("\t") for ln in log.splitlines())]
     _, fixes = afk_decide.read_stack(commits, {m["pr"] for m in listed})
     _git(["-C", path, "reset", "-q", "--hard", tip])
-    stacked: list[Obj] = []
+    stacked: list[Stacked] = []
     for m in members:
         commit, why, files = _stack_pr(rem, path, prs[m["pr"]], m["issue"])
         if commit:
@@ -3062,7 +3077,8 @@ def _await_merged(repo: str, numbers: list[int], timeout: float, poll: float = 2
         time.sleep(min(poll, left))
 
 
-def _finish_batch(run: _Run, batch: str, landed: list[Obj], result: Callable[..., Obj],
+def _finish_batch(run: _Run, batch: str, landed: Sequence[Stacked],
+                  result: Callable[..., Obj],
                   merged_timeout: float, branches: dict[int, str], **more: Any) -> Obj:
     """Finish every PR a batch landed. Each step is skipped when already done,
     so a finishing that was cut short is finished by the next run. Issues first:
@@ -3075,7 +3091,8 @@ def _finish_batch(run: _Run, batch: str, landed: list[Obj], result: Callable[...
     is {PR number: its branch} for the PRs still open as the finishing began —
     a PR GitHub had already merged by then is not in it, and keeps its branch."""
     rem = run.rem
-    instance = (_turn(run.repo, landed[0]["pr"]) or {}).get("instance")
+    granted = _turn(run.repo, landed[0]["pr"])
+    instance = granted["instance"] if granted else None
     for m in landed:
         _upsert_board(run, m["issue"], "merged", instance=instance, pr=m["pr"])
         if _issue_state(run.repo, m["issue"]) == "open":
@@ -3099,7 +3116,7 @@ def _sweep_batches(run: _Run, instance: str, live: Iterable[str]) -> Obj:
     `live` are the ids of the batches that still do."""
     rem = run.rem
     stale = [w for w in _Worktree.of_batches(run.repo, instance)
-             if w.batch not in live and w.remembered]
+             if (w.batch is None or w.batch not in live) and w.remembered]
     removed = []
     if stale:
         workers = _Workers(run)
@@ -3113,7 +3130,7 @@ def _sweep_batches(run: _Run, instance: str, live: Iterable[str]) -> Obj:
     return {"removed": removed, "deleted_branches": gone}
 
 
-def _escalate(run: _Run, instance: str, issue: Obj, attempt: int, reason: str) -> Obj:
+def _escalate(run: _Run, instance: str, issue: IssueRead, attempt: int, reason: str) -> Obj:
     """Hand an issue to a human, in the one order that leaves no gap: status board
     → labels → comment → release. The claim is released LAST: released first, a
     PR-less issue still carrying `ready_label` is back on the frontier for a peer
@@ -3190,7 +3207,8 @@ def _fail_claim(run: _Run, instance: str, agent: _Agent, number: int, reason: st
         for label in add:
             _ensure_label(run.repo, label)
         _edit_labels(run.repo, number, add, remove)
-        issue = {**issue, "labels": [lb for lb in labels if lb not in remove] + add}
+        relabelled: IssueRead = {**issue, "labels": [lb for lb in labels if lb not in remove] + add}
+        issue = relabelled
     worker = _start_worker(run, instance, agent, issue, "fresh", reason)
     return {"issue": number, "action": "retry", "attempt": decision["attempt"],
             "retry_max": cfg["retry"], "worker": worker}
@@ -3240,7 +3258,7 @@ def _park_claim(run: _Run, instance: str, number: int) -> Obj:
     waiting = [b["number"] for b in standings if b["standing"] == "waiting"]
     wt = _Worktree.of_issue(run.repo, number)
     path = wt.path
-    progress = _worktree_progress(path, rem, cfg["base_branch"]) if path else {}
+    progress = _worktree_progress(path, rem, cfg["base_branch"]) if path else None
 
     recorded = {e["number"] for e in _blocked_by(run.repo, number)}
     added = [n for n in waiting if n not in recorded]
@@ -3248,7 +3266,7 @@ def _park_claim(run: _Run, instance: str, number: int) -> Obj:
         _add_blocker(run.repo, number, n)
     _upsert_board(run, number, "parked", blocked_by=waiting)
     _release(run, number)
-    empty = progress.get("commits_ahead") == 0 and not progress.get("dirty")
+    empty = bool(progress and progress["commits_ahead"] == 0 and not progress["dirty"])
     cleanup = wt.remove() if (path and empty) else None
     return {"issue": number, "action": "parked", "blocked_by": waiting, "edges_added": added,
             "released": True, **({"cleanup": cleanup} if cleanup else {})}
@@ -3291,7 +3309,7 @@ def build_parser() -> _Parser:
     sub = ap.add_subparsers(dest="cmd", required=True)
     ap.subcommands = sub.choices
 
-    def command(name: str, fn: Callable[[argparse.Namespace], Obj], help: str,
+    def command(name: str, fn: Callable[[argparse.Namespace], Mapping[str, Any]], help: str,
                 remote: Literal["refs", "gh"] | None = None,
                 needs_config: bool = True) -> argparse.ArgumentParser:
         """One subcommand. All but the two that run before a config exists

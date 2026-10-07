@@ -1759,7 +1759,7 @@ def _each_judgment_comes_with_a_command_for_either_answer(pick, verify=()):
         if pick == "if_yes":
             assert done[1]["action"] == "closed" and w.issue(1)["state"] == "closed"
             assert done[3]["outcome"] == "granted" and len(_turns(w, 30)) == 1
-            turn = afk_decide.latest_turn([{"body": b} for b in _turns(w, 30)])
+            turn = afk_decide.latest_turn([{"id": 0, "url": "", "body": b} for b in _turns(w, 30)])
             assert turn["allow_no_checks"] and turn["verified"] == (head if verify else None)
         else:
             assert done[1]["action"] == done[3]["action"] == "retry"
@@ -1904,7 +1904,7 @@ def test_no_pr_gathers_every_signal_and_decides_in_one_call():
         w.calls()
         r = w.no_pr(*base, "--now", later)
         assert (r["outcome"], r["action"], r["worker_state"]) == ("coding", "leave", "working")
-        assert (r["progress"], r["worker_verdict"]) == ({}, None)
+        assert (r["progress"], r["worker_verdict"]) == (None, None)
         assert w.calls() == []
         # …unless the terminal has said nothing for a grace period: a lost stop report
         w.worker(output=int(later) - 400, state="working", since=real_now)
@@ -2077,7 +2077,7 @@ def test_no_pr_without_a_worktree_and_with_bad_input():
         # declared, and nothing more is read to say so
         r = w.no_pr("--issue", "4", *R)
         assert (r["outcome"], r["action"], r["worktree"], r["progress"]) == \
-            ("dead", "orphan", None, {})
+            ("dead", "orphan", None, None)
         assert w.calls() == []
 
         # the worktree is found through orca — the tick passes no path

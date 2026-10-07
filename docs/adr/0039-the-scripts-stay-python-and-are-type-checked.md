@@ -34,6 +34,8 @@ wherever a separate `turn` was truthy, the two tied only by an assignment forty 
    runs `uvx ruff@<version> check` with the `ANN` rules (`ruff.toml`), so one that does not is red.
    A JSON object — a config, a `gh` row, a result — is `afk_decide.Obj`; what its keys are stays
    where it is made.
+   *(Replaced by [ADR-0040](0040-a-record-is-a-typeddict-read-by-subscript.md): a record is a
+   TypedDict, read by subscript.)*
 4. **A closed vocabulary is a `Literal`.** Declared beside its words in `afk_decide.py`: a tuple of
    them is read off the Literal (`get_args`), and a table of them is keyed by it, so a word
    misspelled where it is used is a type error. Where a chain of branches handles every word it
