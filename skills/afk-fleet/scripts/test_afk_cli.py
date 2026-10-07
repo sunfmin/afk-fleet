@@ -1759,7 +1759,7 @@ def _each_judgment_comes_with_a_command_for_either_answer(pick, verify=()):
         if pick == "if_yes":
             assert done[1]["action"] == "closed" and w.issue(1)["state"] == "closed"
             assert done[3]["outcome"] == "granted" and len(_turns(w, 30)) == 1
-            turn = afk_decide.latest_turn([{"body": b} for b in _turns(w, 30)])
+            turn = afk_decide.latest_turn([{"id": 0, "url": "", "body": b} for b in _turns(w, 30)])
             assert turn["allow_no_checks"] and turn["verified"] == (head if verify else None)
         else:
             assert done[1]["action"] == done[3]["action"] == "retry"

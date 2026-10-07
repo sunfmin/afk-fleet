@@ -48,6 +48,97 @@ Obj = dict[str, Any]
 # ours to declare — and so does a subcommand's result, which only JSON reads.
 
 
+# A row gh returned is declared too, where the fleet's own `--jq` or `--json`
+# says which keys it has (afk.py's `_ISSUES_JQ`, `_ISSUE_JQ`, `_PR_FIELDS`): the
+# projection is the promise that each is there. What orca answers, and what
+# GitHub nests inside a check rollup or a branch protection, has no such
+# promise — those stay `Obj`, read with `.get` where they come in.
+
+
+class Claim(TypedDict):
+    """One claim ref, as the scan lists it. A ref that carries no claim record
+    is still a claim: one that names nobody."""
+    number: int
+    instance: str | None
+    host: str | None
+    ts: int | None
+    sha: str
+
+
+class Issue(TypedDict):
+    """One open issue, as the gather lists it."""
+    number: int
+    id: int
+    title: str
+    labels: list[str]
+    updatedAt: str
+    blocked_by: int                 # how many open issues block it
+
+
+class EligibleIssue(Issue):
+    """An open issue with the three facts the frontier reads (`_eligibility_rows`)."""
+    claimed: bool
+    has_open_pr: bool
+    open_blockers: int
+
+
+class IssueRead(TypedDict):
+    """One issue read on its own, open or closed."""
+    number: int
+    id: int
+    title: str
+    state: str
+    state_reason: str | None
+    labels: list[str]
+    pull_request: bool
+
+
+class IssueRef(TypedDict):
+    number: int
+
+
+class PullRequest(TypedDict):
+    """One open PR, as `gh pr list` returns the fields asked for."""
+    number: int
+    title: str
+    headRefName: str
+    headRefOid: str
+    updatedAt: str
+    statusCheckRollup: list[Obj] | None
+    closingIssuesReferences: list[IssueRef]
+
+
+class Comment(TypedDict):
+    """One comment on an issue or a PR."""
+    id: int
+    body: str
+    url: str
+
+
+class _WorktreeHere(TypedDict):
+    present: bool
+    path: str | None
+
+
+class WorktreeSignal(_WorktreeHere, total=False):
+    """Whether an issue's worktree is still on this machine — and, when it is
+    `present`, its git progress."""
+    commits_ahead: int | None
+    dirty: bool
+    last_commit_ts: int | None
+    worktree_mtime_ts: float | None
+
+
+class _BranchPushed(TypedDict):
+    name: str | None
+    commits_ahead: int | None
+
+
+class BranchSignal(_BranchPushed, total=False):
+    """The branch a dead worker pushed, and how far ahead of base it is."""
+    candidates: list[str]
+
+
 class GateConfig(TypedDict):
     ci: GateCiMode
     local_command: str
@@ -541,15 +632,15 @@ def read_marker(kind: RecordKind, body: str | None) -> Obj | None:
 
 
 def latest_record(kind: RecordKind,
-                  comments: Iterable[Obj] | None) -> tuple[Obj | None, Obj | None]:
+                  comments: Iterable[Comment] | None) -> tuple[Obj | None, Comment | None]:
     """The record of `kind` kept on one issue or PR, from its comments
     ([{"id", "body", "url"}...], oldest first) → (record, the comment that
     carries it), or (None, None). The latest marker wins — and a comment whose
     marker is not a record is passed over, not read as the latest. The comment
     is where a rewrite goes: a record is kept in ONE comment, rewritten in place."""
-    found: tuple[Obj | None, Obj | None] = (None, None)
+    found: tuple[Obj | None, Comment | None] = (None, None)
     for comment in comments or []:
-        record = read_marker(kind, comment.get("body"))
+        record = read_marker(kind, comment["body"])
         if record is not None:
             found = (record, comment)
     return found
@@ -828,17 +919,18 @@ def override_config(cfg: Config, assignments: Iterable[str] | None) -> Config:
 # carries it on every row; the two eligibility facts that are not on the issue
 # itself (claimed / has_open_pr) are grafted by `_eligibility_rows`.
 
-def _eligibility_rows(issues: list[Obj], prs: list[Obj], claims: list[Obj]) -> list[Obj]:
+def _eligibility_rows(issues: list[Issue], prs: list[PullRequest],
+                      claims: list[Claim]) -> list[EligibleIssue]:
     """Each issue + the three eligibility facts `select_frontier` reads:
     `claimed` (a claim ref exists, any owner — not the assignee, ADR-0003),
     `has_open_pr` (an open PR closes it — the open-PR guard) and
     `open_blockers` (the issue's own `blocked_by` count; missing → 0)."""
-    claimed = {c.get("number") for c in claims}
+    claimed = {c["number"] for c in claims}
     pr_for = _closing_pr_map(prs)
     return [{**i,
-             "claimed": i.get("number") in claimed,
-             "has_open_pr": i.get("number") in pr_for,
-             "open_blockers": int(i.get("blocked_by") or 0)}
+             "claimed": i["number"] in claimed,
+             "has_open_pr": i["number"] in pr_for,
+             "open_blockers": int(i["blocked_by"] or 0)}
             for i in issues]
 
 
@@ -865,7 +957,7 @@ def label_bars(labels: Iterable[str] | None, ready_label: str,
     return bars
 
 
-def select_frontier(issues: list[Obj], ready_label: str, epic_labels: Iterable[str]) -> Obj:
+def select_frontier(issues: list[EligibleIssue], ready_label: str, epic_labels: Iterable[str]) -> Obj:
     """
     Decide which issues are dispatchable RIGHT NOW. Shared by `--plan` and the live
     tick, so both compute the identical frontier (a stable published contract).
@@ -878,15 +970,15 @@ def select_frontier(issues: list[Obj], ready_label: str, epic_labels: Iterable[s
     """
     dispatch, excluded = [], []
     for issue in issues:
-        num = issue.get("number")
-        bars = label_bars(issue.get("labels"), ready_label, epic_labels)
+        num = issue["number"]
+        bars = label_bars(issue["labels"], ready_label, epic_labels)
         if bars:
             reason = next(iter(bars.values()))
-        elif issue.get("claimed"):
+        elif issue["claimed"]:
             reason = "already claimed (afk-claim ref exists)"
-        elif issue.get("has_open_pr"):
+        elif issue["has_open_pr"]:
             reason = "has an open linked PR"
-        elif issue.get("open_blockers"):
+        elif issue["open_blockers"]:
             reason = f"{issue['open_blockers']} open blocker(s)"
         else:
             dispatch.append(num)
@@ -915,7 +1007,7 @@ def heartbeat_due(last_ts: float | None, now: float, ttl: float) -> bool:
     return (now - int(last_ts)) > ttl / 3.0
 
 
-def classify_claims(claims: list[Obj], heartbeats: Mapping[str, float], me: str | None,
+def classify_claims(claims: list[Claim], heartbeats: Mapping[str, float], me: str | None,
                     now: float, ttl: float) -> dict[str, list[int]]:
     """
     Partition every afk-claim ref by ownership and owner-liveness — the verdict a
@@ -940,8 +1032,8 @@ def classify_claims(claims: list[Obj], heartbeats: Mapping[str, float], me: str 
     """
     mine, peer_live, stale = [], [], []
     for c in claims:
-        n = c.get("number")
-        inst = c.get("instance")
+        n = c["number"]
+        inst = c["instance"]
         if inst is not None and inst == me:
             mine.append(n)
         elif is_stale(heartbeats.get(inst), now, ttl):
@@ -1356,7 +1448,7 @@ def verdict_marker_format(n: int) -> str:
                          optional=("blocked_by", "reason"))
 
 
-def latest_verdict(comments: Iterable[Obj] | None) -> Verdict:
+def latest_verdict(comments: Iterable[Comment] | None) -> Verdict:
     """
     The worker's verdict on an issue, from its comments ([{"body", "url"}...],
     oldest first, the gh default) — `latest_record`'s. Returns:
@@ -1366,7 +1458,7 @@ def latest_verdict(comments: Iterable[Obj] | None) -> Verdict:
     record, comment = latest_record(VERDICT_RECORD, comments)
     said = {**_NO_VERDICT, **(record or {})}
     return {"found": record is not None, "phase": said["phase"], "blocked_by": said["blocked_by"],
-            "reason": said["reason"], "comment_url": comment.get("url") if comment else None}
+            "reason": said["reason"], "comment_url": comment["url"] if comment else None}
 
 
 # Where one issue a `blocked` verdict names stands (ADR-0022):
@@ -1383,17 +1475,17 @@ _CLOSED_UNDONE = {"not_planned": "was closed as not planned",
                   "duplicate": "was closed as a duplicate"}
 
 
-def _blocker_standing(blocker: Obj | None, claimed: bool, has_open_pr: bool,
+def _blocker_standing(blocker: IssueRead | None, claimed: bool, has_open_pr: bool,
                       config: Config) -> tuple[BlockerStanding, str | None]:
     """One named blocker's `(standing, reason)`, before the cycle check."""
     if blocker is None:
         return _UNMET, "could not be read (it may not exist)"
-    if blocker.get("pull_request"):
+    if blocker["pull_request"]:
         return _UNMET, "is a pull request, not an issue"
-    if blocker.get("state") == "closed":
-        undone = _CLOSED_UNDONE.get(blocker.get("state_reason"))
+    if blocker["state"] == "closed":
+        undone = _CLOSED_UNDONE.get(blocker["state_reason"])
         return (_UNMET, undone) if undone else (_CLOSED, None)
-    bars = label_bars(blocker.get("labels"), config["ready_label"], config["epic_labels"])
+    bars = label_bars(blocker["labels"], config["ready_label"], config["epic_labels"])
     if set(bars) - {"not_ready"}:          # a bar no claim overrides: nothing will dispatch it
         return _UNMET, f"will never be dispatched: {'; '.join(bars.values())}"
     if bars and not (claimed or has_open_pr):
@@ -1416,7 +1508,7 @@ def depends_on(start: int, target: int, edges: Mapping[int, list[int]]) -> bool:
 
 
 def blocker_standings(number: int, named: Iterable[int], config: Config, *,
-                      blockers: Mapping[int, Obj | None] | None, claimed: Collection[int],
+                      blockers: Mapping[int, IssueRead | None] | None, claimed: Collection[int],
                       open_pr: Collection[int],
                       edges: Mapping[int, list[int]] | None) -> list[Standing]:
     """
@@ -1962,7 +2054,7 @@ def turn_comment(turn: Turn) -> str:
     return record_comment(TURN_RECORD, fields, text)
 
 
-def latest_turn(comments: Iterable[Obj] | None) -> Turn | None:
+def latest_turn(comments: Iterable[Comment] | None) -> Turn | None:
     """
     The landing turn recorded on a PR, from its comments ([{"id", "body"}...],
     oldest first) → every field of TURN_RECORD — one the marker does not state
@@ -1975,7 +2067,7 @@ def latest_turn(comments: Iterable[Obj] | None) -> Turn | None:
     record, comment = latest_record(TURN_RECORD, comments)
     if record is None or comment is None:
         return None
-    return cast("Turn", {**_whole_turn({**_NO_TURN, **record}), "comment_id": comment.get("id")})
+    return cast("Turn", {**_whole_turn({**_NO_TURN, **record}), "comment_id": comment["id"]})
 
 
 def held_turn(turn: Turn | None, owner: str | None) -> Turn | None:
@@ -2240,7 +2332,7 @@ def batch_step(worker: BatchWorkerRow) -> BatchStep:
 # gate. It never counts as a retry: it answers "did the FLEET die?", not "is
 # this WORK failing?".
 
-def group_instances(claims: Iterable[Obj] | None, heartbeats: Mapping[str, float] | None,
+def group_instances(claims: Iterable[Claim] | None, heartbeats: Mapping[str, float] | None,
                     me: str | None, now: float, ttl: float) -> list[Obj]:
     """
     Every fleet instance discoverable in fleet state, with what it holds and how
@@ -2260,10 +2352,10 @@ def group_instances(claims: Iterable[Obj] | None, heartbeats: Mapping[str, float
     """
     by: dict[Any, Obj] = {}
     for c in claims or []:
-        inst = c.get("instance")
+        inst = c["instance"]
         row = by.setdefault(inst, {"instance": inst, "host": None, "claims": []})
-        row["claims"].append(c.get("number"))
-        row["host"] = row["host"] or c.get("host")
+        row["claims"].append(c["number"])
+        row["host"] = row["host"] or c["host"]
     for inst in (heartbeats or {}):
         by.setdefault(inst, {"instance": inst, "host": None, "claims": []})
 
@@ -2281,7 +2373,7 @@ def group_instances(claims: Iterable[Obj] | None, heartbeats: Mapping[str, float
     return out
 
 
-def plan_takeover(claims: Iterable[Obj] | None, heartbeats: Mapping[str, float] | None,
+def plan_takeover(claims: Iterable[Claim] | None, heartbeats: Mapping[str, float] | None,
                   target: str | None, me: str | None, now: float, ttl: float,
                   confirmed: bool = False) -> Obj:
     """
@@ -2300,8 +2392,8 @@ def plan_takeover(claims: Iterable[Obj] | None, heartbeats: Mapping[str, float] 
       none     nothing to take: no such instance, or it holds no claims.
       error    the target is THIS fleet — its claims are already mine.
     """
-    rows = sorted(({"number": c.get("number"), "sha": c.get("sha"), "host": c.get("host")}
-                   for c in claims or [] if c.get("instance") == target),
+    rows = sorted(({"number": c["number"], "sha": c["sha"], "host": c["host"]}
+                   for c in claims or [] if c["instance"] == target),
                   key=lambda r: (r["number"] is None, r["number"]))
     ts = (heartbeats or {}).get(target)
     fresh = ts is not None and not is_stale(ts, now, ttl)
@@ -2467,7 +2559,7 @@ def furthest_ahead(ahead_by_branch: Mapping[str, int | None]) -> str | None:
     return max(names, key=lambda b: ahead_by_branch[b] or 0) if names else None
 
 
-def select_recovery(worktree: Obj | None, branch: Obj | None, fresh: bool = False,
+def select_recovery(worktree: WorktreeSignal | None, branch: BranchSignal | None, fresh: bool = False,
                     landing_pr: int | None = None) -> RecoveryPlan:
     """
     How to recover ONE claim whose worker has died — the continue-vs-fresh
@@ -2508,23 +2600,23 @@ def select_recovery(worktree: Obj | None, branch: Obj | None, fresh: bool = Fals
     if fresh:
         return {"tier": 3, "action": "dispatch_fresh", "prompt": "fresh",
                 "reason": "fresh start: the previous attempt was discarded"}
-    wt, br = worktree or {}, branch or {}
-    pushed = int(br.get("commits_ahead") or 0)
+    wt, br = worktree, branch
+    pushed = int((br["commits_ahead"] if br else None) or 0)
     held = "landing" if landing_pr else None
-    if wt.get("present"):
-        ahead = wt.get("commits_ahead")
+    if wt and wt["present"]:
+        ahead = wt["commits_ahead"]
         known = ahead is not None
-        pristine = known and int(ahead) == 0 and not bool(wt.get("dirty")) and pushed == 0
+        pristine = known and int(ahead) == 0 and not wt["dirty"] and pushed == 0
         if pristine:
             reason = "local worktree present but pristine — reuse it, nothing to continue"
         elif not known:
             reason = "local worktree present, progress unreadable — reuse it and inspect"
-        elif int(ahead) == 0 and not wt.get("dirty"):
+        elif int(ahead) == 0 and not wt["dirty"]:
             reason = (f"local worktree present and clean, but its branch carries {pushed} "
                       f"pushed commit(s) ahead of base — reuse it and continue from them")
         else:
             reason = (f"local worktree present with {int(ahead)} commit(s) ahead"
-                      + (" and uncommitted changes" if wt.get("dirty") else ""))
+                      + (" and uncommitted changes" if wt["dirty"] else ""))
         return {"tier": 1, "action": "reuse_worktree",
                 "prompt": held or ("fresh" if pristine else "continue"), "reason": reason}
     if held:
@@ -2532,7 +2624,7 @@ def select_recovery(worktree: Obj | None, branch: Obj | None, fresh: bool = Fals
                 "reason": f"no local worktree; PR #{landing_pr} holds the landing turn — "
                           f"recreate at its head"}
 
-    name, ahead = br.get("name"), br.get("commits_ahead")
+    name, ahead = (br["name"], br["commits_ahead"]) if br else (None, None)
     if name and ahead is not None and int(ahead) > 0:
         return {"tier": 2, "action": "recreate_at_tip", "prompt": "continue",
                 "reason": f"no local worktree; branch {name} is {int(ahead)} commit(s) "
@@ -3931,7 +4023,8 @@ def resolve_worker_command(base_url: str | None, supplied: str | None = None,
 # one tick; a missed change waits at most `force_after`
 # cycles. Correctness never depends on the gate.
 
-def fingerprint(issues: Iterable[Obj], prs: Iterable[Obj], claims: Iterable[Obj]) -> str:
+def fingerprint(issues: Iterable[Issue], prs: Iterable[PullRequest],
+                claims: Iterable[Claim]) -> str:
     """
     Digest the observable fleet inputs — open issues (number + labels +
     updatedAt + open-blocker count, so label churn, closes, fresh blocker
@@ -3958,14 +4051,14 @@ def fingerprint(issues: Iterable[Obj], prs: Iterable[Obj], claims: Iterable[Obj]
     fields never move the digest. Returns a 16-hex digest.
     """
     canon = {
-        "issues": sorted([i.get("number"), sorted(i.get("labels") or []), i.get("updatedAt") or "",
-                          int(i.get("blocked_by") or 0)]
+        "issues": sorted([i["number"], sorted(i["labels"] or []), i["updatedAt"] or "",
+                          int(i["blocked_by"] or 0)]
                          for i in issues),
-        "prs": sorted([p.get("number"), p.get("headRefOid") or "", p.get("updatedAt") or "",
-                       pr_checks_state(p.get("statusCheckRollup")) or "none",
-                       sorted(ref.get("number") for ref in p.get("closingIssuesReferences") or [])]
+        "prs": sorted([p["number"], p["headRefOid"] or "", p["updatedAt"] or "",
+                       pr_checks_state(p["statusCheckRollup"]) or "none",
+                       sorted(ref["number"] for ref in p["closingIssuesReferences"] or [])]
                       for p in prs),
-        "claims": sorted([c.get("number"), c.get("sha") or ""] for c in claims),
+        "claims": sorted([c["number"], c["sha"] or ""] for c in claims),
     }
     blob = json.dumps(canon, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
@@ -4026,25 +4119,25 @@ def pr_checks_state(rollup: Iterable[Obj] | None) -> ChecksState | None:
     return state
 
 
-def _closing_pr_map(prs: Iterable[Obj]) -> dict[int, Obj]:
+def _closing_pr_map(prs: Iterable[PullRequest]) -> dict[int, PullRequest]:
     """issue number → the open PR that closes it. When several do, the highest
     PR number wins — the latest attempt is the live one."""
-    m: dict[int, Obj] = {}
+    m: dict[int, PullRequest] = {}
     for p in prs:
-        for ref in p.get("closingIssuesReferences") or []:
-            n = ref.get("number")
+        for ref in p["closingIssuesReferences"] or []:
+            n = ref["number"]
             cur = m.get(n)
-            if cur is None or (p.get("number") or 0) > (cur.get("number") or 0):
+            if cur is None or p["number"] > cur["number"]:
                 m[n] = p
     return m
 
 
-def closing_pr(prs: Iterable[Obj], number: int) -> Obj | None:
+def closing_pr(prs: Iterable[PullRequest], number: int) -> PullRequest | None:
     """The open PR that closes issue <number> (the latest, when several do), or None."""
     return _closing_pr_map(prs).get(number)
 
 
-def unseen_prs(mine: list[MineRow], prs: Iterable[Obj]) -> list[int]:
+def unseen_prs(mine: list[MineRow], prs: Iterable[PullRequest]) -> list[int]:
     """The claims whose PR a tick did not act on: the issue numbers of the `mine`
     rows it worked from whose closing PR, among the open PRs `prs` read as it
     ended, is not the one the row names — opened, or replaced, while it ran."""
@@ -4053,18 +4146,18 @@ def unseen_prs(mine: list[MineRow], prs: Iterable[Obj]) -> list[int]:
                   if r["number"] in now and now[r["number"]].get("number") != r["pr"])
 
 
-def superseded_prs(prs: Iterable[Obj] | None, number: int) -> list[Obj]:
+def superseded_prs(prs: Iterable[PullRequest] | None, number: int) -> list[PullRequest]:
     """The open PRs a FRESH start of issue <number> supersedes: the ones that
     close it from a branch shaped like the fleet's own (`branch_regex`). A PR a
     human opened from some other branch is never one of them — the fleet closes
     only what the fleet opened."""
     rx = branch_regex(number)
     return [p for p in prs or []
-            if any(ref.get("number") == number for ref in p.get("closingIssuesReferences") or [])
-            and rx.match(p.get("headRefName") or "")]
+            if any(ref["number"] == number for ref in p["closingIssuesReferences"] or [])
+            and rx.match(p["headRefName"] or "")]
 
 
-def assemble_working_set(issues: list[Obj], prs: list[Obj], claims: list[Obj],
+def assemble_working_set(issues: list[Issue], prs: list[PullRequest], claims: list[Claim],
                          heartbeats: Mapping[str, float], me: str, now: float, config: Config,
                          closed: Iterable[int] = (),
                          turns: Mapping[int, Turn] | None = None) -> WorkingSet:
@@ -4122,31 +4215,32 @@ def assemble_working_set(issues: list[Obj], prs: list[Obj], claims: list[Obj],
     `stale_closed` instead, to be deleted rather than taken and dispatched.
     """
     ttl, ci_mode = CLAIM_LEASE_TTL_SECONDS, config["gate"]["ci"]
-    by_num = {i.get("number"): i for i in issues}
+    by_num = {i["number"]: i for i in issues}
     pr_for = _closing_pr_map(prs)
 
     ready = select_frontier(_eligibility_rows(issues, prs, claims),
                             config["ready_label"], config["epic_labels"])
     frontier: Frontier = {
-        "dispatch": [{"number": n, "title": by_num.get(n, {}).get("title")}
+        "dispatch": [{"number": n, "title": by_num[n]["title"]}
                      for n in ready["dispatch"]],
         "excluded": ready["excluded"]}
 
     part = classify_claims(claims, heartbeats, me, now, ttl)
-    by_claim = {c.get("number"): c for c in claims}
+    by_claim = {c["number"]: c for c in claims}
     closed = set(closed)
 
     def stale_rows(numbers: Iterable[int]) -> list[StaleClaim]:
-        return [{"number": n, "instance": by_claim.get(n, {}).get("instance"),
-                 "sha": by_claim.get(n, {}).get("sha")} for n in numbers]
+        return [{"number": n, "instance": by_claim[n]["instance"], "sha": by_claim[n]["sha"]}
+                for n in numbers]
 
     turns = turns or {}
     mine: list[MineRow] = []
     batches: dict[str, Batch] = {}
     for n in part["mine"]:
         pr = pr_for.get(n)
-        checks = pr_checks_state(pr.get("statusCheckRollup")) if pr else None
-        issue = by_num.get(n, {})
+        checks = pr_checks_state(pr["statusCheckRollup"]) if pr else None
+        issue = by_num.get(n)                # None: closed — only open issues are gathered
+        labels = issue["labels"] if issue else None
         turn = turns.get(n)
         held = held_turn(turn, me)
         status = claim_status(pr is not None, checks, ci_mode,
@@ -4158,11 +4252,11 @@ def assemble_working_set(issues: list[Obj], prs: list[Obj], claims: list[Obj],
                 "id": turn["batch"], "instance": turn["instance"], "members": turn["members"],
                 "phase": turn["phase"], "at": turn["at"]})
             seen["at"] = max(seen["at"] or 0, turn["at"] or 0) or None
-        mine.append({"number": n, "title": issue.get("title"),
+        mine.append({"number": n, "title": issue["title"] if issue else None,
                      "status": status, "board_phase": None if batch else BOARD_PHASE_OF[status],
-                     "pr": pr.get("number") if pr else None, "checks": checks,
-                     "attempt": current_attempt(issue.get("labels")),
-                     "starting": attempt_starting(issue.get("labels")),
+                     "pr": pr["number"] if pr else None, "checks": checks,
+                     "attempt": current_attempt(labels),
+                     "starting": attempt_starting(labels),
                      "stopped": landing["stopped"] if landing else None,
                      "batch": {"id": batch, "members": [m["issue"] for m in landing["members"]],
                                "phase": landing["phase"]} if landing and batch else None,
@@ -4172,7 +4266,7 @@ def assemble_working_set(issues: list[Obj], prs: list[Obj], claims: list[Obj],
             "mine": mine,
             "merge_order": turn_order(mine),
             "batches": [batches[k] for k in sorted(batches)],
-            "peer_live": [{"number": n, "instance": by_claim.get(n, {}).get("instance")}
+            "peer_live": [{"number": n, "instance": by_claim[n]["instance"]}
                           for n in part["peer_live"]],
             "stale": stale_rows(n for n in part["stale"] if n not in closed),
             "stale_closed": stale_rows(n for n in part["stale"] if n in closed),

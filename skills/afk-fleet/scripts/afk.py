@@ -57,7 +57,8 @@ import afk_decide
 
 Obj = afk_decide.Obj    # a JSON object: a payload of gh or orca, a row, a result
 # The records the two scripts hand each other, declared in the core (ADR-0039).
-from afk_decide import (BatchMember, BatchWorkerRow, BoardBatch, Call, Config, Progress, Seen,  # noqa: E402
+from afk_decide import (BatchMember, BatchWorkerRow, BoardBatch, BranchSignal, Claim, Comment,
+                        Issue, IssueRead, PullRequest, WorktreeSignal, Call, Config, Progress, Seen,  # noqa: E402
                         Stacked, Standing, Turn, WorkerReading, WorkerRow, WorkingSet)
 Answer = afk_decide.Answer              # how a step of a tick's plan ended
 StartOutcome = afk_decide.StartOutcome  # how beginning a dispatch ended
@@ -287,12 +288,12 @@ _ISSUE_JQ = ("{id, title, state, state_reason, labels: [.labels[].name], "
              "pull_request: (.pull_request != null)}")
 
 
-def _read_issue(repo: str, number: int) -> Obj | RuntimeError:
+def _read_issue(repo: str, number: int) -> IssueRead | RuntimeError:
     """One issue as {"number", "id", "title", "state", "state_reason",
     "labels": [name...], "pull_request": bool} — or, when it could not be read,
     the error that says why: a caller either raises it (`_issue`) or takes it
     for "unknown". An open issue the gather listed is not read again."""
-    def read() -> Obj | RuntimeError:
+    def read() -> IssueRead | RuntimeError:
         try:
             p = _gh(["api", f"repos/{repo}/issues/{number}", "--jq", _ISSUE_JQ])
             return {"number": number, **json.loads(p.stdout)}
@@ -301,7 +302,7 @@ def _read_issue(repo: str, number: int) -> Obj | RuntimeError:
     return _once(("issue", repo, number), read)
 
 
-def _issue(repo: str, number: int) -> Obj:
+def _issue(repo: str, number: int) -> IssueRead:
     """One issue (`_read_issue`). Raises when it cannot be read."""
     issue = _read_issue(repo, number)
     if isinstance(issue, Exception):
@@ -317,12 +318,12 @@ _ISSUES_JQ = (".[] | select(.pull_request == null) | {number, id, title, "
               "blocked_by: (.issue_dependencies_summary.blocked_by // 0)}")
 
 
-def _open_issues(repo: str) -> list[Obj]:
+def _open_issues(repo: str) -> list[Issue]:
     """Every open issue — all of them, page after page — as {"number", "id",
     "title", "labels": [name...], "updatedAt", "blocked_by": <open blocker
     count>}: the one shape afk_decide reads. Each is also what `_read_issue`
     would say of it."""
-    def read() -> list[Obj]:
+    def read() -> list[Issue]:      # the keys are `_ISSUES_JQ`'s
         p = _gh(["api", "--paginate", f"repos/{repo}/issues?state=open&per_page=100",
                  "--jq", _ISSUES_JQ])
         return [json.loads(ln) for ln in p.stdout.splitlines() if ln.strip()]
@@ -339,7 +340,7 @@ _PR_FIELDS = ("number,title,headRefName,headRefOid,updatedAt,statusCheckRollup,"
               "closingIssuesReferences")
 
 
-def _open_prs(repo: str, fresh: bool = False) -> list[Obj]:
+def _open_prs(repo: str, fresh: bool = False) -> list[PullRequest]:
     """Every open PR, with the fields the working set, the merge and a fresh
     start all read. `fresh`: read now, whatever this process read before."""
     if fresh:
@@ -348,10 +349,10 @@ def _open_prs(repo: str, fresh: bool = False) -> list[Obj]:
         _gh(["pr", "list", "--repo", repo, "--state", "open", "--json", _PR_FIELDS]).stdout))
 
 
-def _issue_comments(repo: str, number: int) -> list[Obj]:
+def _issue_comments(repo: str, number: int) -> list[Comment]:
     """An issue's comments, oldest first, as [{"id", "body", "url"}...] — a PR's
     too: its landing turn is one of them."""
-    def read() -> list[Obj]:
+    def read() -> list[Comment]:
         p = _gh(["api", "--paginate", f"repos/{repo}/issues/{number}/comments",
                  "--jq", ".[] | {id, body, url: .html_url}"])
         return [json.loads(ln) for ln in p.stdout.splitlines() if ln.strip()]
@@ -423,18 +424,18 @@ def _close_pr(repo: str, rem: str, number: int, comment: str) -> None:
     _forget(("prs", repo), ("comments", repo, number), ("heads", rem))
 
 
-def _merge_pr(repo: str, rem: str, pr: Obj, head: str) -> None:
+def _merge_pr(repo: str, rem: str, pr: PullRequest, head: str) -> None:
     """Merge an open PR — a merge commit, never a squash or a rebase — only
     while its head is still `head`, and delete its branch. The issues it closes
     are closed by GitHub with it."""
     _gh(["pr", "merge", str(pr["number"]), "--repo", repo, "--merge",
          "--match-head-commit", head, "--delete-branch"])
     _forget(("prs", repo), ("heads", rem))
-    for ref in pr.get("closingIssuesReferences") or []:
+    for ref in pr["closingIssuesReferences"] or []:
         _issue_written(repo, ref["number"])
 
 
-def _blocker(repo: str, number: int) -> Obj | None:
+def _blocker(repo: str, number: int) -> IssueRead | None:
     """One issue a `blocked` verdict names, as `afk_decide.blocker_standings` reads
     it: {"state", "state_reason", "labels": [name...], "pull_request"}. None
     when it cannot be read — which is never "closed"."""
@@ -456,7 +457,7 @@ def _turn(repo: str, pr_number: int) -> Turn | None:
     return afk_decide.latest_turn(_issue_comments(repo, pr_number))
 
 
-def _claim_turns(repo: str, prs: list[Obj], claims: list[Obj],
+def _claim_turns(repo: str, prs: list[PullRequest], claims: list[Claim],
                  instance: str) -> dict[int, Turn]:
     """{issue number: turn} for every claim of `instance` whose open PR carries a
     turn marker, whoever wrote it — `afk_decide.held_turn` says which of them
@@ -580,7 +581,7 @@ def _mirrored_records(kind: afk_decide.RecordKind,
         yield refname.rsplit("/", 1)[-1], sha, _read_record(kind, sha)
 
 
-def _claim_row(number: int, sha: str, record: Obj | None) -> Obj:
+def _claim_row(number: int, sha: str, record: Obj | None) -> Claim:
     """The claim on issue <number> as the scan lists it. The ref is the lock, so
     a claim ref that carries no claim record is still a claim — one that names
     nobody, which is never mine and is stale to everyone."""
@@ -593,11 +594,11 @@ def _scan_key(run: _Run) -> tuple[str, str, str]:
     return ("scan", run.rem, run.cfg["claim_namespace"])
 
 
-def _scan(run: _Run) -> tuple[list[Obj], dict[str, int]]:
+def _scan(run: _Run) -> tuple[list[Claim], dict[str, int]]:
     """Mirror the remote claim+heartbeat refs into a disposable local namespace and
     read every record. Returns (claims, heartbeats). Raises when the remote cannot
     be read: a fleet whose claims are unreadable must not look like one holding none."""
-    def read() -> tuple[list[Obj], dict[str, int]]:
+    def read() -> tuple[list[Claim], dict[str, int]]:
         claim_ns, hb_ns = afk_decide.CLAIM_NAMESPACES[run.cfg["claim_namespace"]]
         _git(["fetch", "--prune", run.rem,
               f"+{claim_ns}/*:{_LOCAL_SCAN}/claim/*",
@@ -1077,7 +1078,7 @@ def cmd_worker_command(a: argparse.Namespace) -> Obj:
 # --------------------------------------------------------------------------- #
 
 # What `_gather` reads: the open issues, the open PRs, the claims, the heartbeats.
-_Gathered = tuple[list[Obj], list[Obj], list[Obj], dict[str, int]]
+_Gathered = tuple[list[Issue], list[PullRequest], list[Claim], dict[str, int]]
 
 
 def _gather(run: _Run, fresh: bool = False) -> _Gathered:
@@ -1397,7 +1398,7 @@ class _Worktree:
         return afk_decide.find_orca_repo(_orca(["repo", "list"]).get("repos"), repo)
 
     @classmethod
-    def cut(cls, run: _Run, at_branch: str, issue: Obj | None = None,
+    def cut(cls, run: _Run, at_branch: str, issue: IssueRead | None = None,
             batch: str | None = None) -> _Worktree:
         """Have orca create a worktree + branch at the REMOTE's current tip of
         `at_branch` (ADR-0005: orca owns both, and names the branch) — for
@@ -1736,7 +1737,8 @@ def _worker_outcome(run: _Run, number: int, worker: _Worker) -> WorkerRow:
 _DEPENDENCY_WALK_LIMIT = 200
 
 
-def _blocker_standings(run: _Run, number: int, named: list[int], prs: list[Obj]) -> list[Standing]:
+def _blocker_standings(run: _Run, number: int, named: list[int],
+                       prs: list[PullRequest]) -> list[Standing]:
     """Where each issue a `blocked` verdict names stands
     (`afk_decide.blocker_standings`), gathering what that takes: the blocker
     itself, the claim refs, the open PRs, and — from every blocker still open —
@@ -1850,8 +1852,9 @@ def _recovery(run: _Run, number: int, path: str | None = None, branch: str | Non
     else:
         wt = _Worktree.at(path)
     present = wt.path is not None
-    worktree = {"present": present, "path": wt.remembered,
-                **(_worktree_progress(wt.path, rem, base) if present else {})}
+    worktree: WorktreeSignal = {"present": present, "path": wt.remembered}
+    if wt.path is not None:
+        worktree = {**worktree, **_worktree_progress(wt.path, rem, base)}
 
     # --- tier-2 signal: the branch the dead worker pushed ---
     candidates = [] if branch else afk_decide.branch_candidates(
@@ -1859,7 +1862,7 @@ def _recovery(run: _Run, number: int, path: str | None = None, branch: str | Non
     ahead = {b: _branch_ahead(rem, b, base, number)
              for b in ([branch] if branch else candidates)}
     branch = branch or afk_decide.furthest_ahead(ahead)
-    branch_sig = {"name": branch, "commits_ahead": ahead.get(branch), "candidates": candidates}
+    branch_sig: BranchSignal = {"name": branch, "commits_ahead": ahead.get(branch), "candidates": candidates}
 
     return {"issue": number, "base": base, "worktree": worktree, "branch": branch_sig,
             **afk_decide.select_recovery(worktree, branch_sig, landing_pr=landing_pr)}
@@ -1907,12 +1910,12 @@ def _discard_attempt(run: _Run, number: int) -> Obj:
     return {"closed_prs": closed, "deleted_branches": deleted, "removed_worktree": path}
 
 
-def _landing_fields(cfg: Config, pr: Obj) -> Obj:
+def _landing_fields(cfg: Config, pr: PullRequest) -> Obj:
     """The LANDING_FIELDS of a landing brief, from the config and the PR."""
     return {"pr": pr["number"], "pr_branch": pr["headRefName"], "target": cfg["base_branch"]}
 
 
-def _prompt_fields(run: _Run, issue: Obj, path: str | None, branch: str | None) -> Obj:
+def _prompt_fields(run: _Run, issue: IssueRead, path: str | None, branch: str | None) -> Obj:
     """The PROMPT_FIELDS of a worker prompt for one issue in one worktree. The
     launcher's terminal is read off the environment, never passed in: the launcher
     runs `afk cycle` itself, so the handle orca gave its terminal is the one
@@ -1931,14 +1934,14 @@ def _prompt_fields(run: _Run, issue: Obj, path: str | None, branch: str | None) 
 _StartFrom = Literal["auto", "fresh"]
 
 
-def _start_worker(run: _Run, instance: str, agent: _Agent, issue: Obj, start: _StartFrom,
+def _start_worker(run: _Run, instance: str, agent: _Agent, issue: IssueRead, start: _StartFrom,
                   reason: str | None = None) -> Obj:
     """Put a worker on an issue this fleet already holds the claim for, start to
     finish (`_begin_worker`, then the rest it returns)."""
     return _begin_worker(run, instance, agent, issue, start, reason)()
 
 
-def _begin_worker(run: _Run, instance: str, agent: _Agent, issue: Obj, start: _StartFrom,
+def _begin_worker(run: _Run, instance: str, agent: _Agent, issue: IssueRead, start: _StartFrom,
                   reason: str | None = None) -> Callable[[], Obj]:
     """Begin putting a worker on an issue `instance` already holds the claim for:
     everything up to its agent's terminal being open. Returns the rest as a
@@ -2391,7 +2394,7 @@ def _grant_turn(run: _Run, instance: str, agent: _Agent, number: int,
     # a judgment made about this PR stands: a re-delivery need not repeat it
     allow = allow_no_checks or bool(held_here and held_here["allow_no_checks"])
     verified = verified or (held_here or {}).get("verified")
-    checks = afk_decide.pr_checks_state(pr.get("statusCheckRollup"))
+    checks = afk_decide.pr_checks_state(pr["statusCheckRollup"])
     ready = afk_decide.turn_gate(cfg["gate"]["ci"], checks, allow,
                                  afk_decide.verifies(cfg), verified, head)
     if ready != "ready":
@@ -2434,7 +2437,7 @@ def _await_checks(repo: str, number: int, head: str, had_checks: bool, timeout: 
         if pr is None:
             raise RuntimeError(f"PR #{number} is no longer open — it was closed or merged while "
                                f"its checks were awaited; nothing was merged here")
-        checks = afk_decide.pr_checks_state(pr.get("statusCheckRollup"))
+        checks = afk_decide.pr_checks_state(pr["statusCheckRollup"])
         if not afk_decide.checks_owed(checks, pr["headRefOid"] == head, had_checks):
             return checks
         left = deadline - time.monotonic()
@@ -2548,7 +2551,7 @@ def cmd_land(a: argparse.Namespace) -> Obj:
                                "and run this again")
         out["gate"] = gate
     else:
-        checks = afk_decide.pr_checks_state(pr.get("statusCheckRollup"))
+        checks = afk_decide.pr_checks_state(pr["statusCheckRollup"])
         if pushed or checks == "pending":
             checks = _await_checks(run.repo, pr["number"], head, had_checks=checks is not None,
                                    timeout=a.checks_timeout, poll=a.checks_poll)
@@ -2851,14 +2854,14 @@ def _close_landed_pr(run: _Run, number: int) -> int | None:
     return pr["number"]
 
 
-def _close_batched_pr(run: _Run, pr: Obj, commit: str, batch: str, prs: list[int]) -> None:
+def _close_batched_pr(run: _Run, pr: PullRequest, commit: str, batch: str, prs: list[int]) -> None:
     """Close one PR a batch landed, with the comment that names its commit."""
     cfg = run.cfg
     _close_pr(run.repo, run.rem, pr["number"],
               afk_decide.batch_landed_comment(commit, cfg["base_branch"], batch, prs))
 
 
-def _stack_pr(rem: str, path: str, pr: Obj,
+def _stack_pr(rem: str, path: str, pr: PullRequest,
               issue: int) -> tuple[str | None, str | None, list[str]]:
     """Stack one PR onto the batch worktree's HEAD with ONE merge commit, whose
     second parent is the PR's own head → (commit, None, []), or (None, why,
@@ -3126,7 +3129,7 @@ def _sweep_batches(run: _Run, instance: str, live: Iterable[str]) -> Obj:
     return {"removed": removed, "deleted_branches": gone}
 
 
-def _escalate(run: _Run, instance: str, issue: Obj, attempt: int, reason: str) -> Obj:
+def _escalate(run: _Run, instance: str, issue: IssueRead, attempt: int, reason: str) -> Obj:
     """Hand an issue to a human, in the one order that leaves no gap: status board
     → labels → comment → release. The claim is released LAST: released first, a
     PR-less issue still carrying `ready_label` is back on the frontier for a peer
@@ -3203,7 +3206,8 @@ def _fail_claim(run: _Run, instance: str, agent: _Agent, number: int, reason: st
         for label in add:
             _ensure_label(run.repo, label)
         _edit_labels(run.repo, number, add, remove)
-        issue = {**issue, "labels": [lb for lb in labels if lb not in remove] + add}
+        relabelled: IssueRead = {**issue, "labels": [lb for lb in labels if lb not in remove] + add}
+        issue = relabelled
     worker = _start_worker(run, instance, agent, issue, "fresh", reason)
     return {"issue": number, "action": "retry", "attempt": decision["attempt"],
             "retry_max": cfg["retry"], "worker": worker}
