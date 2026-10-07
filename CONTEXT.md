@@ -279,6 +279,18 @@ takeover never counts as a **retry** (ADR-0011).
 _Avoid_: failover (implies automatic), rescue (it seeds a standing fleet, not a bounded mission),
 stale reclaim (that is the unattended, lease-gated path)
 
+**Verdict** (a worker's):
+What a **worker** that opens no PR declares instead, as an `afk:verdict` marker leading a comment on
+its issue — one of four phases, told apart by **who can supply what is missing**: nothing is
+(`already-satisfied`: the issue is closed once the empty diff is confirmed), the backlog can
+(`blocked`: **park**), the next worker can (`giving-up`: **retry**), or only the issue's owner can
+(`needs-decision`: the issue as written has a premise that does not hold, or criteria that
+contradict each other — escalated at once, no **retry** spent, because a fresh worker reads the
+same issue and stops at the same question; ADR-0041). A verdict is an input: what the fleet
+concludes from it and from the worktree is the **outcome**.
+_Avoid_: outcome (that is the fleet's conclusion), result (that is the PR), a gate's verdict (what
+one gate run came to), `giving-up` for an issue nobody could do as written
+
 **Retry**:
 What a failed attempt costs and gets: the failure is counted on the issue — its `afk-attempt/<n>`
 label goes up by one — the failed attempt is discarded (its PR closed, its branch deleted, its

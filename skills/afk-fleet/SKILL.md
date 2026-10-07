@@ -52,7 +52,7 @@ is safe because **nothing the launcher must remember lives only in its context**
 - **All durable state lives in GitHub**, so any tick reconstructs the exact working set:
   `refs/afk/claim/<n>` ref = claim (owned by a **fleet instance**) · PR (`Closes #n`) = result · an
   `afk:verdict` marker comment = a worker's machine-readable reason for opening **no** PR
-  (already-satisfied / blocked / giving-up) · `afk-attempt/<n>` label = retry count ·
+  (`already-satisfied` / `blocked` / `giving-up` / `needs-decision`) · `afk-attempt/<n>` label = retry count ·
   `refs/afk/heartbeat/<id>` ref = owner liveness. Nothing is remembered between ticks. (The human-facing **status board** comment is a
   *derived projection* of this state onto the issue surface, re-rendered each tick — never itself a
   source of truth, and never read back by a tick.)
@@ -315,7 +315,7 @@ In this order, each step the same `afk` transition you could type yourself
    with its PR kept (`afk escalate`, ADR-0035); a `giving-up` verdict, a refuted
    `already-satisfied`, a PR-less silence that outlasted its nudge is failed (`afk fail`); a
    `blocked` verdict is parked while the backlog will resolve its blockers (`afk park`, ADR-0022)
-   and escalated when nothing will (`afk escalate`).
+   and escalated when nothing will — as a `needs-decision` one is at once (`afk escalate`, ADR-0041).
 5. **Release** every claim that outlived its issue — a PR its worker landed — and delete every dead
    peer's phantom lock, under the sha it was read at.
 6. **Start workers** (`afk dispatch`): first by [continuation](references/recovery.md) for claims
@@ -506,15 +506,21 @@ the call does the rest and reports which way it went:
   without counting twice, and the next tick does the same by itself.
 - `"action": "escalate"` — the attempts are exhausted. In one fixed order: status board → relabel
   (add `escalate_label`, remove `ready_label` and the attempt label) → comment the reason
-  → release the claim. The PR and the worktree are left for the human.
+  → release the claim. The PR and the worktree are left for the human — except a worktree whose
+  branch holds no work (nothing committed, nothing uncommitted), which is removed with its idle
+  worker: there is nothing in it to read.
 
 An issue that should go to a human **without** consuming a retry takes the same ordered transition
-directly: `afk escalate --issue <n> --instance <id> --reason "<…>"`. Two cases: a `blocked` verdict
+directly: `afk escalate --issue <n> --instance <id> --reason "<…>"`. Three cases: a `blocked` verdict
 naming a dependency nothing will resolve — it does not exist, was closed as not planned, is an
-epic, is open with no fleet to work it, or waiting on it would close a dependency cycle — and a
+epic, is open with no fleet to work it, or waiting on it would close a dependency cycle; a
 **landing turn nobody could get a worker to perform**: silent again after its one restart, the PR
 the pass judged ready goes to the human as it is, open, with its branch and worktree, the reason
-and the worker's last screen (ADR-0035). The pass runs both itself. Never silently drop or silently
+and the worker's last screen (ADR-0035); and a **`needs-decision` verdict**: the issue as written
+needs a decision from its owner — a premise that does not hold, criteria that contradict each
+other — which a fresh worker would only find again, so the escalation comment points at the
+worker's comment, where the decision to make is spelled out (ADR-0041). The pass runs all three
+itself. Never silently drop or silently
 land bad work.
 
 A dependency a worker *discovered* is not such a gap while the backlog will resolve it: `afk park

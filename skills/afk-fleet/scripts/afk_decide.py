@@ -1326,7 +1326,8 @@ def gate_comment(verdict: Obj, command: str) -> str:
 #   1. git PROGRESS in the worktree (commits ahead / dirty tree / last activity);
 #   2. the worker's VERDICT marker on the issue — its declared reason for opening
 #      no PR: `already-satisfied` (done in base, empty diff), `blocked` (a
-#      dependency gap, see blocked_by) or `giving-up` (a failure it could not fix);
+#      dependency gap, see blocked_by), `giving-up` (a failure it could not fix) or
+#      `needs-decision` (the issue as written asks its owner for a decision);
 #      for `blocked`, also the STANDING of each issue it names (`blocker_standings`);
 #   3. the terminal's busy / idle / none state from the orca probe.
 # The join is two pure decisions, asked in this order: `settled_by_worker_state`
@@ -1341,9 +1342,9 @@ def gate_comment(verdict: Obj, command: str) -> str:
 
 # The phases a worker may declare in its marker (worker-prompt.md asks for exactly
 # these; anything else `classify_stopped` treats as a failure).
-VerdictPhase = Literal["already-satisfied", "blocked", "giving-up"]
+VerdictPhase = Literal["already-satisfied", "blocked", "giving-up", "needs-decision"]
 VERDICT_PHASES: tuple[VerdictPhase, ...] = get_args(VerdictPhase)
-_SATISFIED, _BLOCKED, _GIVING_UP = VERDICT_PHASES
+_SATISFIED, _BLOCKED, _GIVING_UP, _NEEDS_DECISION = VERDICT_PHASES
 
 # What a tick does about a worker, by the cause it was classified with: the two
 # columns of WORKER_CAUSES `tick_plan` and `_turn_plan` route on.
@@ -1382,11 +1383,16 @@ class Cause(NamedTuple):
 # escalated with its PR, branch and worktree kept (`silent_past_restart`) — a
 # landing turn's silence never spends an attempt (ADR-0035). A batch has
 # nothing to restart onto: its second silence abandons it.
+#
+# What a worker DECLARED is routed by who can supply what it lacks: the backlog
+# (`blocked` → park), the next worker (`giving-up` → fail, a fresh retry), or
+# the issue's owner (`needs-decision` → escalate at once: a retry would read the
+# same issue and stop at the same question — ADR-0041).
 WorkerCause = Literal[
     "working", "just_stopped", "gone", "within_grace", "awaiting_tick", "satisfied",
     "satisfied_refuted", "blockers_closed", "blockers_waiting", "blocker_unmet",
     "no_blocker_named", "silent", "silent_on_turn", "silent_past_restart", "gave_up",
-    "unknown_phase", "silent_after_nudge", "silent_unnudgeable"]
+    "needs_decision", "unknown_phase", "silent_after_nudge", "silent_unnudgeable"]
 WORKER_CAUSES: dict[WorkerCause, Cause] = {
     # settled by the worker state alone (`settled_by_worker_state`)
     "working":             Cause("coding", "leave", "leave", "leave"),        # its runtime says so
@@ -1405,6 +1411,7 @@ WORKER_CAUSES: dict[WorkerCause, Cause] = {
     "silent_on_turn":      Cause("idle_stalled", "restart", "restart"),       # silent after its nudge, on a landing turn
     "silent_past_restart": Cause("idle_stalled", "escalate", "escalate"),     # …and again, after the turn's one restart
     "gave_up":             Cause("idle_failed", "next_attempt", "fail"),      # `giving-up`
+    "needs_decision":      Cause("idle_undecided", "escalate", "escalate"),   # `needs-decision`: no attempt spent
     "unknown_phase":       Cause("idle_failed", "next_attempt", "fail"),      # a verdict naming no phase the fleet knows
     "silent_after_nudge":  Cause("idle_failed", "next_attempt", "fail", "abandon"),
     "silent_unnudgeable":  Cause("idle_failed", "next_attempt", "fail", "abandon"),  # no worktree here to nudge it in
@@ -1779,6 +1786,8 @@ def classify_stopped(progress: Progress | None, terminal_idle_seconds: float | N
             "redispatch": "blockers_closed", "park": "blockers_waiting",
             "escalate": "blocker_unmet" if named else "no_blocker_named"}
         return _seen(causes[route["action"]], idle_seconds, route["pending_blockers"])
+    if phase == _NEEDS_DECISION:
+        return _seen("needs_decision", idle_seconds)
     return _seen("gave_up" if phase == _GIVING_UP else "unknown_phase", idle_seconds)
 
 
@@ -3448,6 +3457,13 @@ def _reason_on_record(cause: WorkerCause, row: MineRow, worker: WorkerRow) -> tu
     if cause == "gave_up":
         said = declared
         return (f"its worker gave up: {said}", True) if said else ("its worker gave up", False)
+    if cause == "needs_decision":
+        # always on record: the decision itself is the verdict comment's body
+        asks = f": {declared}" if declared else ""
+        return (f"its worker found that the issue as written needs a decision from its owner"
+                f"{asks}. A retry would stop at the same question, so none was spent — the "
+                f"decision to make is in the worker's comment: "
+                f"{verdict['comment_url'] if verdict else None}"), True
     if cause == "unknown_phase":
         return (f"its worker's verdict names no phase the fleet knows "
                 f"({(verdict['phase'] if verdict else None)!r})"), True
