@@ -59,7 +59,8 @@ its result (only, once it has gone silent with no outcome, for *where it stopped
 worktree create` / `orca worktree rm`), the only supported backend — never by the tick with raw `git
 worktree`; orca also names the branch (a `<user>/…` prefix), and the tick **reads that back** rather
 than dictating it (ADR-0005). It is started by running the **worker launch command** in the
-worktree's first terminal, so it runs on the same runtime as the **launcher** that dispatched it.
+worktree's only terminal — the bare shell orca opens a new worktree on is closed first — so it runs
+on the same runtime as the **launcher** that dispatched it.
 It publishes its progress as it goes — incrementally pushing its own branch after each completed
 step, and always before the local gate or any long-running operation — so a hard stop loses at most
 the in-flight step; that pushed branch tip is the durable progress a later **continuation** resumes

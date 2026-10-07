@@ -405,6 +405,9 @@ if cmd == ["worktree", "create"]:
     rows.append({"linkedIssue": linked, "path": wt, "branch": "refs/heads/tester/" + name,
                  "projectId": fake["project"], "isMainWorktree": False, "isArchived": False,
                  "lastActivityAt": len(fake["calls"])})
+    # as real orca: every worktree it cuts opens on a bare shell of its own
+    fake["terminals"].append({"handle": "term-%%d" %% (len(fake["terminals"]) + 1),
+                              "worktreePath": wt, "command": None, "sent": [], "open": True})
     finish({"worktree": {"path": wt, "branch": "refs/heads/tester/" + name,
                          "head": git(wt, "rev-parse", "HEAD"), "baseRef": opt("--base-branch")}})
 
@@ -479,8 +482,11 @@ if cmd == ["terminal", "read"]:
 if cmd == ["terminal", "close"]:
     row = worktree()
     assert "--all" in argv, argv
+    here = lambda t: bool(row) and t["worktreePath"] == row["path"]
+    # a closed agent stays on record, closed; the bare shell leaves nothing behind
+    fake["terminals"] = [t for t in fake["terminals"] if t["command"] or not here(t)]
     for t in fake["terminals"]:
-        t["open"] = t["open"] and not (row and t["worktreePath"] == row["path"])
+        t["open"] = t["open"] and not here(t)
     finish({"closed": True})
 
 finish(error="fake orca: unsupported call %%r" %% (argv,))
@@ -2351,8 +2357,9 @@ def test_dispatch_starts_a_worker_on_the_remote_base_tip_and_submits_its_prompt(
         assert git(wt, "rev-parse", "--abbrev-ref", "HEAD") == r["branch"]
         # the worker starts from what the REMOTE has, not from this clone's stale base
         assert git(wt, "rev-parse", "HEAD") == tip
-        assert w.orca_calls() == ["repo list", "worktree create", "terminal create",
-                                  "terminal wait", "terminal send"]
+        # the shell orca opened the worktree on is closed: the worker's is its only tab
+        assert w.orca_calls() == ["repo list", "worktree create", "terminal close",
+                                  "terminal create", "terminal wait", "terminal send"]
         assert [(t["linkedIssue"], t["path"]) for t in w.worktrees()] == [(1, wt)]
 
         # the agent was started with the run's worker launch command, verbatim —
@@ -4206,7 +4213,7 @@ def test_a_worker_put_where_an_agent_already_is_closes_that_agent_first():
         assert w.orca_calls() == ["terminal close", "terminal create", "terminal wait",
                                   "terminal send"]
         assert agents(d[1]["worktree"]) == [False, True]
-        # a worktree just cut has no agent to close
+        # a worktree just cut had only the shell orca opened it on: the worker's is all it has
         assert agents(d[2]["worktree"]) == [True]
     with open(AFK) as f:
         assert f.read().count('"terminal", "close"') == 1
