@@ -296,7 +296,7 @@ def _read_issue(repo: str, number: int) -> IssueRead | RuntimeError:
     def read() -> IssueRead | RuntimeError:
         try:
             p = _gh(["api", f"repos/{repo}/issues/{number}", "--jq", _ISSUE_JQ])
-            return {"number": number, **json.loads(p.stdout)}
+            return {"number": number, **json.loads(p.stdout)}       # `_ISSUE_JQ`'s keys
         except (RuntimeError, ValueError) as e:
             return RuntimeError(str(e))
     return _once(("issue", repo, number), read)
@@ -1862,7 +1862,8 @@ def _recovery(run: _Run, number: int, path: str | None = None, branch: str | Non
     ahead = {b: _branch_ahead(rem, b, base, number)
              for b in ([branch] if branch else candidates)}
     branch = branch or afk_decide.furthest_ahead(ahead)
-    branch_sig: BranchSignal = {"name": branch, "commits_ahead": ahead.get(branch), "candidates": candidates}
+    branch_sig: BranchSignal = {"name": branch, "candidates": candidates,
+                                "commits_ahead": ahead.get(branch) if branch else None}
 
     return {"issue": number, "base": base, "worktree": worktree, "branch": branch_sig,
             **afk_decide.select_recovery(worktree, branch_sig, landing_pr=landing_pr)}
@@ -2393,7 +2394,7 @@ def _grant_turn(run: _Run, instance: str, agent: _Agent, number: int,
                            "stopped for you; nothing was touched — `afk no-pr` watches it")
     # a judgment made about this PR stands: a re-delivery need not repeat it
     allow = allow_no_checks or bool(held_here and held_here["allow_no_checks"])
-    verified = verified or (held_here or {}).get("verified")
+    verified = verified or (held_here["verified"] if held_here else None)
     checks = afk_decide.pr_checks_state(pr["statusCheckRollup"])
     ready = afk_decide.turn_gate(cfg["gate"]["ci"], checks, allow,
                                  afk_decide.verifies(cfg), verified, head)
@@ -2409,7 +2410,7 @@ def _grant_turn(run: _Run, instance: str, agent: _Agent, number: int,
                 f.read(), _prompt_fields(run, issue, wt.path, wt.checked_out()),
                 _landing_fields(cfg, pr)))
     now = run.now()
-    restarted = now if restart else (held_here or {}).get("restarted")
+    restarted = now if restart else (held_here["restarted"] if held_here else None)
     out["comment_id"] = _record_turn(run.repo, pr["number"], afk_decide.single_turn(
         prev, instance, now, verified=verified, allow_no_checks=allow, restarted=restarted))
     out["again"] = bool(held_here)
@@ -2705,8 +2706,8 @@ def _turn_batch(run: _Run, instance: str, agent: _Agent, working_set: WorkingSet
                         detail="this batch already holds the landing turn and its worker is "
                                "there; nothing was touched — `afk no-pr --batch` watches it")
         # only the PRs that still carry the batch's marker: one left out since is not put back
-        members = [m for m in mine["members"]
-                   if ((_turn(run.repo, m["pr"]) or {}).get("batch") == mine["id"])]
+        marked = ((m, _turn(run.repo, m["pr"])) for m in mine["members"])
+        members = [m for m, turn in marked if turn and turn["batch"] == mine["id"]]
         return _start_batch_worker(run, instance, agent, mine["id"], members,
                                    mine["phase"] or afk_decide.BATCH_PHASES[0], again=True)
     if who == "single":
@@ -2805,9 +2806,8 @@ def _batch_worker(run: _Run, batch: str, worker: _Worker) -> BatchWorkerRow:
     seen = worker.settled
     if not seen:
         now, grace = worker.now, worker.grace
-        told = [(_turn(run.repo, m["pr"]) or {}).get("at")
-                for m in _members_of_batch(run, batch)]
-        turn_at = max((t for t in told if t), default=None)
+        turns = (_turn(run.repo, m["pr"]) for m in _members_of_batch(run, batch))
+        turn_at = max((t["at"] for t in turns if t and t["at"]), default=None)
         progress = _worktree_progress(path, run.rem, cfg["base_branch"]) if path else None
         # a batch's worker declares no verdict and names no blocker — and a batch's
         # turn is never restarted: its second silence abandons the batch
@@ -3091,7 +3091,8 @@ def _finish_batch(run: _Run, batch: str, landed: Sequence[Stacked],
     is {PR number: its branch} for the PRs still open as the finishing began —
     a PR GitHub had already merged by then is not in it, and keeps its branch."""
     rem = run.rem
-    instance = (_turn(run.repo, landed[0]["pr"]) or {}).get("instance")
+    granted = _turn(run.repo, landed[0]["pr"])
+    instance = granted["instance"] if granted else None
     for m in landed:
         _upsert_board(run, m["issue"], "merged", instance=instance, pr=m["pr"])
         if _issue_state(run.repo, m["issue"]) == "open":
@@ -3115,7 +3116,7 @@ def _sweep_batches(run: _Run, instance: str, live: Iterable[str]) -> Obj:
     `live` are the ids of the batches that still do."""
     rem = run.rem
     stale = [w for w in _Worktree.of_batches(run.repo, instance)
-             if w.batch not in live and w.remembered]
+             if (w.batch is None or w.batch not in live) and w.remembered]
     removed = []
     if stale:
         workers = _Workers(run)

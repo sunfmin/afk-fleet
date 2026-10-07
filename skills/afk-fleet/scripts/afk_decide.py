@@ -1036,7 +1036,7 @@ def classify_claims(claims: list[Claim], heartbeats: Mapping[str, float], me: st
         inst = c["instance"]
         if inst is not None and inst == me:
             mine.append(n)
-        elif is_stale(heartbeats.get(inst), now, ttl):
+        elif is_stale(heartbeats.get(inst) if inst else None, now, ttl):
             stale.append(n)
         else:
             peer_live.append(n)
@@ -1483,7 +1483,7 @@ def _blocker_standing(blocker: IssueRead | None, claimed: bool, has_open_pr: boo
     if blocker["pull_request"]:
         return _UNMET, "is a pull request, not an issue"
     if blocker["state"] == "closed":
-        undone = _CLOSED_UNDONE.get(blocker["state_reason"])
+        undone = _CLOSED_UNDONE.get(blocker["state_reason"] or "")
         return (_UNMET, undone) if undone else (_CLOSED, None)
     bars = label_bars(blocker["labels"], config["ready_label"], config["epic_labels"])
     if set(bars) - {"not_ready"}:          # a bar no claim overrides: nothing will dispatch it
@@ -2395,7 +2395,7 @@ def plan_takeover(claims: Iterable[Claim] | None, heartbeats: Mapping[str, float
     rows = sorted(({"number": c["number"], "sha": c["sha"], "host": c["host"]}
                    for c in claims or [] if c["instance"] == target),
                   key=lambda r: (r["number"] is None, r["number"]))
-    ts = (heartbeats or {}).get(target)
+    ts = (heartbeats or {}).get(target) if target else None
     fresh = ts is not None and not is_stale(ts, now, ttl)
     age = None if ts is None else int(now) - int(ts)
     known = ts is not None or bool(rows)
@@ -4143,7 +4143,7 @@ def unseen_prs(mine: list[MineRow], prs: Iterable[PullRequest]) -> list[int]:
     ended, is not the one the row names — opened, or replaced, while it ran."""
     now = _closing_pr_map(prs)
     return sorted(r["number"] for r in mine
-                  if r["number"] in now and now[r["number"]].get("number") != r["pr"])
+                  if r["number"] in now and now[r["number"]]["number"] != r["pr"])
 
 
 def superseded_prs(prs: Iterable[PullRequest] | None, number: int) -> list[PullRequest]:
