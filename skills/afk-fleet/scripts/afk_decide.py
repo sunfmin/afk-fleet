@@ -17,12 +17,35 @@ stolen live claim double-works it). Those get the hardest fixtures.
 None of these functions read the clock — `now` is always an argument — so a fixture
 pins behaviour deterministically.
 """
+from __future__ import annotations
+
 import hashlib
 import json
 import re
 import shlex
 import urllib.parse
-from typing import NamedTuple
+from typing import (Any, Callable, Collection, Generator, Iterable, Literal, Mapping, NamedTuple,
+                    NoReturn, Optional, TypeVar, get_args)
+
+# --------------------------------------------------------------------------- #
+# Types — what the gate's type checker holds the code to (ADR-0039)            #
+# --------------------------------------------------------------------------- #
+#
+# A closed vocabulary is a `Literal`, declared beside the table or the tuple that
+# lists its words: the tuple is read off the Literal, and a table is keyed by it,
+# so a word misspelled where it is used fails the gate rather than a run. Where a
+# chain of branches handles every word, it ends in `assert_never` — and a word
+# added without its branch fails the gate too.
+
+# A JSON object as the fleet passes it around: a config, a row gh or orca
+# returned, a record, a result. What its keys are is said where it is made.
+Obj = dict[str, Any]
+
+
+def assert_never(value: NoReturn) -> NoReturn:
+    """The end of a chain that handles every word of a closed vocabulary."""
+    raise AssertionError(f"unhandled: {value!r}")
+
 
 # --------------------------------------------------------------------------- #
 # Config — one home for every key and default (ADR-0009)                       #
@@ -41,7 +64,7 @@ from typing import NamedTuple
 # gate is, how often a failure is retried. What every fleet does alike is not a
 # key — it is the constants under this table, or simply what the code does.
 
-CONFIG_DEFAULTS = {
+CONFIG_DEFAULTS: Obj = {
     # dispatch contract
     "ready_label": "ready-for-agent",
     "epic_labels": ["epic", "prd", "wayfinder:map"],
@@ -122,20 +145,20 @@ BRANCH_NAMESPACE = "refs/heads"
 
 class RecordKind(NamedTuple):
     word: str           # the record's first word: what kind of record this is
-    fields: dict        # field → its type, in the order they are written
-    required: tuple     # the fields without which a commit or a marker is not this record
-    tail: str = None    # the field, declared last, whose value runs to the record's end
+    fields: dict[str, Any]      # field → its type, in the order they are written
+    required: tuple[str, ...]   # the fields without which a commit or a marker is not this record
+    tail: str | None = None     # the field, declared last, whose value runs to the record's end
 
 
 class FieldType(NamedTuple):
     """How one field's value is spelled. `str` and `int` are declared as
     themselves; the rest are below, or beside the one kind that needs them."""
-    write: object       # value → its text; "" when there is nothing to write
-    read: object        # text (never empty) → value; None when it is no such value
-    empty: object = None    # what a record that does not state the field reads as
+    write: Callable[[Any], str]     # value → its text; "" when there is nothing to write
+    read: Callable[[str], Any]      # text (never empty) → value; None when it is no such value
+    empty: object = None            # what a record that does not state the field reads as
 
 
-def _digits(raw):
+def _digits(raw: str) -> int | None:
     return int(raw) if raw.isascii() and raw.isdigit() else None
 
 
@@ -152,10 +175,10 @@ INTS = FieldType(lambda values: ",".join(str(int(v)) for v in values),
                  or None, empty=())
 
 
-def one_of(vocabulary):
+def one_of(vocabulary: tuple[str, ...]) -> FieldType:
     """A word of a closed vocabulary: any other is not written (a defect in the
     caller: it raises) and not read (the field is missing)."""
-    def write(value):
+    def write(value: str) -> str:
         if value not in vocabulary:
             raise ValueError(f"not one of {', '.join(vocabulary)}: {value!r}")
         return value
@@ -174,12 +197,12 @@ GATE_RUN_RECORD = RecordKind("afk-gate", {"tree": str, "command": str, "at": int
 # What the bootstrap probe pushes to learn whether a namespace takes a push.
 PROBE_RECORD = RecordKind("afk-probe", {"ts": int}, ("ts",))
 
-def _field_type(kind, name):
+def _field_type(kind: RecordKind, name: str) -> FieldType:
     declared = kind.fields[name]
     return _FIELD_TYPES.get(declared, declared)
 
 
-def blank_record(kind):
+def blank_record(kind: RecordKind) -> Obj:
     """Every field of `kind` at the value that says nothing (its type's
     `empty`) — what a reader lays a record over, so a field the marker does not
     state is still there to be asked for."""
@@ -190,7 +213,7 @@ def blank_record(kind):
 _RECORD_SAFE = "!\"#$&'()*+,/:;<=>?@[\\]^`{|}~"
 
 
-def _field_words(kind, record, spell):
+def _field_words(kind: RecordKind, record: Obj, spell: Callable[[str, Any], str]) -> list[str]:
     """The `<field>=<value>` words of `record`, in the kind's order — each value
     as `spell(name, value)` gives it, a field it gives no text for left out."""
     unknown = sorted(set(record) - set(kind.fields))
@@ -207,24 +230,24 @@ def _field_words(kind, record, spell):
     return words
 
 
-def record_message(kind, record):
+def record_message(kind: RecordKind, record: Obj) -> str:
     """A record → the one line that carries it: a commit's message as it is, a
     comment's marker inside `<!--` and `-->` (`record_marker`). Fields are written
     in the kind's order; one that is None or empty is left out. A field the kind
     does not declare, or a required one left out, is a defect in the caller and
     raises."""
-    def spell(name, value):
+    def spell(name: str, value: Any) -> str:
         text = _field_type(kind, name).write(value)
         return text if name == kind.tail else urllib.parse.quote(text, safe=_RECORD_SAFE)
     return " ".join([kind.word, *_field_words(kind, record, spell)])
 
 
-def _read_fields(kind, text):
+def _read_fields(kind: RecordKind, text: str) -> Obj | None:
     """What follows a kind's word → the record, or None when a required field is
     missing. A comma may be followed by whitespace: a list is still one value."""
-    record = {}
+    record: Obj = {}
     tail = re.search(rf"\b{kind.tail}=(.*)$", text, re.DOTALL) if kind.tail else None
-    if tail:
+    if kind.tail and tail:
         text = text[:tail.start()]
         if tail.group(1).strip():
             record[kind.tail] = tail.group(1).strip()
@@ -238,7 +261,7 @@ def _read_fields(kind, text):
     return record if all(name in record for name in kind.required) else None
 
 
-def read_record(kind, message):
+def read_record(kind: RecordKind, message: str | None) -> Obj | None:
     """A commit message → the record of `kind` it carries, as {field: value} with
     every required field present and each optional one present only when the
     commit states it — or None when the commit is not such a record."""
@@ -246,12 +269,12 @@ def read_record(kind, message):
     return _read_fields(kind, rest) if word == kind.word else None
 
 
-def record_marker(kind, record):
+def record_marker(kind: RecordKind, record: Obj) -> str:
     """A record → the marker that carries it in a comment."""
     return f"<!--{record_message(kind, record)}-->"
 
 
-def marker_format(kind, shown, optional=()):
+def marker_format(kind: RecordKind, shown: Obj, optional: tuple[str, ...] = ()) -> str:
     """A kind's marker as it is shown to whoever must write one by hand: each
     field of `shown` ({field: placeholder, or the value already known}) under
     its own name and in the kind's order, the `optional` ones in brackets."""
@@ -260,13 +283,13 @@ def marker_format(kind, shown, optional=()):
     return f"<!--{' '.join([kind.word, *words])}-->"
 
 
-def record_comment(kind, record, text):
+def record_comment(kind: RecordKind, record: Obj, text: str) -> str:
     """The comment that keeps a record: its marker, then the same facts worded
     for a human reading the issue or the PR."""
     return f"{record_marker(kind, record)}\n{text}"
 
 
-def read_marker(kind, body):
+def read_marker(kind: RecordKind, body: str | None) -> Obj | None:
     """A comment body → the record of `kind` its first marker carries, read as
     `read_record` reads a commit; None when the body has no such marker, or the
     marker lacks a required field."""
@@ -274,13 +297,14 @@ def read_marker(kind, body):
     return _read_fields(kind, m.group(1)) if m else None
 
 
-def latest_record(kind, comments):
+def latest_record(kind: RecordKind,
+                  comments: Iterable[Obj] | None) -> tuple[Obj | None, Obj | None]:
     """The record of `kind` kept on one issue or PR, from its comments
     ([{"id", "body", "url"}...], oldest first) → (record, the comment that
     carries it), or (None, None). The latest marker wins — and a comment whose
     marker is not a record is passed over, not read as the latest. The comment
     is where a rewrite goes: a record is kept in ONE comment, rewritten in place."""
-    found = (None, None)
+    found: tuple[Obj | None, Obj | None] = (None, None)
     for comment in comments or []:
         record = read_marker(kind, comment.get("body"))
         if record is not None:
@@ -291,7 +315,8 @@ def latest_record(kind, comments):
 # that gate. `required` waits for the PR's GitHub checks; `local` never reads them
 # and makes `gate.local_command` the gate, run by `afk land` against the exact
 # tree that lands.
-GATE_CI_MODES = {"required": "CI", "local": "本地门"}
+GateCiMode = Literal["required", "local"]
+GATE_CI_MODES: dict[GateCiMode, str] = {"required": "CI", "local": "本地门"}
 
 # Keys that were renamed, and why. A file still carrying the old name must fail
 # LOUDLY with the migration note rather than be silently defaulted — a config that
@@ -370,7 +395,7 @@ _SETTLED_NOTE = ("config: 'claim_namespace' is not set in a file — `afk probe`
                  "remote refuses refs/afk (ADR-0038). Delete the key.")
 
 
-def _renamed(dotted):
+def _renamed(dotted: str) -> str | None:
     """The migration error text for a renamed or removed key, or None if it is neither."""
     if dotted in CONFIG_REMOVED:
         return f"config: {dotted!r} was removed — {CONFIG_REMOVED[dotted]}"
@@ -381,7 +406,7 @@ def _renamed(dotted):
     return f"config: {dotted!r} was renamed to {new!r} — {why}"
 
 
-def validate_config(cfg):
+def validate_config(cfg: Obj) -> Obj:
     """
     The semantic checks a per-key type cannot express, run on the CANONICAL config
     every time one is resolved — first at load time (`afk config`), at bootstrap,
@@ -405,13 +430,13 @@ def validate_config(cfg):
     return cfg
 
 
-def verifies(config):
+def verifies(config: Obj) -> bool:
     """Whether a PR owes an adversarial verify of its head before it lands: the
     repo said what a verifier checks (`gate.adversarial_verify_prompt`)."""
     return bool(config["gate"]["adversarial_verify_prompt"].strip())
 
 
-def _yaml_block(text):
+def _yaml_block(text: str) -> str:
     """The first ```yaml fence's body if `text` is a markdown file, else the
     text itself (already a bare block)."""
     if "```yaml" in text:
@@ -419,7 +444,7 @@ def _yaml_block(text):
     return text
 
 
-def _strip_comment(line):
+def _strip_comment(line: str) -> str:
     """Cut an unquoted trailing `# …` comment; quotes are respected."""
     out, quote = [], None
     for ch in line:
@@ -437,7 +462,7 @@ def _strip_comment(line):
     return "".join(out).strip()
 
 
-def _coerce(key, raw, default):
+def _coerce(key: str, raw: str, default: object) -> bool | int | list[str] | str:
     """One scalar, typed by its default: bool, int, [a, b] list, or string."""
     if isinstance(default, bool):
         if raw in ("true", "True"):
@@ -457,7 +482,7 @@ def _coerce(key, raw, default):
     return raw.strip("'\"")
 
 
-def parse_config_yaml(text):
+def parse_config_yaml(text: str) -> Obj:
     """
     Read the per-repo config — the ```yaml block in docs/agents/afk-fleet.md
     (a whole markdown file or a bare block both work). Schema-aware, zero-dep:
@@ -468,8 +493,8 @@ def parse_config_yaml(text):
     its author, and a launcher-held fact in a file is refused by construction); so does
     a wrong shape. Returns the PARTIAL config — only the keys present.
     """
-    partial = {}
-    section = None
+    partial: Obj = {}
+    section: str | None = None
     for ln in _yaml_block(text).splitlines():
         if not ln.strip() or ln.lstrip().startswith("#"):
             continue
@@ -512,7 +537,7 @@ def parse_config_yaml(text):
     return partial
 
 
-def resolve_config(partial):
+def resolve_config(partial: Obj) -> Obj:
     """Partial config → the complete canonical config: every key present,
     defaults filled from CONFIG_DEFAULTS (one level deep for gate), and the
     settled field beside them. Idempotent — resolving an already-canonical
@@ -530,7 +555,7 @@ def resolve_config(partial):
     return out
 
 
-def override_config(cfg, assignments):
+def override_config(cfg: Obj, assignments: Iterable[str] | None) -> Obj:
     """Lay `key=value` overrides (the CLI's `--set`) onto a canonical config, in
     place, and return it. Keys are the config file's own — dotted for a section
     (`gate.ci=local`), plus the settled `claim_namespace` — and values are typed
@@ -559,7 +584,7 @@ def override_config(cfg, assignments):
 # carries it on every row; the two eligibility facts that are not on the issue
 # itself (claimed / has_open_pr) are grafted by `_eligibility_rows`.
 
-def _eligibility_rows(issues, prs, claims):
+def _eligibility_rows(issues: list[Obj], prs: list[Obj], claims: list[Obj]) -> list[Obj]:
     """Each issue + the three eligibility facts `select_frontier` reads:
     `claimed` (a claim ref exists, any owner — not the assignee, ADR-0003),
     `has_open_pr` (an open PR closes it — the open-PR guard) and
@@ -573,7 +598,8 @@ def _eligibility_rows(issues, prs, claims):
             for i in issues]
 
 
-def label_bars(labels, ready_label, epic_labels):
+def label_bars(labels: Iterable[str] | None, ready_label: str,
+               epic_labels: Iterable[str]) -> dict[str, str]:
     """
     Every reason an issue's LABELS keep a fleet from dispatching it, as
     {kind: reason} in the order the frontier reports them; {} when its labels
@@ -586,7 +612,7 @@ def label_bars(labels, ready_label, epic_labels):
       epic       it carries an epic label — never dispatched, whatever else holds.
     """
     labels = set(labels or [])
-    bars = {}
+    bars: dict[str, str] = {}
     if ready_label not in labels:
         bars["not_ready"] = f"no {ready_label} label"
     hit_epic = labels & {e.strip() for e in epic_labels if e.strip()}
@@ -595,7 +621,7 @@ def label_bars(labels, ready_label, epic_labels):
     return bars
 
 
-def select_frontier(issues, ready_label, epic_labels):
+def select_frontier(issues: list[Obj], ready_label: str, epic_labels: Iterable[str]) -> Obj:
     """
     Decide which issues are dispatchable RIGHT NOW. Shared by `--plan` and the live
     tick, so both compute the identical frontier (a stable published contract).
@@ -629,7 +655,7 @@ def select_frontier(issues, ready_label, epic_labels):
 # Claim ownership + owner-liveness — the correctness-critical partition        #
 # --------------------------------------------------------------------------- #
 
-def is_stale(last_ts, now, ttl):
+def is_stale(last_ts: float | None, now: float, ttl: float) -> bool:
     """A claim's owner is presumed dead when its heartbeat is missing or older
     than `ttl`. Missing (None) counts as stale — an owner that never beat."""
     if last_ts is None:
@@ -637,7 +663,7 @@ def is_stale(last_ts, now, ttl):
     return (now - int(last_ts)) > ttl
 
 
-def heartbeat_due(last_ts, now, ttl):
+def heartbeat_due(last_ts: float | None, now: float, ttl: float) -> bool:
     """Refresh my own heartbeat once it is older than ttl/3 (or never beat). Beating
     at ttl/3 keeps a comfortable 3x margin under the lease while staying cheap."""
     if last_ts is None:
@@ -645,7 +671,8 @@ def heartbeat_due(last_ts, now, ttl):
     return (now - int(last_ts)) > ttl / 3.0
 
 
-def classify_claims(claims, heartbeats, me, now, ttl):
+def classify_claims(claims: list[Obj], heartbeats: Mapping[str, float], me: str | None,
+                    now: float, ttl: float) -> dict[str, list[int]]:
     """
     Partition every afk-claim ref by ownership and owner-liveness — the verdict a
     wrong answer would silently corrupt (ADR-0003).
@@ -685,13 +712,19 @@ def classify_claims(claims, heartbeats, me, now, ttl):
 # re-rendered. The keys are the vocabulary the tick's instructions route on (a
 # test holds the docs to it). `merged` / `escalated` / `parked`, the board's
 # terminal phases, are written by the transitions that reach them.
-BOARD_PHASE_OF = {"awaiting_turn": "awaiting_turn", "landing": "landing",
-                  "awaiting_ci": "pr_open", "failure": "ci_failed", "no_pr": "claimed",
-                  "closed": None}
+ClaimStatus = Literal["awaiting_turn", "landing", "awaiting_ci", "failure", "no_pr", "closed"]
+BOARD_PHASE_OF: dict[ClaimStatus, Optional[StatusPhase]] = {
+    "awaiting_turn": "awaiting_turn", "landing": "landing",
+    "awaiting_ci": "pr_open", "failure": "ci_failed", "no_pr": "claimed",
+    "closed": None}
 CLAIM_STATUSES = tuple(BOARD_PHASE_OF)
 
+# What a PR's checks come to (`pr_checks_state`); no checks at all is None.
+ChecksState = Literal["green", "red", "pending"]
 
-def claim_status(has_pr, checks_state, ci_mode, closed=False, landing=False):
+
+def claim_status(has_pr: bool, checks_state: ChecksState | None, ci_mode: GateCiMode,
+                 closed: bool = False, landing: bool = False) -> ClaimStatus:
     """
     Classify one of MY in-flight claims from its PR + checks → its `status`, one
     of CLAIM_STATUSES: what the tick does next.
@@ -754,7 +787,8 @@ def claim_status(has_pr, checks_state, ci_mode, closed=False, landing=False):
 GATE_EXCERPT_LINES = 40
 
 
-def gate_verdict(exit_code, output, max_lines=GATE_EXCERPT_LINES, timed_out=False):
+def gate_verdict(exit_code: int, output: str | None, max_lines: int = GATE_EXCERPT_LINES,
+                 timed_out: bool = False) -> Obj:
     """
     One local-gate run → `{status, exit_code, excerpt, omitted_lines, timed_out}`.
 
@@ -780,7 +814,7 @@ GATE_RECORD_NAMESPACE = "refs/afk/gate"
 GATE_RECORD_TTL = 24 * 3600
 
 
-def gate_record_ref(tree, command):
+def gate_record_ref(tree: str, command: str) -> str:
     """The remote ref a recorded gate run of `command` on `tree` lives at. The
     name IS the key — the tree tested and the command that tested it — so asking
     "was this tested green?" is asking for one ref, and two runs never contend."""
@@ -788,7 +822,7 @@ def gate_record_ref(tree, command):
             f"{hashlib.sha256(command.encode('utf-8')).hexdigest()[:16]}")
 
 
-def gate_record(tree, command, at):
+def gate_record(tree: str, command: str, at: float) -> Obj:
     """
     What a GREEN run of the local gate on a committed tree puts on record — by
     `afk gate`, `afk land` and a batch's landing alike; never after a red or
@@ -802,7 +836,7 @@ def gate_record(tree, command, at):
     return {"tree": tree, "command": command, "at": int(at)}
 
 
-def gate_record_void(record, now):
+def gate_record_void(record: Obj | None, now: float) -> str | None:
     """
     Why a recorded gate run does NOT stand in for a run of the gate — or None
     when it does, which is the only case a landing skips its own (ADR-0030).
@@ -830,7 +864,8 @@ def gate_record_void(record, now):
     return None
 
 
-def protection_verdict(ci_mode, protection, unavailable=None, batch=False):
+def protection_verdict(ci_mode: GateCiMode, protection: Obj | None,
+                       unavailable: str | None = None, batch: bool = False) -> Obj:
     """
     Is the merge target's branch protection compatible with the configured gate?
     Read at bootstrap, with the human present (ADR-0012).
@@ -890,7 +925,9 @@ def protection_verdict(ci_mode, protection, unavailable=None, batch=False):
             "detail": "target branch requires no status checks — a local gate can merge"}
 
 
-def checks_gate(checks_state, allow_no_checks=False):
+def checks_gate(checks_state: ChecksState | None,
+                allow_no_checks: bool = False) -> Literal["green", "awaiting_ci", "gate_red",
+                                                          "no_checks"]:
     """
     The `gate.ci: required` machine gate, for `afk turn` and `afk land` alike:
     may this PR land on what its GitHub checks say, right now?
@@ -905,10 +942,12 @@ def checks_gate(checks_state, allow_no_checks=False):
     """
     if checks_state is None:
         return "green" if allow_no_checks else "no_checks"
-    return {"green": "green", "red": "gate_red"}.get(checks_state, "awaiting_ci")
+    if checks_state == "green":
+        return "green"
+    return "gate_red" if checks_state == "red" else "awaiting_ci"
 
 
-def checks_owed(checks_state, at_head, had_checks):
+def checks_owed(checks_state: ChecksState | None, at_head: bool, had_checks: bool) -> bool:
     """
     Is a landing still waiting for its PR's checks to speak? `afk land` asks after
     every read of the PR while it waits (ADR-0027); the first False ends the wait
@@ -928,7 +967,7 @@ def checks_owed(checks_state, at_head, had_checks):
     return checks_state is None and had_checks
 
 
-def gate_comment(verdict, command):
+def gate_comment(verdict: Obj, command: str) -> str:
     """The PR comment a red landing gate leaves behind, so whoever words the
     failure — the worker fixing it, or the tick failing a worker that gave up —
     re-reads it from where it lives (ADR-0012)."""
@@ -966,17 +1005,24 @@ def gate_comment(verdict, command):
 
 # The phases a worker may declare in its marker (worker-prompt.md asks for exactly
 # these; anything else `classify_stopped` treats as a failure).
-VERDICT_PHASES = ("already-satisfied", "blocked", "giving-up")
+VerdictPhase = Literal["already-satisfied", "blocked", "giving-up"]
+VERDICT_PHASES: tuple[VerdictPhase, ...] = get_args(VerdictPhase)
 _SATISFIED, _BLOCKED, _GIVING_UP = VERDICT_PHASES
+
+# What a tick does about a worker, by the cause it was classified with: the two
+# columns of WORKER_CAUSES `tick_plan` and `_turn_plan` route on.
+WorkerStep = Literal["leave", "dispatch", "park", "nudge", "restart", "escalate", "fail", "judge"]
+BatchStep = Literal["leave", "continue", "nudge", "abandon"]
+
 
 class Cause(NamedTuple):
     """One reason a claim waiting on its worker is where it is — the row of
     WORKER_CAUSES it is declared in is everything that follows from it."""
     outcome: str            # } how `afk no-pr` prints it for a human; the tick
     action: str             # } routes on neither
-    step: str               # what a tick does about an ISSUE's worker (`worker_step`)
-    batch_step: str = None  # …about a MERGE BATCH's worker (`batch_step`); None:
-    #                         a batch's worker is never classified so
+    step: WorkerStep        # what a tick does about an ISSUE's worker (`worker_step`)
+    batch_step: BatchStep | None = None     # …about a MERGE BATCH's worker (`batch_step`);
+    #                         None: a batch's worker is never classified so
 
 
 # Every cause a classification can name. The cause is the one thing
@@ -1000,7 +1046,12 @@ class Cause(NamedTuple):
 # escalated with its PR, branch and worktree kept (`silent_past_restart`) — a
 # landing turn's silence never spends an attempt (ADR-0035). A batch has
 # nothing to restart onto: its second silence abandons it.
-WORKER_CAUSES = {
+WorkerCause = Literal[
+    "working", "just_stopped", "gone", "within_grace", "awaiting_tick", "satisfied",
+    "satisfied_refuted", "blockers_closed", "blockers_waiting", "blocker_unmet",
+    "no_blocker_named", "silent", "silent_on_turn", "silent_past_restart", "gave_up",
+    "unknown_phase", "silent_after_nudge", "silent_unnudgeable"]
+WORKER_CAUSES: dict[WorkerCause, Cause] = {
     # settled by the worker state alone (`settled_by_worker_state`)
     "working":             Cause("coding", "leave", "leave", "leave"),        # its runtime says so
     "just_stopped":        Cause("coding", "leave", "leave", "leave"),        # stopped, or nudged, within grace
@@ -1044,14 +1095,15 @@ VERDICT_RECORD = RecordKind("afk:verdict",
 _NO_VERDICT = blank_record(VERDICT_RECORD)
 
 
-def verdict_marker(n, phase, blocked_by=(), reason=None):
+def verdict_marker(n: int, phase: VerdictPhase, blocked_by: Iterable[int] = (),
+                   reason: str | None = None) -> str:
     """The marker a worker posts for one verdict — what `latest_verdict` reads
     back (a test round-trips every phase)."""
     return record_marker(VERDICT_RECORD, {"n": n, "phase": phase, "blocked_by": list(blocked_by),
                                           "reason": reason})
 
 
-def verdict_marker_format(n):
+def verdict_marker_format(n: int) -> str:
     """The marker as the worker prompt shows it to issue <n>'s worker: its own
     number filled in, the rest as placeholders, optional fields in brackets."""
     return marker_format(VERDICT_RECORD,
@@ -1060,7 +1112,7 @@ def verdict_marker_format(n):
                          optional=("blocked_by", "reason"))
 
 
-def latest_verdict(comments):
+def latest_verdict(comments: Iterable[Obj] | None) -> Obj:
     """
     The worker's verdict on an issue, from its comments ([{"body", "url"}...],
     oldest first, the gh default) — `latest_record`'s. Returns:
@@ -1078,7 +1130,8 @@ def latest_verdict(comments):
 #   waiting  open, and the backlog will resolve it with no human: a fleet holds
 #            it, a PR is open for it, or it carries `ready_label`;
 #   unmet    nothing will resolve it — `reason` says why.
-BLOCKER_STANDINGS = ("closed", "waiting", "unmet")
+BlockerStanding = Literal["closed", "waiting", "unmet"]
+BLOCKER_STANDINGS: tuple[BlockerStanding, ...] = get_args(BlockerStanding)
 _CLOSED, _WAITING, _UNMET = BLOCKER_STANDINGS
 
 # The `state_reason`s of a closed issue whose work was NOT done.
@@ -1086,7 +1139,8 @@ _CLOSED_UNDONE = {"not_planned": "was closed as not planned",
                   "duplicate": "was closed as a duplicate"}
 
 
-def _blocker_standing(blocker, claimed, has_open_pr, config):
+def _blocker_standing(blocker: Obj | None, claimed: bool, has_open_pr: bool,
+                      config: Obj) -> tuple[BlockerStanding, str | None]:
     """One named blocker's `(standing, reason)`, before the cycle check."""
     if blocker is None:
         return _UNMET, "could not be read (it may not exist)"
@@ -1103,7 +1157,7 @@ def _blocker_standing(blocker, claimed, has_open_pr, config):
     return _WAITING, None
 
 
-def depends_on(start, target, edges):
+def depends_on(start: int, target: int, edges: Mapping[int, list[int]]) -> bool:
     """Does issue `start` depend — directly or through any chain of open
     blockers — on issue `target`? `edges` is {issue number: [its open blockers]}."""
     seen, todo = set(), [start]
@@ -1117,7 +1171,10 @@ def depends_on(start, target, edges):
     return False
 
 
-def blocker_standings(number, named, config, *, blockers, claimed, open_pr, edges):
+def blocker_standings(number: int, named: Iterable[int], config: Obj, *,
+                      blockers: Mapping[int, Obj | None] | None, claimed: Collection[int],
+                      open_pr: Collection[int],
+                      edges: Mapping[int, list[int]] | None) -> list[Obj]:
     """
     Where each issue a `blocked` verdict names stands — will the dependency
     issue <number>'s worker discovered resolve on its own, or must a human look?
@@ -1149,7 +1206,7 @@ def blocker_standings(number, named, config, *, blockers, claimed, open_pr, edge
     return rows
 
 
-def blocked_route(named, standings):
+def blocked_route(named: list[int], standings: Mapping[int, str] | None) -> Obj:
     """
     What a `blocked` verdict comes to, from the standing of each blocker it names.
 
@@ -1172,7 +1229,7 @@ def blocked_route(named, standings):
     return {"action": "park" if pending else "redispatch", "pending_blockers": pending}
 
 
-def park_refusal(verdict, standings):
+def park_refusal(verdict: Obj, standings: list[Obj]) -> str | None:
     """
     Why a claim cannot be parked, or None when it can — `afk park`'s own
     check of what `afk no-pr` told the tick, worded so the tick knows what to do
@@ -1195,7 +1252,8 @@ def park_refusal(verdict, standings):
     return f"nothing will resolve {unmet} — escalate it instead"
 
 
-def read_worker_state(row, now, grace_seconds, tui_idle=None):
+def read_worker_state(row: Obj | None, now: float, grace_seconds: float,
+                      tui_idle: bool | None = None) -> Obj:
     """
     A worker's state, read from its worktree's row of `orca worktree ps --json` —
     the reading `settled_by_worker_state` takes,
@@ -1229,7 +1287,7 @@ def read_worker_state(row, now, grace_seconds, tui_idle=None):
     if not row or not row.get("liveTerminalCount"):
         return {"terminal": "none", "terminal_idle_seconds": None, "state": None}
 
-    def ago(ms):
+    def ago(ms: float | None) -> int | None:
         return max(0, int(now) - int(ms) // 1000) if ms else None
 
     output_idle = ago(row.get("lastOutputAt"))
@@ -1237,19 +1295,20 @@ def read_worker_state(row, now, grace_seconds, tui_idle=None):
     lead = max(agents, key=lambda x: x.get("stateStartedAt") or 0, default=None)
     state = lead["state"] if lead else None
 
-    def out(terminal, idle):
+    def out(terminal: str, idle: int | None) -> Obj:
         return {"terminal": terminal, "terminal_idle_seconds": idle, "state": state}
 
     if state == "working":
         live = output_idle is not None and output_idle < grace_seconds
         return out("busy" if live else "idle", output_idle)
-    if state is not None:
+    if lead:
         stopped = ago(lead.get("stateStartedAt"))
         return out("idle", output_idle if stopped is None else stopped)
     return out("busy" if tui_idle is False else "idle", None)
 
 
-def _seen(cause, idle_seconds, pending_blockers=()):
+def _seen(cause: WorkerCause, idle_seconds: int | None,
+          pending_blockers: Iterable[int] = ()) -> Obj:
     """One worker's classification: its cause, and the row words it comes to."""
     row = WORKER_CAUSES[cause]
     return {"cause": cause, "outcome": row.outcome, "action": row.action,
@@ -1257,7 +1316,8 @@ def _seen(cause, idle_seconds, pending_blockers=()):
             "pending_blockers": list(pending_blockers)}
 
 
-def _idle_seconds(now, terminal_idle_seconds, *signs):
+def _idle_seconds(now: float, terminal_idle_seconds: float | None,
+                  *signs: float | None) -> int | None:
     """Seconds since the MOST RECENT sign of life: the terminal's own clock, and
     each epoch-second `signs` that is known. None when none is known — which is
     never "within grace"."""
@@ -1267,7 +1327,8 @@ def _idle_seconds(now, terminal_idle_seconds, *signs):
     return max(0, int(now) - max(seen)) if seen else None
 
 
-def settled_by_worker_state(reading, now, grace_seconds, nudged_at=None):
+def settled_by_worker_state(reading: Obj, now: float, grace_seconds: float,
+                            nudged_at: float | None = None) -> Obj | None:
     """
     Does a worker's state alone settle what the tick does about it? Asked before
     anything else is gathered — a worker it settles costs no git and no GitHub read
@@ -1292,7 +1353,7 @@ def settled_by_worker_state(reading, now, grace_seconds, nudged_at=None):
     return None
 
 
-def single_turn_held(turn):
+def single_turn_held(turn: Obj | None) -> bool:
     """Is `turn` (`latest_turn`, or {} / None) ONE PR's landing turn, held — `at`
     set, not `released`, no merge batch's? A no_pr claim has no turn, so never."""
     turn = turn or {}
@@ -1300,7 +1361,7 @@ def single_turn_held(turn):
                 and not turn.get("batch"))
 
 
-def restartable_turn(turn):
+def restartable_turn(turn: Obj | None) -> bool:
     """Is `turn` one PR's held landing turn whose silent worker may still be
     restarted onto it — one that has not had its one restart (`restarted`)?
     ADR-0035. Past the restart the same silence escalates the claim with
@@ -1308,8 +1369,10 @@ def restartable_turn(turn):
     return single_turn_held(turn) and not (turn or {}).get("restarted")
 
 
-def classify_stopped(progress, terminal_idle_seconds, worker_verdict, blocker_states,
-                     now, grace_seconds, nudged_at=None, can_nudge=True, turn=None):
+def classify_stopped(progress: Obj | None, terminal_idle_seconds: float | None,
+                     worker_verdict: Obj | None, blocker_states: Mapping[int, str] | None,
+                     now: float, grace_seconds: float, nudged_at: float | None = None,
+                     can_nudge: bool = True, turn: Obj | None = None) -> Obj:
     """
     The classification of one of MY claims that is waiting on a worker which has
     STOPPED — a `no_pr` claim, or a `landing` one, that `settled_by_worker_state`
@@ -1376,9 +1439,10 @@ def classify_stopped(progress, terminal_idle_seconds, worker_verdict, blocker_st
     if phase == _BLOCKED:
         named = verdict.get("blocked_by") or []
         route = blocked_route(named, blocker_states)
-        cause = {"redispatch": "blockers_closed", "park": "blockers_waiting",
-                 "escalate": "blocker_unmet" if named else "no_blocker_named"}[route["action"]]
-        return _seen(cause, idle_seconds, route["pending_blockers"])
+        causes: dict[str, WorkerCause] = {
+            "redispatch": "blockers_closed", "park": "blockers_waiting",
+            "escalate": "blocker_unmet" if named else "no_blocker_named"}
+        return _seen(causes[route["action"]], idle_seconds, route["pending_blockers"])
     return _seen("gave_up" if phase == _GIVING_UP else "unknown_phase", idle_seconds)
 
 
@@ -1387,7 +1451,7 @@ STALL_TAIL_LINES = 30
 _STALL_LINE_CHARS = 200
 
 
-def nudge_text(brief=None):
+def nudge_text(brief: str | None = None) -> str:
     """The one line `afk nudge` types at a worker that stopped without an outcome.
     Short on purpose: a long text arrives as a paste the worker asks to have
     confirmed, which is the stall this is sent to break."""
@@ -1397,22 +1461,22 @@ def nudge_text(brief=None):
             f"outcome it asks for — a PR, a landing, or an afk:verdict marker comment.")
 
 
-def stall_tail(lines, limit=STALL_TAIL_LINES):
+def stall_tail(lines: Iterable[str] | None, limit: int = STALL_TAIL_LINES) -> list[str]:
     """The last `limit` non-blank lines of a terminal screen, each cut to a
     bounded width — what a stalled worker was last saying, small enough to carry."""
     kept = [ln.rstrip()[:_STALL_LINE_CHARS] for ln in (lines or []) if str(ln).strip()]
     return kept[-limit:]
 
 
-def stall_reason(reason, tail):
+def stall_reason(reason: str, tail: Iterable[str] | None) -> str:
     """A failure or escalation reason with the stalled worker's last screen
     appended, so the retry (or the human it escalates to) reads WHERE it stopped,
     not just that it did."""
-    tail = stall_tail(tail)
-    if not tail:
+    kept = stall_tail(tail)
+    if not kept:
         return reason
     return (f"{reason.rstrip()}\n\nThe worker stopped without an outcome and stayed silent "
-            f"after one nudge. Its terminal ended with:\n\n```\n" + "\n".join(tail) + "\n```")
+            f"after one nudge. Its terminal ended with:\n\n```\n" + "\n".join(kept) + "\n```")
 
 
 # --------------------------------------------------------------------------- #
@@ -1453,37 +1517,44 @@ def stall_reason(reason, tail):
 # Every `outcome` `afk land` can stop with — the vocabulary the worker's prompt
 # routes on (a test holds the prompt and the docs to it). What each means is
 # `afk.cmd_land`'s docstring, and nowhere else in the code.
-LAND_OUTCOMES = ("merged", "conflict", "gate_red", "awaiting_ci", "needs_verify", "no_checks")
+LandOutcome = Literal["merged", "conflict", "gate_red", "awaiting_ci", "needs_verify", "no_checks"]
+LAND_OUTCOMES: tuple[LandOutcome, ...] = get_args(LandOutcome)
 
 # The landing outcomes where the next move is the TICK's, not the worker's: the
 # worker wakes the launcher and stops, and is told to land again (`afk turn`).
-LAND_WAITS = ("awaiting_ci", "needs_verify", "no_checks")
+LandWait = Literal["awaiting_ci", "needs_verify", "no_checks"]
+LAND_WAITS: tuple[LandWait, ...] = get_args(LandWait)
 
 # Every `outcome` `afk turn` can stop with — the vocabulary the tick's
 # instructions route on (a test holds the docs to it). What each means is
 # `afk.cmd_turn`'s docstring; what the tick does next with it is `turn_step`.
-TURN_OUTCOMES = ("granted", "waiting", "landing", "awaiting_ci", "gate_red", "no_checks",
-                 "needs_verify")
+TurnOutcome = Literal["granted", "waiting", "landing", "awaiting_ci", "gate_red", "no_checks",
+                      "needs_verify"]
+TURN_OUTCOMES: tuple[TurnOutcome, ...] = get_args(TurnOutcome)
 
 # Every `outcome` `afk turn --batch` and `afk turn --abandon` can stop with: the
 # three a single turn shares, `too_few` (no batch to form: the turn goes to one
 # PR) and `abandoned`. The pass routes them in code (`_turn_plan`).
-BATCH_TURN_OUTCOMES = ("granted", "waiting", "landing", "too_few", "abandoned")
+BatchTurnOutcome = Literal["granted", "waiting", "landing", "too_few", "abandoned"]
+BATCH_TURN_OUTCOMES: tuple[BatchTurnOutcome, ...] = get_args(BatchTurnOutcome)
 
 # What a merge batch's worker is doing with the stack, as its last
 # `afk land --batch` wrote it on the members' turn markers.
-BATCH_PHASES = ("stacking", "gating", "fixing")
+BatchPhase = Literal["stacking", "gating", "fixing"]
+BATCH_PHASES: tuple[BatchPhase, ...] = get_args(BatchPhase)
 
 # Every `outcome` `afk land --batch` can stop with — the vocabulary the batch
 # brief routes on (a test holds the brief and the docs to it).
-BATCH_OUTCOMES = ("landed", "gate_red", "target_moved", "too_small")
+BatchOutcome = Literal["landed", "gate_red", "target_moved", "too_small"]
+BATCH_OUTCOMES: tuple[BatchOutcome, ...] = get_args(BatchOutcome)
 
 # Why a PR left a merge batch without landing: it conflicted with the stack, the
 # batch's worker went silent (or its fleet died), or too few members remained.
-UNBATCHED = ("left_out", "abandoned", "dissolved")
+Unbatched = Literal["left_out", "abandoned", "dissolved"]
+UNBATCHED: tuple[Unbatched, ...] = get_args(Unbatched)
 
 
-def _batch_members(raw):
+def _batch_members(raw: str | None) -> list[dict[str, int]]:
     """`1:10,2:20` → [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}]; anything
     else in the list is dropped."""
     pairs = [tok.split(":") for tok in (raw or "").split(",")]
@@ -1504,14 +1575,17 @@ TURN_RECORD = RecordKind("afk:turn", {
     "unbatched": one_of(UNBATCHED), "of": str, "released": FLAG}, ("instance",))
 
 
-def _refusing(vocabulary, what):
+_Word = TypeVar("_Word", bound=str)
+
+
+def _refusing(vocabulary: tuple[_Word, ...], what: str) -> Callable[[str], _Word]:
     """`outcome → outcome`, refused (ValueError) unless it is a word of
     `vocabulary`: a subcommand cannot stop with a word its caller was never told
     how to act on."""
-    def check(outcome):
+    def check(outcome: str) -> _Word:
         if outcome not in vocabulary:
             raise ValueError(f"not {what}: {outcome!r}")
-        return outcome
+        return vocabulary[vocabulary.index(outcome)]
     return check
 
 
@@ -1529,7 +1603,7 @@ batch_outcome = _refusing(BATCH_OUTCOMES, "a batch outcome")
 _NO_TURN = {**blank_record(TURN_RECORD), "comment_id": None}
 
 
-def _whole_turn(fields):
+def _whole_turn(fields: Obj) -> Obj:
     """A turn's fields with the ones that say nothing alone taken out: `head` is
     where a landing `stopped`, `members` and `phase` are a `batch`'s."""
     return {**fields,
@@ -1537,7 +1611,7 @@ def _whole_turn(fields):
             **({} if fields.get("batch") else {"members": [], "phase": None})}
 
 
-def next_turn(prev, **changed):
+def next_turn(prev: Obj | None, **changed: Any) -> Obj:
     """The record a turn marker is REWRITTEN from: `prev` — the record as it was
     read (`latest_turn`), None when the PR has none — plus what changed. A field
     nobody names survives, `comment_id` among them: the rewrite replaces the
@@ -1551,7 +1625,8 @@ def next_turn(prev, **changed):
     return turn
 
 
-def single_turn(prev, instance, at, verified=None, allow_no_checks=False, restarted=None):
+def single_turn(prev: Obj | None, instance: str, at: float, verified: str | None = None,
+                allow_no_checks: bool = False, restarted: int | None = None) -> Obj:
     """The record of ONE PR's landing turn, granted now (or granted again) over
     `prev`: the worker is told to land, so it has not stopped, and the turn is
     no batch's.
@@ -1572,7 +1647,8 @@ def single_turn(prev, instance, at, verified=None, allow_no_checks=False, restar
                      restarted=restarted, batch=None, members=[], phase=None, released=False)
 
 
-def batch_turn(prev, instance, at, batch, members, phase):
+def batch_turn(prev: Obj | None, instance: str, at: float, batch: str,
+               members: Iterable[Obj], phase: BatchPhase) -> Obj:
     """The record of a MERGE BATCH's landing turn on one member PR, over that
     PR's `prev` — the same on every member (ADR-0029).
 
@@ -1585,7 +1661,8 @@ def batch_turn(prev, instance, at, batch, members, phase):
                      released=False)
 
 
-def unbatched_turn(prev, instance, at, batch, why):
+def unbatched_turn(prev: Obj | None, instance: str, at: float, batch: str,
+                   why: Unbatched) -> Obj:
     """The record that replaces a batch's turn on a PR that left it without
     landing. It holds no turn (`released`): the PR is back to waiting, takes a
     single landing turn, and is never batched again.
@@ -1596,7 +1673,7 @@ def unbatched_turn(prev, instance, at, batch, why):
                      unbatched=why, of=batch, released=True)
 
 
-def turn_comment(turn):
+def turn_comment(turn: Obj) -> str:
     """The PR comment that records a landing turn, from its record (`latest_turn`,
     or one of `next_turn` / `single_turn` / `batch_turn` / `unbatched_turn`): the
     marker `latest_turn` reads back — every field the record holds — then the
@@ -1639,7 +1716,7 @@ def turn_comment(turn):
     return record_comment(TURN_RECORD, fields, text)
 
 
-def latest_turn(comments):
+def latest_turn(comments: Iterable[Obj] | None) -> Obj | None:
     """
     The landing turn recorded on a PR, from its comments ([{"id", "body"}...],
     oldest first) → every field of TURN_RECORD — one the marker does not state
@@ -1650,12 +1727,12 @@ def latest_turn(comments):
     record back: the two are a round trip.
     """
     record, comment = latest_record(TURN_RECORD, comments)
-    if record is None:
+    if record is None or comment is None:
         return None
     return {**_whole_turn({**_NO_TURN, **record}), "comment_id": comment.get("id")}
 
 
-def held_turn(turn, owner):
+def held_turn(turn: Obj | None, owner: str | None) -> Obj | None:
     """`turn` (`latest_turn`) when it is held by the claim's owner, else None.
 
       owner: the instance id the claim ref is stamped with; None or "" when
@@ -1669,7 +1746,10 @@ def held_turn(turn, owner):
     return turn if held else None
 
 
-def turn_gate(ci_mode, checks_state, allow_no_checks, adversarial_verify, verified, head):
+def turn_gate(ci_mode: GateCiMode, checks_state: ChecksState | None, allow_no_checks: bool,
+              adversarial_verify: bool, verified: str | None,
+              head: str) -> Literal["ready", "awaiting_ci", "gate_red", "no_checks",
+                                    "needs_verify"]:
     """
     May a landing turn be granted (or its worker told to land again) on what is
     known of the PR right now? The tick's judgments are settled HERE, before the
@@ -1695,7 +1775,7 @@ def turn_gate(ci_mode, checks_state, allow_no_checks, adversarial_verify, verifi
     return "ready"
 
 
-def turn_order(rows):
+def turn_order(rows: list[Obj]) -> list[int]:
     """
     The order landing turns are granted in — the merge queue: the issue numbers
     of the `mine` rows whose PR is ready, a PR that already holds a turn first,
@@ -1723,41 +1803,48 @@ def turn_order(rows):
 _BATCH_ID_UNSAFE = re.compile(r"[^A-Za-z0-9_.-]")
 
 
-def batch_id(instance, now):
+def batch_id(instance: str, now: float) -> str:
     """A new merge batch's id: the granting fleet instance and the second it was
     formed — unique, since an instance has one turn out at a time. It is a bare
     token: it names a branch, a worktree and a marker field."""
     return f"{_BATCH_ID_UNSAFE.sub('-', instance)}-{int(now)}"
 
 
-def batch_formed_by(batch, instance):
+def batch_formed_by(batch: str | None, instance: str | None) -> bool:
     """Is `batch` an id `batch_id` gives a batch of `instance`?"""
     return bool(instance) and bool(
         re.fullmatch(rf"{re.escape(_BATCH_ID_UNSAFE.sub('-', instance))}-\d+", batch or ""))
 
 
-def batch_name(batch):
+def batch_name(batch: str) -> str:
     """The name a batch's worktree is created under — and so, behind orca's
     `<user>/` prefix, its branch (`batch_branch_regex`)."""
     return f"afk-batch-{batch}"
 
 
-def batch_branch_regex(batch=None, instance=None):
+def batch_branch_regex(batch: str | None = None,
+                       instance: str | None = None) -> re.Pattern[str]:
     """The regex a batch's branch matches, as orca names it: `<user>/` in front,
     and `-<k>` behind when a continuation was cut under a name already taken.
     For one `batch`, or — group 1 the id — for every batch of one `instance`."""
-    which = re.escape(batch) if batch else rf"({re.escape(_BATCH_ID_UNSAFE.sub('-', instance))}-\d+)"
+    if batch:
+        which = re.escape(batch)
+    elif instance:
+        which = rf"({re.escape(_BATCH_ID_UNSAFE.sub('-', instance))}-\d+)"
+    else:
+        raise ValueError("batch_branch_regex takes a batch or an instance")
     return re.compile(rf"^(?:[^/]+/)?afk-batch-{which}(?:-\d+)?$")
 
 
-def batch_branches(heads, batch):
+def batch_branches(heads: Iterable[str] | None, batch: str) -> list[str]:
     """The remote branches that are one batch's, sorted: the stack its worker
     pushed (ADR-0011) — what a continuation on another machine starts from."""
     rx = batch_branch_regex(batch)
     return sorted(h for h in (heads or []) if h and rx.match(h))
 
 
-def batch_worktrees(worktrees, repo, batch=None, instance=None):
+def batch_worktrees(worktrees: Iterable[Obj] | None, repo: str | None,
+                    batch: str | None = None, instance: str | None = None) -> list[Obj]:
     """The orca worktrees on this machine that are a batch's — one `batch`'s, or
     every batch of `instance` — as [{"batch", "path", "branch"}...], the most
     recently active first. Same row shape and repo check as `find_orca_worktree`;
@@ -1776,7 +1863,7 @@ def batch_worktrees(worktrees, repo, batch=None, instance=None):
     return [row for _, row in sorted(hits, key=lambda h: -h[0])]
 
 
-def batches_form(config):
+def batches_form(config: Obj) -> bool:
     """Whether this config's PRs may land as merge batches at all: the stack is
     gated by ONE run of `gate.local_command`, which only `gate.ci: local` has,
     and with an adversarial verify every PR owes one of its own head before
@@ -1784,7 +1871,8 @@ def batches_form(config):
     return config["gate"]["ci"] == "local" and not verifies(config)
 
 
-def batch_candidates(mine, merge_order, config, busy=()):
+def batch_candidates(mine: list[Obj], merge_order: list[int], config: Obj,
+                     busy: Iterable[int] = ()) -> list[int]:
     """
     The claims a merge batch is formed from — their issue numbers, in merge
     order — or [] when the turn goes to ONE PR as before. The cycle's
@@ -1810,7 +1898,8 @@ def batch_candidates(mine, merge_order, config, busy=()):
     return picked if len(picked) >= 2 else []
 
 
-def turn_holder(ws, instance):
+def turn_holder(ws: Obj,
+                instance: str) -> tuple[Literal["dead", "mine", "single"] | None, Any]:
     """Who holds this fleet's landing turn, as far as a merge batch goes → (who,
     what), the first of these that is so — the one precedence `tick_plan` and
     `afk turn --batch` both read:
@@ -1830,21 +1919,22 @@ def turn_holder(ws, instance):
     return ("single", single) if single is not None else (None, None)
 
 
-def stack_message(title, pr, issue):
+def stack_message(title: str | None, pr: int, issue: int) -> str:
     """The message of the merge commit a batched PR is stacked with: the PR's
     title, `(#<pr>)`, and the closing keyword. The `(#<pr>)` is also how the
     stack is read back (`read_stack`)."""
     return f"{(title or '').strip() or f'PR {pr}'} (#{pr})\n\nCloses #{issue}\n"
 
 
-def stacked_pr(subject):
+def stacked_pr(subject: str | None) -> int | None:
     """The PR a commit subject names the way `stack_message` writes it — its
     trailing ` (#<pr>)` — or None."""
     m = re.search(r" \(#(\d+)\)$", subject or "")
     return int(m.group(1)) if m else None
 
 
-def read_stack(commits, prs):
+def read_stack(commits: Iterable[tuple[str, str]],
+               prs: Collection[int]) -> tuple[dict[int, str], list[str]]:
     """
     A batch worktree's commits above the target, read back → (stacked, fixes):
 
@@ -1858,17 +1948,18 @@ def read_stack(commits, prs):
       fixes:   [sha...] — every other commit, oldest first: what the batch
                worker committed to turn a red stack green
     """
-    stacked, fixes = {}, []
+    stacked: dict[int, str] = {}
+    fixes: list[str] = []
     for sha, subject in commits:
         pr = stacked_pr(subject)
-        if pr in prs and pr not in stacked:
+        if pr is not None and pr in prs and pr not in stacked:
             stacked[pr] = sha
         else:
             fixes.append(sha)
     return stacked, fixes
 
 
-def batch_landed_comment(commit, target, batch, prs):
+def batch_landed_comment(commit: str, target: str, batch: str, prs: Iterable[int]) -> str:
     """The comment a batched PR is closed with when GitHub did not show it merged
     — its head moved after it was stacked, or GitHub never caught up: the PR
     itself says which commit landed it."""
@@ -1879,12 +1970,13 @@ def batch_landed_comment(commit, target, batch, prs):
             f"is on `{target}`.")
 
 
-def batch_step(worker):
+def batch_step(worker: Obj) -> BatchStep:
     """What a tick does about the batch that holds the turn, from the cause its
     worker was classified with → that cause's `batch_step` in WORKER_CAUSES. A
     batch's worker holds no claim and declares no verdict, so a cause with none
     is an error."""
-    step = getattr(WORKER_CAUSES.get(worker["cause"]), "batch_step", None)
+    cause = WORKER_CAUSES.get(worker["cause"])
+    step = cause.batch_step if cause else None
     if step is None:
         raise ValueError(f"no step for a batch worker classified {worker['cause']!r}")
     return step
@@ -1901,7 +1993,8 @@ def batch_step(worker):
 # gate. It never counts as a retry: it answers "did the FLEET die?", not "is
 # this WORK failing?".
 
-def group_instances(claims, heartbeats, me, now, ttl):
+def group_instances(claims: Iterable[Obj] | None, heartbeats: Mapping[str, float] | None,
+                    me: str | None, now: float, ttl: float) -> list[Obj]:
     """
     Every fleet instance discoverable in fleet state, with what it holds and how
     stale its lease is — the takeover picker's input (`afk takeover --list`).
@@ -1918,7 +2011,7 @@ def group_instances(claims, heartbeats, me, now, ttl):
     claim whose marker names no instance appears under `instance: null`; it needs
     no takeover, being already reclaimable as stale.
     """
-    by = {}
+    by: dict[Any, Obj] = {}
     for c in claims or []:
         inst = c.get("instance")
         row = by.setdefault(inst, {"instance": inst, "host": None, "claims": []})
@@ -1927,7 +2020,7 @@ def group_instances(claims, heartbeats, me, now, ttl):
     for inst in (heartbeats or {}):
         by.setdefault(inst, {"instance": inst, "host": None, "claims": []})
 
-    out = []
+    out: list[Obj] = []
     for inst, row in by.items():
         ts = (heartbeats or {}).get(inst)
         nums = sorted(n for n in row["claims"] if n is not None)
@@ -1941,7 +2034,9 @@ def group_instances(claims, heartbeats, me, now, ttl):
     return out
 
 
-def plan_takeover(claims, heartbeats, target, me, now, ttl, confirmed=False):
+def plan_takeover(claims: Iterable[Obj] | None, heartbeats: Mapping[str, float] | None,
+                  target: str | None, me: str | None, now: float, ttl: float,
+                  confirmed: bool = False) -> Obj:
     """
     Whether `afk takeover --instance <target>` may proceed, and over which claims.
     Pure: the effectful layer scans the refs, this decides, then it pushes.
@@ -1963,12 +2058,12 @@ def plan_takeover(claims, heartbeats, target, me, now, ttl, confirmed=False):
                   key=lambda r: (r["number"] is None, r["number"]))
     ts = (heartbeats or {}).get(target)
     fresh = ts is not None and not is_stale(ts, now, ttl)
+    age = None if ts is None else int(now) - int(ts)
     known = ts is not None or bool(rows)
 
-    def out(action, detail):
+    def out(action: str, detail: str) -> Obj:
         return {"action": action, "instance": target, "claims": rows,
-                "fresh": fresh, "heartbeat_age": None if ts is None else int(now) - int(ts),
-                "detail": detail}
+                "fresh": fresh, "heartbeat_age": age, "detail": detail}
 
     if target is not None and target == me:
         return out("error", "that is this fleet's own instance id — its claims are already mine")
@@ -1977,7 +2072,7 @@ def plan_takeover(claims, heartbeats, target, me, now, ttl, confirmed=False):
                            else "that instance holds no claims (nothing to take)")
     if fresh and not confirmed:
         return out("confirm",
-                   f"that fleet's heartbeat is only {int(now) - int(ts)}s old (lease {int(ttl)}s) — "
+                   f"that fleet's heartbeat is only {age}s old (lease {int(ttl)}s) — "
                    f"it looks ALIVE; forcing a takeover steals its live work if you are wrong")
     return out("take", f"taking {len(rows)} claim(s) from {target}"
                        + (" (fresh heartbeat, human-confirmed)" if fresh else ""))
@@ -1996,7 +2091,7 @@ def plan_takeover(claims, heartbeats, target, me, now, ttl, confirmed=False):
 _PLACEHOLDER_RE = re.compile(r"\{(number|slug)\}")
 
 
-def branch_regex(number):
+def branch_regex(number: int) -> re.Pattern[str]:
     """
     An issue number → the regex that matches the branch orca
     ACTUALLY created for it. Two things are wildcards, by construction: orca
@@ -2014,7 +2109,7 @@ def branch_regex(number):
     return re.compile(r"^(?:[^/]+/)?" + "".join(out) + r"$")
 
 
-def branch_candidates(heads, number):
+def branch_candidates(heads: Iterable[str] | None, number: int) -> list[str]:
     """The remote branch names that could be issue <number>'s work branch, sorted.
     Used when NO local worktree survived: the claim ref records the issue, not the
     branch, so tier 2 has to recognise the branch by its name."""
@@ -2022,14 +2117,14 @@ def branch_candidates(heads, number):
     return sorted(h for h in (heads or []) if h and rx.match(h))
 
 
-def short_branch(ref):
+def short_branch(ref: str | None) -> str:
     """`refs/heads/x/y` → `x/y`; a name that is already short is returned as is.
     orca reports a worktree's branch either way."""
     ref = ref or ""
     return ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
 
 
-def in_orca_project(worktree, repo):
+def in_orca_project(worktree: Obj, repo: str) -> bool:
     """Whether an orca worktree row belongs to `repo` ("owner/name"): its
     `projectId` is `github:owner/name`, which orca writes lower-cased whatever
     the repo's own casing — so, like `find_orca_repo`, compared case-insensitively
@@ -2038,7 +2133,8 @@ def in_orca_project(worktree, repo):
     return (worktree.get("projectId") or "").lower() == f"github:{repo}".lower()
 
 
-def find_orca_worktree(worktrees, number, repo=None):
+def find_orca_worktree(worktrees: Iterable[Obj] | None, number: int,
+                       repo: str | None = None) -> Obj:
     """
     The orca worktree belonging to issue <number> on THIS machine, from
     `orca worktree list --json`'s `result.worktrees` rows — the tier-1 signal.
@@ -2058,7 +2154,8 @@ def find_orca_worktree(worktrees, number, repo=None):
         # compared numerically: a str/int drift in orca's JSON would silently
         # downgrade every tier-1 recovery and lose the uncommitted work it saves
         try:
-            if int(w.get("linkedIssue")) != int(number):
+            linked = w.get("linkedIssue")
+            if linked is None or int(linked) != int(number):
                 continue
         except (TypeError, ValueError):
             continue
@@ -2074,20 +2171,21 @@ def find_orca_worktree(worktrees, number, repo=None):
             "branch": short_branch(best.get("branch")) or None}
 
 
-def remotes_of(urls, repo):
+def remotes_of(urls: Mapping[str, str] | None, repo: str) -> list[str]:
     """The names of the git remotes that ARE the target repo, from a checkout's
     `remote.<name>.url` settings ({name: url}) — the ones whose remote-tracking
     ref a fetch by URL leaves behind. A URL matches when it ends in
     `github.com/<owner>/<name>` or `github.com:<owner>/<name>`, `.git` or not,
     case-insensitively, as GitHub does."""
     want = repo.lower()
-    def names(url):
+
+    def names(url: str) -> bool:
         url = url.lower().rstrip("/").removesuffix(".git")
         return url.endswith(f"github.com/{want}") or url.endswith(f"github.com:{want}")
     return sorted(name for name, url in (urls or {}).items() if names(url))
 
 
-def find_orca_repo(repos, repo):
+def find_orca_repo(repos: Iterable[Obj] | None, repo: str) -> Obj | None:
     """
     The repo orca knows the target by, from `orca repo list --json`'s
     `result.repos` rows → {"id", "path"}: the id `orca worktree create --repo
@@ -2104,7 +2202,7 @@ def find_orca_repo(repos, repo):
     return None
 
 
-def worktree_name(number, title):
+def worktree_name(number: int, title: str | None) -> str:
     """BRANCH_PATTERN filled for one issue — the NAME hint handed to `orca
     worktree create --name` (orca derives the real branch from it, ADR-0005). The
     slug is the title lowercased to `[a-z0-9-]`, at most 40 characters; a title
@@ -2114,7 +2212,7 @@ def worktree_name(number, title):
             .replace("{slug}", slug or "work"))
 
 
-def furthest_ahead(ahead_by_branch):
+def furthest_ahead(ahead_by_branch: Mapping[str, int | None]) -> str | None:
     """Of several remote branches matching one issue (an earlier attempt left one
     behind), the one furthest ahead of base — ties, and unmeasurable counts
     (None), go to the first by name. None when there is no candidate."""
@@ -2122,7 +2220,8 @@ def furthest_ahead(ahead_by_branch):
     return max(names, key=lambda b: ahead_by_branch[b] or 0) if names else None
 
 
-def select_recovery(worktree, branch, fresh=False, landing_pr=None):
+def select_recovery(worktree: Obj | None, branch: Obj | None, fresh: bool = False,
+                    landing_pr: int | None = None) -> Obj:
     """
     How to recover ONE claim whose worker has died — the continue-vs-fresh
     selection of ADR-0011, tiered by what survived. Pure: `afk recovery` gathers
@@ -2222,7 +2321,8 @@ def select_recovery(worktree, branch, fresh=False, landing_pr=None):
 # (`verdict_marker_format`).
 
 _BLOCK_RE = re.compile(r"<!--afk:block ([a-z0-9_.]+)-->\n(.*?)\n?<!--/afk:block-->", re.DOTALL)
-PROMPT_VARIANTS = ("fresh", "continue")
+PromptVariant = Literal["fresh", "continue"]
+PROMPT_VARIANTS: tuple[PromptVariant, ...] = get_args(PromptVariant)
 PROMPT_FIELDS = ("n", "title", "repo", "base_branch", "local_command", "afk_path", "config",
                  "branch", "worktree_path", "launcher_terminal")
 LANDING_FIELDS = ("pr", "pr_branch", "target")
@@ -2233,13 +2333,13 @@ _NO_WAKE = "true   # (no coordinator terminal to wake: it finds your outcome at 
 _TERMINAL_HANDLE_RE = re.compile(r"[A-Za-z0-9_.:-]+")
 
 
-def wake_line(number):
+def wake_line(number: int | str) -> str:
     """The one line a wake types at the launcher's terminal. It names the issue for
     the human scrolling back, and nothing the launcher may act on (ADR-0020)."""
     return f"afk-wake #{number}"
 
 
-def wake_command(launcher_terminal, number):
+def wake_command(launcher_terminal: str | None, number: int | str) -> str:
     """
     The command a worker runs once its outcome is on GitHub — a PR, a verdict
     marker, a landing that merged or stopped for the tick — to wake the launcher out of its sleep
@@ -2259,7 +2359,7 @@ def wake_command(launcher_terminal, number):
     return f'orca terminal send --terminal {handle} --text "{wake_line(number)}" --enter'
 
 
-def gate_command(afk_path, local_command):
+def gate_command(afk_path: str, local_command: str | None) -> str:
     """
     The command a worker runs the local gate with: `afk gate`, carrying the
     configured `gate.local_command` as its config, so the run is made — and, when
@@ -2278,17 +2378,17 @@ def gate_command(afk_path, local_command):
     return f"{shlex.quote(afk_path)} gate --config {shlex.quote(config)}"
 
 
-def _prompt_blocks(template):
+def _prompt_blocks(template: str | None) -> Callable[[str], str]:
     blocks = dict(_BLOCK_RE.findall(template or ""))
 
-    def block(name):
+    def block(name: str) -> str:
         if name not in blocks:
             raise ValueError(f"worker prompt template has no {name!r} block")
         return blocks[name]
     return block
 
 
-def land_command(afk_path, number, repo, config):
+def land_command(afk_path: str, number: int, repo: str, config: str) -> str:
     """
     The one command a worker lands its PR with, on its landing turn: `afk land`,
     carrying the run's config — the merge target, the gate, the
@@ -2301,7 +2401,8 @@ def land_command(afk_path, number, repo, config):
             f"--config {shlex.quote(config)}")
 
 
-def _fill_prompt(text, fields, landing=None, reason=None):
+def _fill_prompt(text: str, fields: Obj, landing: Obj | None = None,
+                 reason: str | None = None) -> str:
     """Fill every field of an assembled prompt text. Raises ValueError on a missing
     field or a placeholder left unfilled; the free-text values (title, reason, the
     land command's config) go in last and in one pass, so one that happens to
@@ -2333,7 +2434,8 @@ def _fill_prompt(text, fields, landing=None, reason=None):
     return text.strip() + "\n"
 
 
-def render_worker_prompt(template, variant, fields, reason=None):
+def render_worker_prompt(template: str, variant: PromptVariant, fields: Obj,
+                         reason: str | None = None) -> str:
     """
     The prompt one worker is started with, from the template file's text.
 
@@ -2366,14 +2468,14 @@ BATCH_FIELDS = ("batch", "members", "repo", "target", "afk_path", "config", "bra
                 "worktree_path", "launcher_terminal")
 
 
-def batch_land_command(afk_path, batch, repo, config):
+def batch_land_command(afk_path: str, batch: str, repo: str, config: str) -> str:
     """The one command a batch worker stacks, gates and lands its batch with:
     `afk land --batch`, carrying the run's config (ADR-0029)."""
     return (f"{shlex.quote(afk_path)} land --batch {shlex.quote(batch)} --repo {shlex.quote(repo)} "
             f"--config {shlex.quote(config)}")
 
 
-def render_batch_brief(template, fields):
+def render_batch_brief(template: str, fields: Obj) -> str:
     """
     The brief a merge batch's worker is started on: the template's `batch` block
     — the `afk land --batch` command and its outcome table.
@@ -2404,7 +2506,7 @@ def render_batch_brief(template, fields):
     return text.strip() + "\n"
 
 
-def render_landing(template, fields, landing):
+def render_landing(template: str, fields: Obj, landing: Obj) -> str:
     """
     The brief a worker is pointed at when its PR is given the landing turn: the
     template's `landing` block — the `afk land` command and its outcome table —
@@ -2457,7 +2559,9 @@ _STATUS_STEPS = (
 # `afk close`), and parked (the worker found an open dependency; the claim is
 # released until it closes — `afk park`).
 _NOTHING_REACHED = None    # no step ticked: the phase is before, or outside, the happy path
-_PHASES = {
+StatusPhase = Literal["claimed", "pr_open", "ci_failed", "awaiting_turn", "landing", "merged",
+                      "escalated", "closed", "parked"]
+_PHASES: dict[StatusPhase, tuple[Optional[str], str]] = {
     "claimed":        ("claimed", "▸ 当前:worker 实现中,尚无 PR"),
     "pr_open":        ("pr_open", "▸ 当前:等 {gate}"),
     "ci_failed":      ("pr_open", "▸ 当前:{gate} 失败,修复重试中({attempt}/{retry_max}) —— 见下方 {gate} 与评论"),
@@ -2474,13 +2578,14 @@ STATUS_PHASES = tuple(_PHASES)
 # a merge batch (ADR-0029), and what its batch worker is doing, by BATCH_PHASES.
 _BATCH_LINE = ("▸ 当前:已轮到落地,与 {prs} 合为一个 merge batch —— batch worker {doing},"
                "整批过一次门后一起落地")
-_BATCH_DOING = {"stacking": "正在把各 PR 叠放到目标分支上(stacking)",
-                "gating": "正在对整批过门(gating)",
-                "fixing": "正在修复整批的红门(being fixed)"}
+_BATCH_DOING: dict[BatchPhase, str] = {"stacking": "正在把各 PR 叠放到目标分支上(stacking)",
+                                       "gating": "正在对整批过门(gating)",
+                                       "fixing": "正在修复整批的红门(being fixed)"}
 
 
-def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attempt=0,
-                        blocked_by=(), batch=None):
+def render_status_board(phase: StatusPhase, gate_ci: GateCiMode, retry_max: int,
+                        instance: str | None = None, pr: int | None = None, attempt: int = 0,
+                        blocked_by: Iterable[int] = (), batch: Obj | None = None) -> str:
     """
     Render the human-facing progress *status board* comment body. Pure: a function
     of the discrete lifecycle state the tick already derived from fleet state; no
@@ -2509,7 +2614,7 @@ def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attem
     ticked = steps[:steps.index(reached) + 1] if reached is not _NOTHING_REACHED else []
     escalated = phase == "escalated"
 
-    def done(key):
+    def done(key: str) -> bool:
         if escalated:              # terminal give-up: only what truly happened stays ticked
             return key == "claimed" or (key == "pr_open" and bool(pr))
         return key in ticked
@@ -2528,7 +2633,7 @@ def render_status_board(phase, gate_ci, retry_max, instance=None, pr=None, attem
     return record_comment(STATUS_RECORD, {}, "\n".join(lines))
 
 
-def board_key(body):
+def board_key(body: str) -> str:
     """A short digest of a status board body — what the cycle state keeps per
     claim instead of the body. A board that renders to the key the state holds
     is the one already on the issue, and is not read to find that out."""
@@ -2542,7 +2647,7 @@ def board_key(body):
 _ATTEMPT_PREFIX = "afk-attempt/"
 
 
-def current_attempt(labels):
+def current_attempt(labels: Iterable[str] | None) -> int:
     """The attempt an issue is on, from its label names: the highest n across its
     `afk-attempt/<n>` labels, 0 when it has none (never retried). The ONE reader
     of that label format — `afk rebuild` puts the number on every `mine` row, and
@@ -2556,7 +2661,7 @@ def current_attempt(labels):
     return max(attempts)
 
 
-def attempt_labels(labels):
+def attempt_labels(labels: Iterable[str] | None) -> list[str]:
     """Every `afk-attempt/*` label among an issue's label names — what a retry
     swaps out and an escalation strips, however many a hand-edit left behind."""
     return sorted(lb for lb in labels or []
@@ -2571,14 +2676,14 @@ def attempt_labels(labels):
 ATTEMPT_STARTING = f"{_ATTEMPT_PREFIX}starting"
 
 
-def attempt_starting(labels):
+def attempt_starting(labels: Collection[str] | None) -> bool:
     """Whether the failure an issue's claim is in has already been counted
     (`ATTEMPT_STARTING`) — a retry that was begun and has not put a worker on
     the issue yet. Never so for an issue that carries no counted attempt."""
     return ATTEMPT_STARTING in (labels or []) and current_attempt(labels) > 0
 
 
-def next_attempt(attempt, retry_max, counted=False):
+def next_attempt(attempt: int, retry_max: int, counted: bool = False) -> Obj:
     """
     Retry-or-escalate for a failed issue on attempt `attempt` (`current_attempt`).
 
@@ -2600,7 +2705,7 @@ def next_attempt(attempt, retry_max, counted=False):
             "to_label": f"{_ATTEMPT_PREFIX}{attempt + 1}"}
 
 
-def retry_labels(labels, to_label):
+def retry_labels(labels: Iterable[str] | None, to_label: str) -> tuple[list[str], list[str]]:
     """The label edit that counts a failure: `(add, remove)`, made in ONE edit of
     the issue. Adds `to_label` and `ATTEMPT_STARTING` where the issue lacks them
     and removes every other attempt label it carries — so for a failure already
@@ -2610,7 +2715,7 @@ def retry_labels(labels, to_label):
             [lb for lb in attempt_labels(labels) if lb not in wanted])
 
 
-def escalation_comment(reason, attempt, pr=None):
+def escalation_comment(reason: str | None, attempt: int, pr: int | None = None) -> str:
     """The durable hand-off comment an escalation appends to the issue (ADR-0006
     keeps it apart from the status board, which only points here). The stuck-point
     wording is the tick's; this frames it."""
@@ -2620,7 +2725,8 @@ def escalation_comment(reason, attempt, pr=None):
             f"{(reason or '').strip()}")
 
 
-def escalation_labels(labels, config):
+def escalation_labels(labels: Iterable[str] | None,
+                      config: Obj) -> tuple[list[str], list[str]]:
     """The label edit that hands an issue to a human: `(add, remove)`. Removes
     `ready_label` and every attempt label the issue actually carries (never one it
     does not — gh refuses to remove an absent label), adds `escalate_label`."""
@@ -2629,7 +2735,7 @@ def escalation_labels(labels, config):
     return [config["escalate_label"]], remove
 
 
-def pace(did_work, in_flight, empty_streak):
+def pace(did_work: bool, in_flight: int, empty_streak: int) -> int:
     """
     The launcher's next sleep, in seconds.
 
@@ -2676,14 +2782,16 @@ def pace(did_work, in_flight, empty_streak):
 #
 # The caller never reads or edits a field; it is state for this code alone.
 
-CYCLE_START = {"fingerprint": "", "skips": 0, "empty_streak": 0,
+CYCLE_START: Obj = {"fingerprint": "", "skips": 0, "empty_streak": 0,
                "in_flight": 0, "frontier_remaining": 0, "unsettled": False, "boards": {}}
 CYCLE_FACTS = ("instance", "worker_command")
 
 # What a tick reports having done, per issue number — each with the word the
 # progress line uses for it. The first seven are WORK: any of them keeps the fleet
 # on the busy interval (`cycle_ticked`).
-TICK_WORK = {
+TickDid = Literal["granted", "dispatched", "reclaimed", "cleared", "escalated", "parked",
+                  "abandoned", "retried", "nudged", "restarted"]
+TICK_WORK: dict[TickDid, str] = {
     "granted": "landing turn to",
     "dispatched": "dispatched",
     "reclaimed": "reclaimed",
@@ -2692,11 +2800,12 @@ TICK_WORK = {
     "parked": "parked",
     "abandoned": "abandoned the batch of",
 }
-TICK_DID = {**TICK_WORK, "retried": "retried", "nudged": "nudged", "restarted": "restarted"}
+TICK_DID: dict[TickDid, str] = {**TICK_WORK, "retried": "retried", "nudged": "nudged", "restarted": "restarted"}
 TICK_COUNTS = ("in_flight", "frontier_remaining")
 
 
-def cycle_state(raw, instance=None, worker_command=None):
+def cycle_state(raw: Any, instance: str | None = None,
+                worker_command: str | None = None) -> Obj:
     """The cycle state from what the caller handed back (None / "" on the first
     cycle → CYCLE_START plus the two facts, which the first cycle must be given).
     Raises ValueError on anything that is not a state this code produced — a
@@ -2725,7 +2834,7 @@ def cycle_state(raw, instance=None, worker_command=None):
             **{k: raw[k] for k in CYCLE_FACTS}}
 
 
-def cycle_wake(state, current_fp, woke=False):
+def cycle_wake(state: Obj, current_fp: str, woke: bool = False) -> Obj:
     """
     The top of one cycle: tick, or skip?
 
@@ -2748,7 +2857,7 @@ def cycle_wake(state, current_fp, woke=False):
     """
     gate = fingerprint_gate(state["fingerprint"], current_fp, state["skips"],
                             FORCE_TICK_AFTER_SKIPS)
-    new = {**state, "fingerprint": current_fp, "skips": gate["skips"]}
+    new: Obj = {**state, "fingerprint": current_fp, "skips": gate["skips"]}
     if gate["action"] == "tick":
         return {"action": "tick", "reason": gate["reason"], "state": new}
     if state["unsettled"] or woke:
@@ -2762,7 +2871,9 @@ def cycle_wake(state, current_fp, woke=False):
             "progress": f"nothing moved; {_standing(new)}"}
 
 
-def cycle_ticked(state, did, judgments=0, errors=0, left=None, boards=None, unseen=0):
+def cycle_ticked(state: Obj, did: Obj, judgments: int = 0, errors: int = 0,
+                 left: str | None = None, boards: Mapping[Any, str] | None = None,
+                 unseen: int = 0) -> Obj:
     """
     The bottom of a cycle that ran a tick: fold what the tick did into the cycle
     state and say how long to sleep.
@@ -2807,7 +2918,8 @@ def cycle_ticked(state, did, judgments=0, errors=0, left=None, boards=None, unse
             "progress": "; ".join([*parts, _standing(new)])}
 
 
-def cycle_drained(state, released, kept, errors=0):
+def cycle_drained(state: Obj, released: Collection[int], kept: Collection[int],
+                  errors: int = 0) -> Obj:
     """
     The bottom of the LAST cycle of a run — `afk cycle --drain`, the launcher's
     stop: fold what the drain released and kept into the cycle state.
@@ -2830,7 +2942,7 @@ def cycle_drained(state, released, kept, errors=0):
             "progress": "; ".join(["drained", *parts])}
 
 
-def _standing(state):
+def _standing(state: Obj) -> str:
     return (f"{state['in_flight']} in flight, "
             f"{state['frontier_remaining']} left on the frontier")
 
@@ -2844,14 +2956,15 @@ def _standing(state):
 # RETURNED as a judgment — a question, and for each answer the one transition to
 # run. Every answer is a transition, so the next cycle does not ask again.
 
-JUDGMENT_KINDS = ("empty_diff", "no_checks", "adversarial_verify", "reason")
+JudgmentKind = Literal["empty_diff", "no_checks", "adversarial_verify", "reason"]
+JUDGMENT_KINDS: tuple[JudgmentKind, ...] = get_args(JudgmentKind)
 
 # The subcommands that may start a worker, and so take `--worker-command`: the
 # parser adds the flag to exactly these, and `afk_command` writes it for them.
 STARTS_WORKER = ("dispatch", "turn", "fail")
 
 
-def afk_command(call, sub, number, *flags):
+def afk_command(call: Obj, sub: str, number: int, *flags: str) -> str:
     """One runnable `afk` transition on issue <number>, as a shell line.
 
       call:  {"afk_path", "repo", "config" (the run's config, as JSON),
@@ -2864,7 +2977,8 @@ def afk_command(call, sub, number, *flags):
     return shlex.join([*argv, "--repo", call["repo"], "--config", call["config"], *flags])
 
 
-def judgment(kind, number, question, context, if_yes, if_no, bulky=False):
+def judgment(kind: JudgmentKind, number: int, question: str, context: Obj, if_yes: str,
+             if_no: str, bulky: bool = False) -> Obj:
     """One judgment a tick returns instead of deciding. `bulky` marks one whose
     answer takes reading something long (a diff under review, a CI log): the
     caller delegates it to an ephemeral subagent that returns one line."""
@@ -2873,7 +2987,8 @@ def judgment(kind, number, question, context, if_yes, if_no, bulky=False):
             "if_yes": if_yes, "if_no": if_no, **({"bulky": True} if bulky else {})}
 
 
-def reason_judgment(call, number, sub, default, where, context=None, bulky=False):
+def reason_judgment(call: Obj, number: int, sub: Literal["fail", "escalate"], default: str,
+                    where: str, context: Obj | None = None, bulky: bool = False) -> Obj:
     """A `reason` judgment: the transition is already fixed — `afk fail` or `afk
     escalate` — and what is asked for is its wording. Both answers are therefore
     the SAME command, runnable as it stands with `default`; the answer is the
@@ -2886,7 +3001,7 @@ def reason_judgment(call, number, sub, default, where, context=None, bulky=False
                     {"where": where, **(context or {})}, command, command, bulky=bulky)
 
 
-def asks_after(mine):
+def asks_after(mine: list[Obj]) -> list[int]:
     """The claims a tick asks `afk no-pr` about, in one call: every `no_pr` row,
     and every `landing` row whose worker has not stopped for the tick. A row in
     a merge batch is not one of them: its own worker has nothing to do, and the
@@ -2897,7 +3012,7 @@ def asks_after(mine):
                 and r["stopped"] not in LAND_WAITS)]
 
 
-def turn_due(mine, merge_order):
+def turn_due(mine: list[Obj], merge_order: list[int]) -> int | None:
     """The ONE issue a tick runs `afk turn` on, or None: the head of the merge
     queue — unless its PR holds the turn and its worker is at it."""
     row = next((r for r in mine if merge_order and r["number"] == merge_order[0]), None)
@@ -2906,14 +3021,15 @@ def turn_due(mine, merge_order):
     return row["number"]
 
 
-def failure_judgment(call, row):
+def failure_judgment(call: Obj, row: Obj) -> Obj:
     """The judgment for a `failure` row — its PR's checks are red: the reason
     lives in a CI log, which is bulky to read."""
     return reason_judgment(call, row["number"], "fail", f"the checks of PR #{row['pr']} are red",
                            f"the failing checks of PR #{row['pr']}", {"pr": row["pr"]}, bulky=True)
 
 
-def turn_step(call, result, config, restart=False):
+def turn_step(call: Obj, result: Obj, config: Obj,
+              restart: bool = False) -> tuple[Literal["granted", "leave", "judge"], Obj | None]:
     """
     What a tick does with `afk turn`'s result → (do, judgment):
 
@@ -2930,7 +3046,8 @@ def turn_step(call, result, config, restart=False):
     `restart`: the result is `afk turn --restart`'s (a silent worker restarted
     onto its turn, ADR-0035), so a judgment's yes runs the restart, not a grant.
     """
-    number, pr, head, outcome = result["issue"], result["pr"], result["head"], result["outcome"]
+    number, pr, head = result["issue"], result["pr"], result["head"]
+    outcome: TurnOutcome = result["outcome"]
     if outcome == "granted":
         return "granted", None
     context = {"pr": pr, "head": head}
@@ -2957,45 +3074,48 @@ def turn_step(call, result, config, restart=False):
             afk_command(call, "fail", number, "--reason",
                         f"PR #{pr} has no checks, and it does not meet the issue's acceptance "
                         f"criteria"))
-    return "leave", None
+    if outcome in ("waiting", "landing", "awaiting_ci"):
+        return "leave", None
+    assert_never(outcome)
 
 
-def _reason_on_record(cause, row, worker):
+def _reason_on_record(cause: WorkerCause, row: Obj, worker: Obj) -> tuple[str, bool]:
     """The words a tick fails or escalates a claim with, for a cause that ends
-    in one → (the reason, None when it is not on record and must be asked for;
-    what stands in for it meanwhile). The cause picks the wording; what the
-    verdict declared is read only for the words quoted."""
+    in one → (the words, whether they are the reason itself — False when the
+    reason is not on record and must be asked for, and these stand in for it
+    meanwhile). The cause picks the wording; what the verdict declared is read
+    only for the words quoted."""
     verdict = worker.get("worker_verdict") or {}
     if cause == "silent_past_restart":
         return (f"PR #{row['pr']} was judged ready and given the landing turn, its worker was "
                 f"restarted onto the turn once, and the landing still did not happen: "
                 f"{row.get('stopped') or 'no `afk land` outcome'}. The PR, its branch and its "
-                f"worktree are kept as they are"), None
+                f"worktree are kept as they are"), True
     if cause == "blocker_unmet":
         unmet = [f"#{b['number']} {b['reason']}" for b in worker.get("blockers") or []
                  if b["standing"] == "unmet"]
-        return f"blocked by a dependency nothing will resolve: {'; '.join(unmet)}", None
+        return f"blocked by a dependency nothing will resolve: {'; '.join(unmet)}", True
     if cause == "no_blocker_named":
         said = verdict.get("reason")
-        return (f"its worker reported blocked, naming no blocker: {said}" if said else None,
-                "its worker reported blocked without naming a blocker")
+        return ((f"its worker reported blocked, naming no blocker: {said}", True) if said
+                else ("its worker reported blocked without naming a blocker", False))
     if cause == "satisfied_refuted":
-        return "its worker declared `already-satisfied`, but the branch holds changes", None
+        return "its worker declared `already-satisfied`, but the branch holds changes", True
     if cause == "gave_up":
         said = verdict.get("reason")
-        return f"its worker gave up: {said}" if said else None, "its worker gave up"
+        return (f"its worker gave up: {said}", True) if said else ("its worker gave up", False)
     if cause == "unknown_phase":
         return (f"its worker's verdict names no phase the fleet knows "
-                f"({verdict.get('phase')!r})"), None
+                f"({verdict.get('phase')!r})"), True
     if cause == "silent_after_nudge":
-        return "idle with no PR and no verdict a grace period after its nudge", None
+        return "idle with no PR and no verdict a grace period after its nudge", True
     if cause == "silent_unnudgeable":
-        return "idle with no PR and no verdict, and no worktree here to nudge it in", None
+        return "idle with no PR and no verdict, and no worktree here to nudge it in", True
     raise ValueError(f"issue #{row['number']}: no reason is worded for a worker classified "
                      f"{cause!r}")
 
 
-def worker_step(call, row, worker, config):
+def worker_step(call: Obj, row: Obj, worker: Obj, config: Obj) -> tuple[WorkerStep, Any]:
     """
     What a tick does about one claim it asked after → (do, detail). `do` is the
     `step` of the cause its worker was classified with (WORKER_CAUSES), which
@@ -3044,10 +3164,10 @@ def worker_step(call, row, worker, config):
         raise ValueError(f"issue #{number}: a landing claim's silence is never a failure — "
                          f"its turn is restarted onto, then escalated (ADR-0035); a "
                          f"`landing` row classified {cause!r} holds no turn of one PR")
-    reason, default = _reason_on_record(cause, row, worker)
-    if reason:
-        return step, reason
-    return "judge", reason_judgment(call, number, step, default, "its worker's verdict comment",
+    words, on_record = _reason_on_record(cause, row, worker)
+    if on_record:
+        return step, words
+    return "judge", reason_judgment(call, number, step, words, "its worker's verdict comment",
                                     said)
 
 
@@ -3066,7 +3186,10 @@ def worker_step(call, row, worker, config):
 
 # Every step a plan hands out, as {"do": <key>, **arguments} → the name its
 # failure is reported under in the cycle's `errors`.
-TICK_STEPS = {
+TickStep = Literal["no-pr", "turn", "batch-turn", "abandon", "restart", "nudge", "park", "fail",
+                   "escalate", "release", "reclaim", "begin", "finish", "heartbeat", "status",
+                   "sweep"]
+TICK_STEPS: dict[TickStep, str] = {
     "no-pr": "no-pr",           # {issues} | {batch}: `afk no-pr`'s rows for them
     "turn": "turn",             # {issue}: `afk turn`
     "batch-turn": "turn",       # `afk turn --batch`: form a merge batch, or continue mine
@@ -3087,9 +3210,17 @@ TICK_STEPS = {
 
 # How beginning a dispatch ended. A `begin` step answers with the first two;
 # the third is a start that raised, or was not tried.
-START_OUTCOMES = BEGUN, LOST, FAILED = ("begun", "lost", "failed")
+StartOutcome = Literal["begun", "lost", "failed"]
+START_OUTCOMES: tuple[StartOutcome, ...] = get_args(StartOutcome)
+BEGUN, LOST, FAILED = START_OUTCOMES
 #   BEGUN   the claim is held and the agent's terminal is open
 #   LOST    a peer won the claim: nothing was started
+
+# How a step a plan handed out ended: (its result, None), or (None, what it raised).
+Answer = tuple[Any, Optional[str]]
+# A plan, or a stage of one: it yields steps, is sent each one's answer, and
+# returns what the stage came to.
+Plan = Generator[Obj, Answer, Any]
 
 
 class TickBooks:
@@ -3099,21 +3230,25 @@ class TickBooks:
     — and every count is read back from that record: nothing a tick reports
     (`account`) is kept twice."""
 
-    SETTLES = ("parked", "escalated", "cleared")       # these release the claim
-    WRITES_BOARD = ("granted", "abandoned", "retried", "dispatched", "reclaimed", "restarted")
+    SETTLES: tuple[TickDid, ...] = ("parked", "escalated", "cleared")   # these release the claim
+    WRITES_BOARD: tuple[TickDid, ...] = ("granted", "abandoned", "retried", "dispatched",
+                                         "reclaimed", "restarted")
 
-    def __init__(self, ws):
+    def __init__(self, ws: Obj) -> None:
         self.ws = ws
-        self.mine = {r["number"]: r for r in ws["mine"]}
-        self.judgments, self.errors = [], []
+        self.mine: dict[int, Obj] = {r["number"]: r for r in ws["mine"]}
+        self.judgments: list[Obj] = []
+        self.errors: list[Obj] = []
         self.starting = True            # False once a start failed to begin
-        self.begun = []                 # (the list it joins, issue) of each start begun
-        self._done = []                 # (a TICK_DID key, issue), in the order it happened
-        self._took = set()              # stale claims taken from a dead peer
-        self._off_frontier = set()      # frontier issues begun, or lost to a peer
-        self._fresh = set()             # frontier issues whose start was begun
+        # (the list it joins, issue) of each start begun
+        self.begun: list[tuple[TickDid, int]] = []
+        # (a TICK_DID key, issue), in the order it happened
+        self._done: list[tuple[TickDid, int]] = []
+        self._took: set[int] = set()            # stale claims taken from a dead peer
+        self._off_frontier: set[int] = set()    # frontier issues begun, or lost to a peer
+        self._fresh: set[int] = set()           # frontier issues whose start was begun
 
-    def run(self, do, **args):
+    def run(self, do: TickStep, **args: Any) -> Plan:
         """Hand out one step and wait for its answer → its result, None when it
         failed. One that failed is recorded in `errors` and the tick goes on."""
         result, error = yield {"do": do, **args}
@@ -3121,19 +3256,20 @@ class TickBooks:
             self.failed(do, args.get("issue"), error)
         return result
 
-    def failed(self, do, number, error):
+    def failed(self, do: TickStep, number: int | None, error: str) -> None:
         self.errors.append({"step": TICK_STEPS[do], **({"issue": number} if number else {}),
                             "error": error})
 
-    def did(self, what, *numbers):
+    def did(self, what: TickDid, *numbers: int) -> None:
         """Record that `what` — a key of TICK_DID — happened to these issues."""
         self._done += [(what, n) for n in numbers]
 
-    def take(self, number):
+    def take(self, number: int) -> None:
         """Record a stale claim taken from a dead peer: held from here, started or not."""
         self._took.add(number)
 
-    def begin(self, number, counted, outcome, frontier=False):
+    def begin(self, number: int, counted: TickDid, outcome: StartOutcome,
+              frontier: bool = False) -> None:
         """Record how beginning one start ended — a START_OUTCOMES. `counted` is
         the list the issue joins once its worker runs; `frontier` says it came
         off the frontier."""
@@ -3147,48 +3283,48 @@ class TickBooks:
             if frontier:
                 self._fresh.add(number)
 
-    def _numbers(self, *whats):
+    def _numbers(self, *whats: TickDid) -> list[int]:
         return [n for what, n in self._done if what in whats]
 
     @property
-    def settled(self):
+    def settled(self) -> set[int]:
         """My claims this tick released."""
         return set(self._numbers(*self.SETTLES)) & set(self.mine)
 
     @property
-    def touched(self):
+    def touched(self) -> set[int]:
         """The claims whose status board a transition of this tick wrote."""
         return set(self._numbers(*self.WRITES_BOARD))
 
     @property
-    def held(self):
+    def held(self) -> set[int]:
         """The claims whose status board is still mine to remember."""
         return (set(self.mine) - self.settled) | set(self._numbers("dispatched", "reclaimed"))
 
     @property
-    def slots(self):
+    def slots(self) -> int:
         """The dispatch slots still free for the frontier."""
         return (self.ws["free_slots"] + len(self.settled) - len(self._took)
                 - len(self._fresh))
 
     @property
-    def in_flight(self):
+    def in_flight(self) -> int:
         """The claims this fleet holds: a frontier issue counts once its worker runs."""
         staffed = self._fresh & set(self._numbers("dispatched"))
         return len(self.mine) - len(self.settled) + len(self._took) + len(staffed)
 
     @property
-    def frontier_remaining(self):
+    def frontier_remaining(self) -> int:
         return len(self.ws["frontier"]["dispatch"]) - len(self._off_frontier)
 
-    def account(self):
+    def account(self) -> Obj:
         """What the tick did, as `cycle_ticked` reads it: the issues per TICK_DID
         key, and the TICK_COUNTS."""
         return {**{k: self._numbers(k) for k in TICK_DID},
                 "in_flight": self.in_flight, "frontier_remaining": self.frontier_remaining}
 
 
-def tick_plan(ws, call, config):
+def tick_plan(ws: Obj, call: Obj, config: Obj) -> Plan:
     """
     One reconciliation pass over the working set `ws`, as the steps to run — a
     generator: each value it yields is ONE step ({"do": a TICK_STEPS key,
@@ -3251,7 +3387,7 @@ def tick_plan(ws, call, config):
                 told, asks = turn_step(call, again, config, restart=True)
                 if told == "granted":
                     tick.did("restarted", number)
-                elif told == "judge":
+                elif asks:      # "judge"
                     tick.judgments.append(asks)
         elif do == "park":
             if (yield from run("park", issue=number)):
@@ -3260,6 +3396,8 @@ def tick_plan(ws, call, config):
             done = yield from run(do, issue=number, reason=detail)
             if done:        # a failure past its last retry is an escalation
                 tick.did("escalated" if done["action"] == "escalate" else "retried", number)
+        elif do not in ("leave", "dispatch"):       # a dispatch is begun below, with the starts
+            assert_never(do)
 
     # --- release what outlived its issue ---
     for row in ws["mine"]:
@@ -3270,7 +3408,7 @@ def tick_plan(ws, call, config):
             tick.did("cleared", row["number"])
 
     # --- start workers: continuations of claims already held, then the frontier ---
-    def begin(number, counted, frontier=False):
+    def begin(number: int, counted: TickDid, frontier: bool = False) -> Plan:
         """Begin one start; the claim is held from here unless it failed or a peer won it."""
         outcome = (yield from run("begin", issue=number)) if tick.starting else None
         tick.begin(number, counted, outcome or FAILED, frontier=frontier)
@@ -3310,7 +3448,7 @@ def tick_plan(ws, call, config):
             "held": tick.held}
 
 
-def _turn_plan(tick, call, config):
+def _turn_plan(tick: TickBooks, call: Obj, config: Obj) -> Plan:
     """The landing-turn stage of `tick_plan` → the ids of the merge batches that
     hold a turn when it is done; what it did and what it could not decide go
     into `tick`. One turn is out at a time, held by one PR or by one batch
@@ -3326,7 +3464,7 @@ def _turn_plan(tick, call, config):
                                               the turn, as before"""
     ws, run, instance = tick.ws, tick.run, call["instance"]
 
-    def abandon(batch):
+    def abandon(batch: Obj) -> Plan:
         gone = yield from run("abandon", batch=batch["id"])
         if gone:
             tick.did("abandoned", *gone["issues"])
@@ -3353,6 +3491,8 @@ def _turn_plan(tick, call, config):
         elif do == "abandon":
             if (yield from abandon(mine)):
                 live = set()
+        elif do != "leave":
+            assert_never(do)
         return live
     if batch_candidates(ws["mine"], ws["merge_order"], config):
         formed = yield from run("batch-turn")
@@ -3363,22 +3503,22 @@ def _turn_plan(tick, call, config):
             return {formed["batch"]}
     due = turn_due(ws["mine"], ws["merge_order"])
     single = (yield from run("turn", issue=due)) if due else None
-    if single:
+    if due and single:
         do, asks = turn_step(call, single, config)
         if do == "granted":
             tick.did("granted", due)
-        elif do == "judge":
+        elif asks:      # "judge"
             tick.judgments.append(asks)
     return live
 
 
-def follow(plan, carry_out):
+def follow(plan: Plan, carry_out: Callable[[Obj], Answer]) -> Any:
     """Carry a `tick_plan` out → what it returns. `carry_out(step)` performs one
     step and answers as the plan expects; it is all the effectful side supplies."""
-    answer = None
     try:
+        step = next(plan)
         while True:
-            answer = carry_out(plan.send(answer))
+            step = plan.send(carry_out(step))
     except StopIteration as end:
         return end.value
 
@@ -3413,7 +3553,10 @@ YOLO_FLAGS = ("--dangerously-skip-permissions", "--dangerously-bypass-approvals-
               "--unrestricted", "--auto-approve")
 
 
-def detect_runtime(env):
+Runtime = Literal["claude", "qoderclicn"]
+
+
+def detect_runtime(env: Mapping[str, str]) -> Runtime:
     """The agent runtime a launcher with environment `env` runs under —
     'qoderclicn' or 'claude'. One fleet instance runs one runtime (ADR-0014):
     qoderclicn sets QODERCN_CLI=1 in every child process; its absence means
@@ -3426,13 +3569,13 @@ def detect_runtime(env):
 _ALIAS_RE = re.compile(r"^(?:alias\s+)?([^=\s]+)=(.*)$")
 
 
-def first_word(command):
+def first_word(command: str | None) -> str:
     """The token whose resolvability decides whether the command can run at all."""
     parts = (command or "").strip().split()
     return parts[0] if parts else ""
 
 
-def parse_aliases(text):
+def parse_aliases(text: str | None) -> dict[str, str]:
     """Shell `alias` output → {name: expansion}. Accepts both zsh's `n='v'` and
     bash's `alias n='v'`. Quotes are stripped; the expansion is only ever shown
     to a human or substring-searched, never executed by the fleet."""
@@ -3448,7 +3591,7 @@ def parse_aliases(text):
     return out
 
 
-def launch_candidates(aliases):
+def launch_candidates(aliases: Mapping[str, str] | None) -> list[Obj]:
     """The shell aliases that start a Claude Code, as {name, expansion, wraps_env}
     — what the bootstrap offers the human. `wraps_env` marks the ones that do more
     than run `claude` bare, i.e. the ones that could carry a provider; a stock
@@ -3465,7 +3608,8 @@ def launch_candidates(aliases):
     return out
 
 
-def resolve_worker_command(base_url, supplied=None, resolved=None, runtime="claude"):
+def resolve_worker_command(base_url: str | None, supplied: str | None = None,
+                           resolved: str | None = None, runtime: Runtime = "claude") -> Obj:
     """
     Settle the one string every worker is started with.
 
@@ -3500,7 +3644,8 @@ def resolve_worker_command(base_url, supplied=None, resolved=None, runtime="clau
         base_url, supplied = None, None
     fw = first_word(supplied) if supplied else ""
 
-    def out(status, command=None, yolo=None, detail=""):
+    def out(status: str, command: str | None = None, yolo: bool | None = None,
+            detail: str = "") -> Obj:
         return {"status": status, "command": command, "base_url": base_url or None,
                 "first_word": fw or None, "yolo": yolo, "detail": detail, "runtime": runtime}
 
@@ -3533,7 +3678,7 @@ def resolve_worker_command(base_url, supplied=None, resolved=None, runtime="clau
 # one tick; a missed change waits at most `force_after`
 # cycles. Correctness never depends on the gate.
 
-def fingerprint(issues, prs, claims):
+def fingerprint(issues: Iterable[Obj], prs: Iterable[Obj], claims: Iterable[Obj]) -> str:
     """
     Digest the observable fleet inputs — open issues (number + labels +
     updatedAt + open-blocker count, so label churn, closes, fresh blocker
@@ -3573,7 +3718,7 @@ def fingerprint(issues, prs, claims):
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
-def fingerprint_gate(last, current, skips, force_after):
+def fingerprint_gate(last: str | None, current: str, skips: int, force_after: int) -> Obj:
     """
     Skip-or-tick verdict for one launcher cycle.
 
@@ -3610,7 +3755,7 @@ _CHECK_RED = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED",
 _CHECK_OK = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 
 
-def pr_checks_state(rollup):
+def pr_checks_state(rollup: Iterable[Obj] | None) -> ChecksState | None:
     """Collapse a gh statusCheckRollup into "green" | "red" | "pending" | None.
     None = no checks at all — the progressive gate's "no CI yet" case, which the
     tick judges. Accepts CheckRun rows (status/conclusion) and StatusContext
@@ -3618,7 +3763,7 @@ def pr_checks_state(rollup):
     (running, PENDING, STALE, unknown) holds the verdict at pending."""
     if not rollup:
         return None
-    state = "green"
+    state: ChecksState = "green"
     for c in rollup:
         concl = (c.get("conclusion") or c.get("state") or "").upper()
         if concl in _CHECK_RED:
@@ -3628,10 +3773,10 @@ def pr_checks_state(rollup):
     return state
 
 
-def _closing_pr_map(prs):
+def _closing_pr_map(prs: Iterable[Obj]) -> dict[int, Obj]:
     """issue number → the open PR that closes it. When several do, the highest
     PR number wins — the latest attempt is the live one."""
-    m = {}
+    m: dict[int, Obj] = {}
     for p in prs:
         for ref in p.get("closingIssuesReferences") or []:
             n = ref.get("number")
@@ -3641,12 +3786,12 @@ def _closing_pr_map(prs):
     return m
 
 
-def closing_pr(prs, number):
+def closing_pr(prs: Iterable[Obj], number: int) -> Obj | None:
     """The open PR that closes issue <number> (the latest, when several do), or None."""
     return _closing_pr_map(prs).get(number)
 
 
-def unseen_prs(mine, prs):
+def unseen_prs(mine: list[Obj], prs: Iterable[Obj]) -> list[int]:
     """The claims whose PR a tick did not act on: the issue numbers of the `mine`
     rows it worked from whose closing PR, among the open PRs `prs` read as it
     ended, is not the one the row names — opened, or replaced, while it ran."""
@@ -3655,7 +3800,7 @@ def unseen_prs(mine, prs):
                   if r["number"] in now and now[r["number"]].get("number") != r["pr"])
 
 
-def superseded_prs(prs, number):
+def superseded_prs(prs: Iterable[Obj] | None, number: int) -> list[Obj]:
     """The open PRs a FRESH start of issue <number> supersedes: the ones that
     close it from a branch shaped like the fleet's own (`branch_regex`). A PR a
     human opened from some other branch is never one of them — the fleet closes
@@ -3666,8 +3811,10 @@ def superseded_prs(prs, number):
             and rx.match(p.get("headRefName") or "")]
 
 
-def assemble_working_set(issues, prs, claims, heartbeats, me, now, config,
-                         closed=(), turns=None):
+def assemble_working_set(issues: list[Obj], prs: list[Obj], claims: list[Obj],
+                         heartbeats: Mapping[str, float], me: str, now: float, config: Obj,
+                         closed: Iterable[int] = (),
+                         turns: Mapping[int, Obj] | None = None) -> Obj:
     """
     The tick's whole working set from the raw observables. Pure — afk.py's
     `rebuild` gathers, this assembles, and a fixture pins the join.
@@ -3734,7 +3881,7 @@ def assemble_working_set(issues, prs, claims, heartbeats, me, now, config,
     by_claim = {c.get("number"): c for c in claims}
     closed = set(closed)
 
-    def stale_rows(numbers):
+    def stale_rows(numbers: Iterable[int]) -> list[Obj]:
         return [{"number": n, "instance": by_claim.get(n, {}).get("instance"),
                  "sha": by_claim.get(n, {}).get("sha")} for n in numbers]
 

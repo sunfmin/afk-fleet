@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shlex
+import typing
 
 import afk_decide as d
 
@@ -3236,9 +3237,6 @@ def test_a_cause_names_its_own_step_in_the_one_table():
     second mapping to fall out of step with it."""
     cfg = d.resolve_config({})
     for cause, row in d.WORKER_CAUSES.items():
-        assert row.step in ("leave", "dispatch", "park", "nudge", "restart", "escalate",
-                            "fail", "judge"), cause
-        assert row.batch_step in (None, "leave", "continue", "nudge", "abandon"), cause
         # the words a human reads and the step the tick takes cannot disagree
         # about whether an attempt is spent, or whether anything happens at all
         assert (row.step == "fail") == (row.action == "next_attempt"), cause
@@ -3247,3 +3245,14 @@ def test_a_cause_names_its_own_step_in_the_one_table():
             assert d.batch_step({"cause": cause}) == row.batch_step
         if row.step in ("leave", "dispatch", "park", "nudge", "restart"):
             assert d.worker_step(CALL, _mine(4), {"cause": cause}, cfg) == (row.step, None)
+
+
+def test_a_closed_vocabulary_and_its_table_list_the_same_words():
+    """A table keyed by a Literal cannot name a word the Literal lacks — the
+    gate's type checker refuses it (ADR-0039) — but it can still lack one the
+    Literal has: this is that half."""
+    for vocabulary, table in ((d.GateCiMode, d.GATE_CI_MODES), (d.ClaimStatus, d.BOARD_PHASE_OF),
+                              (d.WorkerCause, d.WORKER_CAUSES), (d.StatusPhase, d.STATUS_PHASES),
+                              (d.BatchPhase, d._BATCH_DOING), (d.TickDid, d.TICK_DID),
+                              (d.TickStep, d.TICK_STEPS)):
+        assert set(typing.get_args(vocabulary)) == set(table), vocabulary

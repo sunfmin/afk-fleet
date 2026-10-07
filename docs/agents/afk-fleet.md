@@ -18,7 +18,7 @@ concurrency: 10
 # --- completion gate ---
 gate:
   ci: local
-  local_command: "uv run --with pytest --with pytest-xdist pytest skills/afk-fleet/scripts -q -n auto"
+  local_command: "uvx ruff@0.16.10 check && uvx ty@0.0.85 check && uv run --with pytest --with pytest-xdist pytest skills/afk-fleet/scripts -q -n auto"
 ```
 
 ## Notes
@@ -28,7 +28,12 @@ gate:
   and by its landing on the head that lands — no `no_checks` judgment per PR, and nothing lands
   ungated. A landing whose sync moved nothing does not run the gate a second time: the worker's
   green run is on record for that tree (ADR-0030).
-- **Local gate.** `gate.local_command` runs the skill's tests via `uv`, per the repo's uv-only Python
+- **Types first.** Before the tests, `gate.local_command` holds the production scripts to their
+  types (ADR-0039): `ruff` that every function states them, `ty` that they agree. Seconds, against
+  the suite's minute and a half, so a type error is red at once. `ruff.toml` and `ty.toml` say what
+  is checked; the versions are pinned here, since a new checker finds new errors and nothing should
+  turn the gate red but a change to the repo.
+- **Local gate.** `gate.local_command` then runs the skill's tests via `uv`, per the repo's uv-only Python
   rule, in parallel: 71 s against 488 s serial, measured on 2026-10-05 on a 14-core Apple M4 Pro
   (Mac16,8). That is a snapshot, not a promise — the suite grows. It is a real gate for the code-touching issues and a no-op pass for
   prompt/docs-only issues.
