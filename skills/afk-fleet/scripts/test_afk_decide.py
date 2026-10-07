@@ -1532,6 +1532,14 @@ def test_select_recovery_knows_a_retry_and_a_held_landing_turn():
         assert "PR #30" in r["reason"]
 
 
+def test_remotes_of_names_the_remotes_that_are_the_target_repo():
+    urls = {"origin": "git@github.com:Acme/Widgets.git", "https": "https://github.com/acme/widgets",
+            "fork": "https://github.com/me/widgets.git", "other": "https://github.com/acme/widgets-old",
+            "mirror": "/srv/git/widgets.git"}
+    assert d.remotes_of(urls, "acme/widgets") == ["https", "origin"]
+    assert d.remotes_of({}, "acme/widgets") == d.remotes_of(None, "acme/widgets") == []
+
+
 def test_turn_holder_reads_one_precedence():
     mine_b = {"id": "m", "instance": "me", "members": [], "phase": None}
     dead_b = {"id": "x", "instance": "gone", "members": [], "phase": None}
