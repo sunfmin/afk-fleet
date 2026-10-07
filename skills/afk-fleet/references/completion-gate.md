@@ -3,7 +3,7 @@
 Disclosed reference for [`afk-fleet`](../SKILL.md): the invariants behind the landing gate and the
 adversarial-verify procedure. `afk land` — the worker's — applies the configured machine gate itself; read this for
 *why* the gate runs the way it does, and for the adversarial procedure when
-`gate.adversarial_verify` is on.
+`gate.adversarial_verify_prompt` is set.
 
 A PR may land only when **all** configured gates are green. Which **machine gate** applies is
 `gate.ci` ([ADR-0012](../../../docs/adr/0012-local-completion-gate.md)):
@@ -31,7 +31,7 @@ A PR may land only when **all** configured gates are green. Which **machine gate
   re-read from where the failure lives. A green landing carries `gate: {status, source, head, …}`:
   `source: run` — the gate ran here, on `head`. Adopting this mode is
   the repo's claim that its command is CI-equivalent, and it is expected to scope remote CI away from
-  worker branches; bootstrap **hard-errors** when `merge.target` requires status checks (see
+  worker branches; bootstrap **hard-errors** when `base_branch` requires status checks (see
   [Bootstrap](../SKILL.md#bootstrap-once-with-the-human-present) step 2).
 - **A recorded gate run — a tree is gated once**
   ([ADR-0030](../../../docs/adr/0030-a-gate-run-is-recorded-on-the-remote-under-the-tree-it-tested.md); `local` only). When the landing's sync is a no-op, the
@@ -54,7 +54,7 @@ A PR may land only when **all** configured gates are green. Which **machine gate
   on the machine, is not asked again for a day.
 - **A merge batch — one landing run for several PRs**
   ([ADR-0029](../../../docs/adr/0029-a-merge-batch-lands-n-prs-behind-one-gate-run.md); `local`
-  only, with `gate.adversarial_verify` off; not an option). The landing's run is the fleet's landing throughput: N finished PRs are N runs.
+  only, with no `gate.adversarial_verify_prompt`; not an option). The landing's run is the fleet's landing throughput: N finished PRs are N runs.
   So when two or more finished PRs may land together the landing turn goes to all
   of them as a **merge batch**: a batch worker, in a worktree of the batch's own, stacks them on the
   target's tip — one merge commit per PR, in merge order — and `afk land --batch` runs
@@ -68,11 +68,11 @@ A PR may land only when **all** configured gates are green. Which **machine gate
   the command again — nobody bisects for the PR at fault. The push is the only lock: a target that
   moved while the gate ran refuses it (`target_moved`), nothing lands, and the same command
   re-stacks and gates again. A PR that conflicts with the stack is left out and lands on a single
-  turn. Never batched: a PR that owes an adversarial verify (so with `gate.adversarial_verify` on,
+  turn. Never batched: a PR that owes an adversarial verify (so with `gate.adversarial_verify_prompt` set,
   none is), one whose own worker is still working, a peer's. The target must accept a direct push:
   bootstrap **hard-errors** when its protection requires pull request reviews, restricts pushes, or
   is locked.
-- **Independent adversarial verification** (if `gate.adversarial_verify`) — a *separate* agent (not
+- **Independent adversarial verification** (if `gate.adversarial_verify_prompt` is set) — a *separate* agent (not
   the author, doesn't see its reasoning) re-derives the result and tries to **refute** it (e.g.
   re-solve and assert `final == official answer:`, audit the derivation). Refute-first: any
   refutation blocks the landing, is **posted as a PR review comment** (durable, re-readable on retry),

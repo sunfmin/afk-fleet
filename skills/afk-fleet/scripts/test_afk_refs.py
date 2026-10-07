@@ -29,7 +29,7 @@ from contextlib import contextmanager
 import afk_decide
 
 AFK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "afk.py")
-TTL = afk_decide.CONFIG_DEFAULTS["claim_lease_ttl_seconds"]   # the default lease
+TTL = afk_decide.CLAIM_LEASE_TTL_SECONDS
 T0 = 1_000_000      # the pinned clock
 
 # A hermetic git: no user/system config, no credential prompt, a fixed identity —
@@ -660,11 +660,10 @@ def test_takeover_lists_and_force_takes_a_dead_fleet():
         # `--instance` is MY id on every subcommand, takeover included; without a
         # `--from` there is nothing to take, and that is said rather than guessed
         assert "--from" in afk_error(w, "takeover", "--instance", "new-fleet")
-        # the lease the freshness check uses comes from --config when no flag is given
-        short = json.dumps({"claim_lease_ttl_seconds": 5})
+        # the lease the freshness check uses is the fleet's one lease: a beat that old is stale
         rows = {r["instance"]: r for r in
-                afk(w, "takeover", "--list", "--instance", "x", "--now", str(T0),
-                    "--config", short)["instances"]}
+                afk(w, "takeover", "--list", "--instance", "x",
+                    "--now", str(T0 + TTL + 1))["instances"]}
         assert rows["live-fleet"]["fresh"] is False
 
 
@@ -674,7 +673,7 @@ def test_recovery_reads_pushed_progress_from_the_remote_alone():
     from the issue number — the claim ref never records a branch name."""
     with sandbox() as sb:
         w = sb.clones[0]
-        cfg = json.dumps({"base_branch": sb.base, "branch_pattern": "issue-{number}-{slug}"})
+        cfg = json.dumps({"base_branch": sb.base})
 
         # nothing pushed → tier 3, the old fresh re-dispatch
         r = afk(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg)

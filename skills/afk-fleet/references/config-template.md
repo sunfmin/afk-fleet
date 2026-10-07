@@ -14,28 +14,24 @@ authorization, ADR-0023):
   provider. It is settled at bootstrap by `afk worker-command` — passed with the invocation or asked for — and
   held only by the launcher (ADR-0010).
 
+A key is here because repos really differ in it. What every fleet does alike is **not** a key, and a
+file that still sets one is refused with a note saying so (ADR-0038): the pacing and the claim lease,
+the worktree name, that a landing syncs with `base_branch` before it gates, that a landed branch and
+worktree are removed, that every claimed issue carries a status board and every escalation a comment,
+and where claim refs live (`afk probe` settles that at every bootstrap).
+
 ```yaml
 # --- dispatch contract ---
 ready_label: ready-for-agent          # a child issue is dispatchable when it carries this
                                       #   (a human reserves an issue by REMOVING this label)
-epic_labels: [epic, prd, wayfinder:map]   # never dispatched (a PRD is not a worker task)
-claim_namespace: refs/afk             # where claim + heartbeat refs live: refs/afk | refs/heads, nothing
-                                      #   else. Leave it: bootstrap's `afk probe`
-                                      #   switches the run to refs/heads (ordinary afk-claim/* branches, so
-                                      #   `on: push` CI fires) when an org ruleset forbids non-branch refs.
-                                      #   Set refs/heads here only to skip that probe-and-warn every run.
+epic_labels: [epic, prd, wayfinder:map]   # never dispatched (a PRD is not a worker task), and an
+                                      #   issue blocked by one is never waited on
 
 # --- workers ---
-base_branch: main
-branch_pattern: "issue-{number}-{slug}"   # worktree-NAME hint passed to `orca worktree create --name`;
-                                      #   orca sets the real branch (prefixed <user>/…) — ADR-0005
-concurrency: 3                         # max workers running at once
-worktree_cleanup: true                 # after a landing or a close, remove the worker's worktree (via orca).
-                                      #   An escalated issue's worktree is always left for the human.
-worker_idle_grace_seconds: 300         # a no-PR worker that went idle is judged "finished" only after
-                                      #   this much quiet (no commits, clean tree, no recent file activity);
-                                      #   inside the window it's assumed still working between steps, so a
-                                      #   finished-and-idle worker is never mistaken for one still coding
+base_branch: main                     # the repo's trunk: workers cut their branch from it, open
+                                      #   their PR against it, and the PR lands on it — the fleet
+                                      #   stops there; deploy is a separate human-gated step
+concurrency: 3                        # max workers running at once
 
 # --- completion gate ---
 gate:
@@ -48,52 +44,15 @@ gate:
   local_command: ""                    # the repo's build/test command (e.g. "pnpm build && pnpm test").
                                       #   In `required` mode: the worker's pre-PR filter. In `local` mode:
                                       #   the completion gate itself, at both ends.
-  adversarial_verify: false            # set true for content repos: an independent agent re-derives
-                                       # the result and refutes wrong output before it lands (refute-first)
-  adversarial_verify_prompt: ""        # what the verifier checks (e.g. "re-solve; assert final == official answer:")
-
-# --- merge ---
-merge:                                 # a PR always lands as a MERGE COMMIT (ADR-0034): no squash, no rebase
-  target: main                         # fleet stops here; deploy is a separate human-gated step
-  sync_before_merge: true              # on the landing turn: MERGE origin/<target> into the branch (never
-                                      #   rebase — a rebase drops merge commits and re-ignites the conflicts
-                                      #   already resolved inside them), re-gate, then merge. Renamed from
-                                      #   rebase_before_merge in ADR-0012; the old key is a load-time error.
-  delete_branch: true
-                                      # No key turns MERGE BATCHES on: with `gate.ci: local` and
-                                      #   adversarial_verify off, two or more finished PRs that wait for the
-                                      #   landing turn together always land as one batch (ADR-0029, ADR-0034)
-                                      #   — stacked on the target with one merge commit per PR, gated ONCE,
-                                      #   pushed as a fast-forward. That needs a target that accepts a direct
-                                      #   push (checked at bootstrap).
+  adversarial_verify_prompt: ""        # for content repos: what an independent agent checks before a PR
+                                      #   lands (e.g. "re-solve; assert final == official answer"). Any
+                                      #   text turns the verify on — it re-derives the result and refutes
+                                      #   wrong output (refute-first); empty, there is none
 
 # --- failure handling ---
 retry: 2                               # per-issue retries; count tracked via an afk-attempt/<n> label on the issue
-escalate_label: ready-for-human        # applied (with ready_label removed, claim ref deleted) on give-up
-escalate_comment: true                 # comment the stuck-point + PR/log links
-
-# --- progress (human-facing) ---
-progress_comment: true                 # upsert ONE "status board" comment per issue — a progress checklist
-                                       #   rendered from fleet state (claim + PR + checks + afk-attempt) so a
-                                       #   human reading the issue sees how far along it is, including the
-                                       #   otherwise-invisible "claimed, coding, no PR yet" phase. Edited in
-                                       #   place, never appended; human-read only, never a tick input (ADR-0006).
-
-# --- loop (launcher pacing) ---
-busy_interval_seconds: 90              # re-tick soon (~1.5 min) when the last tick had work / in-flight PRs
-idle_interval_seconds: 1500            # slow re-tick (~25 min) when idle
-idle_ticks_before_sleep: 3             # this many consecutive empty cycles (nothing done, nothing in
-                                      #   flight, frontier empty — a tick or a skipped cycle) → idle cadence
-claim_lease_ttl_seconds: 4500          # a claim is live while its owner's heartbeat is this fresh (~75 min,
-                                      #   3× idle). A peer may reclaim only a staler claim; while holding a
-                                      #   claim the launcher never sleeps past ttl/2 so the lease can't lapse.
-fingerprint_gate: true                 # each cycle, `afk cycle` (code, zero LLM tokens) runs its
-                                      #   reconciliation pass only when the digest of observable
-                                      #   state (issues+labels+blockers, PRs + whether their checks
-                                      #   are green/red/pending, claim refs) moved (ADR-0007)
-force_tick_after_skips: 6              # safety net: a full tick at least every N skipped cycles — time-
-                                      #   driven events (a peer's lease expiring) are invisible to any
-                                      #   state hash. 1 disables skipping entirely.
+escalate_label: ready-for-human        # applied (with ready_label removed, claim ref deleted) on give-up,
+                                      #   with a comment naming the stuck-point + PR/log links
 ```
 
 ## Notes
@@ -105,8 +64,14 @@ force_tick_after_skips: 6              # safety net: a full tick at least every 
 - **Progressive gate.** Before the repo has a build/test/CI, the gate degrades to "the issue's own
   acceptance criteria + whatever build/test exists." `gate.ci: required` starts enforcing once the
   earliest issues have stood up CI.
-- **Adversarial verify** is the pluggable, domain-specific half. Leave it `false` for plain software
-  repos; turn it on for content/correctness repos where a machine gate can't catch a wrong answer.
+- **Adversarial verify** is the pluggable, domain-specific half. Leave `gate.adversarial_verify_prompt`
+  empty for plain software repos; write one for content/correctness repos where a machine gate can't
+  catch a wrong answer.
+- **Merge batches need no key.** With `gate.ci: local` and no adversarial verify, two or more finished
+  PRs that wait for the landing turn together always land as one batch (ADR-0029, ADR-0034) — stacked
+  on `base_branch` with one merge commit per PR, gated ONCE, pushed as a fast-forward. That needs a
+  `base_branch` that accepts a direct push (checked at bootstrap). A PR always lands as a MERGE COMMIT:
+  no squash, no rebase.
 - **Set `gate.local_command` as soon as the repo can build.** The fleet's most expensive failure is
   a retry: a red CI gate tears the worker down and a *fresh* worker re-reads the issue, the docs,
   and the failure from scratch. A local `build && test` gate catches most failures inside the same
@@ -120,7 +85,7 @@ force_tick_after_skips: 6              # safety net: a full tick at least every 
   - **Scope remote CI away from worker branches** (e.g. trigger `on: push` for the target branch only,
     and drop `on: pull_request`). The fleet cannot edit your workflows — if you leave them broad you
     keep paying the congestion, you just stop reading it.
-  - **Do not require status checks on `merge.target`.** `gh pr merge` would be rejected however green
+  - **Do not require status checks on `base_branch`.** `gh pr merge` would be rejected however green
     the local gate is, and the only bypass (`--admin`) also overrides human review, so the fleet
     refuses to use it. Bootstrap probes the protection and **hard-errors** on this combination.
   - **Own the environment parity.** `ci: local` is a claim that `local_command` is CI-equivalent. If
@@ -136,18 +101,19 @@ force_tick_after_skips: 6              # safety net: a full tick at least every 
   machine-dependent gate on unchanged content. A gate that leaves untracked, un-ignored files
   behind makes every run "not on a committed tree" — ignore its artifacts. A remote that refuses
   `refs/afk/gate/*` is a bootstrap warning: nothing is recorded and every landing gates.
-- **Fingerprint gate.** On a skipped cycle no tick runs — its only cost is the one `afk cycle`
-  call — which, while the fleet holds claims, refreshes the lease itself, so skipping never
-  lapses a lease. Correctness never depends on the gate: a missed change waits at most
-  `force_tick_after_skips` cycles (ADR-0007).
-- **Deploy is out of scope.** The fleet's mandate ends at a green merge to `merge.target`. Deploying
+- **Fingerprint gate.** Each cycle, `afk cycle` (code, zero LLM tokens) runs its reconciliation pass
+  only when the digest of observable state moved. On a skipped cycle no tick runs — its only cost is
+  the one `afk cycle` call — which, while the fleet holds claims, refreshes the lease itself, so
+  skipping never lapses a lease. Correctness never depends on the gate: a full tick runs at least
+  every sixth cycle, so a missed change waits at most that long (ADR-0007).
+- **Deploy is out of scope.** The fleet's mandate ends at a green merge to `base_branch`. Deploying
   (secrets, live infra) is never done by the fleet.
 - **Reserved labels, refs & the status comment.** The fleet manages, durably in GitHub, the
   `afk-attempt/<n>` labels (retry count) and `afk-attempt/starting` (a retry under way), the hidden `refs/afk/*` ref namespace — `refs/afk/claim/<n>` (the
-  claim, one per owned issue) and `refs/afk/heartbeat/<id>` (per-instance liveness) — and, when
-  `progress_comment` is on, the single status-board comment tagged `<!--afk:status-->` (found and
+  claim, one per owned issue) and `refs/afk/heartbeat/<id>` (per-instance liveness) — and the single status-board comment tagged `<!--afk:status-->` (found and
   overwritten by that marker each tick). This is what keeps ticks stateless and lets fleets cooperate
   (see the skill's "Why it runs forever" and ADR-0003). Don't hand-edit them or reuse the
   `afk-attempt/*` / `refs/afk/*` prefixes or the `<!--afk:status-->` marker. If an org ruleset forbids
-  non-branch refs, bootstrap's `afk probe` falls back to `refs/heads/afk-claim/*` for the run (it returns
-  the config with `claim_namespace` switched) and warns that `on: push` CI will then fire.
+  non-branch refs, bootstrap's `afk probe` falls back to `refs/heads/afk-claim/*` for the run (the
+  config it returns carries that as `claim_namespace`, the one field no file sets) and warns that
+  `on: push` CI will then fire.

@@ -141,8 +141,7 @@ before its pre-PR **local gate**, so integration conflicts surface inside the wo
 where they are cheapest to fix; and the worker's **landing** syncs again, on its **landing turn**, picking up
 whatever the base gained since — a conflict there is left in progress for the same worker to resolve. Merge rather than rebase because a rebase drops
 merge commits and re-ignites the conflicts already resolved inside them — and those merge commits
-land on the target as they are: a PR lands as a merge commit, never squashed (ADR-0034). Retires `rebase_before_merge` (the config key
-becomes `sync_before_merge`).
+land on the target as they are: a PR lands as a merge commit, never squashed (ADR-0034). It is not an option: there is no config key for it (ADR-0038).
 _Avoid_: rebase (retired from the merge path), rebase onto latest, update branch
 
 **Mechanics vs judgment**:
@@ -211,8 +210,8 @@ _Avoid_: queue, backlog (the backlog is the whole issue set; the frontier is onl
 The atomic lock that marks one issue as owned by one **fleet instance**: a git ref `refs/afk/claim/<n>` in
 the hidden `refs/afk/*` namespace, whose creation the server accepts for exactly one fleet and rejects
 for every other (that rejection is the compare-and-swap; a push that fails for any *other* reason is
-an error, never a lost race — ADR-0015). Where the refs live is the config key `claim_namespace`,
-one of exactly two layouts: `refs/afk` (`refs/afk/claim/<n>`), or `refs/heads` (ordinary
+an error, never a lost race — ADR-0015). Where the refs live is the run's `claim_namespace`,
+which no file sets (ADR-0038) — one of exactly two layouts: `refs/afk` (`refs/afk/claim/<n>`), or `refs/heads` (ordinary
 `afk-claim/<n>` branches), which bootstrap's probe switches to when an org ruleset forbids non-branch
 refs. Every later call inherits it through the config, which every call must carry (ADR-0016). Its marker commit names the owning instance.
 It is the single source of truth for "taken" — replacing the assignee, which under a shared account
@@ -223,8 +222,8 @@ _Avoid_: assignee (dropped as a claim signal), assignment, lock (too generic)
 **Heartbeat** (and its lease):
 The liveness signal a **fleet instance** publishes for itself — one ref `refs/afk/heartbeat/<id>` carrying
 a timestamp, refreshed while it holds any claim (per instance, not per claim; roughly once per
-`claim_lease_ttl_seconds`/3, not once per tick). A claim is leased-live while its owner's heartbeat is within
-`claim_lease_ttl_seconds`; its freshness is the only thing that lets a peer tell a live owner from a dead one.
+a third of the claim lease, not once per tick). A claim is leased-live while its owner's heartbeat is within
+the claim lease (`CLAIM_LEASE_TTL_SECONDS`, the same in every repo); its freshness is the only thing that lets a peer tell a live owner from a dead one.
 _Avoid_: ping, keepalive, liveness probe, **worker state** (that is per worker, read from orca — a
 different thing, at a different granularity)
 
@@ -252,7 +251,7 @@ Contrast **Stale claim**, which is a peer's.
 _Avoid_: stuck issue, dead worker, zombie
 
 **Stale claim**:
-A **peer's** claim whose owner's **heartbeat** has expired past `claim_lease_ttl_seconds` — evidence the owning
+A **peer's** claim whose owner's **heartbeat** has expired past the claim lease — evidence the owning
 instance died mid-flight. It is the only claim a fleet may take from another *unattended*: reclaimed
 by an atomic `git push --force-with-lease` takeover of the ref, and only then, then recovered by
 **continuation**. A live peer's claim is never touched — that is what keeps cooperating fleets from
@@ -265,7 +264,7 @@ _Avoid_: dead claim, abandoned claim, orphaned claim (that is one's *own* worker
 **Takeover**:
 The **human-authorized**, **immediate** reclaim of a dead **fleet instance**'s claims — the
 lease-bypassing sibling of **stale-claim** reclaim. Where a stale reclaim is unattended and waits for
-the owner's **heartbeat** to expire past `claim_lease_ttl_seconds` (the only machine-visible proof of death),
+the owner's **heartbeat** to expire past the claim lease (the only machine-visible proof of death),
 a takeover is initiated by a present human who *is* the proof of death — the oracle that knows, before
 the lease lapses, that the fleet hard-stopped (quota exhausted, process killed). It is a **launcher**
 bootstrap variant (`afk-fleet --takeover`): the new instance runs the full bootstrap (config, instance

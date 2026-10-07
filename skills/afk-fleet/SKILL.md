@@ -48,7 +48,7 @@ is safe because **nothing the launcher must remember lives only in its context**
   cannot be recovered: stop and say so — the claims it held are a [`--takeover`](#takeover-mode---takeover) away.
 - **A cycle whose observable state is unchanged runs no pass at all** — the gate inside `afk cycle`
   (pure code) proves the no-op, refreshes the lease and returns the sleep; a forced full pass every
-  `force_tick_after_skips` cycles backstops what a state hash can't see (ADR-0007).
+  sixth cycle backstops what a state hash can't see (ADR-0007).
 - **All durable state lives in GitHub**, so any tick reconstructs the exact working set:
   `refs/afk/claim/<n>` ref = claim (owned by a **fleet instance**) · PR (`Closes #n`) = result · an
   `afk:verdict` marker comment = a worker's machine-readable reason for opening **no** PR
@@ -80,7 +80,7 @@ is safe because **nothing the launcher must remember lives only in its context**
 ### Bootstrap (once)
 
 **Invoking the skill is the launch** (ADR-0023): the invocation is itself the go-ahead to push worker
-branches and **auto-merge** green PRs to `merge.target`, unattended, for this run. Bootstrap shows no
+branches and **auto-merge** green PRs to `base_branch`, unattended, for this run. Bootstrap shows no
 preview and asks for no confirmation — go straight from step 3 into the [Loop](#loop). It stops only
 on what makes the run impossible (a config error, a merge target that would reject every merge), and
 asks only the one thing code cannot derive (step 3, and only when it was not passed in).
@@ -104,10 +104,10 @@ asks only the one thing code cannot derive (step 3, and only when it was not pas
      [Cooperative multi-fleet](references/cooperative-multi-fleet.md). An `{"error": …}` here means the
      remote could not be pushed to at all (auth, network) — fix that; it is not a namespace question.
    - **Branch protection** (only when `gate.ci: local`) — `protection.verdict == "error"` means
-     `merge.target` **requires status checks**, so `gh pr merge` would be rejected however green the
+     `base_branch` **requires status checks**, so `gh pr merge` would be rejected however green the
      local gate is: **stop here** — drop the required checks on that branch or
      switch to `gate.ci: required`. (`gh pr merge --admin` is not an option: it bypasses human review
-     too.) Unless `gate.adversarial_verify` is on, it is also an `"error"` when the target would refuse a direct push
+     too.) Unless `gate.adversarial_verify_prompt` is set, it is also an `"error"` when the target would refuse a direct push
      (required pull request reviews, push restrictions, a locked branch) — a merge batch lands by
      pushing; **stop here** too. A `"warn"` verdict (the read was inconclusive — no admin rights) is reported and continues.
    - **Gate records** (only when `gate.ci: local`) — `gate_records.verdict == "warn"` means the
@@ -146,7 +146,7 @@ written to a file, gone when the launcher stops.
 
 For when a fleet **hard-stopped** — its provider quota ran out, its process was killed — and you are
 standing right there. The lease will hand its claims to a peer, but only after
-`claim_lease_ttl_seconds` (default 4500), because a heartbeat is the only *machine-visible* line between "dead" and "alive but slow".
+`CLAIM_LEASE_TTL_SECONDS` (4500), because a heartbeat is the only *machine-visible* line between "dead" and "alive but slow".
 The present human is the oracle that knows *now*; the dying fleet cannot help, since a hard stop runs no
 code at all (no drain, no release) — [ADR-0011](../../docs/adr/0011-takeover-and-progress-preservation.md).
 
@@ -201,10 +201,10 @@ from the first cycle on.
    (`ScheduleWakeup`). `sleep_seconds` 0 with no judgments is not a sleep: a PR opened while the
    tick ran, and it gets its landing turn from the next cycle — **step 1 at once**, with no
    `ScheduleWakeup` in between (it cannot wait less than a minute). The number already encodes the pacing rules — you
-   apply none yourself: `busy_interval_seconds` (default 90) while the last tick did anything or anything is in
-   flight, so finished PRs land promptly; `idle_interval_seconds` (default 1500) once `idle_ticks_before_sleep`
+   apply none yourself, and none is configurable: `BUSY_INTERVAL_SECONDS` (90) while the last tick did anything or anything is in
+   flight, so finished PRs land promptly — far inside the claim lease, so a held claim never lapses; and `IDLE_INTERVAL_SECONDS` (1500) once `IDLE_TICKS_BEFORE_SLEEP` (3)
    consecutive cycles were **empty** (a tick that did nothing, or a skip, with nothing in flight and
-   nothing left on the frontier); and never past `claim_lease_ttl_seconds`/2 while the fleet holds any claim.
+   nothing left on the frontier).
    **A wake ends the sleep early.** A line `afk-wake #<n>` arriving in this terminal is a worker
    saying its outcome is on GitHub (ADR-0020): go to step 1 **now** instead of waiting the sleep out,
    and let the sleep this new cycle ends with replace the one you were in. That is all it means — it
@@ -337,7 +337,7 @@ instance id and the worker launch command.
 |---|---|---|---|
 | `empty_diff` | A worker declared `already-satisfied` and stopped with nothing on its branch. Is the diff against base **really** empty? Look in `context.worktree`. | `afk close` | `afk fail` |
 | `no_checks` | The PR that is next to land has **no checks at all** — the progressive gate. Are the issue's acceptance criteria met? | `afk turn --allow-no-checks` | `afk fail` |
-| `adversarial_verify` | `gate.adversarial_verify` is on: does `context.head` survive the [adversarial verify](references/completion-gate.md)? A PR that also has no checks is asked this one question — the verify is then its only gate. | `afk turn --verified <head>` | `afk fail` |
+| `adversarial_verify` | `gate.adversarial_verify_prompt` is set: does `context.head` survive the [adversarial verify](references/completion-gate.md)? A PR that also has no checks is asked this one question — the verify is then its only gate. | `afk turn --verified <head>` | `afk fail` |
 | `reason` | Not a yes/no: the transition is already fixed — a failure or an escalation whose reason is **not** on record (red checks, a verdict that gave none). Re-read the reason from `context.where` and put it in place of the text after `--reason`. | `afk fail --reason …` — or, for an escalation, `afk escalate --reason …` | the **same** command |
 
 - **Decide, then run the command you were handed** — as written, changing only a `--reason`'s text.
@@ -391,7 +391,7 @@ that lands, and never reads checks. `afk land` applies whichever is configured
 behind them — the local gate's two-run rule, the one case the landing
 skips its own run (a green run is on record, on the remote, for the tree that lands;
 [ADR-0030](../../docs/adr/0030-a-gate-run-is-recorded-on-the-remote-under-the-tree-it-tested.md)), the
-ephemeral CI sub-read, and the adversarial-verify procedure when `gate.adversarial_verify` is on — are
+ephemeral CI sub-read, and the adversarial-verify procedure when `gate.adversarial_verify_prompt` is set — are
 disclosed in [references/completion-gate.md](references/completion-gate.md). Read it before running an
 adversarial verify or switching a repo to `gate.ci: local`. `afk gate` and `afk land` are the
 **worker's** subcommands: you never run them.
@@ -399,7 +399,7 @@ adversarial verify or switching a repo to `gate.ci: local`. `afk gate` and `afk 
 ## Landing — the worker lands its own PR, on its turn
 
 **Nobody but its worker merges a PR.** A finished PR is landed by the worker that wrote it, with
-`afk land`, in its own worktree — sync with `merge.target` (by **merging, never rebasing** —
+`afk land`, in its own worktree — sync with `base_branch` (by **merging, never rebasing** —
 ADR-0012) → push → the machine gate on that exact head → `gh pr merge` **pinned to the gated head**.
 A sync conflict or a red gate at landing is fixed where the context is: by that worker, in place,
 with no round trip through the launcher
@@ -452,7 +452,7 @@ the branch moved after the gate. No landing outcome spends an attempt or closes 
 does a landing worker's silence; only `afk fail` does, and it reaches a landing claim only by your
 own judgments — red checks in `required` mode, a refuted verify — never by silence.
 
-**A merge batch — several PRs on one turn** (`gate.ci: local` with `gate.adversarial_verify` off;
+**A merge batch — several PRs on one turn** (`gate.ci: local` with no `gate.adversarial_verify_prompt`;
 there is no switch —
 [ADR-0029](../../docs/adr/0029-a-merge-batch-lands-n-prs-behind-one-gate-run.md),
 [ADR-0034](../../docs/adr/0034-every-pr-lands-as-a-merge-commit-and-batches-need-no-switch.md)). When two or more
@@ -471,7 +471,7 @@ abandoned batch's PRs land on single turns, as above, and are never batched agai
 The turn guards against a worker that **strays**, not a malicious one: worker and launcher share one
 `gh` credential, so nothing here stops a worker that decides to run `gh pr merge` itself.
 
-The fleet's mandate **ends at a green merge to `merge.target`.** Deploying is a separate,
+The fleet's mandate **ends at a green merge to `base_branch`.** Deploying is a separate,
 human-gated step — never done here.
 
 ## Failure handling — bounded retry → escalate, never silently drop
@@ -505,8 +505,8 @@ the call does the rest and reports which way it went:
   errors after counting (a PR close refused, orca down), **run it again**: it finishes the retry
   without counting twice, and the next tick does the same by itself.
 - `"action": "escalate"` — the attempts are exhausted. In one fixed order: status board → relabel
-  (add `escalate_label`, remove `ready_label` and the attempt label) → comment the reason (if
-  `escalate_comment`) → release the claim. The PR and the worktree are left for the human.
+  (add `escalate_label`, remove `ready_label` and the attempt label) → comment the reason
+  → release the claim. The PR and the worktree are left for the human.
 
 An issue that should go to a human **without** consuming a retry takes the same ordered transition
 directly: `afk escalate --issue <n> --instance <id> --reason "<…>"`. Two cases: a `blocked` verdict
@@ -539,11 +539,11 @@ touch shared root config are naturally throttled by the DAG — chain them with 
 ## Guardrails
 
 - **The invocation is the authorization, and it covers only this.** Running the skill is the human's
-  go-ahead to push worker branches and land green PRs on `merge.target`, for this repo, for
+  go-ahead to push worker branches and land green PRs on `base_branch`, for this repo, for
   this run — ask for no further confirmation, and read it as permission for nothing else
   (ADR-0023). `--plan` is how to look without acting.
 - **Keep every credential inside the worker's own shell.** Push only to worker branches and the merge
-  to `merge.target`; deploying, secrets, and every other remote stay out of scope. Carry no credential
+  to `base_branch`; deploying, secrets, and every other remote stay out of scope. Carry no credential
   to a worker — no copied `ANTHROPIC_*` (or any) env, no env file, no token from a secret manager: the
   opaque **worker launch command** exists so the wrapper the human named does this itself (ADR-0010).
   Copying the launcher's env would also break the fleet outright — `ORCA_TERMINAL_HANDLE` and friends
@@ -560,7 +560,7 @@ touch shared root config are naturally throttled by the DAG — chain them with 
   verdict marker (see In-flight — *stopped* alone is never *finished*). A full transcript never enters the launcher; the one terminal read is
   `afk nudge` / `afk fail` / `afk escalate` taking the last screen of a worker that went silent, to
   say *where* it stopped — never its result (ADR-0018).
-- **Never merge a PR yourself.** No `gh pr merge`, no push to `merge.target`: a PR lands only through
+- **Never merge a PR yourself.** No `gh pr merge`, no push to `base_branch`: a PR lands only through
   its worker's `afk land`, on the turn `afk turn` gave it — or, in a merge batch, through the batch
   worker's `afk land --batch`. A turn nobody lands is escalated with its PR kept, and a batch nobody
   lands abandoned, not merged around (ADR-0027, ADR-0029, ADR-0035).
