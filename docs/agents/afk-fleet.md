@@ -4,7 +4,7 @@ Per-repo config consumed by `/afk-fleet` at bootstrap via `afk config --file <th
 validates every key against the one schema (unknown key or wrong shape → error) and emits the
 canonical JSON every tick and tool consumes (ADR-0009). Anything omitted uses the default — so this
 file sets only the keys where this repo differs, and a default that moves is followed. This repo's
-trunk is not `main`, so `base_branch` and `merge.target` are set accordingly. The worker
+trunk is not `main`, so `base_branch` is set accordingly. The worker
 launch command is intentionally NOT here (settled at bootstrap; ADR-0010).
 
 ```yaml
@@ -19,10 +19,6 @@ concurrency: 10
 gate:
   ci: local
   local_command: "uv run --with pytest --with pytest-xdist pytest skills/afk-fleet/scripts -q -n auto"
-
-# --- merge ---
-merge:
-  target: master
 ```
 
 ## Notes
@@ -36,8 +32,8 @@ merge:
   rule, in parallel: 71 s against 488 s serial, measured on 2026-10-05 on a 14-core Apple M4 Pro
   (Mac16,8). That is a snapshot, not a promise — the suite grows. It is a real gate for the code-touching issues and a no-op pass for
   prompt/docs-only issues.
-- **Sync, not rebase.** `merge.sync_before_merge` merges the merge target into the branch before the
-  landing's re-gate (ADR-0012, ADR-0027); the retired `rebase_before_merge` key is now a load-time error.
+- **Sync, not rebase.** A landing merges `base_branch` into the branch before its re-gate
+  (ADR-0012, ADR-0027) — always: there is no key for it (ADR-0038).
 - **Reserved surfaces.** The fleet manages the `afk-attempt/<n>` labels, the `refs/afk/*` ref
   namespace (`refs/afk/claim/*`, `refs/afk/heartbeat/*`), the single `<!--afk:status-->` status-board
   comment, and the `<!--afk:turn …-->` landing-turn comment on a PR. Don't hand-edit them.

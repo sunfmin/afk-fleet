@@ -157,8 +157,8 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 
 **Where it forks.**
 - The digest is unchanged: no pass is run, the same call refreshes the heartbeat if the fleet
-  holds claims and returns the sleep, and a full tick is forced every `force_tick_after_skips`
-  cycles: `skills/afk-fleet/scripts/afk_decide.py:cycle_wake`, ADR-0007.
+  holds claims and returns the sleep, and a full tick is forced every sixth
+  cycle: `skills/afk-fleet/scripts/afk_decide.py:cycle_wake`, ADR-0007.
 - A worker's **wake** arrives during the sleep of step 7: the launcher goes to step 4 at once, and
   acts on nothing the line says, `skills/afk-fleet/SKILL.md:wake`, ADR-0020.
 - A wake arrives while the call of step 4 is still running: the next cycle is opened at once with
@@ -177,7 +177,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    older than a third of the lease.
    `skills/afk-fleet/scripts/afk_decide.py:heartbeat_due`
 2. The fleet hard-stops and runs no code; a peer's next rebuild finds a claim whose owner's heartbeat
-   is older than `claim_lease_ttl_seconds`, and classifies it a **stale claim**.
+   is older than the claim lease, and classifies it a **stale claim**.
    `skills/afk-fleet/scripts/afk_decide.py:classify_claims`
 3. The peer takes the claim by re-stamping the ref with its own instance, a push the server rejects
    unless the ref still points at the sha the peer read.

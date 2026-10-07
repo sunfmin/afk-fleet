@@ -37,7 +37,7 @@ sends it to read, so a number from this repo's ADRs names the wrong document the
 
 The fields are `{n}`, `{title}`, `{repo}`, `{base_branch}` (from the issue and the
 config), `{branch}`, `{worktree_path}` (the **actual** values orca returned — orca names the branch
-`<user>/…`, never assumed from `branch_pattern`), `{wake_command}` — the line that **wakes** the
+`<user>/…`, never assumed from the worktree name), `{wake_command}` — the line that **wakes** the
 launcher, built from the handle of the terminal the launcher runs in, or a no-op when it runs in
 none (ADR-0020) — `{gate_command}` — the line the worker runs the **local gate** with: `afk gate`
 carrying `gate.local_command`, so a green run is on record for the landing (ADR-0030), or a no-op when

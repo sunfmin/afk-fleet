@@ -403,21 +403,19 @@ def _pr_comment(repo, number, body):
     _forget(("comments", repo, number))
 
 
-def _close_pr(repo, rem, number, comment, delete_branch):
-    """Close an open PR unmerged, with the comment that says why; `delete_branch`
-    takes its branch off the remote with it."""
-    _gh(["pr", "close", str(number), "--repo", repo, "--comment", comment,
-         *(["--delete-branch"] if delete_branch else [])])
-    _forget(("prs", repo), ("comments", repo, number),
-            *([("heads", rem)] if delete_branch else []))
+def _close_pr(repo, rem, number, comment):
+    """Close an open PR unmerged, with the comment that says why, and take its
+    branch off the remote with it."""
+    _gh(["pr", "close", str(number), "--repo", repo, "--comment", comment, "--delete-branch"])
+    _forget(("prs", repo), ("comments", repo, number), ("heads", rem))
 
 
-def _merge_pr(repo, rem, pr, head, delete_branch):
+def _merge_pr(repo, rem, pr, head):
     """Merge an open PR — a merge commit, never a squash or a rebase — only
-    while its head is still `head`. The issues it closes are closed by GitHub
-    with it."""
+    while its head is still `head`, and delete its branch. The issues it closes
+    are closed by GitHub with it."""
     _gh(["pr", "merge", str(pr["number"]), "--repo", repo, "--merge",
-         "--match-head-commit", head, *(["--delete-branch"] if delete_branch else [])])
+         "--match-head-commit", head, "--delete-branch"])
     _forget(("prs", repo), ("heads", rem))
     for ref in pr.get("closingIssuesReferences") or []:
         _issue_written(repo, ref["number"])
@@ -614,10 +612,10 @@ def cmd_scan(a):
 
 def cmd_classify_claims(a):
     run = _run(a)
-    cfg, now = run.cfg, run.now()
+    now = run.now()
     claims, heartbeats = _scan(run)
     return {**afk_decide.classify_claims(claims, heartbeats, a.instance, now,
-                                         cfg["claim_lease_ttl_seconds"]),
+                                         afk_decide.CLAIM_LEASE_TTL_SECONDS),
             "now": now}
 
 
@@ -688,8 +686,8 @@ def cmd_takeover(a):
     fleet die?", not "is this work failing?". What each taken claim then *does* is
     continuation (`afk recovery`), not a fresh re-dispatch."""
     run = _run(a)
-    cfg, now = run.cfg, run.now()
-    ttl = cfg["claim_lease_ttl_seconds"]
+    now = run.now()
+    ttl = afk_decide.CLAIM_LEASE_TTL_SECONDS
     claims, heartbeats = _scan(run)
 
     if a.list:
@@ -752,7 +750,7 @@ def cmd_release(a):
           a claim another instance holds. With `--repo`, a claim whose issue is
           CLOSED — the `closed` row: its worker landed the PR, and `afk land`
           can neither release the claim nor remove the worktree it runs in — has
-          its worktree removed too (`cleanup`, when `worktree_cleanup`). An open
+          its worktree removed too (`cleanup`). An open
           issue's worktree is never touched: it may hold work. A PR a merge
           batch landed that GitHub still does not show merged is closed here
           (`closed_pr`), and the landing is fast-forwarded into the fleet's own
@@ -793,7 +791,7 @@ def _settle_landed(run, number):
     """What only the tick can do for a claim whose issue is closed — `afk land`
     runs inside the worktree and holds no instance id → {"closed_pr"?,
     "cleanup"?}: close the PR a merge batch landed that GitHub still shows open
-    (`_close_landed_pr`), remove the worktree (when `worktree_cleanup`), and
+    (`_close_landed_pr`), remove the worktree, and
     bring the landing into the fleet's own checkout (`_sync_checkout`). An open
     issue's worktree is never touched: it may hold work."""
     settled = {}
@@ -801,7 +799,7 @@ def _settle_landed(run, number):
     if closed_pr:
         settled["closed_pr"] = closed_pr
     worktree = _Worktree.of_issue(run.repo, number)
-    if worktree.remembered and run.cfg["worktree_cleanup"]:
+    if worktree.remembered:
         settled["cleanup"] = worktree.remove()
     settled["synced"] = _sync_checkout(run)
     return settled
@@ -820,7 +818,7 @@ def _sync_checkout(run):
     local branch that diverged, changes in the way, no such local branch, no
     orca — each is `skipped` and nothing is changed: SOFT, a checkout that
     cannot follow never fails the release it rides on."""
-    target = run.cfg["merge"]["target"]
+    target = run.cfg["base_branch"]
     try:
         orca_repo = _Worktree.source(run.repo)
         if not orca_repo:
@@ -874,7 +872,7 @@ def _beat(run, instance):
     ref = _heartbeat_ref(cfg, instance)
     heartbeats = _scan(run)[1]
     last = heartbeats.get(instance)
-    if not afk_decide.heartbeat_due(last, now, cfg["claim_lease_ttl_seconds"]):
+    if not afk_decide.heartbeat_due(last, now, afk_decide.CLAIM_LEASE_TTL_SECONDS):
         return {"refreshed": False, "reason": "not due", "ts": last, "ref": ref}
     sha = _record_commit(afk_decide.HEARTBEAT_RECORD, {"instance": instance, "ts": now})
     _git(["push", rem, "--force", f"{sha}:{ref}"])
@@ -951,8 +949,8 @@ def cmd_probe(a):
     """The bootstrap compatibility probe — three questions, all answered with the
     human present so a misfit is fixed here rather than mid-run (ADR-0009's tradition):
 
-    1. **Claim namespace** — can we push under the configured `claim_namespace`
-       (`refs/afk`)? Else fall back to branches (`refs/heads/afk-claim/*`) and say
+    1. **Claim namespace** — can we push under the config's `claim_namespace`
+       (`refs/afk`, unless a `--set` says otherwise)? Else fall back to branches (`refs/heads/afk-claim/*`) and say
        so: `blocked`, with the server's rejection as `detail` — claim churn will
        then fire `on: push` CI. The result's `config` is the canonical config with
        the namespace that actually works: the launcher holds THAT config from here
@@ -973,7 +971,7 @@ def cmd_probe(a):
     if rejection:
         result["detail"] = rejection
 
-    ci_mode, target = cfg["gate"]["ci"], cfg["merge"]["target"]
+    ci_mode, target = cfg["gate"]["ci"], cfg["base_branch"]
     if ci_mode == "local":
         if not run.repo:
             result["protection"] = {"branch": target, "verdict": "warn", "required_checks": [],
@@ -1106,7 +1104,6 @@ def cmd_cycle(a):
     tick — `_drain` releases my claims that no open PR stands behind and keeps
     the rest → `"action": "drain"`, `sleep_seconds` null."""
     run = _run(a)
-    cfg = run.cfg
     state = afk_decide.cycle_state(json.loads(a.state) if a.state else None,
                                    a.instance, a.worker_command)
     instance = state["instance"]
@@ -1116,9 +1113,9 @@ def cmd_cycle(a):
         return {"action": "drain", "reason": "stop",
                 **afk_decide.cycle_drained(state, released, kept, len(errors)),
                 "judgments": [], **({"errors": errors} if errors else {})}
-    gathered = _gather(run) if cfg["fingerprint_gate"] else None
-    fp = afk_decide.fingerprint(*gathered[:3]) if gathered else None  # heartbeats: see fingerprint
-    woke = afk_decide.cycle_wake(state, fp, cfg, woke=a.wake)
+    gathered = _gather(run)
+    fp = afk_decide.fingerprint(*gathered[:3])      # heartbeats: see fingerprint
+    woke = afk_decide.cycle_wake(state, fp, woke=a.wake)
     if woke["action"] == "skip":
         if not woke.pop("heartbeat"):
             return {**woke, "judgments": []}
@@ -1128,15 +1125,14 @@ def cmd_cycle(a):
     ws = _rebuild(run, instance, gathered)
     did, judgments, errors = _tick(run, instance, a.host, agent, ws)
     left, unseen = None, []
-    if gathered:
-        try:
-            after = _gather(run, fresh=True)
-            left = afk_decide.fingerprint(*after[:3])
-            unseen = afk_decide.unseen_prs(ws["mine"], after[1])
-        except (OSError, RuntimeError):
-            pass        # keep the opening digest: the next cycle reads `changed`, and ticks
+    try:
+        after = _gather(run, fresh=True)
+        left = afk_decide.fingerprint(*after[:3])
+        unseen = afk_decide.unseen_prs(ws["mine"], after[1])
+    except (OSError, RuntimeError):
+        pass            # keep the opening digest: the next cycle reads `changed`, and ticks
     return {"action": "tick", "reason": woke["reason"],
-            **afk_decide.cycle_ticked(woke["state"], did, cfg, len(judgments), len(errors),
+            **afk_decide.cycle_ticked(woke["state"], did, len(judgments), len(errors),
                                       left=left, boards=dict(run.boards), unseen=len(unseen)),
             "judgments": judgments, **({"errors": errors} if errors else {})}
 
@@ -1388,7 +1384,7 @@ class _Worktree:
         contain it, however orca resolved the ref. A worker started on a base
         that is commits behind builds on files that have already moved."""
         if issue is not None:
-            name = afk_decide.worktree_name(run.cfg["branch_pattern"], issue["number"],
+            name = afk_decide.worktree_name(issue["number"],
                                             issue["title"])
         else:
             name = afk_decide.batch_name(batch)
@@ -1589,7 +1585,7 @@ class _Workers:
 
     def __init__(self, run):
         self._repo = run.repo
-        self.now, self.grace = run.now(), run.cfg["worker_idle_grace_seconds"]
+        self.now, self.grace = run.now(), afk_decide.WORKER_IDLE_GRACE_SECONDS
 
     @functools.cached_property
     def _rows(self):
@@ -1795,7 +1791,7 @@ def _recovery(run, number, path=None, branch=None, no_worktree=False, landing_pr
     Two signals, both mechanics: (1) is a worktree for this issue still on THIS
     machine — asked of `orca worktree list` (soft: no orca → "no worktree", never
     an abort), overridable with `path` / `no_worktree`; (2) is the issue's branch
-    ahead of base on the remote — the branch is recognised from `branch_pattern`
+    ahead of base on the remote — the branch is recognised from its name
     (the claim ref records the issue, not the branch) and the compare is plain
     git. `afk_decide.select_recovery` then picks the tier.
 
@@ -1817,7 +1813,7 @@ def _recovery(run, number, path=None, branch=None, no_worktree=False, landing_pr
 
     # --- tier-2 signal: the branch the dead worker pushed ---
     candidates = [] if branch else afk_decide.branch_candidates(
-        _remote_heads(rem), cfg["branch_pattern"], number)
+        _remote_heads(rem), number)
     ahead = {b: _branch_ahead(rem, b, base, number)
              for b in ([branch] if branch else candidates)}
     branch = branch or afk_decide.furthest_ahead(ahead)
@@ -1849,15 +1845,15 @@ def _discard_attempt(run, number):
     Closing the PR is what keeps the claim from re-entering the retry ladder on
     the same red PR next tick; deleting the branches is what keeps a later
     continuation from resuming the attempt that was discarded."""
-    cfg, rem = run.cfg, run.rem
+    rem = run.rem
     closed = []
-    for pr in afk_decide.superseded_prs(_open_prs(run.repo), number, cfg["branch_pattern"]):
+    for pr in afk_decide.superseded_prs(_open_prs(run.repo), number):
         _close_pr(run.repo, rem, pr["number"],
                   "afk-fleet: superseded — this attempt failed and the issue is being retried "
-                  "from a clean base.", delete_branch=True)
+                  "from a clean base.")
         closed.append(pr["number"])
     deleted = []
-    for branch in afk_decide.branch_candidates(_remote_heads(rem), cfg["branch_pattern"], number):
+    for branch in afk_decide.branch_candidates(_remote_heads(rem), number):
         _delete_branch(rem, branch)
         deleted.append(branch)
     wt = _Worktree.of_issue(run.repo, number)
@@ -1871,7 +1867,7 @@ def _discard_attempt(run, number):
 
 def _landing_fields(cfg, pr):
     """The LANDING_FIELDS of a landing brief, from the config and the PR."""
-    return {"pr": pr["number"], "pr_branch": pr["headRefName"], "target": cfg["merge"]["target"]}
+    return {"pr": pr["number"], "pr_branch": pr["headRefName"], "target": cfg["base_branch"]}
 
 
 def _prompt_fields(run, issue, path, branch):
@@ -2022,12 +2018,8 @@ def _upsert_board(run, number, phase, instance=None, pr=None, attempt=0, blocked
     Renders the body from the given phase (pure), then find-or-create by marker
     and write ONLY when the body changed — so re-entrant/disposable ticks and
     retry re-dispatches never spam the issue. A body that is the one the issue is
-    already known to carry (`run.boards`) is not even read for: `known`. With
-    `progress_comment` off there is no board, and nothing is read or written:
-    `off` — the one place that switch is read, so no caller asks first."""
+    already known to carry (`run.boards`) is not even read for: `known`."""
     repo, cfg = run.repo, run.cfg
-    if not cfg["progress_comment"]:
-        return {"action": "off", "issue": number}
     body = afk_decide.render_status_board(phase, cfg["gate"]["ci"], cfg["retry"],
                                           instance=instance, pr=pr, attempt=attempt,
                                           blocked_by=blocked_by, batch=batch)
@@ -2279,7 +2271,7 @@ def cmd_turn(a):
       no_checks     required mode, and the PR has no checks at all — the
                     progressive gate. Re-run with `--allow-no-checks` if the tick
                     judges the acceptance criteria met.
-      needs_verify  `gate.adversarial_verify` is on and `--verified` does not name
+      needs_verify  an adversarial verify is owed and `--verified` does not name
                     the PR's `head`. Run the verifier on `head`, then re-run with
                     `--verified <head>`.
 
@@ -2347,7 +2339,7 @@ def _grant_turn(run, instance, agent, number, allow_no_checks=False, verified=No
     verified = verified or (held_here or {}).get("verified")
     checks = afk_decide.pr_checks_state(pr.get("statusCheckRollup"))
     ready = afk_decide.turn_gate(cfg["gate"]["ci"], checks, allow,
-                                 cfg["gate"]["adversarial_verify"], verified, head)
+                                 afk_decide.verifies(cfg), verified, head)
     if ready != "ready":
         return stop(ready, checks=checks)
 
@@ -2417,7 +2409,7 @@ def cmd_land(a):
                     still running when `--checks-timeout` ran out. Up to then
                     this waits for them itself — after a sync that pushed a
                     new head too — and goes on to merge, or to `gate_red`.
-      needs_verify  `gate.adversarial_verify` is on and the head that would land
+      needs_verify  an adversarial verify is owed and the head that would land
                     is not the one the tick verified — the sync moved it.
       no_checks     required mode, the PR has no checks at all, and the tick has
                     not said it may land so.
@@ -2457,7 +2449,7 @@ def cmd_land(a):
         raise RuntimeError(f"PR #{pr['number']} does not hold the landing turn of the fleet "
                            f"instance that holds issue #{a.number}'s claim; nothing was changed. "
                            f"Do not land it any other way — you are told when its turn comes")
-    branch, target = pr["headRefName"], cfg["merge"]["target"]
+    branch, target = pr["headRefName"], cfg["base_branch"]
     out = {"issue": a.number, "pr": pr["number"]}
 
     def stop(outcome, **more):
@@ -2478,13 +2470,12 @@ def cmd_land(a):
         _git(["-C", path, "merge", "--ff-only", pr_tip])
 
     # --- sync: merge the target in, push what that produced ---
-    if cfg["merge"]["sync_before_merge"]:
-        files = _sync(rem, path, target)
-        if files:
-            return stop("conflict", files=files, worktree=path,
-                        detail=f"merging {target} into {branch} conflicted; the merge is in "
-                               f"progress here — resolve every file, `git add` it, COMMIT the "
-                               f"merge, and run this again")
+    files = _sync(rem, path, target)
+    if files:
+        return stop("conflict", files=files, worktree=path,
+                    detail=f"merging {target} into {branch} conflicted; the merge is in "
+                           f"progress here — resolve every file, `git add` it, COMMIT the "
+                           f"merge, and run this again")
     head = _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip()
     pushed = head != pr_tip
     if pushed:
@@ -2518,13 +2509,13 @@ def cmd_land(a):
             return stop(checks_say, checks=checks,
                         detail="send your wake and stop — you are told to run this again once "
                                "that is settled")
-    if cfg["gate"]["adversarial_verify"] and turn["verified"] != head:
+    if afk_decide.verifies(cfg) and turn["verified"] != head:
         return stop("needs_verify",
                     detail="the head that would land is not the one that was verified — send "
                            "your wake and stop; you are told to run this again once it is")
 
     # --- land it. The claim and this worktree are the next cycle's to settle ---
-    _merge_pr(run.repo, rem, pr, head, cfg["merge"]["delete_branch"])
+    _merge_pr(run.repo, rem, pr, head)
     _upsert_board(run, a.number, "merged", instance=owner, pr=pr["number"])
     return {**out, "outcome": afk_decide.land_outcome("merged"),
             "detail": "landed — send your wake and stop"}
@@ -2680,7 +2671,7 @@ def _start_batch_worker(run, instance, agent, batch, members, phase, again):
     `granted`. Recorded before delivered: a start that then fails leaves a batch
     whose worker has no terminal, which the next cycle continues."""
     cfg, rem = run.cfg, run.rem
-    target = cfg["merge"]["target"]
+    target = cfg["base_branch"]
     _record_batch(run, instance, batch, members, phase)
     wt = _Worktree.of_batch(run.repo, batch)
     if wt.path:
@@ -2751,7 +2742,7 @@ def _batch_worker(run, batch, worker):
         told = [(_turn(run.repo, m["pr"]) or {}).get("at")
                 for m in _members_of_batch(run, batch)]
         turn_at = max((t for t in told if t), default=None)
-        progress = _worktree_progress(path, run.rem, cfg["merge"]["target"])
+        progress = _worktree_progress(path, run.rem, cfg["base_branch"])
         # a batch's worker declares no verdict and names no blocker — and a batch's
         # turn is never restarted: its second silence abandons the batch
         seen = afk_decide.classify_stopped(progress, worker.reading["terminal_idle_seconds"],
@@ -2789,7 +2780,7 @@ def _close_landed_pr(run, number):
     turn = _turn(run.repo, pr["number"]) if pr else None
     if not turn or not turn["batch"] or turn["released"]:
         return None
-    target = run.cfg["merge"]["target"]
+    target = run.cfg["base_branch"]
     commit = _landed_commit(".", _fetch_tip(run.rem, target), pr["number"])
     if not commit:
         return None
@@ -2801,8 +2792,7 @@ def _close_batched_pr(run, pr, commit, batch, prs):
     """Close one PR a batch landed, with the comment that names its commit."""
     cfg = run.cfg
     _close_pr(run.repo, run.rem, pr["number"],
-              afk_decide.batch_landed_comment(commit, cfg["merge"]["target"], batch, prs),
-              cfg["merge"]["delete_branch"])
+              afk_decide.batch_landed_comment(commit, cfg["base_branch"], batch, prs))
 
 
 def _stack_pr(rem, path, pr, issue):
@@ -2899,7 +2889,7 @@ def _land_batch(run, batch, limits, merged_timeout):
     (`_members_of_batch`): the worktree keeps no list, so one recreated from the
     batch's pushed branch lands the same members."""
     cfg, rem = run.cfg, run.rem
-    target = cfg["merge"]["target"]
+    target = cfg["base_branch"]
     path = _git(["rev-parse", "--show-toplevel"]).stdout.strip()
     branch = _git(["-C", path, "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
     if not afk_decide.batch_branches([branch], batch):
@@ -3027,7 +3017,7 @@ def _finish_batch(run, batch, landed, result, merged_timeout, branches, **more):
     release closes it if it is open even then (`_close_landed_pr`). `branches`
     is {PR number: its branch} for the PRs still open as the finishing began —
     a PR GitHub had already merged by then is not in it, and keeps its branch."""
-    cfg, rem = run.cfg, run.rem
+    rem = run.rem
     instance = (_turn(run.repo, landed[0]["pr"]) or {}).get("instance")
     for m in landed:
         _upsert_board(run, m["issue"], "merged", instance=instance, pr=m["pr"])
@@ -3035,12 +3025,11 @@ def _finish_batch(run, batch, landed, result, merged_timeout, branches, **more):
             _close_issue(run.repo, m["issue"])
     _delete_batch_branches(rem, batch)
     still_open = _await_merged(run.repo, [m["pr"] for m in landed], merged_timeout)
-    if cfg["merge"]["delete_branch"]:
-        heads = _remote_heads(rem)
-        for m in landed:
-            branch = branches.get(m["pr"])
-            if m["pr"] not in still_open and branch in heads:
-                _delete_branch(rem, branch, check=False)
+    heads = _remote_heads(rem)
+    for m in landed:
+        branch = branches.get(m["pr"])
+        if m["pr"] not in still_open and branch in heads:
+            _delete_branch(rem, branch, check=False)
     return result("landed", landed, **more, unmerged=sorted(still_open),
                   landed=[{k: m[k] for k in ("issue", "pr", "commit")} for m in landed],
                   detail="landed — send your wake and stop")
@@ -3051,11 +3040,11 @@ def _sweep_batches(run, instance, live):
     turn — landed, dissolved or abandoned: its worktree on this machine (never
     one whose worker is still busy: it is finishing) and its pushed branch.
     `live` are the ids of the batches that still do."""
-    cfg, rem = run.cfg, run.rem
+    rem = run.rem
     stale = [w for w in _Worktree.of_batches(run.repo, instance)
              if w.batch not in live and w.remembered]
     removed = []
-    if stale and cfg["worktree_cleanup"]:
+    if stale:
         workers = _Workers(run)
         for w in stale:
             if not workers.at(w.remembered).busy:
@@ -3081,10 +3070,8 @@ def _escalate(run, instance, issue, attempt, reason):
     add, remove = afk_decide.escalation_labels(issue["labels"], cfg)
     _ensure_label(run.repo, add[0])
     _edit_labels(run.repo, number, add, remove)
-    comment_id = None
-    if cfg["escalate_comment"]:
-        comment_id = _comment(run.repo, number,
-                              afk_decide.escalation_comment(reason, attempt, pr_number))
+    comment_id = _comment(run.repo, number,
+                          afk_decide.escalation_comment(reason, attempt, pr_number))
     _release(run, number)
     return {"issue": number, "action": "escalate", "attempt": attempt, "pr": pr_number,
             "labels": {"added": add, "removed": remove}, "comment_id": comment_id,
@@ -3205,7 +3192,7 @@ def _park_claim(run, instance, number):
     _upsert_board(run, number, "parked", blocked_by=waiting)
     _release(run, number)
     empty = progress.get("commits_ahead") == 0 and not progress.get("dirty")
-    cleanup = wt.remove() if (path and empty and cfg["worktree_cleanup"]) else None
+    cleanup = wt.remove() if (path and empty) else None
     return {"issue": number, "action": "parked", "blocked_by": waiting, "edges_added": added,
             "released": True, **({"cleanup": cleanup} if cleanup else {})}
 
@@ -3215,13 +3202,12 @@ def cmd_close(a):
     `idle_done`), after the tick has verified the empty diff against base: status
     board → close the issue → release the claim → remove the worktree."""
     run = _run(a)
-    cfg = run.cfg
     _require_mine(run, a.number, a.instance)
     _upsert_board(run, a.number, "closed", instance=a.instance)
     _close_issue(run.repo, a.number)
     _release(run, a.number)
     wt = _Worktree.of_issue(run.repo, a.number)
-    cleanup = wt.remove() if (wt.remembered and cfg["worktree_cleanup"]) else None
+    cleanup = wt.remove() if wt.remembered else None
     return {"issue": a.number, "action": "closed", "released": True,
             **({"cleanup": cleanup} if cleanup else {})}
 
@@ -3259,7 +3245,7 @@ def build_parser():
                                 "it omits fall back to the defaults table — ADR-0009)")
             p.add_argument("--set", action="append", metavar="KEY=VALUE",
                            help="override one config key for this call, e.g. "
-                                "claim_lease_ttl_seconds=60 or gate.ci=local (repeatable; "
+                                "concurrency=1 or gate.ci=local (repeatable; "
                                 "for tests and hand-debugging)")
             p.add_argument("--now", type=int, default=None, help="epoch override (tests)")
         if remote:
@@ -3464,7 +3450,7 @@ def build_parser():
                    help="give a merge batch up with nothing landed: its PRs go back to "
                         "waiting and take single turns")
     p.add_argument("--verified", default=None, metavar="head",
-                   help="the head sha an adversarial verify passed (gate.adversarial_verify)")
+                   help="the head sha an adversarial verify passed (gate.adversarial_verify_prompt)")
     p.add_argument("--allow-no-checks", action="store_true",
                    help="gate.ci required: let a PR that has no checks at all land (the tick's "
                         "progressive-gate judgment)")

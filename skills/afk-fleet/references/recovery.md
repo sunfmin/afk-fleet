@@ -13,7 +13,7 @@ while progress exists. Workers push after every completed step (see
 worktree if it is still on this machine, else the branch tip on GitHub ([ADR-0011](../../../docs/adr/0011-takeover-and-progress-preservation.md)).
 
 `afk dispatch` asks `orca worktree list` whether a worktree for this issue is still here, recognises
-the issue's branch on the remote from `branch_pattern` (the claim ref records the issue, not the
+the issue's branch on the remote by its name, `issue-<n>-…` (the claim ref records the issue, not the
 branch), compares it against the remote's `base_branch`, and then acts:
 
 | tier | action | what `afk dispatch` does | prompt |

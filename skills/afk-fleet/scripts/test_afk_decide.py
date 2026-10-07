@@ -13,7 +13,7 @@ import shlex
 
 import afk_decide as d
 
-TTL = d.CONFIG_DEFAULTS["claim_lease_ttl_seconds"]  # the default lease
+TTL = d.CLAIM_LEASE_TTL_SECONDS
 
 
 def test_select_frontier():
@@ -383,7 +383,8 @@ def test_the_cycle_forms_a_batch_only_from_two_or_more_eligible_prs():
     assert picked(left) == [] and d.turn_order(rows(*left)[0])[0] == 4
     assert d.turn_due(*rows(*left)) == 4
     # every PR owes its own adversarial verify before its turn: none is eligible
-    verify = d.resolve_config({"gate": {"ci": "local", "local_command": "x", "adversarial_verify": True}})
+    verify = d.resolve_config({"gate": {"ci": "local", "local_command": "x",
+                                        "adversarial_verify_prompt": "re-derive it"}})
     assert picked(waiting, cfg=verify) == []
     assert [d.batches_form(c) for c in (on, off, verify)] == [True, False, False]
 
@@ -472,7 +473,7 @@ def test_validate_config():
         d.validate_config(d.resolve_config({"claim_namespace": ns}))
     assert set(d.CLAIM_NAMESPACES) == {"refs/afk", "refs/heads"}
     assert d.BRANCH_NAMESPACE in d.CLAIM_NAMESPACES
-    assert d.CONFIG_DEFAULTS["claim_namespace"] in d.CLAIM_NAMESPACES
+    assert d.CONFIG_SETTLED["claim_namespace"] in d.CLAIM_NAMESPACES
     for bad_ns in ("afk", "heads/afk", "refs/afk/", "", "refs/heads/afk", "refs/x", None):
         try:
             d.validate_config(d.resolve_config({"claim_namespace": bad_ns}))
@@ -498,7 +499,7 @@ def test_validate_config():
                 assert False, f"expected ValueError for merge.{key}"
             except ValueError as e:
                 assert f"merge.{key}" in str(e) and "removed" in str(e) and "Delete the key" in str(e)
-    assert set(d.CONFIG_DEFAULTS["merge"]) == {"target", "sync_before_merge", "delete_branch"}
+    assert "merge" not in d.CONFIG_DEFAULTS
 
 
 def test_gate_verdict():
@@ -788,7 +789,7 @@ def test_a_batch_shows_on_the_board_in_the_brief_and_in_the_working_set():
               "branch": "u/afk-batch-me-100", "worktree_path": "/w/batch",
               "members": [{"issue": 1, "pr": 10, "title": "one {braces}"},
                           {"issue": 2, "pr": 20, "title": "two"}],
-              "afk_path": "/s/afk.py", "config": '{"merge": {"batch": true}}',
+              "afk_path": "/s/afk.py", "config": '{"retry": 2}',
               "launcher_terminal": "term_1"}
     brief = d.render_batch_brief(template, fields)
     assert "/s/afk.py land --batch me-100 --repo acme/widgets --config " in brief
@@ -808,8 +809,7 @@ def test_a_batch_shows_on_the_board_in_the_brief_and_in_the_working_set():
         ["leave", "continue", "nudge", "abandon"]
 
     # --- the working set: a batch's members are `landing` rows that name it ---
-    cfg = d.resolve_config({"gate": {"ci": "local", "local_command": "make test"},
-                            "merge": {"batch": True}})
+    cfg = d.resolve_config({"gate": {"ci": "local", "local_command": "make test"}})
     issues = [{"number": n, "title": f"i{n}", "labels": ["ready-for-agent"], "updatedAt": "t"}
               for n in (1, 2, 3)]
     prs = [{"number": n * 10, "headRefOid": f"h{n}", "statusCheckRollup": [],
@@ -1412,20 +1412,14 @@ def test_branch_regex_and_candidates():
         "sunfmin/issue-10-takeover",
         "sunfmin/feature/issue-9-nope",          # slug never spans a slash
     ]
-    got = d.branch_candidates(heads, "issue-{number}-{slug}", 9)
+    got = d.branch_candidates(heads, 9)
     assert got == ["issue-9-continuation-second-try", "sunfmin/issue-9-continuation"], got
 
     # the number is the one field that is NOT a wildcard: 9 never matches 90
-    assert d.branch_candidates(heads, "issue-{number}-{slug}", 90) == \
+    assert d.branch_candidates(heads, 90) == \
         ["sunfmin/issue-90-calibration"]
-    assert d.branch_candidates(heads, "issue-{number}-{slug}", 11) == []
-    assert d.branch_candidates(None, "issue-{number}-{slug}", 9) == []
-
-    # a pattern with regex metacharacters in its literal part is matched literally
-    assert d.branch_regex("wip.{number}", 9).match("wip.9")
-    assert not d.branch_regex("wip.{number}", 9).match("wipX9")
-    # a pattern with no {slug} still works, and a bare {number} needs the whole name
-    assert d.branch_candidates(["afk/9", "afk/91"], "afk/{number}", 9) == ["afk/9"]
+    assert d.branch_candidates(heads, 11) == []
+    assert d.branch_candidates(None, 9) == []
 
 
 def test_find_orca_worktree():
@@ -1699,29 +1693,19 @@ def test_render_status_board():
             pass
 
 
-PACE_CFG = {"busy_interval_seconds": 90, "idle_interval_seconds": 1500,
-            "idle_ticks_before_sleep": 3, "claim_lease_ttl_seconds": TTL,
-            "fingerprint_gate": True, "force_tick_after_skips": 6}
-
-
 def test_pace():
-    cfg = PACE_CFG
     # did work → busy
-    assert d.pace(True, 0, 0, cfg) == 90
-    # in-flight → busy, and under the ttl/2 cap, however long the streak
-    assert d.pace(False, 2, 9, cfg) == 90
+    assert d.pace(True, 0, 0) == 90
+    # in-flight → busy, however long the streak
+    assert d.pace(False, 2, 9) == 90
     # idle but recently active (streak < threshold) → stay busy for stragglers
-    assert d.pace(False, 0, 2, cfg) == 90
+    assert d.pace(False, 0, 2) == 90
     # idle past threshold → idle interval
-    assert d.pace(False, 0, 3, cfg) == 1500
-    # ttl/2 cap actually bites when the interval would exceed it while holding a claim
-    assert d.pace(False, 1, 0, {**cfg, "busy_interval_seconds": 999999}) == TTL // 2
-    # pace re-applies no default: a config arriving here is canonical
-    try:
-        d.pace(False, 0, 9, {})
-        assert False, "expected a KeyError: pace must not re-apply defaults"
-    except KeyError:
-        pass
+    assert d.pace(False, 0, 3) == 1500
+    # the sleep while a claim is held can never let its lease lapse: the heartbeat
+    # a skipped cycle sends is due well inside it (ADR-0003)
+    assert d.BUSY_INTERVAL_SECONDS <= d.CLAIM_LEASE_TTL_SECONDS // 2
+    assert d.CLAIM_LEASE_TTL_SECONDS == 3 * d.IDLE_INTERVAL_SECONDS
 
 
 FACTS = {"instance": "fl-1", "worker_command": "ckimi --yolo"}
@@ -1763,10 +1747,10 @@ def _did(**did):
 
 
 def test_cycle_ticked_folds_what_the_tick_did_and_counts_empty_ticks():
-    cfg, st = PACE_CFG, d.cycle_state(None, **FACTS)
+    st = d.cycle_state(None, **FACTS)
 
     def ticked(state, **did):
-        return d.cycle_ticked(state, _did(**did), cfg)
+        return d.cycle_ticked(state, _did(**did))
 
     # an EMPTY tick: nothing done, nothing in flight, nothing left to dispatch
     r = ticked(st)
@@ -1794,7 +1778,7 @@ def test_cycle_ticked_folds_what_the_tick_did_and_counts_empty_ticks():
     # tick itself wrote is not a change next cycle; with it, the board each claim
     # still held was left with
     left = d.cycle_ticked({**st, "fingerprint": "abc", "boards": {"9": "old"}}, _did(in_flight=1),
-                          cfg, left="def", boards={4: "0a1b2c3d"})["state"]
+                          left="def", boards={4: "0a1b2c3d"})["state"]
     assert (left["fingerprint"], left["boards"]) == ("def", {"4": "0a1b2c3d"})
     assert d.cycle_state(left) == left
     assert ticked({**st, "boards": {"9": "old"}})["state"]["boards"] == {"9": "old"}
@@ -1808,14 +1792,14 @@ def test_cycle_ticked_folds_what_the_tick_did_and_counts_empty_ticks():
     # a tick that returned a judgment sleeps 0 — the caller answers and opens the
     # next cycle at once — and one that left a judgment or an error is unsettled:
     # never empty, and the next cycle ticks whatever the digest says
-    asked = d.cycle_ticked(r["state"], _did(), cfg, judgments=2)
+    asked = d.cycle_ticked(r["state"], _did(), judgments=2)
     assert (asked["sleep_seconds"], asked["state"]["unsettled"]) == (0, True)
     assert asked["state"]["empty_streak"] == 0 and "2 judgments open" in asked["progress"]
-    failed = d.cycle_ticked(r["state"], _did(), cfg, errors=1)
+    failed = d.cycle_ticked(r["state"], _did(), errors=1)
     assert (failed["sleep_seconds"], failed["state"]["unsettled"]) == (90, True)
     # a PR that opened while the tick ran is in the digest it keeps, unseen: the
     # next cycle is opened at once, and ticks
-    missed = d.cycle_ticked(r["state"], _did(in_flight=2), cfg, unseen=1)
+    missed = d.cycle_ticked(r["state"], _did(in_flight=2), unseen=1)
     assert (missed["sleep_seconds"], missed["state"]["unsettled"]) == (0, True)
     assert missed["progress"] == "1 PR opened meanwhile; 2 in flight, 0 left on the frontier"
     assert "1 error;" in failed["progress"]
@@ -1823,7 +1807,7 @@ def test_cycle_ticked_folds_what_the_tick_did_and_counts_empty_ticks():
 
 
 def test_cycle_drained_folds_the_stop_and_schedules_nothing():
-    st = d.cycle_ticked(d.cycle_state(None, **FACTS), _did(in_flight=3), PACE_CFG)["state"]
+    st = d.cycle_ticked(d.cycle_state(None, **FACTS), _did(in_flight=3))["state"]
     r = d.cycle_drained(st, [1, 2], [7])
     assert r["progress"] == "drained; released #1, #2; kept #7"
     assert r["sleep_seconds"] is None                          # no cycle follows a drain
@@ -1837,55 +1821,48 @@ def test_cycle_drained_folds_the_stop_and_schedules_nothing():
 
 
 def test_cycle_wake_gates_beats_and_paces_a_skipped_cycle():
-    cfg, st = PACE_CFG, d.cycle_state(None, **FACTS)
-    first = d.cycle_wake(st, "aaa", cfg)
+    st = d.cycle_state(None, **FACTS)
+    first = d.cycle_wake(st, "aaa")
     assert (first["action"], first["reason"]) == ("tick", "first")
     assert first["state"]["fingerprint"] == "aaa"
     # a tick owes its sleep to cycle_ticked, not to the gate
     assert set(first) == {"action", "reason", "state"}
 
     # unchanged + idle fleet → skip; each such skip is itself an empty cycle
-    idle = d.cycle_ticked(first["state"], _did(), cfg)["state"]
-    s1 = d.cycle_wake(idle, "aaa", cfg)
+    idle = d.cycle_ticked(first["state"], _did())["state"]
+    s1 = d.cycle_wake(idle, "aaa")
     assert (s1["action"], s1["reason"], s1["heartbeat"]) == ("skip", "unchanged", False)
     assert (s1["state"]["skips"], s1["state"]["empty_streak"], s1["sleep_seconds"]) == (1, 2, 90)
     assert s1["progress"] == "nothing moved; 0 in flight, 0 left on the frontier"
-    s2 = d.cycle_wake(s1["state"], "aaa", cfg)
+    s2 = d.cycle_wake(s1["state"], "aaa")
     assert (s2["state"]["empty_streak"], s2["sleep_seconds"]) == (3, 1500)
 
     # unchanged while HOLDING claims → skip, but beat, stay busy, and never count as empty
-    held = d.cycle_ticked(first["state"], _did(in_flight=2), cfg)["state"]
-    h = d.cycle_wake(held, "aaa", cfg)
+    held = d.cycle_ticked(first["state"], _did(in_flight=2))["state"]
+    h = d.cycle_wake(held, "aaa")
     assert (h["action"], h["heartbeat"], h["sleep_seconds"]) == ("skip", True, 90)
     assert h["state"]["empty_streak"] == 0
-    long_busy = {**cfg, "busy_interval_seconds": 999999}
-    assert d.cycle_wake(held, "aaa", long_busy)["sleep_seconds"] == TTL // 2     # the lease cap
     # frontier left over (the tick had no free slot) is not empty either
-    waiting = d.cycle_ticked(first["state"], _did(frontier_remaining=3), cfg)["state"]
-    assert d.cycle_wake(waiting, "aaa", cfg)["state"]["empty_streak"] == 0
+    waiting = d.cycle_ticked(first["state"], _did(frontier_remaining=3))["state"]
+    assert d.cycle_wake(waiting, "aaa")["state"]["empty_streak"] == 0
 
     # changed → tick; the Nth consecutive skip → a forced tick
-    moved = d.cycle_wake(s2["state"], "bbb", cfg)
+    moved = d.cycle_wake(s2["state"], "bbb")
     assert (moved["action"], moved["reason"], moved["state"]["skips"]) == ("tick", "changed", 0)
-    forced = d.cycle_wake({**idle, "skips": 5}, "aaa", cfg)
+    forced = d.cycle_wake({**idle, "skips": 5}, "aaa")
     assert (forced["action"], forced["reason"], forced["state"]["skips"]) == ("tick", "forced", 0)
     # the streak survives a tick decision: only cycle_ticked resets it
     assert moved["state"]["empty_streak"] == 3
 
     # the last tick left a judgment open or met an error: unchanged is not a skip
-    owed = d.cycle_wake({**idle, "unsettled": True, "skips": 2}, "aaa", cfg)
+    owed = d.cycle_wake({**idle, "unsettled": True, "skips": 2}, "aaa")
     assert (owed["action"], owed["reason"], owed["state"]["skips"]) == ("tick", "unsettled", 0)
 
     # a wake that arrived while the last cycle was running: the digest that cycle
     # kept may already hold what the wake announced, so unchanged is not a skip
-    woke = d.cycle_wake({**idle, "skips": 2}, "aaa", cfg, woke=True)
+    woke = d.cycle_wake({**idle, "skips": 2}, "aaa", woke=True)
     assert (woke["action"], woke["reason"], woke["state"]["skips"]) == ("tick", "wake", 0)
-    assert d.cycle_wake(idle, "bbb", cfg, woke=True)["reason"] == "changed"
-
-    # fingerprint_gate off → always a tick, and nothing was gathered to digest
-    off = d.cycle_wake({**idle, "skips": 3}, None, {**cfg, "fingerprint_gate": False})
-    assert (off["action"], off["reason"]) == ("tick", "gate_off")
-    assert off["state"]["fingerprint"] == "aaa" and off["state"]["skips"] == 0
+    assert d.cycle_wake(idle, "bbb", woke=True)["reason"] == "changed"
 
 
 CALL = {"afk_path": "/skill/scripts/afk.py", "repo": "acme/widgets", "instance": "fl-1",
@@ -1924,8 +1901,7 @@ def test_a_tick_asks_after_waiting_workers_and_grants_one_turn():
 
 def test_turn_step_routes_every_outcome_or_returns_the_judgment():
     cfg = d.resolve_config({})
-    verify = d.resolve_config({"gate": {"adversarial_verify": True,
-                                        "adversarial_verify_prompt": "be harsh"}})
+    verify = d.resolve_config({"gate": {"adversarial_verify_prompt": "be harsh"}})
 
     def step(outcome, config=cfg):
         return d.turn_step(CALL, {"issue": 4, "pr": 30, "head": "abc123", "outcome": outcome},
@@ -2192,16 +2168,15 @@ def test_find_orca_repo_and_worktree_name():
     assert d.find_orca_repo(repos, "acme/widget") is None             # never a prefix match
     assert d.find_orca_repo(None, "acme/widgets") is None
 
-    name = d.worktree_name("issue-{number}-{slug}", 31, "Fix the  Names inspector: tab (v2)!")
+    name = d.worktree_name(31, "Fix the  Names inspector: tab (v2)!")
     assert name == "issue-31-fix-the-names-inspector-tab-v2"
     # the name it produces is one recovery recognises as this issue's branch
     assert d.branch_candidates([f"sunfmin/{name}", f"sunfmin/{name}-2", "sunfmin/issue-3-x"],
-                               "issue-{number}-{slug}", 31) == [f"sunfmin/{name}", f"sunfmin/{name}-2"]
-    assert d.worktree_name("issue-{number}-{slug}", 4, "中文标题") == "issue-4-work"
-    assert d.worktree_name("issue-{number}-{slug}", 4, None) == "issue-4-work"
-    long = d.worktree_name("issue-{number}-{slug}", 4, "word " * 40)
+                               31) == [f"sunfmin/{name}", f"sunfmin/{name}-2"]
+    assert d.worktree_name(4, "中文标题") == "issue-4-work"
+    assert d.worktree_name(4, None) == "issue-4-work"
+    long = d.worktree_name(4, "word " * 40)
     assert len(long) <= len("issue-4-") + 40 and not long.endswith("-")
-    assert d.worktree_name("afk/{number}", 9, "anything") == "afk/9"
 
 
 def test_closing_pr_and_superseded_prs():
@@ -2218,9 +2193,9 @@ def test_closing_pr_and_superseded_prs():
     assert d.closing_pr(prs, 4)["number"] == 32 and d.closing_pr(prs, 99) is None
     # a fresh start closes only what the FLEET opened for THIS issue: fleet-shaped
     # branch AND closes the issue — never a human's PR, never issue 30's
-    assert [p["number"] for p in d.superseded_prs(prs, 3, "issue-{number}-{slug}")] == [30, 31]
-    assert d.superseded_prs(prs, 4, "issue-{number}-{slug}") == []
-    assert d.superseded_prs(None, 3, "issue-{number}-{slug}") == []
+    assert [p["number"] for p in d.superseded_prs(prs, 3)] == [30, 31]
+    assert d.superseded_prs(prs, 4) == []
+    assert d.superseded_prs(None, 3) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -2423,7 +2398,7 @@ def test_a_tick_grants_at_most_one_landing_turn():
     assert done["did"]["granted"] == []
     # a merge batch is that one turn: formed from the PRs free to land together,
     # and no single turn beside it
-    batching = d.resolve_config({"merge": {"batch": True}, "gate": {"ci": "local"}})
+    batching = d.resolve_config({"gate": {"ci": "local"}})
     formed = {"outcome": "granted", "batch": "b9", "issues": [1, 2, 3]}
     steps, done = _play(_working_set(mine=waiting), {"batch-turn": formed}, config=batching)
     assert _brief(steps) == [("batch-turn",), ("heartbeat",), ("sweep",)]
@@ -2531,9 +2506,6 @@ def test_a_tick_runs_its_stages_in_one_order_and_writes_each_board_once():
     assert [(j["issue"], j["kind"]) for j in done["judgments"]] == [(6, "reason"), (4, "empty_diff")]
     # the boards still mine to remember: every claim held as the tick ends
     assert done["held"] == {1, 2, 4, 5, 6, 8, 9, 20, 30, 31, 32}
-    # `progress_comment: false` writes none
-    quiet = d.resolve_config({"progress_comment": False})
-    assert not [s for s in _play(ws, causes=causes, config=quiet)[0] if s["do"] == "status"]
 
 
 def test_a_landing_worker_silent_after_its_nudge_is_restarted_onto_its_turn():
@@ -2597,7 +2569,7 @@ def _prompt_template():
 PROMPT_FIELDS = {"n": 31, "title": "Names inspector tab", "repo": "acme/widgets",
                  "base_branch": "main", "local_command": "make test",
                  "afk_path": "/skills/afk fleet/scripts/afk.py",
-                 "config": '{"merge": {"target": "main"}}',
+                 "config": '{"base_branch": "main"}',
                  "branch": "sunfmin/issue-31-names", "worktree_path": "/wt/issue-31",
                  "launcher_terminal": "term_launcher-1"}
 
@@ -2674,7 +2646,7 @@ def test_a_worker_reads_the_one_way_its_pr_lands_when_it_holds_the_turn():
     t = _prompt_template()
     # the config travels whole, quoted for the worker's shell — and it is free text
     # to the template: a `{branch}` or an apostrophe inside it arrives verbatim
-    config = json.dumps({"merge": {"target": "main"}, "note": "it's {branch} {title} {pr}"})
+    config = json.dumps({"base_branch": "main", "note": "it's {branch} {title} {pr}"})
     fields = {**PROMPT_FIELDS, "config": config}
     land = d.land_command(fields["afk_path"], 31, "acme/widgets", config)
     assert land == ("'/skills/afk fleet/scripts/afk.py' land --issue 31 --repo acme/widgets "
@@ -2882,7 +2854,7 @@ def test_assemble_working_set():
         {"number": 6, "instance": "peerB", "sha": "s6"},
     ]
     heartbeats = {"me": now - 10, "peerA": now - 100, "peerB": now - TTL - 999}
-    cfg = d.resolve_config({"epic_labels": ["epic", "prd"], "claim_lease_ttl_seconds": TTL})
+    cfg = d.resolve_config({"epic_labels": ["epic", "prd"]})
     ws = d.assemble_working_set(issues, prs, claims, heartbeats, "me", now, cfg)
 
     # frontier: the join (claimed / has_open_pr / blockers) grafted in code, titles ride along
@@ -2966,10 +2938,10 @@ def test_assemble_working_set():
     assert ws4["stale_closed"] == [{"number": 6, "instance": "peerB", "sha": "s6"}]
     assert ws4["peer_live"] == ws["peer_live"] and ws4["mine"] == ws["mine"]
 
-    # the lease the partition uses is the CONFIG's: shorten it and the live peer goes stale
-    short = d.assemble_working_set(issues, prs, claims, heartbeats, "me", now,
-                                   {**cfg, "claim_lease_ttl_seconds": 50})
-    assert [s["number"] for s in short["stale"]] == [5, 6] and short["peer_live"] == []
+    # the lease the partition uses is the fleet's one lease: once that much time has
+    # passed since the live peer's beat, it is stale too
+    late = d.assemble_working_set(issues, prs, claims, heartbeats, "me", now + TTL, cfg)
+    assert [s["number"] for s in late["stale"]] == [5, 6] and late["peer_live"] == []
 
     # several open PRs closing one issue → the highest PR number is the live attempt
     two_prs = prs + [{"number": 31, "headRefOid": "bbb", "updatedAt": "T8",
@@ -2986,22 +2958,17 @@ def test_parse_config_yaml():
 ready_label: ready-for-agent          # trailing comment
 epic_labels: [epic, prd]
 concurrency: 5
-worktree_cleanup: false
-branch_pattern: "issue-{number}-{slug}"   # quoted value with a # inside comment
+escalate_label: "needs-#human"            # quoted value with a # inside, then a comment
 gate:
   ci: required
-  adversarial_verify: true
-merge:
-  target: trunk
+  adversarial_verify_prompt: re-derive it
 retry: 3
 """
     p = d.parse_config_yaml(text)
     assert p["ready_label"] == "ready-for-agent"
     assert p["epic_labels"] == ["epic", "prd"]
-    assert p["concurrency"] == 5 and p["worktree_cleanup"] is False
-    assert p["branch_pattern"] == "issue-{number}-{slug}"
-    assert p["gate"] == {"ci": "required", "adversarial_verify": True}
-    assert p["merge"] == {"target": "trunk"}
+    assert p["concurrency"] == 5 and p["escalate_label"] == "needs-#human"
+    assert p["gate"] == {"ci": "required", "adversarial_verify_prompt": "re-derive it"}
     assert p["retry"] == 3          # top-level scalar after a section closes it
 
     # a whole markdown file: the first ```yaml fence is the config
@@ -3024,22 +2991,22 @@ retry: 3
     # a RENAMED key fails loudly with its migration note — never silently defaulted,
     # which would leave a config file quietly lying to its author (ADR-0009/ADR-0012)
     try:
-        d.parse_config_yaml("merge:\n  rebase_before_merge: true")
-        assert False, "expected ValueError for the retired rebase_before_merge key"
+        d.parse_config_yaml("merge:\n  target: trunk")
+        assert False, "expected ValueError for the renamed merge.target key"
     except ValueError as e:
-        assert "merge.sync_before_merge" in str(e) and "ADR-0012" in str(e)
-    assert d.parse_config_yaml("merge:\n  sync_before_merge: false") == \
-        {"merge": {"sync_before_merge": False}}
+        assert "renamed to 'base_branch'" in str(e) and "ADR-0038" in str(e)
 
 
 def test_resolve_config():
     full = d.resolve_config({})
     assert full["concurrency"] == 3 and full["gate"]["ci"] == "required"
-    r = d.resolve_config({"concurrency": 5, "gate": {"adversarial_verify": True}})
+    r = d.resolve_config({"concurrency": 5, "gate": {"local_command": "make test"}})
     assert r["concurrency"] == 5
-    # deep-merge keeps sibling defaults; untouched sections stay whole
-    assert r["gate"]["adversarial_verify"] is True and r["gate"]["ci"] == "required"
-    assert r["merge"]["target"] == "main"
+    # deep-merge keeps sibling defaults; untouched keys stay whole
+    assert r["gate"]["local_command"] == "make test" and r["gate"]["ci"] == "required"
+    assert r["base_branch"] == "main"
+    # the settled field rides in the canonical config, though no file sets it
+    assert r["claim_namespace"] == "refs/afk" and "claim_namespace" not in d.CONFIG_DEFAULTS
     # idempotent: resolving canonical config is a no-op
     assert d.resolve_config(r) == r
 
@@ -3058,7 +3025,7 @@ def test_override_config_types_every_key_like_the_file_does():
     samples = {bool: ("false", False), int: ("123", 123), list: ("[a, b]", ["a", "b"]),
                str: ("some value", "some value")}
     seen = 0
-    for dotted, default in _leaves(d.CONFIG_DEFAULTS):
+    for dotted, default in _leaves({**d.CONFIG_DEFAULTS, "claim_namespace": "refs/afk"}):
         raw, want = samples[type(default)]
         if default == want:                               # make the override visible
             raw, want = ("true", True) if isinstance(default, bool) else (raw + "x", want + "x")
@@ -3072,7 +3039,7 @@ def test_override_config_types_every_key_like_the_file_does():
         (other[section] if section else other)[key] = want
         assert cfg == other, dotted
         seen += 1
-    assert seen == len(list(_leaves(d.CONFIG_DEFAULTS))) > 20
+    assert seen == len(list(_leaves(d.CONFIG_DEFAULTS))) + 1 == 10
 
     cfg = d.resolve_config({})
     assert d.override_config(cfg, None) == d.resolve_config({}) == d.override_config(cfg, [])
@@ -3088,7 +3055,7 @@ def test_override_config_types_every_key_like_the_file_does():
                 "nope.ci=local",        # unknown section
                 "retry.ci=1",           # a scalar is not a section
                 "retry=soon",           # wrong type, by the file's own rules
-                "worktree_cleanup=yes",
+                "concurrency=many",
                 "epic_labels=a,b",
                 "=3", ""):
         try:
@@ -3180,8 +3147,7 @@ def test_template_matches_defaults():
         text = f.read()
     parsed = d.parse_config_yaml(text)
     # a key with a closed set of values spells that set out, exactly
-    for choices in (d.CLAIM_NAMESPACES, d.GATE_CI_MODES):
-        assert " | ".join(choices) in text, f"template does not list {' | '.join(choices)}"
+    assert " | ".join(d.GATE_CI_MODES) in text, "template does not list the gate.ci modes"
     full = d.resolve_config({})
     for k, v in parsed.items():
         if isinstance(v, dict):
@@ -3191,8 +3157,7 @@ def test_template_matches_defaults():
             assert full[k] == v, f"template drifted at {k}: {v!r}"
     # and the template shows every key the schema knows (nothing undocumented)
     assert set(parsed) == set(d.CONFIG_DEFAULTS)
-    for k in ("gate", "merge"):
-        assert set(parsed[k]) == set(d.CONFIG_DEFAULTS[k]), f"template missing keys in {k}:"
+    assert set(parsed["gate"]) == set(d.CONFIG_DEFAULTS["gate"]), "template missing gate keys"
 
 
 def test_detect_runtime_from_env():

@@ -922,6 +922,12 @@ def cycle(w, state=None, *extra, now=T0):
     return w.afk("cycle", *R, "--now", str(now), *carried, *extra)
 
 
+def tick(w, state=None, *extra, now=T0):
+    """One `afk cycle` that runs its tick whatever the digest says, as after a
+    wake: time passing is the one thing a tick acts on that no digest holds."""
+    return cycle(w, state, *extra, "--wake", now=now)
+
+
 def answer(w, command):
     """Run the command a judgment handed back, exactly as written → its JSON."""
     p = subprocess.run(command, shell=True, cwd=w.cwd, capture_output=True, text=True, env=w.env)
@@ -981,8 +987,6 @@ def test_cycle_gates_ticks_paces_and_beats_through_a_whole_run():
         assert (late["action"], late["heartbeat"]["refreshed"]) == ("skip", True)
         # …and does not itself move the digest it is gated on
         assert cycle(w, late["state"])["action"] == "skip"
-        # the sleep under a held claim is capped at half the lease, whatever the config
-        assert cycle(w, held, "--set", "busy_interval_seconds=99999")["sleep_seconds"] == TTL // 2
 
         # each kind of movement a tick would act on wakes it
         w.set(prs=[pr(30, closes=2, conclusion="FAILURE")])
@@ -1004,18 +1008,12 @@ def test_cycle_gates_ticks_paces_and_beats_through_a_whole_run():
         assert "heartbeat" not in s2                                  # holding nothing: no beat
         s3 = cycle(w, s2["state"])
         assert (s3["state"]["empty_streak"], s3["sleep_seconds"]) == (3, 1500)   # idle, at last
-        assert cycle(w, s2["state"], "--set", "idle_ticks_before_sleep=9")["sleep_seconds"] == 90
 
-        # the forced full tick: default every 6 skips, from --config, or --set — --set wins
+        # the forced full tick: every 6th cycle in a row that would have skipped
         assert cycle(w, {**s3["state"], "skips": 5})["reason"] == "forced"
-        short = ("--config", json.dumps({"force_tick_after_skips": 3}))
-        assert cycle(w, s3["state"], *short)["reason"] == "forced"
-        assert cycle(w, s3["state"], *short, "--set", "force_tick_after_skips=9")["action"] == "skip"
+        assert cycle(w, {**s3["state"], "skips": 4})["action"] == "skip"
         # an empty TICK counts exactly like an empty skip
         assert cycle(w, {**s2["state"], "skips": 5})["sleep_seconds"] == 1500
-        # the gate switched off: always a tick
-        off = cycle(w, s3["state"], "--set", "fingerprint_gate=false")
-        assert (off["action"], off["reason"], off["state"]["skips"]) == ("tick", "gate_off", 0)
 
         # a state the caller mangled is an error, never a fleet paced on zeros
         assert "--state" in w.error("cycle", *R, "--state", json.dumps({"fingerprint": "x"}))
@@ -1252,7 +1250,7 @@ def test_a_closed_pr_is_gone_from_the_reads_after_it():
         with inside(w) as rem:
             *_, prs, heads, comments = _read_everything(rem, 1, 10)
             assert [p["number"] for p in prs] == [10] and d["branch"] in heads and not comments
-            afk._close_pr(REPO, rem, 10, "superseded", delete_branch=True)
+            afk._close_pr(REPO, rem, 10, "superseded")
             assert afk._open_prs(REPO) == [] and d["branch"] not in afk._remote_heads(rem)
             assert [c["body"] for c in afk._issue_comments(REPO, 10)] == ["superseded"]
 
@@ -1265,7 +1263,7 @@ def test_a_merged_pr_and_the_issue_it_closed_are_gone_from_the_reads_after_it():
         with inside(w) as rem:
             issues, one, state, prs, heads, _ = _read_everything(rem, 1, 10)
             assert (len(issues), one["state"], state) == (2, "open", "open")
-            afk._merge_pr(REPO, rem, prs[0], head, delete_branch=True)
+            afk._merge_pr(REPO, rem, prs[0], head)
             assert afk._open_prs(REPO) == [] and d["branch"] not in afk._remote_heads(rem)
             assert afk._issue_state(REPO, 1) == "closed" and afk._issue(REPO, 1)["state"] == "closed"
             assert [i["number"] for i in afk._open_issues(REPO)] == [2]
@@ -1487,15 +1485,17 @@ def test_one_tick_reads_each_thing_once_and_sees_its_own_writes():
         w.calls()
 
         r = w.afk("cycle", *R, *ME, "--worker-command", WORKER, "--now", str(now),
-                  "--set", "concurrency=4", "--set", "fingerprint_gate=false", env=w.spans())
+                  "--set", "concurrency=4", env=w.spans())
         assert "errors" not in r and r["judgments"] == [], r
         assert r["progress"] == ("landing turn to #6; dispatched #1; reclaimed #8; nudged #7; "
                                  "4 in flight, 0 left on the frontier"), r["progress"]
+        # each list is read twice and no more: once for the tick, and once for the
+        # digest of what the tick left — taken after its last write
         calls = w.calls()
-        assert len([c for c in calls if c[:2] == ["pr", "list"]]) == 1
+        assert len([c for c in calls if c[:2] == ["pr", "list"]]) == 2
         assert len([c for c in calls if c[:2] == ["api", "--paginate"]
-                    and "/issues?" in c[2]]) == 1
-        assert len(w.spanned("git", "fetch", "afk-scan")) == 1
+                    and "/issues?" in c[2]]) == 2
+        assert len(w.spanned("git", "fetch", "afk-scan")) == 2
         turn_reads = [c for c in calls if c[:2] == ["api", "--paginate"]
                       and c[2] == f"repos/{REPO}/issues/60/comments"]
         assert len(turn_reads) == 1 and len(_turns(w, 60)) == 1
@@ -1503,8 +1503,7 @@ def test_one_tick_reads_each_thing_once_and_sees_its_own_writes():
         # no create-only push it would lose to itself, no second look at the refs
         assert w.claimed_by(8) == "me" and 8 in {wt["linkedIssue"] for wt in w.worktrees()}
         assert len(w.spanned("git", "push", "refs/afk/claim/8")) == 1
-        # with the gate on, the one further gather is the digest of what the tick
-        # left — taken after its last write, so it holds every one of them
+        # that digest holds every write the tick made
         state = cycle(w, None, "--set", "concurrency=4", now=now + 1)["state"]
         assert state["fingerprint"] == w.afk("rebuild", *ME, *R)["fingerprint"]
 
@@ -1591,7 +1590,7 @@ def test_what_changed_while_a_tick_ran_still_gets_a_tick():
     made on GitHub while the tick ran is inside that digest, unseen. Nothing is
     lost: the forced tick finds it, and a wake that arrived meanwhile — which the
     launcher passes on as `--wake` — makes the very next cycle tick."""
-    forced = ("--set", "force_tick_after_skips=2", "--set", "concurrency=5")
+    forced = ("--set", "concurrency=5")
     with world(issues=[issue(1, "ready-for-agent")]) as w:
         # #2 is filed while the tick that dispatches #1 is writing #1's board
         w.set(arrives_mid_tick=[issue(2, "ready-for-agent")])
@@ -1602,7 +1601,7 @@ def test_what_changed_while_a_tick_ran_still_gets_a_tick():
         quiet = cycle(w, first["state"], *forced)
         assert (quiet["action"], quiet["reason"]) == ("skip", "unchanged")
         # …and the forced tick picks it up
-        caught = cycle(w, quiet["state"], *forced)
+        caught = cycle(w, {**quiet["state"], "skips": 5}, *forced)
         assert (caught["action"], caught["reason"]) == ("tick", "forced")
         assert caught["progress"].startswith("dispatched #2; 2 in flight")
 
@@ -1710,7 +1709,7 @@ def _judged(r):
     return {j["issue"]: j for j in r["judgments"]}
 
 
-_VERIFY = ("--set", "gate.adversarial_verify=true")
+_VERIFY = ("--set", "gate.adversarial_verify_prompt=re-derive it")
 
 
 def _each_judgment_comes_with_a_command_for_either_answer(pick, verify=()):
@@ -1856,7 +1855,7 @@ def _comment(cid, body):
 
 def test_no_pr_gathers_every_signal_and_decides_in_one_call():
     with world(issues=[issue(4, "ready-for-agent"), issue(41), issue(42)]) as w:
-        cfg = json.dumps({"base_branch": w.sb.base, "worker_idle_grace_seconds": 300})
+        cfg = json.dumps({"base_branch": w.sb.base})
         base = ("--issue", "4", *R, "--config", cfg)
         w.orca([_orca_row(4, w.cwd)],
                terminals=[{"handle": "term-1", "worktreePath": w.cwd, "sent": [], "open": True}])
@@ -1911,10 +1910,7 @@ def test_no_pr_gathers_every_signal_and_decides_in_one_call():
         assert (r["outcome"], r["idle_seconds"], r["worker_state"]) == ("idle_stalled", 400, "done")
         w.worker(output=int(later) - 1, state="waiting", since=int(later) - 100)
         assert w.no_pr(*base, "--now", later)["outcome"] == "coding"     # stopped within grace
-        # grace: --set beats config
         w.worker(output=int(later) - 400, state="done", since=int(later) - 400)
-        r = w.no_pr(*base, "--now", later, "--set", "worker_idle_grace_seconds=99999")
-        assert r["outcome"] == "coding"
         # no live terminal: gone — also decided from orca alone
         terms = w.terminals()
         terms[0]["open"] = False
@@ -1990,7 +1986,7 @@ def test_a_silent_worker_is_nudged_once_and_its_screen_explains_the_failure():
     with world(issues=[issue(7, "ready-for-agent")]) as w:
         d = w.afk(*dispatch(7))
         wt, real_now = d["worktree"], int(time.time())
-        cfg = ("--config", json.dumps({"base_branch": w.sb.base, "worker_idle_grace_seconds": 300}))
+        cfg = ("--config", json.dumps({"base_branch": w.sb.base}))
         nudge = ("nudge", "--issue", "7", *ME, *R, *cfg)
 
         def no_pr(at, busy=False):
@@ -2162,7 +2158,7 @@ def test_a_busy_or_gone_worker_costs_no_git_and_no_github_read():
         assert gh and progress_reads
 
     with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
-        gate = (*_counted(w), "--set", "fingerprint_gate=false")
+        gate = _counted(w)
         for n in (1, 2):
             with_pr(w, n, n * 10, gate=gate)
         now = int(time.time()) + 5000
@@ -2238,9 +2234,9 @@ def test_config_file_loads_validates_and_round_trips():
                 f.write("# config\n\n```yaml\n" + yaml + "\n```\n")
             return path
 
-        cfg = w.afk("config", "--file", load("retry: 4\nclaim_namespace: refs/heads\ngate:\n  ci: local\n"
+        cfg = w.afk("config", "--file", load("retry: 4\ngate:\n  ci: local\n"
                                              "  local_command: make test"))
-        assert cfg["retry"] == 4 and cfg["claim_namespace"] == "refs/heads"
+        assert cfg["retry"] == 4 and cfg["claim_namespace"] == "refs/afk"
         assert cfg["gate"] == {**defaults["gate"], "ci": "local", "local_command": "make test"}
         # canonical JSON fed back as --config is a fixed point for every consumer
         assert w.afk("rebuild", *ME, *R, *NOW, "--config", json.dumps(cfg))["free_slots"] == \
@@ -2249,8 +2245,12 @@ def test_config_file_loads_validates_and_round_trips():
 
         for bad, why in (("retyr: 4", "unknown key"),
                          ("gate:\n  ci: local", "local_command"),
-                         ("claim_namespace: afk", "claim_namespace"),
-                         ("claim_namespace: refs/heads/afk", "claim_namespace"),
+                         ("claim_namespace: refs/heads", "`afk probe` settles"),
+                         ("merge:\n  target: main", "renamed to 'base_branch'"),
+                         ("merge:\n  delete_branch: false", "was removed"),
+                         ("fingerprint_gate: false", "was removed"),
+                         ("claim_lease_ttl_seconds: 60", "was removed"),
+                         ("gate:\n  adversarial_verify: true", "adversarial_verify_prompt"),
                          ("worker_command: ckimi", "per-run")):
             assert why in w.error("config", "--file", load(bad)), bad
         assert "--file" in w.error("config")
@@ -2381,8 +2381,8 @@ def test_dispatch_starts_a_worker_on_the_remote_base_tip_and_submits_its_prompt(
         # however orca resolved the base it was handed, the worktree ends up containing
         # the fetched tip — asserted by code, not hoped for
         w.orca(stale_base=stale)
-        r2 = w.afk(*dispatch(2, "--set", "progress_comment=false"))
-        assert git(r2["worktree"], "rev-parse", "HEAD") == tip and w.board(2) == ""
+        r2 = w.afk(*dispatch(2))
+        assert git(r2["worktree"], "rev-parse", "HEAD") == tip
 
 
 def test_dispatch_claims_first_and_never_starts_a_worker_it_cannot_own():
@@ -2483,7 +2483,7 @@ def test_what_a_turn_marker_says_survives_a_landing_that_stops_and_a_turn_grante
     marker from what it said: that the PR left a merge batch, and the tick's two
     judgments, are still on it — neither names them."""
     with world(issues=[issue(7, "ready-for-agent")]) as w:
-        on = (*local_gate("true"), "--set", "gate.adversarial_verify=true")
+        on = (*local_gate("true"), "--set", "gate.adversarial_verify_prompt=re-derive it")
         d, head = with_pr(w, 7, 70)
         wt = d["worktree"]
         left = afk_decide.unbatched_turn(None, "me", T0, "me-1", "left_out")
@@ -2677,10 +2677,11 @@ def test_release_removes_a_worktree_only_for_a_claim_whose_issue_is_closed():
         # an open issue's worktree may hold work: releasing its claim leaves it alone
         r = w.afk("release", "1", *ME, *R)
         assert r["released"] is True and "cleanup" not in r and os.path.isdir(d1["worktree"])
-        # closed, but the config keeps worktrees
+        # closed: its PR landed, and nothing is left to keep the worktree for
         w.set(issues=[issue(1, "ready-for-agent"), issue(2, "ready-for-agent", state="closed")])
-        r = w.afk("release", "2", *ME, *R, "--set", "worktree_cleanup=false")
-        assert r["released"] is True and "cleanup" not in r and os.path.isdir(d2["worktree"])
+        r = w.afk("release", "2", *ME, *R)
+        assert r["cleanup"] == {"removed": True, "path": d2["worktree"]}
+        assert not os.path.isdir(d2["worktree"])
 
 
 def test_a_settled_landing_fast_forwards_the_fleets_checkout_and_nothing_else():
@@ -2758,10 +2759,9 @@ def test_a_red_gate_on_the_turn_is_the_workers_to_fix_and_spends_nothing():
 
         # the worker fixes the code, commits, and lands again — its commit is pushed
         fixed = w.work(wt, "fixed.txt", push=False)
-        r = _land(w, 4, wt, *red, "--set", "merge.delete_branch=false")
+        r = _land(w, 4, wt, *red)
         assert (r["outcome"], r["synced"], r["head"]) == ("merged", True, fixed), r
-        assert w.pr(40)["merged"] == {"head": fixed, "delete_branch": False}
-        assert w.sb.remote_ref(f"refs/heads/{branch}") == fixed       # config decides what stays
+        assert w.pr(40)["merged"] == {"head": fixed, "delete_branch": True}
 
 
 def test_a_sync_conflict_on_the_turn_is_resolved_in_place_by_the_worker():
@@ -2869,7 +2869,6 @@ def test_in_required_mode_the_turn_waits_for_checks_on_the_head_that_lands():
         heads, d = {}, {}
         for n, conclusion in ((1, "SUCCESS"), (2, "FAILURE"), (3, "PENDING"), (4, None), (5, "SUCCESS")):
             d[n], heads[n] = with_pr(w, n, n * 10, conclusion=conclusion)
-        base0 = w.sb.remote_ref(f"refs/heads/{w.sb.base}")
 
         def branch_tip(n):
             return w.sb.remote_ref("refs/heads/" + w.pr(n * 10)["headRefName"])
@@ -2963,19 +2962,13 @@ def test_in_required_mode_the_turn_waits_for_checks_on_the_head_that_lands():
         checks_run(5, "PENDING", "PENDING", "FAILURE")
         r = land(5, *wait)
         assert (r["outcome"], r["checks"], r["synced"]) == ("gate_red", "red", False), r
-        # sync_before_merge: false → the PR head lands as it is, on its own checks
-        w.set(prs=[{**p, "statusCheckRollup": pr(50, 5)["statusCheckRollup"]}
-                   if p["number"] == 50 else p for p in w.state()["prs"]])
-        r = land(5, "--set", "merge.sync_before_merge=false")
-        assert (r["outcome"], r["synced"]) == ("merged", False), r
-        assert base0 != w.sb.remote_ref(f"refs/heads/{w.sb.base}")
 
 
 def test_the_adversarial_verify_is_settled_before_the_turn_and_pinned_to_the_head():
     """A worker never verifies itself: the tick's verifier speaks about a head
     BEFORE the turn is granted, and a landing whose sync moved that head stops
     and waits for it to speak again."""
-    on = (*local_gate("true"), "--set", "gate.adversarial_verify=true")
+    on = (*local_gate("true"), "--set", "gate.adversarial_verify_prompt=re-derive it")
     with world(issues=[issue(6, "ready-for-agent")]) as w:
         d, pr_head = with_pr(w, 6, 60)
         wt = d["worktree"]
@@ -3079,7 +3072,7 @@ def test_a_recorded_gate_run_is_void_unless_it_is_of_the_tree_that_lands():
         runs = os.path.join(w.sb.root, "gate-runs")
         flaky = os.path.join(w.sb.root, "flaky")
         command = f"echo run >> {runs}; test ! -f broken.txt && test ! -f {flaky}"
-        on = (*local_gate(command), "--set", "gate.adversarial_verify=true")
+        on = (*local_gate(command), "--set", "gate.adversarial_verify_prompt=re-derive it")
         d, head = with_pr(w, 7, 70)
         wt = d["worktree"]
         w.set(comments={"70": [{"id": 2001, "html_url": "u", "body":
@@ -3200,7 +3193,7 @@ def test_a_ref_afk_did_not_write_is_not_a_recorded_gate_run():
             git(wt, "push", "-q", "--force", "origin", f"{forged}:{ref}")
             w.set(comments={"60": [{"id": 2001, "html_url": "u", "body":
                                     afk_decide.turn_comment(afk_decide.single_turn(None, "me", T0, verified="0" * 40))}]})
-            r = _land(w, 6, wt, *gate, "--set", "gate.adversarial_verify=true")
+            r = _land(w, 6, wt, *gate, "--set", "gate.adversarial_verify_prompt=re-derive it")
             assert (r["outcome"], r["gate"]["source"]) == ("needs_verify", "run"), r
             assert "no green run" in r["gate"]["not_trusted"], r["gate"]
         with open(runs) as f:
@@ -3230,7 +3223,7 @@ def test_a_worker_silent_on_its_turn_is_nudged_once_then_restarted_onto_it_once_
         with_pr(w, 6, 60)
         wt, branch = d["worktree"], d["branch"]
         t0 = int(time.time()) + 5000
-        cfg = ("--config", json.dumps({"base_branch": w.sb.base, "worker_idle_grace_seconds": 300}))
+        cfg = ("--config", json.dumps({"base_branch": w.sb.base}))
         nudge = ("nudge", "--issue", "5", *ME, *R, *cfg)
 
         def no_pr(at):
@@ -3345,11 +3338,11 @@ def test_a_worker_silent_on_its_turn_is_nudged_once_then_restarted_onto_it_once_
         d, pr_head = with_pr(w, 8, 80)
         wt = d["worktree"]
         t0 = int(time.time()) + 5000
-        cfg = {"base_branch": w.sb.base, "worker_idle_grace_seconds": 300, "concurrency": 1,
-               "gate": {"ci": "local", "local_command": "true"}, "fingerprint_gate": False}
+        cfg = {"base_branch": w.sb.base, "concurrency": 1,
+               "gate": {"ci": "local", "local_command": "true"}}
 
         def cycle(at, state=None):
-            return w.afk("cycle", *ME, "--worker-command", WORKER, *R, "--now", str(at),
+            return w.afk("cycle", *ME, "--worker-command", WORKER, *R, "--now", str(at), "--wake",
                          "--config", json.dumps(cfg), *(("--state", json.dumps(state)) if state
                                                        else ()))
 
@@ -3439,9 +3432,9 @@ def test_a_turn_with_no_terminal_is_delivered_by_continuation_never_from_base():
         assert wt7 != d7["worktree"] and git(wt7, "rev-parse", "HEAD") == head7
         told = _told(w.terminals()[-1])
         assert f"**Your branch:** `{d7['branch']}-2`" in told and f"`{d7['branch']}`" in told
-        r = _land(w, 7, wt7, *gate, "--set", "merge.delete_branch=false")
+        r = _land(w, 7, wt7, *gate)
         assert (r["outcome"], r["synced"]) == ("merged", True), r
-        assert w.sb.remote_ref(f"refs/heads/{d7['branch']}") == r["head"] != head7
+        assert w.pr(70)["merged"] == {"head": r["head"], "delete_branch": True} and r["head"] != head7
         assert {"feature7.txt", "landed-later.txt"} <= w.remote_files(w.sb.base)
         git(w.cwd, "fetch", "-q", "origin", w.sb.base)
         assert git(w.cwd, "merge-base", base_tip, r["head"]) == base_tip
@@ -3901,9 +3894,8 @@ def test_land_batch_without_the_batchs_turn_changes_nothing():
         w.set(comments=marked)
 
         # abandoned while its gate runs: the gate goes green, and still nothing lands
-        cfg = json.dumps({"base_branch": w.sb.base, "merge": {"target": w.sb.base, "batch": True},
-                          "gate": {"ci": "local", "local_command": "true"},
-                          "worktree_cleanup": False})
+        cfg = json.dumps({"base_branch": w.sb.base,
+                          "gate": {"ci": "local", "local_command": "true"}})
         abandon = (f"cd {w.cwd} && {sys.executable} {AFK} turn --abandon {batch} --instance me "
                    f"--worker-command '{WORKER}' --repo {REPO} --now {T0} --config '{cfg}' "
                    f"| tee {w.sb.root}/abandoned.json")
@@ -3931,12 +3923,11 @@ def test_a_silent_batch_worker_is_nudged_once_then_the_batch_is_abandoned():
     back to waiting, land on single turns, and are not batched again."""
     with world(issues=[issue(n, "ready-for-agent") for n in (1, 2, 3)]) as w:
         t0 = int(time.time()) + 5000
-        gate = (*_counted(w), "--set", "worker_idle_grace_seconds=300",
-                "--set", "fingerprint_gate=false")
+        gate = _counted(w)
         d = {n: with_pr(w, n, n * 10, gate=gate)[0] for n in (1, 2, 3)}
         base0 = _target(w)
 
-        c = cycle(w, None, *gate, now=t0)
+        c = tick(w, None, *gate, now=t0)
         assert c["progress"].startswith("landing turn to #1, #2, #3; "), c
         b = _the_batch(w, gate)
         batch, bwt = b["batch"], b["worktree"]
@@ -3949,10 +3940,10 @@ def test_a_silent_batch_worker_is_nudged_once_then_the_batch_is_abandoned():
         # the turn is a sign of life: one grace period to start on it
         assert no_pr(t0 + 299)[:2] == ("coding", "leave")
         assert no_pr(t0 + 300) == ("idle_stalled", "nudge", t0)
-        c = cycle(w, c["state"], *gate, now=t0 + 299)
+        c = tick(w, c["state"], *gate, now=t0 + 299)
         assert "nudged" not in c["progress"] and "abandoned" not in c["progress"]
         told = len(w.terminals()[-1]["sent"])
-        c = cycle(w, c["state"], *gate, now=t0 + 300)
+        c = tick(w, c["state"], *gate, now=t0 + 300)
         assert c["progress"].startswith("nudged #1, #2, #3; ") and "errors" not in c, c
         assert len(w.terminals()[-1]["sent"]) == told + 1
         # the nudge points at the batch brief
@@ -3960,9 +3951,9 @@ def test_a_silent_batch_worker_is_nudged_once_then_the_batch_is_abandoned():
         with open(re.search(r"\((\S+)\)", said).group(1)) as f:
             assert f" land --batch {batch} " in f.read()
         # nudged once: a grace period more, then the batch is given up
-        c = cycle(w, c["state"], *gate, now=t0 + 599)
+        c = tick(w, c["state"], *gate, now=t0 + 599)
         assert "abandoned" not in c["progress"] and _batch_rows(w, gate)[2] != []
-        c = cycle(w, c["state"], *gate, now=t0 + 600)
+        c = tick(w, c["state"], *gate, now=t0 + 600)
         assert c["progress"].startswith("abandoned the batch of #1, #2, #3; "), c
         assert c["judgments"] == [] and "errors" not in c
         # nothing landed, nothing failed: no attempt spent, every PR open and waiting
@@ -3981,10 +3972,10 @@ def test_a_silent_batch_worker_is_nudged_once_then_the_batch_is_abandoned():
 
         # its PRs land on single turns, in order — three wait, and no batch forms
         assert w.afk(*_turn_batch(*gate, now=t0 + 690))["outcome"] == "too_few"
-        c = cycle(w, c["state"], *gate, now=t0 + 690)
+        c = tick(w, c["state"], *gate, now=t0 + 690)
         assert c["progress"].startswith("landing turn to #1; "), c["progress"]
         assert _land(w, 1, d[1]["worktree"], *gate, now=t0 + 700)["outcome"] == "merged"
-        c = cycle(w, c["state"], *gate, now=t0 + 780)
+        c = tick(w, c["state"], *gate, now=t0 + 780)
         assert c["progress"].startswith("landing turn to #2; cleared #1; "), c["progress"]
         assert "unbatched=abandoned" in _turns(w, 20)[0] and "released" not in _turns(w, 20)[0]
 
@@ -3995,11 +3986,11 @@ def test_a_batch_whose_worker_is_gone_is_continued_from_its_worktree_else_its_br
     in its worktree when that is here (fix commits and all), else in a new one
     cut from the batch's pushed branch."""
     with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
-        gate = (*_counted(w, "test -f fix.txt"), "--set", "fingerprint_gate=false")
+        gate = _counted(w, "test -f fix.txt")
         for n in (1, 2):
             with_pr(w, n, n * 10, gate=gate)
         base0 = _target(w)
-        c = cycle(w, None, *gate)
+        c = tick(w, None, *gate)
         b = _the_batch(w, gate)
         batch, bwt = b["batch"], b["worktree"]
         assert _land_batch(w, b, *gate)["outcome"] == "gate_red"
@@ -4008,12 +3999,12 @@ def test_a_batch_whose_worker_is_gone_is_continued_from_its_worktree_else_its_br
 
         # its worker is there: a cycle leaves it alone
         terms = len(w.terminals())
-        c = cycle(w, c["state"], *gate)
+        c = tick(w, c["state"], *gate)
         assert "landing turn" not in c["progress"] and len(w.terminals()) == terms
         # its terminal is gone, its worktree is here: a new worker, in the SAME worktree
         _close_terminals(w)
         assert w.no_pr("--batch", batch, *R, *gate, *NOW)["action"] == "orphan"
-        c = cycle(w, c["state"], *gate)
+        c = tick(w, c["state"], *gate)
         assert c["progress"].startswith("landing turn to #1, #2; ") and "errors" not in c, c
         new = w.terminals()[-1]
         assert (new["worktreePath"], new["command"], new["open"]) == (bwt, WORKER, True)
@@ -4041,7 +4032,7 @@ def test_a_batch_whose_worker_is_gone_is_continued_from_its_worktree_else_its_br
             ["feature 1 (#10)", "feature 2 (#20)", "work: fix.txt"]
         assert not [x for x in w.sb.all_refs() if "afk-batch" in x]
         # the next cycle sweeps the continued batch's worktree with the claims
-        c = cycle(w, c["state"], *gate)
+        c = tick(w, c["state"], *gate)
         assert c["progress"].startswith("cleared #1, #2; ") and w.worktrees() == []
 
 
@@ -4052,14 +4043,14 @@ def test_a_dead_fleets_batch_is_abandoned_by_the_fleet_that_takes_its_claims():
     with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
         # (the fake GitHub does not move a PR's updatedAt when a comment on it is
         # rewritten, as the real one does — so the digest gate is off here)
-        gate = (*_counted(w), "--set", "fingerprint_gate=false")
+        gate = _counted(w)
         for n in (1, 2):
             with_pr(w, n, n * 10, instance="old", gate=gate)
         base0 = _target(w)
         b = w.afk(*_turn_batch(*gate, instance="old"))
         w.afk("heartbeat", "--instance", "old", "--now", str(T0 - TTL - 60), *R)
 
-        c = cycle(w, None, *gate)
+        c = tick(w, None, *gate)
         assert c["progress"].startswith("reclaimed #1, #2; "), c
         ws = w.afk("rebuild", *ME, *R, *NOW, *gate)
         assert [(x["id"], x["instance"]) for x in ws["batches"]] == [(b["batch"], "old")]
@@ -4072,12 +4063,12 @@ def test_a_dead_fleets_batch_is_abandoned_by_the_fleet_that_takes_its_claims():
         assert (r["outcome"], r["batch"]) == ("waiting", b["batch"]), r
         assert all(f"instance=old at={T0} batch=" in _turns(w, p)[0] for p in (10, 20))
 
-        c = cycle(w, c["state"], *gate)
+        c = tick(w, c["state"], *gate)
         assert c["progress"].startswith("abandoned the batch of #1, #2; "), c
         assert all(f"instance=me at={T0} unbatched=abandoned of={b['batch']} released=1" in
                    _turns(w, p)[0] for p in (10, 20))
         assert not os.path.isdir(b["worktree"])
-        c = cycle(w, c["state"], *gate)
+        c = tick(w, c["state"], *gate)
         assert c["progress"].startswith("landing turn to #1; "), c
 
 
@@ -4098,7 +4089,7 @@ def test_a_batch_is_formed_only_from_prs_that_are_free_to_land_together():
             return r
 
         too_few()                                                   # `required`: each PR's checks gate it
-        too_few(*gate, "--set", "gate.adversarial_verify=true")     # each owes its own verify
+        too_few(*gate, "--set", "gate.adversarial_verify_prompt=re-derive it")     # each owes its own verify
         # there is no switch: the key that used to be one is refused, with the reason
         for value in ("true", "false"):
             assert "'merge.batch' was removed" in \
@@ -4266,7 +4257,7 @@ def test_bootstrap_refuses_a_merge_batch_the_target_would_not_take():
             assert r["verdict"] == "error" and "merge batch" in r["detail"] and \
                 word in r["detail"].lower(), r
             # only where batches form: with a verify owed per PR, none ever does
-            assert verdict(prot, *gate, "--set", "gate.adversarial_verify=true")["verdict"] == "ok"
+            assert verdict(prot, *gate, "--set", "gate.adversarial_verify_prompt=re-derive it")["verdict"] == "ok"
         assert verdict({"lock_branch": {"enabled": False}, "enforce_admins": {"enabled": True}},
                        *gate)["verdict"] == "ok"
 
@@ -4493,10 +4484,9 @@ def test_escalate_relabels_before_it_releases():
         assert w.afk("rebuild", "--instance", "peer", *R, *NOW)["frontier"]["dispatch"] == \
             [{"number": 9, "title": "issue 9"}][:0]
 
-        # both human-facing writes are config
-        r = w.afk(*escalate(9, "--set", "escalate_comment=false", "--set", "progress_comment=false",
-                            "--set", "escalate_label=needs-human"))
-        assert r["comment_id"] is None and w.comments(9) == []
+        # the label a human is called with is the repo's own
+        r = w.afk(*escalate(9, "--set", "escalate_label=needs-human"))
+        assert r["comment_id"] and len(w.comments(9)) == 2
         assert w.issue(9)["labels"] == ["needs-human"] and "needs-human" in w.state()["labels"]
 
 
@@ -4513,7 +4503,7 @@ def test_a_worker_blocked_on_workable_backlog_is_parked_until_the_blocker_closes
               issue(137), issue(138), issue(139, "ready-for-agent"),
               issue(140, "ready-for-agent", "epic"), issue(141, "ready-for-agent")]
     with world(issues=issues) as w:
-        cfg = ("--config", json.dumps({"base_branch": w.sb.base, "worker_idle_grace_seconds": 300}))
+        cfg = ("--config", json.dumps({"base_branch": w.sb.base}))
         w.afk(*dispatch(135))
         d136, d141 = w.afk(*dispatch(136)), w.afk(*dispatch(141))
         w.afk("claim", "137", "--instance", "peer", *NOW, *R)
@@ -4594,11 +4584,11 @@ def test_a_worker_blocked_on_workable_backlog_is_parked_until_the_blocker_closes
         w.set(deps={**w.state()["deps"], "141": [139]})
         later = str(int(time.time()) + 5000)
         assert stops_blocked(141, "139,135") == ("park", [139], ["waiting", "closed"])
-        r = w.afk(*_park(141, "--set", "progress_comment=false"))
+        r = w.afk(*_park(141))
         assert r == {"issue": 141, "action": "parked", "blocked_by": [139], "edges_added": [],
                      "released": True}
         assert os.path.isdir(d141["worktree"]) and w.claimed_by(141) is None
-        assert w.state()["deps"]["141"] == [139] and "等待依赖" not in w.board(141)
+        assert w.state()["deps"]["141"] == [139] and "等待依赖" in w.board(141)
 
 
 def test_close_settles_an_issue_that_needed_no_change():
@@ -4619,9 +4609,10 @@ def test_close_settles_an_issue_that_needed_no_change():
         assert w.issue(6)["state"] == "closed" and w.claimed_by(6) is None
         assert "无需改动" in w.board(6) and not os.path.isdir(d6["worktree"])
 
-        r = w.afk(*close(7, "--set", "worktree_cleanup=false"))
-        assert r == {"issue": 7, "action": "closed", "released": True}
-        assert os.path.isdir(d7["worktree"]) and w.afk("rebuild", *ME, *R, *NOW)["mine"] == []
+        r = w.afk(*close(7))
+        assert r == {"issue": 7, "action": "closed", "released": True,
+                     "cleanup": {"removed": True, "path": d7["worktree"]}}
+        assert w.afk("rebuild", *ME, *R, *NOW)["mine"] == []
 
 
 # --------------------------------------------------------------------------- #
@@ -4689,13 +4680,13 @@ def test_config_is_required_and_resolves_one_way_on_every_subcommand():
                 return afk._cfg(parser.parse_args([*sub_argv, *extra]))
 
             assert cfg("--config", "{}") == afk_decide.resolve_config({}), name
-            given = ("--config", json.dumps({"retry": 7, "gate": {"adversarial_verify": True}}))
+            given = ("--config", json.dumps({"retry": 7, "gate": {"local_command": "make"}}))
             got = cfg(*given)
-            assert got["retry"] == 7 and got["gate"]["adversarial_verify"] is True, name
+            assert got["retry"] == 7 and got["gate"]["local_command"] == "make", name
             assert got["gate"]["ci"] == "required" and got["concurrency"] == 3      # omitted → default
-            got = cfg(*given, "--set", "retry=9", "--set", "merge.target=rel")
-            assert (got["retry"], got["merge"]["target"]) == (9, "rel"), name
-            assert got["gate"]["adversarial_verify"] is True                  # --set is an overlay
+            got = cfg(*given, "--set", "retry=9", "--set", "base_branch=rel")
+            assert (got["retry"], got["base_branch"]) == (9, "rel"), name
+            assert got["gate"]["local_command"] == "make"                     # --set is an overlay
             # the three inputs are the whole interface: no per-key override flags
             flags = set(sub._option_string_actions)
             assert {"--config", "--set", "--now"} <= flags, name
@@ -4929,29 +4920,28 @@ def test_the_docs_restate_config_only_as_the_schema_has_it():
                 continue
             assert value == json.dumps(table[leaf]).strip('"'), f"{name}: `{key}` default {value}"
             quoted += 1
-    assert quoted >= 4, quoted            # the scan really found the restated defaults
-
-    # a duration key is written with its unit, as the file has it: `claim_lease_ttl`
-    # is not a key, and a config that sets it is refused
-    stems = [k[:-len("_seconds")] for k in defaults if k.endswith("_seconds")]
-    short = re.compile(r"\b(%s)(?!_seconds)\b" % "|".join(stems))
-    for name, text in docs.items():
-        assert not short.findall(text), f"{name}: {sorted(set(short.findall(text)))}"
+    assert quoted >= 3, quoted            # the scan really found the restated defaults
 
     # the one phrasing the scan above reads: a default written any other way is unheld
     for name, text in docs.items():
         assert not re.findall(r"defaults to `?\d", text), name
 
-    # the template glosses a duration in minutes, and the lease as a multiple of the
-    # idle pace: both are arithmetic on the values beside them
-    template = docs["config-template.md"]
-    glossed = re.findall(r"^(\w+_seconds): (\d+) +#[^\n]*?~([\d.]+) min", template, re.M)
-    assert [key for key, _, _ in glossed] == \
-        ["busy_interval_seconds", "idle_interval_seconds", "claim_lease_ttl_seconds"], glossed
-    for key, seconds, minutes in glossed:
-        assert int(seconds) == defaults[key] == float(minutes) * 60, key
-    times, = re.findall(r"(\d+)× idle\b", template)
-    assert defaults["claim_lease_ttl_seconds"] == int(times) * defaults["idle_interval_seconds"]
+    # what is not a key is a constant, and prose that states one names it beside its value
+    stated = 0
+    for name, text in docs.items():
+        for const, value in re.findall(r"`([A-Z][A-Z_]+)` \((\d+)\)", text):
+            assert getattr(afk_decide, const) == int(value), f"{name}: `{const}` ({value})"
+            stated += 1
+    assert stated >= 4, stated
+
+    # and a key that is gone is named nowhere but where its removal is explained
+    gone = {key.rpartition(".")[2] for key in afk_decide.CONFIG_REMOVED}
+    gone = {key for key in gone if "_" in key} - set(afk_decide.JUDGMENT_KINDS)
+    for name, text in docs.items():
+        if name == "flows.md":
+            continue
+        named = sorted({key for key in gone if re.search(r"`(?:\w+\.)?%s\b" % key, text)})
+        assert not named, f"{name}: {named}"
 
 
 def test_the_docs_restate_a_flags_default_only_as_the_parser_has_it():
@@ -5086,7 +5076,7 @@ def test_this_repos_own_config_loads_and_restates_no_default():
                 for sk in (v if isinstance(v, dict) else [None])
                 if (v[sk] == defaults[k][sk] if isinstance(v, dict) else v == defaults[k])]
     assert not restated, restated
-    assert partial["gate"]["ci"] == "local" and partial["merge"]["target"] == "master"
+    assert partial["gate"]["ci"] == "local" and partial["base_branch"] == "master"
 
 
 def test_every_flow_anchor_still_names_something():

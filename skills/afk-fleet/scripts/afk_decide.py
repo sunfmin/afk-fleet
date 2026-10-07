@@ -35,45 +35,44 @@ from typing import NamedTuple
 # suite red. The instance id and the worker launch command are deliberately NOT
 # keys here: they are per-run, launcher-held facts, and the unknown-key error below is
 # what keeps them out of files.
+#
+# A key is here because repos really differ in it (ADR-0038): which labels the
+# repo triages with, its trunk, how many workers the machine carries, what its
+# gate is, how often a failure is retried. What every fleet does alike is not a
+# key — it is the constants under this table, or simply what the code does.
 
 CONFIG_DEFAULTS = {
     # dispatch contract
     "ready_label": "ready-for-agent",
     "epic_labels": ["epic", "prd", "wayfinder:map"],
-    "claim_namespace": "refs/afk",
     # workers
     "base_branch": "main",
-    "branch_pattern": "issue-{number}-{slug}",
     "concurrency": 3,
-    "worktree_cleanup": True,
-    "worker_idle_grace_seconds": 300,
     # completion gate
     "gate": {
         "ci": "required",
         "local_command": "",
-        "adversarial_verify": False,
         "adversarial_verify_prompt": "",
-    },
-    # merge
-    "merge": {
-        "target": "main",
-        "sync_before_merge": True,
-        "delete_branch": True,
     },
     # failure handling
     "retry": 2,
     "escalate_label": "ready-for-human",
-    "escalate_comment": True,
-    # progress (human-facing)
-    "progress_comment": True,
-    # loop (launcher pacing)
-    "busy_interval_seconds": 90,
-    "idle_interval_seconds": 1500,
-    "idle_ticks_before_sleep": 3,
-    "claim_lease_ttl_seconds": 4500,
-    "fingerprint_gate": True,
-    "force_tick_after_skips": 6,
 }
+
+# The one field of the canonical config that no file sets: where this run's claim
+# and heartbeat refs live. `afk probe` settles it at bootstrap and returns it in
+# the config the launcher holds from then on, so every later call agrees with it.
+CONFIG_SETTLED = {"claim_namespace": "refs/afk"}
+
+# What a fleet does the same in every repo. Each was a config key once, and no
+# repo ever set one to anything else (ADR-0038).
+BRANCH_PATTERN = "issue-{number}-{slug}"    # the worktree-NAME hint handed to orca (ADR-0005)
+WORKER_IDLE_GRACE_SECONDS = 300             # quiet before an idle no-PR worker is judged finished
+BUSY_INTERVAL_SECONDS = 90                  # the launcher's sleep while there is work or a claim
+IDLE_INTERVAL_SECONDS = 1500                # ... and once the fleet has gone quiet
+IDLE_TICKS_BEFORE_SLEEP = 3                 # empty cycles in a row before it counts as quiet
+CLAIM_LEASE_TTL_SECONDS = 4500              # a claim is live while its heartbeat is this fresh
+FORCE_TICK_AFTER_SKIPS = 6                  # a full tick at least every N skipped cycles (ADR-0007)
 
 
 # The two places claim + heartbeat refs can live, as namespace → (claim ref prefix,
@@ -298,12 +297,14 @@ GATE_CI_MODES = {"required": "CI", "local": "本地门"}
 # LOUDLY with the migration note rather than be silently defaulted — a config that
 # lies to its author is the failure mode ADR-0009 exists to prevent.
 CONFIG_RENAMED = {
-    "merge.rebase_before_merge": (
-        "merge.sync_before_merge",
-        "the merge path now MERGES origin/<base> into the branch instead of rebasing it "
-        "(ADR-0012) — a rebase drops merge commits and re-ignites the conflicts already "
-        "resolved inside them. Rename the key; its meaning and default (true) are unchanged."),
+    "merge.target": (
+        "base_branch",
+        "the branch workers cut from and open their PR against is the branch that PR lands "
+        "on, so it is named once (ADR-0038). Set base_branch, and delete the merge: section."),
 }
+
+# What ADR-0038 says of every key that turned out to be the same in every repo.
+_ALWAYS = "(ADR-0038). Delete the key."
 
 # Keys that were removed, and why — refused as loudly as a renamed one.
 CONFIG_REMOVED = {
@@ -325,10 +326,48 @@ CONFIG_REMOVED = {
         "a worker is always started through orca (ADR-0005): the key named the one backend "
         "there is, and nothing read it. Delete the key."),
     "merge.batch": (
-        "merge batches are no longer an option (ADR-0034): with gate.ci 'local' and "
-        "gate.adversarial_verify off, two or more PRs that are ready together always land as "
+        "merge batches are no longer an option (ADR-0034): with gate.ci 'local' and no "
+        "adversarial verify, two or more PRs that are ready together always land as "
         "one batch. Delete the key."),
+    "gate.adversarial_verify": (
+        "a non-empty gate.adversarial_verify_prompt is what turns the adversarial verify on "
+        "(ADR-0038): say what the verifier checks, or leave it empty for none. Delete the key."),
+    "merge.sync_before_merge": (
+        f"a landing always merges the base branch into the PR's branch before it gates: the "
+        f"tree that is gated is the tree that lands {_ALWAYS}"),
+    "merge.rebase_before_merge": (
+        f"a landing always merges the base branch into the PR's branch before it gates — a "
+        f"merge, never a rebase (ADR-0012) {_ALWAYS}"),
+    "merge.delete_branch": (
+        f"a landed or superseded PR's branch is always deleted {_ALWAYS}"),
+    "branch_pattern": (
+        f"a worker's worktree is always named issue-<number>-<slug>, which is how its branch "
+        f"is found again {_ALWAYS}"),
+    "worktree_cleanup": (
+        f"a landed or closed issue's worktree is always removed, and an escalated one's is "
+        f"always left for the human {_ALWAYS}"),
+    "escalate_comment": (
+        f"an escalation always says where it got stuck {_ALWAYS}"),
+    "progress_comment": (
+        f"every claimed issue carries its status board (ADR-0006) {_ALWAYS}"),
+    "fingerprint_gate": (
+        f"a cycle always skips its tick while nothing observable moved (ADR-0007) {_ALWAYS}"),
+    **{key: f"the fleet's timing is the same in every repo {_ALWAYS}"
+       for key in ("worker_idle_grace_seconds", "busy_interval_seconds", "idle_interval_seconds",
+                   "idle_ticks_before_sleep", "claim_lease_ttl_seconds",
+                   "force_tick_after_skips")},
 }
+
+# Sections that no longer hold a key: a file that still opens one is read on, so
+# that each key under it gets its own note.
+_RETIRED_SECTIONS = {key.partition(".")[0] for key in (*CONFIG_RENAMED, *CONFIG_REMOVED)
+                     if "." in key} - set(CONFIG_DEFAULTS)
+
+
+# Why a file may not set the settled field — said where a file tries to.
+_SETTLED_NOTE = ("config: 'claim_namespace' is not set in a file — `afk probe` settles where claim "
+                 "refs live at every bootstrap, and falls back to refs/heads by itself when the "
+                 "remote refuses refs/afk (ADR-0038). Delete the key.")
 
 
 def _renamed(dotted):
@@ -364,6 +403,12 @@ def validate_config(cfg):
                          "local mode that command IS the completion gate (ADR-0012), so an empty "
                          "one would merge every PR unverified")
     return cfg
+
+
+def verifies(config):
+    """Whether a PR owes an adversarial verify of its head before it lands: the
+    repo said what a verifier checks (`gate.adversarial_verify_prompt`)."""
+    return bool(config["gate"]["adversarial_verify_prompt"].strip())
 
 
 def _yaml_block(text):
@@ -417,7 +462,7 @@ def parse_config_yaml(text):
     Read the per-repo config — the ```yaml block in docs/agents/afk-fleet.md
     (a whole markdown file or a bare block both work). Schema-aware, zero-dep:
     it parses only the dialect this schema uses (`key: value` scalars, one
-    inline `[a, b]` list, one-level `gate:`/`merge:` sections), and every key
+    inline `[a, b]` list, the one-level `gate:` section), and every key
     and type is checked against CONFIG_DEFAULTS — so parsing IS validation. An
     unknown key raises (a typo silently ignored would be a config that lies to
     its author, and a launcher-held fact in a file is refused by construction); so does
@@ -438,13 +483,18 @@ def parse_config_yaml(text):
         key, raw = key.strip(), raw.strip()
         if indented:
             if section is None:
-                raise ValueError(f"config: indented key {key!r} outside a gate:/merge: section")
-            sub = CONFIG_DEFAULTS[section]
+                raise ValueError(f"config: indented key {key!r} outside a gate: section")
+            sub = CONFIG_DEFAULTS.get(section, {})
             if key not in sub:
                 raise ValueError(_renamed(f"{section}.{key}")
                                  or f"config: unknown key {section}.{key}")
             partial.setdefault(section, {})[key] = _coerce(f"{section}.{key}", raw, sub[key])
         else:
+            if key in _RETIRED_SECTIONS and not raw:
+                section = key           # read on: each key under it has its own note
+                continue
+            if key in CONFIG_SETTLED:
+                raise ValueError(_SETTLED_NOTE)
             if key not in CONFIG_DEFAULTS:
                 raise ValueError(_renamed(key)
                                  or f"config: unknown key {key!r} (note: the instance id and "
@@ -464,10 +514,11 @@ def parse_config_yaml(text):
 
 def resolve_config(partial):
     """Partial config → the complete canonical config: every key present,
-    defaults filled from CONFIG_DEFAULTS (one level deep for gate/merge).
-    Idempotent — resolving an already-canonical config is a no-op."""
+    defaults filled from CONFIG_DEFAULTS (one level deep for gate), and the
+    settled field beside them. Idempotent — resolving an already-canonical
+    config is a no-op."""
     out = {}
-    for k, dv in CONFIG_DEFAULTS.items():
+    for k, dv in {**CONFIG_DEFAULTS, **CONFIG_SETTLED}.items():
         if isinstance(dv, dict):
             merged = dict(dv)
             merged.update(partial.get(k) or {})
@@ -482,16 +533,16 @@ def resolve_config(partial):
 def override_config(cfg, assignments):
     """Lay `key=value` overrides (the CLI's `--set`) onto a canonical config, in
     place, and return it. Keys are the config file's own — dotted for a section
-    (`gate.ci=local`) — and values are typed by the key's default exactly as the
-    file's are, except that a string is taken verbatim (the shell already
-    unquoted it). An unknown key, or an item with no `=`, raises ValueError; a
+    (`gate.ci=local`), plus the settled `claim_namespace` — and values are typed
+    by the key's default exactly as the file's are, except that a string is taken
+    verbatim (the shell already unquoted it). An unknown key, or an item with no `=`, raises ValueError; a
     renamed or removed one raises with its migration note, as the file does."""
     for item in assignments or []:
         dotted, eq, raw = item.partition("=")
         if _renamed(dotted.strip()):
             raise ValueError(_renamed(dotted.strip()))
         section, _, key = dotted.strip().rpartition(".")
-        table = CONFIG_DEFAULTS.get(section) if section else CONFIG_DEFAULTS
+        table = CONFIG_DEFAULTS.get(section) if section else {**CONFIG_DEFAULTS, **CONFIG_SETTLED}
         if not eq or not isinstance(table, dict) or isinstance(table.get(key), (dict, type(None))):
             raise ValueError(f"--set: expected <config key>=<value>, got {item!r}")
         default = table[key]
@@ -602,7 +653,7 @@ def classify_claims(claims, heartbeats, me, now, ttl):
       claims:     [{"number": int, "instance": str}, ...]  (from refs/afk/claim/*)
       heartbeats: {instance_id: last_ts_epoch}             (from refs/afk/heartbeat/*)
       me:         my instance id
-      now, ttl:   epoch seconds / `claim_lease_ttl_seconds`
+      now, ttl:   epoch seconds / CLAIM_LEASE_TTL_SECONDS
 
     Returns {"mine":[n...], "peer_live":[n...], "stale":[n...]}:
       mine       — stamped with my instance; I reconcile these locally (a no-PR/
@@ -1154,7 +1205,7 @@ def read_worker_state(row, now, grace_seconds, tui_idle=None):
            parentPaneKey}]} (orca's clocks are epoch MILLISECONDS), or None when
            orca lists no such worktree. `state` is what the agent's own hooks
            reported: working | waiting | blocked | done.
-      now, grace_seconds: epoch seconds / `worker_idle_grace_seconds`.
+      now, grace_seconds: epoch seconds / WORKER_IDLE_GRACE_SECONDS.
       tui_idle: for a runtime that reports NO state (qoderclicn), whether orca
            sees its terminal idle — `orca terminal wait --for tui-idle` answered
            (True) or timed out (False). None when not asked, read as idle.
@@ -1271,7 +1322,7 @@ def classify_stopped(progress, terminal_idle_seconds, worker_verdict, blocker_st
       worker_verdict:  the `latest_verdict` dict (or None) — what the worker declared.
       blocker_states:  {issue number: one of BLOCKER_STANDINGS} for the verdict's
                        blocked_by (`blocker_standings`). Anything else is `unmet`.
-      now, grace_seconds: epoch seconds / `worker_idle_grace_seconds`.
+      now, grace_seconds: epoch seconds / WORKER_IDLE_GRACE_SECONDS.
       nudged_at:       epoch seconds this worker was nudged (`afk nudge`), None if
                        it never was. A nudge is spent once.
       can_nudge:       False when there is nowhere to record a nudge (no worktree
@@ -1627,7 +1678,7 @@ def turn_gate(ci_mode, checks_state, allow_no_checks, adversarial_verify, verifi
       ci_mode:            gate.ci
       checks_state:       `pr_checks_state` of the PR's current head
       allow_no_checks:    the tick's judgment that a PR with no checks may land
-      adversarial_verify: gate.adversarial_verify
+      adversarial_verify: whether the repo asks for one (`verifies`)
       verified:           the head the tick says an adversarial verify passed
       head:               the PR's current head
 
@@ -1728,10 +1779,9 @@ def batch_worktrees(worktrees, repo, batch=None, instance=None):
 def batches_form(config):
     """Whether this config's PRs may land as merge batches at all: the stack is
     gated by ONE run of `gate.local_command`, which only `gate.ci: local` has,
-    and with `gate.adversarial_verify` every PR owes a verify of its own head
-    before its turn (ADR-0029)."""
-    gate = config["gate"]
-    return gate["ci"] == "local" and not gate["adversarial_verify"]
+    and with an adversarial verify every PR owes one of its own head before
+    its turn (ADR-0029)."""
+    return config["gate"]["ci"] == "local" and not verifies(config)
 
 
 def batch_candidates(mine, merge_order, config, busy=()):
@@ -1741,7 +1791,7 @@ def batch_candidates(mine, merge_order, config, busy=()):
     batch-or-single decision, whole (ADR-0029):
 
       mine, merge_order: the working set's
-      config:  read for gate.ci and gate.adversarial_verify (`batches_form`)
+      config:  read for gate.ci and gate.adversarial_verify_prompt (`batches_form`)
       busy:    the issue numbers whose own worker is still working — its PR may
                yet move, so it is not stacked
 
@@ -1946,16 +1996,16 @@ def plan_takeover(claims, heartbeats, target, me, now, ttl, confirmed=False):
 _PLACEHOLDER_RE = re.compile(r"\{(number|slug)\}")
 
 
-def branch_regex(branch_pattern, number):
+def branch_regex(number):
     """
-    `branch_pattern` + an issue number → the regex that matches the branch orca
+    An issue number → the regex that matches the branch orca
     ACTUALLY created for it. Two things are wildcards, by construction: orca
     prefixes the branch with `<user>/` (ADR-0005 — the fleet reads the name back
     rather than dictating it), and the slug is whatever the dispatching tick
     passed. The number is not: it is the one field that identifies the issue.
     """
     out, pos = [], 0
-    pattern = branch_pattern or ""
+    pattern = BRANCH_PATTERN
     for m in _PLACEHOLDER_RE.finditer(pattern):
         out.append(re.escape(pattern[pos:m.start()]))
         out.append(str(number) if m.group(1) == "number" else "[^/]*")
@@ -1964,11 +2014,11 @@ def branch_regex(branch_pattern, number):
     return re.compile(r"^(?:[^/]+/)?" + "".join(out) + r"$")
 
 
-def branch_candidates(heads, branch_pattern, number):
+def branch_candidates(heads, number):
     """The remote branch names that could be issue <number>'s work branch, sorted.
     Used when NO local worktree survived: the claim ref records the issue, not the
     branch, so tier 2 has to recognise the branch by its name."""
-    rx = branch_regex(branch_pattern, number)
+    rx = branch_regex(number)
     return sorted(h for h in (heads or []) if h and rx.match(h))
 
 
@@ -2054,13 +2104,13 @@ def find_orca_repo(repos, repo):
     return None
 
 
-def worktree_name(branch_pattern, number, title):
-    """`branch_pattern` filled for one issue — the NAME hint handed to `orca
+def worktree_name(number, title):
+    """BRANCH_PATTERN filled for one issue — the NAME hint handed to `orca
     worktree create --name` (orca derives the real branch from it, ADR-0005). The
     slug is the title lowercased to `[a-z0-9-]`, at most 40 characters; a title
     with nothing usable (all CJK, say) slugs to `work`."""
     slug = re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")[:40].rstrip("-")
-    return (branch_pattern.replace("{number}", str(number))
+    return (BRANCH_PATTERN.replace("{number}", str(number))
             .replace("{slug}", slug or "work"))
 
 
@@ -2579,29 +2629,25 @@ def escalation_labels(labels, config):
     return [config["escalate_label"]], remove
 
 
-def pace(did_work, in_flight, empty_streak, config):
+def pace(did_work, in_flight, empty_streak):
     """
     The launcher's next sleep, in seconds.
 
       did_work:     the tick that just ran granted a turn / dispatched / reclaimed / escalated
       in_flight:    claims this fleet holds
       empty_streak: consecutive empty cycles so far (`cycle_ticked` / `cycle_wake`)
-      config:       read for busy_interval_seconds, idle_interval_seconds,
-                    idle_ticks_before_sleep and claim_lease_ttl_seconds
 
-    - did work, or holding claims → busy interval;
-    - else stay busy until `idle_ticks_before_sleep` empty cycles, then idle interval;
-    - HARD CAP: while holding any claim, never exceed ttl/2, so the per-instance
-      heartbeat cannot lapse and get a live claim reclaimed (ADR-0003).
+    - did work, or holding claims → BUSY_INTERVAL_SECONDS;
+    - else stay busy until IDLE_TICKS_BEFORE_SLEEP empty cycles, then
+      IDLE_INTERVAL_SECONDS.
+
+    While it holds a claim a fleet sleeps the busy interval, which is far inside
+    half the lease — so the per-instance heartbeat cannot lapse and get a live
+    claim reclaimed (ADR-0003).
     """
-    busy = int(config["busy_interval_seconds"])
-    if did_work or in_flight > 0 or empty_streak < int(config["idle_ticks_before_sleep"]):
-        interval = busy       # working, or recently active — stay responsive
-    else:
-        interval = int(config["idle_interval_seconds"])
-    if in_flight > 0:
-        interval = min(interval, int(config["claim_lease_ttl_seconds"]) // 2)
-    return int(interval)
+    if did_work or in_flight > 0 or empty_streak < IDLE_TICKS_BEFORE_SLEEP:
+        return BUSY_INTERVAL_SECONDS    # working, or recently active — stay responsive
+    return IDLE_INTERVAL_SECONDS
 
 
 # --------------------------------------------------------------------------- #
@@ -2679,13 +2725,12 @@ def cycle_state(raw, instance=None, worker_command=None):
             **{k: raw[k] for k in CYCLE_FACTS}}
 
 
-def cycle_wake(state, current_fp, config, woke=False):
+def cycle_wake(state, current_fp, woke=False):
     """
     The top of one cycle: tick, or skip?
 
       state:      the cycle state (`cycle_state`)
-      current_fp: `fingerprint` of what a rebuild would observe now; None when
-                  `fingerprint_gate` is off (nothing was gathered)
+      current_fp: `fingerprint` of what a rebuild would observe now
       woke:       a wake arrived while the previous cycle was running. The digest
                   that cycle kept was taken as its tick ENDED, so whatever the
                   wake announced may already be inside it, unseen by that tick
@@ -2701,10 +2746,8 @@ def cycle_wake(state, current_fp, config, woke=False):
     nothing is in flight and nothing is left on the frontier: unchanged state
     then proves the cycle empty.
     """
-    if not config["fingerprint_gate"]:
-        return {"action": "tick", "reason": "gate_off", "state": {**state, "skips": 0}}
     gate = fingerprint_gate(state["fingerprint"], current_fp, state["skips"],
-                            config["force_tick_after_skips"])
+                            FORCE_TICK_AFTER_SKIPS)
     new = {**state, "fingerprint": current_fp, "skips": gate["skips"]}
     if gate["action"] == "tick":
         return {"action": "tick", "reason": gate["reason"], "state": new}
@@ -2715,11 +2758,11 @@ def cycle_wake(state, current_fp, config, woke=False):
         new["empty_streak"] += 1
     return {"action": "skip", "reason": gate["reason"], "state": new,
             "heartbeat": new["in_flight"] > 0,
-            "sleep_seconds": pace(False, new["in_flight"], new["empty_streak"], config),
+            "sleep_seconds": pace(False, new["in_flight"], new["empty_streak"]),
             "progress": f"nothing moved; {_standing(new)}"}
 
 
-def cycle_ticked(state, did, config, judgments=0, errors=0, left=None, boards=None, unseen=0):
+def cycle_ticked(state, did, judgments=0, errors=0, left=None, boards=None, unseen=0):
     """
     The bottom of a cycle that ran a tick: fold what the tick did into the cycle
     state and say how long to sleep.
@@ -2760,7 +2803,7 @@ def cycle_ticked(state, did, config, judgments=0, errors=0, left=None, boards=No
               if count]
     return {"state": new,
             "sleep_seconds": 0 if judgments or unseen else pace(did_work, in_flight,
-                                                      new["empty_streak"], config),
+                                                      new["empty_streak"]),
             "progress": "; ".join([*parts, _standing(new)])}
 
 
@@ -2879,7 +2922,7 @@ def turn_step(call, result, config, restart=False):
       ("judge", {...})    gate_red → `reason`; no_checks → `no_checks`;
                           needs_verify → `adversarial_verify`
 
-    With `gate.adversarial_verify` on, a PR with no checks at all owes both
+    With an adversarial verify (`verifies`), a PR with no checks at all owes both
     judgments, and `afk turn` records neither until both are in: they are asked
     as ONE `adversarial_verify` whose yes carries both flags — a head that
     survives the verify is one whose acceptance criteria are met.
@@ -2895,8 +2938,7 @@ def turn_step(call, result, config, restart=False):
     if outcome == "gate_red":
         return "judge", reason_judgment(call, number, "fail", f"the checks of PR #{pr} are red",
                                         f"the failing checks of PR #{pr}", context, bulky=True)
-    verify = config["gate"]["adversarial_verify"]
-    if outcome == "needs_verify" or (outcome == "no_checks" and verify):
+    if outcome == "needs_verify" or (outcome == "no_checks" and verifies(config)):
         flags = [*(["--allow-no-checks"] if outcome == "no_checks" else []), "--verified", head]
         bare = " It has no checks at all, so the verify is its only gate." \
             if outcome == "no_checks" else ""
@@ -3257,12 +3299,11 @@ def tick_plan(ws, call, config):
     # --- the lease, and what a human reads on each issue ---
     if tick.in_flight:
         yield from run("heartbeat")
-    if config["progress_comment"]:
-        written = tick.settled | tick.touched
-        for row in ws["mine"]:
-            if row["board_phase"] and row["number"] not in written:
-                yield from run("status", issue=row["number"], phase=row["board_phase"],
-                               pr=row["pr"], attempt=row["attempt"])
+    written = tick.settled | tick.touched
+    for row in ws["mine"]:
+        if row["board_phase"] and row["number"] not in written:
+            yield from run("status", issue=row["number"], phase=row["board_phase"],
+                           pr=row["pr"], attempt=row["attempt"])
     if batches_form(config) or ws["batches"]:
         yield from run("sweep", live=sorted(live))
     return {"did": tick.account(), "judgments": tick.judgments, "errors": tick.errors,
@@ -3539,8 +3580,7 @@ def fingerprint_gate(last, current, skips, force_after):
       last:        the previous cycle's digest ("" / None on the first cycle)
       current:     the digest just computed
       skips:       consecutive skipped cycles so far
-      force_after: run a full tick at least every N skips (>= 1; 1 disables
-                   skipping entirely)
+      force_after: run a full tick at least every N skips (>= 1)
 
     Returns {"action": "tick"|"skip", "reason": "first"|"changed"|"forced"|
     "unchanged", "skips": <new streak>} — `cycle_wake` folds both into the cycle
@@ -3615,12 +3655,12 @@ def unseen_prs(mine, prs):
                   if r["number"] in now and now[r["number"]].get("number") != r["pr"])
 
 
-def superseded_prs(prs, number, branch_pattern):
+def superseded_prs(prs, number):
     """The open PRs a FRESH start of issue <number> supersedes: the ones that
     close it from a branch shaped like the fleet's own (`branch_regex`). A PR a
     human opened from some other branch is never one of them — the fleet closes
     only what the fleet opened."""
-    rx = branch_regex(branch_pattern, number)
+    rx = branch_regex(number)
     return [p for p in prs or []
             if any(ref.get("number") == number for ref in p.get("closingIssuesReferences") or [])
             and rx.match(p.get("headRefName") or "")]
@@ -3640,7 +3680,7 @@ def assemble_working_set(issues, prs, claims, heartbeats, me, now, config,
       heartbeats:  {instance: last_ts}
       me, now:     my instance id / epoch seconds
       config:      the canonical config — read for ready_label, epic_labels,
-                   claim_lease_ttl_seconds, gate.ci and concurrency
+                   gate.ci and concurrency
       closed:      the numbers of the claims whose issue is closed (`issues` holds
                    only open ones, so `afk rebuild` asks about each claim that is
                    missing from it). One of mine becomes a `closed` row; a stale
@@ -3681,7 +3721,7 @@ def assemble_working_set(issues, prs, claims, heartbeats, me, now, config,
     fleet died before releasing — is a phantom lock with nothing behind it, and is listed in
     `stale_closed` instead, to be deleted rather than taken and dispatched.
     """
-    ttl, ci_mode = config["claim_lease_ttl_seconds"], config["gate"]["ci"]
+    ttl, ci_mode = CLAIM_LEASE_TTL_SECONDS, config["gate"]["ci"]
     by_num = {i.get("number"): i for i in issues}
     pr_for = _closing_pr_map(prs)
 

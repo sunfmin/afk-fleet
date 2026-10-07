@@ -66,8 +66,8 @@ each one runs is shown so the mechanism is legible, but the tick calls the tool.
   releasing safe: a still-finishing orphan's PR is never re-dispatched, and a human's PR is left alone.
   A skipped delete is a **phantom lock** that silently starves an issue — the canonical definition of
   that failure lives here.
-- **Namespace fallback** — where the refs live is the config key `claim_namespace`: `refs/afk`
-  (default) or `refs/heads`, and nothing else. If bootstrap's `afk probe` finds an org ruleset
+- **Namespace fallback** — where the refs live is the run's `claim_namespace`, which no file sets: `refs/afk`,
+  or `refs/heads`, and nothing else. If bootstrap's `afk probe` finds an org ruleset
   rejecting `refs/afk/*`, it reports `blocked` and returns the config with `claim_namespace: refs/heads` — claims become `refs/heads/afk-claim/*`, heartbeats
   `refs/heads/afk-heartbeat/*` — and the launcher warns that `on: push` CI fires on claim churn. Every
   later call inherits the namespace through `--config`; there is no separate flag to carry.
