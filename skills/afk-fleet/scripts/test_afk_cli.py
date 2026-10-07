@@ -1705,6 +1705,29 @@ def test_a_tick_in_code_carries_out_every_no_pr_action_whose_reason_is_on_record
         assert "after its nudge" in _told(_worker_of(w, 4))
 
 
+def test_a_needs_decision_verdict_is_escalated_at_once_and_spends_no_attempt():
+    """ADR-0041: what the issue lacks is its owner's decision, which no fresh
+    worker can supply — so the claim goes to the human on the first tick that
+    reads the verdict, with no attempt counted and no retry started."""
+    with world(issues=[issue(1, "ready-for-agent")]) as w:
+        t = int(time.time()) + 5000
+        w.afk(*dispatch(1))
+        verdict(w, 1, "needs-decision", reason="split the module or keep it in Core")
+
+        r = cycle(w, None, now=t)
+        assert r["judgments"] == [] and "errors" not in r, r
+        assert r["progress"] == "escalated #1; 0 in flight, 0 left on the frontier"
+        assert w.issue(1)["labels"] == ["ready-for-human"] and w.claimed_by(1) is None
+        handoff = w.comments(1)[-1]
+        assert "escalated to a human** (without a retry)" in handoff
+        assert "split the module or keep it in Core" in handoff
+        # …and it points at the comment that holds the decision to make
+        assert "https://" in handoff and "worker's comment" in handoff
+        # nothing is on the branch, so the worktree goes with its idle worker: an
+        # escalated claim keeps evidence for the human, and this one has none
+        assert w.worktrees() == [] and not [t for t in w.terminals() if t["open"]]
+
+
 def _worker_of(w, n):
     """The terminal of the worker now on issue n."""
     path = next(wt["path"] for wt in w.worktrees() if wt["linkedIssue"] == n)
@@ -2059,8 +2082,11 @@ def test_a_silent_worker_is_nudged_once_and_its_screen_explains_the_failure():
         terms = w.terminals()
         terms[-1]["open"] = False
         w.orca(terminals=terms)
+        with open(os.path.join(d["worktree"], "wip.txt"), "w") as f:
+            f.write("uncommitted\n")              # work on the branch: the escalation keeps it
         r = w.afk(*_fail(8, "went quiet", "--set", "retry=0"))
         assert r["action"] == "escalate" and "● 确认一下？" in w.comments(8)[-1]
+        assert "cleanup" not in r and os.path.isdir(d["worktree"])
         w.afk("claim", "8", *ME, "--now", str(T0 + 1), *R)
         w.set(issues=[issue(8, "ready-for-agent")])
         r = w.afk(*dispatch(8)[:-2], "--now", str(T0 + 2))

@@ -3130,13 +3130,29 @@ def _sweep_batches(run: _Run, instance: str, live: Iterable[str]) -> Obj:
     return {"removed": removed, "deleted_branches": gone}
 
 
+def _workless_worktree(run: _Run, number: int) -> _Worktree | None:
+    """Issue <number>'s worktree on this machine when its branch holds no work —
+    nothing committed past the base, nothing uncommitted — else None: the one
+    a transition that releases an open issue's claim may remove, worker and
+    all. A worktree with work in it is evidence, and is never removed here."""
+    wt = _Worktree.of_issue(run.repo, number)
+    path = wt.path
+    progress = _worktree_progress(path, run.rem, run.cfg["base_branch"]) if path else None
+    empty = bool(progress and progress["commits_ahead"] == 0 and not progress["dirty"])
+    return wt if empty else None
+
+
 def _escalate(run: _Run, instance: str, issue: IssueRead, attempt: int, reason: str) -> Obj:
     """Hand an issue to a human, in the one order that leaves no gap: status board
-    → labels → comment → release. The claim is released LAST: released first, a
-    PR-less issue still carrying `ready_label` is back on the frontier for a peer
-    to dispatch before the relabel lands."""
+    → labels → comment → release → remove the worktree, when its branch holds no
+    work. The claim is released before anything is removed, and after the
+    relabel: released first, a PR-less issue still carrying `ready_label` is
+    back on the frontier for a peer to dispatch before the relabel lands. A
+    worktree with work in it stays for the human, with its PR; an empty one is
+    only an idle worker (ADR-0041)."""
     cfg = run.cfg
     number = issue["number"]
+    idle = _workless_worktree(run, number)
     pr = afk_decide.closing_pr(_open_prs(run.repo), number)
     pr_number = pr["number"] if pr else None
     _upsert_board(run, number, "escalated", instance=instance,
@@ -3147,9 +3163,10 @@ def _escalate(run: _Run, instance: str, issue: IssueRead, attempt: int, reason: 
     comment_id = _comment(run.repo, number,
                           afk_decide.escalation_comment(reason, attempt, pr_number))
     _release(run, number)
+    cleanup = idle.remove() if idle else None
     return {"issue": number, "action": "escalate", "attempt": attempt, "pr": pr_number,
             "labels": {"added": add, "removed": remove}, "comment_id": comment_id,
-            "released": True}
+            "released": True, **({"cleanup": cleanup} if cleanup else {})}
 
 
 def _ensure_label(repo: str, name: str) -> None:
@@ -3216,10 +3233,12 @@ def _fail_claim(run: _Run, instance: str, agent: _Agent, number: int, reason: st
 
 def cmd_escalate(a: argparse.Namespace) -> Obj:
     """Hand one of my claims straight to a human, outside the retry ladder — where
-    `afk no-pr` says `escalate` (`afk_decide.WORKER_CAUSES`: a DAG gap, or a
-    landing turn nobody could get a worker to perform). Same ordered transition `afk fail` ends in; the attempt count is
+    `afk no-pr` says `escalate` (`afk_decide.WORKER_CAUSES`: a DAG gap, a decision
+    only the issue's owner can make, or a landing turn nobody could get a worker
+    to perform). Same ordered transition `afk fail` ends in; the attempt count is
     reported, not consulted, and no attempt is spent: the PR stays open, the
-    branch and the worktree stay. After an unanswered nudge the worker's last
+    branch and the worktree stay — unless the branch holds no work at all, where
+    the worktree is removed with its idle worker. After an unanswered nudge the worker's last
     screen is appended to the reason, as `afk fail` appends it."""
     return _escalate_claim(_run(a), a.instance, a.number, a.reason)
 
@@ -3248,7 +3267,6 @@ def cmd_park(a: argparse.Namespace) -> Obj:
 
 def _park_claim(run: _Run, instance: str, number: int) -> Obj:
     """`afk park` — of `instance`'s claim on issue <number>."""
-    cfg, rem = run.cfg, run.rem
     _require_mine(run, number, instance)
     declared = afk_decide.latest_verdict(_issue_comments(run.repo, number))
     standings = _blocker_standings(run, number, declared["blocked_by"], _open_prs(run.repo))
@@ -3256,9 +3274,7 @@ def _park_claim(run: _Run, instance: str, number: int) -> Obj:
     if refusal:
         raise ValueError(f"issue #{number} is not parkable: {refusal}; nothing was changed")
     waiting = [b["number"] for b in standings if b["standing"] == "waiting"]
-    wt = _Worktree.of_issue(run.repo, number)
-    path = wt.path
-    progress = _worktree_progress(path, rem, cfg["base_branch"]) if path else None
+    idle = _workless_worktree(run, number)
 
     recorded = {e["number"] for e in _blocked_by(run.repo, number)}
     added = [n for n in waiting if n not in recorded]
@@ -3266,8 +3282,7 @@ def _park_claim(run: _Run, instance: str, number: int) -> Obj:
         _add_blocker(run.repo, number, n)
     _upsert_board(run, number, "parked", blocked_by=waiting)
     _release(run, number)
-    empty = bool(progress and progress["commits_ahead"] == 0 and not progress["dirty"])
-    cleanup = wt.remove() if (path and empty) else None
+    cleanup = idle.remove() if idle else None
     return {"issue": number, "action": "parked", "blocked_by": waiting, "edges_added": added,
             "released": True, **({"cleanup": cleanup} if cleanup else {})}
 

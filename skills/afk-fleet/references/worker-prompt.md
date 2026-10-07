@@ -99,7 +99,13 @@ must be exactly this, on one line, followed by a human-readable body
   and does not exist yet. Do not create it yourself. Name every blocking issue in `blocked_by=`
   (e.g. `blocked_by=41,42`) and say what is missing.
 - **`giving-up`** — after a genuine effort you cannot complete the work or make the gate pass. Say
-  where you are stuck.
+  where you are stuck. A fresh worker retries the issue from `{base_branch}`.
+- **`needs-decision`** — the issue as written cannot be done by anyone: its premise does not hold in
+  the code, its acceptance criteria contradict each other, or it reads two ways that lead to
+  different work. Nobody retries it — it goes straight to the issue's owner — so the comment must
+  let them decide in one reply: the evidence (file and line), **the decision to make**, the options
+  and the one you would pick. Put the question itself in `reason=`. Leave nothing on the branch.
+  Not for work that is merely hard, or a gate you could not make green: that is `giving-up`.
 
 ## Hard rules
 - End with a PR or that comment — never just stop, and never wait for an answer: nobody reads this

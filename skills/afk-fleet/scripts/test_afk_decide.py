@@ -911,7 +911,7 @@ def test_the_verdict_marker_round_trips_through_its_reader():
         assert (bare["n"], bare["phase"], bare["blocked_by"], bare["reason"]) == (7, phase, [], None)
     # what the worker is shown is that same spelling, with placeholders
     shown = d.verdict_marker_format(31)
-    assert shown == ("<!--afk:verdict n=31 phase=<already-satisfied|blocked|giving-up> "
+    assert shown == ("<!--afk:verdict n=31 phase=<already-satisfied|blocked|giving-up|needs-decision> "
                      "[blocked_by=<csv of issue numbers>] [reason=<short>]-->")
 
 
@@ -1099,6 +1099,11 @@ def test_classification_routes_idle_workers_on_their_verdict():
     # giving-up, a garbage phase → failed: the worker DECLARED something
     assert _no_pr(ZERO, "idle", 600, _verdict("giving-up")) == ("idle_failed", "next_attempt")
     assert _no_pr(ZERO, "idle", 600, _verdict("weird-phase")) == ("idle_failed", "next_attempt")
+    # needs-decision → escalated, never failed: the issue's owner is the only one who
+    # can supply what is missing, so no attempt is spent on it — work on the branch or not
+    assert _no_pr(ZERO, "idle", 600, _verdict("needs-decision")) == ("idle_undecided", "escalate")
+    assert _no_pr({**ZERO, "commits_ahead": 2}, "idle", 9999, _verdict("needs-decision")) == \
+        ("idle_undecided", "escalate")
     # no verdict at all, a not-found verdict → it declared nothing: stalled, not failed
     assert _no_pr(ZERO, "idle", 600, None) == ("idle_stalled", "nudge")
     assert _no_pr(ZERO, "idle", 600, {"found": False}) == ("idle_stalled", "nudge")
@@ -2066,7 +2071,8 @@ def test_worker_step_routes_every_cause_or_returns_the_judgment():
             raise AssertionError("a cause with no route was routed")
     assert {c for c, row in d.WORKER_CAUSES.items() if row.batch_step is None} == {
         "satisfied", "satisfied_refuted", "blockers_closed", "blockers_waiting", "blocker_unmet",
-        "no_blocker_named", "gave_up", "unknown_phase",         # a batch worker declares nothing
+        "no_blocker_named", "gave_up", "needs_decision",        # a batch worker declares nothing
+        "unknown_phase",
         "silent_on_turn", "silent_past_restart"}                # …and is abandoned, never restarted
 
 
@@ -2079,6 +2085,10 @@ _KEPT = ("PR #{pr} was judged ready and given the landing turn, its worker was r
          "the turn once, and the landing still did not happen: {stopped}. The PR, its branch "
          "and its worktree are kept as they are")
 _GONE_QUIET = {"progress": ZERO, "idle": 9000}
+# the reason a `needs-decision` verdict is escalated with (ADR-0041)
+_ASKS = ("its worker found that the issue as written needs a decision from its owner{asks}. A "
+         "retry would stop at the same question, so none was spent — the decision to make is "
+         "in the worker's comment: https://gh/c/7")
 REASONS = (
     ("blocker_unmet", "escalate",
      {"verdict": _declared("blocked", blocked_by=[9, 8]), "blockers": _UNMET}, "no_pr",
@@ -2091,6 +2101,13 @@ REASONS = (
      "its worker declared `already-satisfied`, but the branch holds changes"),
     ("gave_up", "fail", {"verdict": _declared("giving-up", reason="flaky build")}, "no_pr",
      "its worker gave up: flaky build"),
+    # a decision only the issue's owner can make is escalated with the worker's own
+    # words and a pointer at its comment — and is on record with no `reason=` at all
+    ("needs_decision", "escalate",
+     {"verdict": _declared("needs-decision", reason="split or keep in Core")}, "no_pr",
+     _ASKS.format(asks=": split or keep in Core")),
+    ("needs_decision", "escalate", {"verdict": _declared("needs-decision")}, "no_pr",
+     _ASKS.format(asks="")),
     ("unknown_phase", "fail", {"verdict": _declared("on-holiday")}, "no_pr",
      "its worker's verdict names no phase the fleet knows ('on-holiday')"),
     ("unknown_phase", "fail", {"verdict": {**_declared("x"), "phase": None}}, "no_pr",

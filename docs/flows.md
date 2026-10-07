@@ -73,7 +73,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 
 **Where it forks.**
 - The worker opens no PR and leaves an `afk:verdict` marker instead (already-satisfied, blocked,
-  giving-up), or goes quiet: `skills/afk-fleet/scripts/afk_decide.py:classify_stopped`.
+  giving-up, needs-decision), or goes quiet: `skills/afk-fleet/scripts/afk_decide.py:classify_stopped`.
 - While the worker is still at it, the tick's question costs no GitHub read: the worker state its
   runtime reported to orca settles it, `skills/afk-fleet/scripts/afk_decide.py:read_worker_state`
   (ADR-0021).
@@ -228,7 +228,8 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    relabelled: the escalate label on, the ready label and the attempt label off.
    `skills/afk-fleet/scripts/afk_decide.py:escalation_labels`
 7. The stuck point is commented with the PR, and only then is the claim released; the issue is now
-   a human's, with its PR and worktree left as evidence.
+   a human's, with its PR and worktree left as evidence — a worktree with no work on its branch is
+   removed instead.
    `skills/afk-fleet/scripts/afk.py:_escalate`
 
 **Where it forks.**
@@ -244,6 +245,9 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   back until the blocker closes (`skills/afk-fleet/scripts/afk.py:cmd_park`, ADR-0022); one nothing
   will resolve, or none named, it is escalated as a DAG gap
   (`skills/afk-fleet/scripts/afk.py:cmd_escalate`).
+- A worker that declares `needs-decision` — the issue as written needs its owner to decide
+  something — skips steps 2–5: it is escalated at once, no attempt counted, the escalation
+  pointing at the worker's comment (ADR-0041).
 - A worker that declares the issue already satisfied, with nothing on its branch: the issue is
   closed and the claim released (the first mainline's fork).
 
