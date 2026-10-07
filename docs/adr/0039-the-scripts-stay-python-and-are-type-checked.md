@@ -1,6 +1,6 @@
 # ADR-0039 — The scripts stay Python, and the gate type-checks them
 
-**Status:** accepted — adds `ty` to this repo's gate. Leaves the runtime dependencies of
+**Status:** accepted — adds `ruff` and `ty` to this repo's gate, and types the production scripts. Leaves the runtime dependencies of
 [ADR-0004](0004-deterministic-mechanics-as-tools.md) as they are: `python3` + `git` + `gh`.
 
 ## Context
@@ -28,8 +28,17 @@ wherever a separate `turn` was truthy, the two tied only by an assignment forty 
 
 1. **The scripts stay Python**, standard library only.
 2. **The gate type-checks them.** `gate.local_command` runs `uvx ty@<version> check` before the
-   tests. `ty.toml` at the repo root says what is checked: every script but the tests.
-3. **The version is pinned in the command.** `ty` is pre-1.0 and each release finds new errors; an
+   tests. `ty.toml` at the repo root says what is checked — every script but the tests — and as
+   which Python: 3.9, macOS's own `python3`, the oldest the scripts run on.
+3. **Every function states its types.** Parameters and return, nested functions included; the gate
+   runs `uvx ruff@<version> check` with the `ANN` rules (`ruff.toml`), so one that does not is red.
+   A JSON object — a config, a `gh` row, a result — is `afk_decide.Obj`; what its keys are stays
+   where it is made.
+4. **A closed vocabulary is a `Literal`.** Declared beside its words in `afk_decide.py`: a tuple of
+   them is read off the Literal (`get_args`), and a table of them is keyed by it, so a word
+   misspelled where it is used is a type error. Where a chain of branches handles every word it
+   ends in `afk_decide.assert_never`, and a word added without its branch is a type error too.
+5. **The versions are pinned in the command.** `ty` is pre-1.0 and each release finds new errors; an
    unattended worker's gate must go red only for what the worker changed.
 
 ## Considered and rejected
@@ -43,8 +52,12 @@ wherever a separate `turn` was truthy, the two tied only by an assignment forty 
 ## Consequences
 
 - A type error fails the gate in seconds, before any test runs.
-- The scripts are mostly unannotated, so `ty` checks what it can infer: `None`-safety and call
-  shapes, not yet the closed sets (`LAND_OUTCOMES`, `TICK_STEPS`, …), which are still tuples of
-  `str`. Typing those as `Literal` and routing on them with `assert_never` is the next step, taken
-  where a set is next changed rather than all at once.
-- Bumping `ty` is a deliberate change: the pin moves together with whatever the new version finds.
+- A table keyed by a Literal cannot name a word the Literal lacks, but can lack one it has: one
+  test holds each table to its Literal. The two assertions that listed `WORKER_CAUSES`' steps by
+  hand are gone — a step that is not a `WorkerStep` no longer type-checks.
+- What is typed is the vocabulary and the shapes of calls, not the keys of a JSON object: `Obj` is
+  `dict[str, Any]`, and a misspelled key is still the tests' to catch.
+- `from __future__ import annotations` heads each script, so a signature may say `str | None` on
+  Python 3.9; a type evaluated at run time — an alias — is spelled `Optional[...]`.
+- Bumping `ruff` or `ty` is a deliberate change: the pin moves together with whatever the new
+  version finds.
