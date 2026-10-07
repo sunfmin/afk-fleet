@@ -440,7 +440,7 @@ def test_turns_are_granted_in_one_order_a_held_turn_first_then_pr_number():
     holds a turn first, then the lower PR number — never the order claims were
     scanned in."""
     def row(number, status, pr):
-        return {"number": number, "status": status, "pr": pr}
+        return _mine(number, status, pr=pr)
 
     rows = [row(1, "awaiting_turn", 30), row(2, "no_pr", None), row(3, "awaiting_turn", 10),
             row(4, "landing", 40), row(5, "awaiting_ci", 5), row(6, "failure", 6),
@@ -955,6 +955,8 @@ def _classify(progress, terminal, idle, verdict=None, blockers=None, **more):
     """One worker's classification, the way `afk no-pr` reaches it: is it settled
     by its worker state alone — and only if not, as a stopped worker."""
     reading = {"terminal": terminal, "terminal_idle_seconds": idle, "state": None}
+    if more.get("turn"):                    # a whole turn record, saying what the test names
+        more["turn"] = d.next_turn(None, **more["turn"])
     return d.settled_by_worker_state(reading, NOW, GRACE, more.get("nudged_at")) or \
         d.classify_stopped(progress, idle, verdict, blockers or {}, NOW, GRACE, **more)
 
@@ -1153,8 +1155,9 @@ def test_classification_nudges_a_silent_worker_once_before_failing_it():
         assert (r["cause"], r["action"]) == ("silent_after_nudge", "next_attempt"), held
         r = _classify(ZERO, "idle", 9000, can_nudge=False, turn=held)
         assert (r["cause"], r["action"]) == ("silent_unnudgeable", "next_attempt"), held
-    assert d.restartable_turn({"at": 1}) and not d.restartable_turn({"at": 1, "restarted": 2})
-    assert d.single_turn_held({"at": 1, "restarted": 2}) and not d.single_turn_held({"at": 1, "batch": "b"})
+    a = lambda **said: d.next_turn(None, **said)
+    assert d.restartable_turn(a(at=1)) and not d.restartable_turn(a(at=1, restarted=2))
+    assert d.single_turn_held(a(at=1, restarted=2)) and not d.single_turn_held(a(at=1, batch="b"))
     r = _classify(ZERO, "none", None, turn={"at": NOW - 10})
     assert (r["outcome"], r["action"]) == ("dead", "orphan")      # a gone terminal is still dead
     # a worker whose landing stopped FOR THE TICK (CI, a verify, absent checks) is
@@ -1880,8 +1883,19 @@ def _argv(command):
     return argv[1], argv
 
 
+def _worker(cause, **more):
+    """A whole `afk no-pr` row (`afk_decide.WorkerRow`) for a worker classified `cause`."""
+    row = d.WORKER_CAUSES.get(cause)
+    return {"cause": cause, "outcome": row and row.outcome, "action": row and row.action,
+            "idle_seconds": None, "pending_blockers": [], "worktree": None, "progress": None,
+            "worker_verdict": None, "blockers": [], "nudged_at": None, "turn_at": None, **more}
+
+
 def _mine(n, status="no_pr", **more):
-    return {"number": n, "status": status, "pr": None, "stopped": None, **more}
+    """A whole `mine` row (`afk_decide.MineRow`), saying nothing but what is named."""
+    return {"number": n, "title": None, "status": status, "board_phase": None, "pr": None,
+            "checks": None, "attempt": 0, "starting": False, "stopped": None, "batch": None,
+            "unbatched": None, **more}
 
 
 def test_a_tick_asks_after_waiting_workers_and_grants_one_turn():
@@ -1967,7 +1981,7 @@ def test_worker_step_routes_every_cause_or_returns_the_judgment():
     cfg = d.resolve_config({})
 
     def step(cause, row=None, **worker):
-        return d.worker_step(CALL, row or _mine(4), {"cause": cause, **worker}, cfg)
+        return d.worker_step(CALL, row or _mine(4), _worker(cause, **worker), cfg)
 
     for cause in ("working", "just_stopped", "within_grace", "awaiting_tick"):
         assert step(cause) == ("leave", None), cause
@@ -2087,16 +2101,16 @@ def test_every_reason_a_tick_words_is_pinned_to_the_cause_it_is_worded_for():
     cfg = d.resolve_config({})
     for cause, do, got, status, reason in REASONS:
         verdict, blockers = got.get("verdict", _declared()), got.get("blockers", [])
-        turn = {"at": NOW - 9000, "stopped": got.get("stopped"),
-                "restarted": got.get("restarted")} if status == "landing" else None
+        turn = d.next_turn(None, at=NOW - 9000, stopped=got.get("stopped"),
+                           restarted=got.get("restarted")) if status == "landing" else None
         seen = d.classify_stopped(got.get("progress", ZERO), 9000, verdict,
                                   {b["number"]: b["standing"] for b in blockers}, NOW, GRACE,
                                   nudged_at=got.get("nudged_at"),
                                   can_nudge=got.get("can_nudge", True), turn=turn)
         assert seen["cause"] == cause, (seen, reason)
         row = _mine(4, status, pr=30, stopped=got.get("stopped")) if status == "landing" else _mine(4)
-        worker = {**seen, "worker_verdict": verdict, "blockers": blockers,
-                  "nudged_at": got.get("nudged_at")}
+        worker = {**_worker(seen["cause"]), **seen, "worker_verdict": verdict,
+                  "blockers": blockers, "nudged_at": got.get("nudged_at")}
         assert d.worker_step(CALL, row, worker, cfg) == (do, reason), cause
         # the cause alone carries the decision: with the row's words for it
         # scrambled, the reason is the same
@@ -2207,9 +2221,7 @@ class _Raises(str):
     """A scripted answer: the step raised, saying this."""
 
 
-def _row(n, status="no_pr", **more):
-    return {"number": n, "status": status, "pr": None, "stopped": None, "batch": None,
-            "unbatched": None, "board_phase": None, "attempt": 0, **more}
+_row = _mine
 
 
 def _working_set(mine=(), frontier=(), stale=(), stale_closed=(), batches=(), concurrency=3):
@@ -2252,7 +2264,7 @@ def _play(ws, answers=None, causes=None, config=None):
         key = step.get("issue", step.get("batch"))
         if do == "no-pr" and ("no-pr", key) not in answers and "no-pr" not in answers:
             asked = step.get("issues") or [step["batch"]]
-            return {"workers": [{"issue": n, "cause": causes.get(n, "working")}
+            return {"workers": [_worker(causes.get(n, "working"), issue=n)
                                 for n in asked]}, None
         if do == "turn" and ("turn", key) not in answers and "turn" not in answers:
             return {"issue": key, "pr": key * 10, "head": "abc", "outcome": "granted"}, None
@@ -3244,7 +3256,7 @@ def test_a_cause_names_its_own_step_in_the_one_table():
         if row.batch_step:
             assert d.batch_step({"cause": cause}) == row.batch_step
         if row.step in ("leave", "dispatch", "park", "nudge", "restart"):
-            assert d.worker_step(CALL, _mine(4), {"cause": cause}, cfg) == (row.step, None)
+            assert d.worker_step(CALL, _mine(4), _worker(cause), cfg) == (row.step, None)
 
 
 def test_a_closed_vocabulary_and_its_table_list_the_same_words():

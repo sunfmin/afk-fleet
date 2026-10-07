@@ -57,7 +57,8 @@ import afk_decide
 
 Obj = afk_decide.Obj    # a JSON object: a payload of gh or orca, a row, a result
 # The records the two scripts hand each other, declared in the core (ADR-0039).
-from afk_decide import BatchMember, BoardBatch, Config, Stacked, Turn, WorkingSet  # noqa: E402
+from afk_decide import (BatchMember, BatchWorkerRow, BoardBatch, Call, Config, Progress, Seen,  # noqa: E402
+                        Stacked, Standing, Turn, WorkerReading, WorkerRow, WorkingSet)
 Answer = afk_decide.Answer              # how a step of a tick's plan ended
 StartOutcome = afk_decide.StartOutcome  # how beginning a dispatch ended
 _T = TypeVar("_T")
@@ -480,7 +481,7 @@ def _record_turn(repo: str, pr_number: int, turn: Turn) -> int:
     return _comment(repo, pr_number, afk_decide.turn_comment(turn), turn["comment_id"])
 
 
-def _worktree_progress(wt: str, rem: str, base: str) -> Obj:
+def _worktree_progress(wt: str, rem: str, base: str) -> Progress:
     """One worktree's git progress: commits ahead of `base`, dirty tree, last
     commit + newest file mtime. `base` is measured where it actually is — the
     REMOTE's tip, fetched here — never the local branch of that name, which a
@@ -1243,7 +1244,7 @@ def _tick(run: _Run, instance: str, host: str, agent: _Agent,
     def carry_out(step: Obj) -> Answer:
         return answered(steps[step["do"]], **{k: v for k, v in step.items() if k != "do"})
 
-    call = {"afk_path": os.path.abspath(__file__), "repo": run.repo, "instance": instance,
+    call: Call = {"afk_path": os.path.abspath(__file__), "repo": run.repo, "instance": instance,
             "worker_command": agent.command, "config": json.dumps(cfg, ensure_ascii=False)}
     done = afk_decide.follow(afk_decide.tick_plan(ws, call, cfg), carry_out)
     for number in set(run.boards) - done["held"]:
@@ -1587,7 +1588,7 @@ class _Worker:
     """One worker as `_Workers` saw it: where its worktree is on this machine,
     and what it is doing."""
 
-    def __init__(self, path: str | None, reading: Obj, now: int, grace: int) -> None:
+    def __init__(self, path: str | None, reading: WorkerReading, now: int, grace: int) -> None:
         self.path = path            # its worktree, on this disk — None: none here, so no worker
         self.reading = reading      # `afk_decide.read_worker_state`: busy, idle or none
         self.now, self.grace = now, grace  # the clock and the grace period it was read with
@@ -1602,7 +1603,7 @@ class _Worker:
         return (_Worktree.at(self.path).nudge or {}).get("at")
 
     @property
-    def settled(self) -> Obj | None:
+    def settled(self) -> Seen | None:
         """Its classification when the reading alone decides it — busy, or gone
         (`afk_decide.settled_by_worker_state`) — else None: only then is anything
         in git or on GitHub worth reading for it."""
@@ -1704,17 +1705,17 @@ def _workers_seen(run: _Run, numbers: list[int] | None = None, batch_id: str | N
     return {"workers": seen}
 
 
-def _worker_outcome(run: _Run, number: int, worker: _Worker) -> Obj:
+def _worker_outcome(run: _Run, number: int, worker: _Worker) -> WorkerRow:
     """One worker's classification, gathering only what its reading leaves open:
     busy or gone is settled by the reading alone (`_Worker.settled`), so it costs
     no git and no GitHub."""
     cfg, path, nudged_at = run.cfg, worker.path, worker.nudged_at
     settled = worker.settled
     if settled:
-        return {**settled, "worktree": path, "progress": {}, "worker_verdict": None,
+        return {**settled, "worktree": path, "progress": None, "worker_verdict": None,
                 "blockers": [], "nudged_at": nudged_at, "turn_at": None}
     now, grace = worker.now, worker.grace
-    progress = _worktree_progress(path, run.rem, cfg["base_branch"]) if path else {}
+    progress = _worktree_progress(path, run.rem, cfg["base_branch"]) if path else None
     declared = afk_decide.latest_verdict(_issue_comments(run.repo, number))
     prs = _open_prs(run.repo)
     blockers = _blocker_standings(run, number, declared["blocked_by"], prs)
@@ -1735,7 +1736,7 @@ def _worker_outcome(run: _Run, number: int, worker: _Worker) -> Obj:
 _DEPENDENCY_WALK_LIMIT = 200
 
 
-def _blocker_standings(run: _Run, number: int, named: list[int], prs: list[Obj]) -> list[Obj]:
+def _blocker_standings(run: _Run, number: int, named: list[int], prs: list[Obj]) -> list[Standing]:
     """Where each issue a `blocked` verdict names stands
     (`afk_decide.blocker_standings`), gathering what that takes: the blocker
     itself, the claim refs, the open PRs, and — from every blocker still open —
@@ -1986,8 +1987,9 @@ def _begin_worker(run: _Run, instance: str, agent: _Agent, issue: Obj, start: _S
         if landing:
             prompt = afk_decide.render_landing(f.read(), fields, _landing_fields(cfg, landing))
         else:
-            prompt = afk_decide.render_worker_prompt(f.read(), plan["prompt"], fields,
-                                                     reason=reason)
+            variant = plan["prompt"]
+            assert variant != "landing", plan       # that brief is a PR's that holds the turn
+            prompt = afk_decide.render_worker_prompt(f.read(), variant, fields, reason=reason)
     submit = wt.put(agent, prompt)
 
     def ready() -> Obj:
@@ -2788,7 +2790,7 @@ def _abandon_batch(run: _Run, instance: str, batch: str) -> Obj:
             "deleted_branches": deleted, **({"cleanup": cleanup} if cleanup else {})}
 
 
-def _batch_worker(run: _Run, batch: str, worker: _Worker) -> Obj:
+def _batch_worker(run: _Run, batch: str, worker: _Worker) -> BatchWorkerRow:
     """`afk no-pr --batch` — is the batch's worker still at it? The same reading
     and the same ladder as any worker holding a turn (`classify_stopped`), from the
     batch's worktree: busy, or within grace of its turn or of its last
@@ -2796,14 +2798,14 @@ def _batch_worker(run: _Run, batch: str, worker: _Worker) -> Obj:
     silent past grace it is nudged once, and silent again the batch is
     abandoned (`afk_decide.batch_step`)."""
     cfg, path, nudged_at = run.cfg, worker.path, worker.nudged_at
-    turn_at, progress = None, {}
+    turn_at, progress = None, None
     seen = worker.settled
     if not seen:
         now, grace = worker.now, worker.grace
         told = [(_turn(run.repo, m["pr"]) or {}).get("at")
                 for m in _members_of_batch(run, batch)]
         turn_at = max((t for t in told if t), default=None)
-        progress = _worktree_progress(path, run.rem, cfg["base_branch"]) if path else {}
+        progress = _worktree_progress(path, run.rem, cfg["base_branch"]) if path else None
         # a batch's worker declares no verdict and names no blocker — and a batch's
         # turn is never restarted: its second silence abandons the batch
         seen = afk_decide.classify_stopped(progress, worker.reading["terminal_idle_seconds"],
@@ -3251,7 +3253,7 @@ def _park_claim(run: _Run, instance: str, number: int) -> Obj:
     waiting = [b["number"] for b in standings if b["standing"] == "waiting"]
     wt = _Worktree.of_issue(run.repo, number)
     path = wt.path
-    progress = _worktree_progress(path, rem, cfg["base_branch"]) if path else {}
+    progress = _worktree_progress(path, rem, cfg["base_branch"]) if path else None
 
     recorded = {e["number"] for e in _blocked_by(run.repo, number)}
     added = [n for n in waiting if n not in recorded]
@@ -3259,7 +3261,7 @@ def _park_claim(run: _Run, instance: str, number: int) -> Obj:
         _add_blocker(run.repo, number, n)
     _upsert_board(run, number, "parked", blocked_by=waiting)
     _release(run, number)
-    empty = progress.get("commits_ahead") == 0 and not progress.get("dirty")
+    empty = bool(progress and progress["commits_ahead"] == 0 and not progress["dirty"])
     cleanup = wt.remove() if (path and empty) else None
     return {"issue": number, "action": "parked", "blocked_by": waiting, "edges_added": added,
             "released": True, **({"cleanup": cleanup} if cleanup else {})}
