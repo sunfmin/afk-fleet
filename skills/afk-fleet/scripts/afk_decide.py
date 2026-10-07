@@ -2024,6 +2024,19 @@ def find_orca_worktree(worktrees, number, repo=None):
             "branch": short_branch(best.get("branch")) or None}
 
 
+def remotes_of(urls, repo):
+    """The names of the git remotes that ARE the target repo, from a checkout's
+    `remote.<name>.url` settings ({name: url}) — the ones whose remote-tracking
+    ref a fetch by URL leaves behind. A URL matches when it ends in
+    `github.com/<owner>/<name>` or `github.com:<owner>/<name>`, `.git` or not,
+    case-insensitively, as GitHub does."""
+    want = repo.lower()
+    def names(url):
+        url = url.lower().rstrip("/").removesuffix(".git")
+        return url.endswith(f"github.com/{want}") or url.endswith(f"github.com:{want}")
+    return sorted(name for name, url in (urls or {}).items() if names(url))
+
+
 def find_orca_repo(repos, repo):
     """
     The repo orca knows the target by, from `orca repo list --json`'s

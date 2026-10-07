@@ -2662,7 +2662,11 @@ def test_a_worker_lands_its_own_pr_on_the_turn_the_fleet_grants():
         w.orca_calls()
         r = w.afk("release", "3", *ME, *R, *gate)
         assert (r["released"], r["cleanup"]) == (True, {"removed": True, "path": wt}), r
-        assert w.orca_calls() == ["worktree rm"]
+        # … and the landing is in the fleet's own checkout, with nobody pulling
+        assert r["synced"] == {"branch": w.sb.base, "tip": synced, "updated": True}
+        assert git(w.cwd, "rev-parse", w.sb.base) == synced
+        assert os.path.exists(os.path.join(w.cwd, "feature3.txt"))
+        assert w.orca_calls() == ["worktree rm", "repo list"]
         assert w.claimed_by(3) is None and w.worktrees() == [] and not os.path.isdir(wt)
         assert w.afk("rebuild", *ME, *R, *NOW, *gate)["mine"] == []
 
@@ -2677,6 +2681,41 @@ def test_release_removes_a_worktree_only_for_a_claim_whose_issue_is_closed():
         w.set(issues=[issue(1, "ready-for-agent"), issue(2, "ready-for-agent", state="closed")])
         r = w.afk("release", "2", *ME, *R, "--set", "worktree_cleanup=false")
         assert r["released"] is True and "cleanup" not in r and os.path.isdir(d2["worktree"])
+
+
+def test_a_settled_landing_fast_forwards_the_fleets_checkout_and_nothing_else():
+    closed = lambda *ns: [issue(n, "ready-for-agent", state="closed" if n in ns else "open")
+                          for n in (1, 2, 3, 4)]
+    with world(issues=closed()) as w:
+        base, local = w.sb.base, lambda: git(w.cwd, "rev-parse", w.sb.base)
+        for n in (1, 2, 3, 4):
+            w.afk(*dispatch(n))
+
+        def settle(n, *extra):
+            w.set(issues=closed(*range(1, n + 1)))
+            return w.afk("release", str(n), *ME, *R, *extra).get("synced")
+
+        # already there: nothing to move
+        assert settle(1) == {"branch": base, "tip": local(), "updated": False}
+        tip = w.advance_base("one.txt")
+        # checked out, with an edit the landing does not touch: followed, edit kept
+        with open(os.path.join(w.cwd, "scratch.txt"), "w") as f:
+            f.write("mine\n")
+        assert settle(2) == {"branch": base, "tip": tip, "updated": True} and local() == tip
+        assert os.path.exists(os.path.join(w.cwd, "one.txt"))
+        assert os.path.exists(os.path.join(w.cwd, "scratch.txt"))
+        # not checked out: the branch's ref is moved, the work tree is not
+        git(w.cwd, "checkout", "-q", "-b", "elsewhere")
+        tip = w.advance_base("two.txt")
+        assert settle(3) == {"branch": base, "tip": tip, "updated": True} and local() == tip
+        assert not os.path.exists(os.path.join(w.cwd, "two.txt"))
+        # diverged: only ever a fast-forward — skipped, and the release still stands
+        git(w.cwd, "checkout", "-q", base)
+        git(w.cwd, "commit", "-q", "--allow-empty", "-m", "local only")
+        w.advance_base("three.txt")
+        was, synced = local(), settle(4)
+        assert synced["branch"] == base and synced["skipped"] and local() == was
+        assert w.claimed_by(4) is None
 
 
 def test_a_red_gate_on_the_turn_is_the_workers_to_fix_and_spends_nothing():

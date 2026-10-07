@@ -755,7 +755,8 @@ def cmd_release(a):
           its worktree removed too (`cleanup`, when `worktree_cleanup`). An open
           issue's worktree is never touched: it may hold work. A PR a merge
           batch landed that GitHub still does not show merged is closed here
-          (`closed_pr`).
+          (`closed_pr`), and the landing is fast-forwarded into the fleet's own
+          checkout (`synced`, ADR-0037).
       afk release <n> --instance <id> --expect-sha <sha>
           a `stale_closed` row of rebuild — a dead peer's claim on an issue that
           is already closed: a phantom lock, deleted instead of reclaimed."""
@@ -792,8 +793,9 @@ def _settle_landed(run, number):
     """What only the tick can do for a claim whose issue is closed — `afk land`
     runs inside the worktree and holds no instance id → {"closed_pr"?,
     "cleanup"?}: close the PR a merge batch landed that GitHub still shows open
-    (`_close_landed_pr`), and remove the worktree (when `worktree_cleanup`). An
-    open issue's worktree is never touched: it may hold work."""
+    (`_close_landed_pr`), remove the worktree (when `worktree_cleanup`), and
+    bring the landing into the fleet's own checkout (`_sync_checkout`). An open
+    issue's worktree is never touched: it may hold work."""
     settled = {}
     closed_pr = _close_landed_pr(run, number)
     if closed_pr:
@@ -801,7 +803,48 @@ def _settle_landed(run, number):
     worktree = _Worktree.of_issue(run.repo, number)
     if worktree.remembered and run.cfg["worktree_cleanup"]:
         settled["cleanup"] = worktree.remove()
+    settled["synced"] = _sync_checkout(run)
     return settled
+
+
+def _sync_checkout(run):
+    """Fast-forward the merge target's LOCAL branch, in the checkout orca cuts
+    worktrees from — the one the launcher runs in and its human reads — to the
+    remote's tip, so what the fleet landed is on this machine without anyone
+    pulling (ADR-0037) → {"branch", "tip", "updated": bool}, or {"branch",
+    "skipped": why}.
+
+    Only ever a fast-forward: checked out, the branch is merged `--ff-only`
+    (uncommitted changes the landing does not touch stay as they are); not
+    checked out, its ref is moved by a fetch, which refuses anything else. A
+    local branch that diverged, changes in the way, no such local branch, no
+    orca — each is `skipped` and nothing is changed: SOFT, a checkout that
+    cannot follow never fails the release it rides on."""
+    target = run.cfg["merge"]["target"]
+    try:
+        orca_repo = _Worktree.source(run.repo)
+        if not orca_repo:
+            return {"branch": target, "skipped": f"orca knows no repo for {run.repo}"}
+        at = ["-C", orca_repo["path"]]
+        local = f"refs/heads/{target}"
+        before = _git([*at, "rev-parse", "-q", "--verify", local], check=False).stdout.strip()
+        if not before:
+            return {"branch": target, "skipped": f"this checkout has no local branch {target!r}"}
+        tip = _fetch_tip(run.rem, target, cwd=orca_repo["path"])
+        if before != tip:
+            here = _git([*at, "symbolic-ref", "-q", "--short", "HEAD"], check=False).stdout.strip()
+            moved = _git([*at, "merge", "--ff-only", "--quiet", tip] if here == target else
+                         [*at, "fetch", "--quiet", run.rem, f"{local}:{local}"], check=False)
+            if moved.returncode != 0:
+                return {"branch": target, "skipped": moved.stderr.strip().splitlines()[0]}
+        urls = _git([*at, "config", "--get-regexp", r"^remote\..*\.url$"], check=False).stdout
+        named = {key[len("remote."):-len(".url")]: url
+                 for key, url in (line.split(None, 1) for line in urls.splitlines())}
+        for name in afk_decide.remotes_of(named, run.repo):
+            _git([*at, "update-ref", f"refs/remotes/{name}/{target}", tip], check=False)
+        return {"branch": target, "tip": tip, "updated": before != tip}
+    except _FAILURES as e:
+        return {"branch": target, "skipped": str(e)}
 
 
 def _claim_owner(run, number):
@@ -1328,6 +1371,13 @@ class _Worktree:
         """The worktree at a path named by hand, or already known."""
         return cls(path)
 
+    @staticmethod
+    def source(repo):
+        """The checkout orca cuts `repo`'s worktrees from → {"id", "path"}, or
+        None when orca knows no such repo. It is also the fleet's own checkout:
+        the one the launcher runs in."""
+        return afk_decide.find_orca_repo(_orca(["repo", "list"]).get("repos"), repo)
+
     @classmethod
     def cut(cls, run, at_branch, issue=None, batch=None):
         """Have orca create a worktree + branch at the REMOTE's current tip of
@@ -1342,7 +1392,7 @@ class _Worktree:
                                             issue["title"])
         else:
             name = afk_decide.batch_name(batch)
-        orca_repo = afk_decide.find_orca_repo(_orca(["repo", "list"]).get("repos"), run.repo)
+        orca_repo = cls.source(run.repo)
         if not orca_repo:
             raise RuntimeError(f"orca knows no repo for {run.repo} — add this checkout once with "
                                f"`orca repo add --path <path>`")
