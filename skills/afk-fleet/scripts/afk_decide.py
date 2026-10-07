@@ -25,7 +25,7 @@ import re
 import shlex
 import urllib.parse
 from typing import (Any, Callable, Collection, Generator, Iterable, Literal, Mapping, NamedTuple,
-                    NoReturn, Optional, TypeVar, get_args)
+                    NoReturn, Optional, TypedDict, TypeVar, cast, get_args)
 
 # --------------------------------------------------------------------------- #
 # Types — what the gate's type checker holds the code to (ADR-0039)            #
@@ -40,6 +40,150 @@ from typing import (Any, Callable, Collection, Generator, Iterable, Literal, Map
 # A JSON object as the fleet passes it around: a config, a row gh or orca
 # returned, a record, a result. What its keys are is said where it is made.
 Obj = dict[str, Any]
+
+# The records the fleet's own code makes and reads are not `Obj`: each is a
+# TypedDict here, so a key misspelled where it is subscripted, a key left out
+# where one is built, or a word outside its vocabulary fails the gate. A row gh
+# or orca returned stays `Obj` — which keys it has is the caller's `--jq`, not
+# ours to declare — and so does a subcommand's result, which only JSON reads.
+
+
+class GateConfig(TypedDict):
+    ci: GateCiMode
+    local_command: str
+    adversarial_verify_prompt: str
+
+
+class Config(TypedDict):
+    """The canonical config (`resolve_config`): every key of CONFIG_DEFAULTS,
+    and the settled one beside them."""
+    ready_label: str
+    epic_labels: list[str]
+    base_branch: str
+    concurrency: int
+    gate: GateConfig
+    retry: int
+    escalate_label: str
+    claim_namespace: str
+
+
+class BatchMember(TypedDict):
+    """One PR a merge batch holds, with the issue it closes."""
+    issue: int
+    pr: int
+
+
+class Turn(TypedDict):
+    """A landing turn as `latest_turn` reads it off a PR: every field of
+    TURN_RECORD, one the marker does not state at its blank, plus the comment
+    it was read from."""
+    instance: str
+    at: int | None
+    verified: str | None
+    allow_no_checks: bool
+    stopped: LandOutcome | None
+    head: str | None
+    restarted: int | None
+    batch: str | None
+    members: list[BatchMember]
+    phase: BatchPhase | None
+    unbatched: Unbatched | None
+    of: str | None
+    released: bool
+    comment_id: int | None
+
+
+class Verdict(TypedDict):
+    """A worker's verdict as `latest_verdict` reads it off an issue. `phase` is
+    whatever the marker says: a word outside VERDICT_PHASES is a failure, not
+    an error."""
+    found: bool
+    phase: str | None
+    blocked_by: list[int]
+    reason: str | None
+    comment_url: str | None
+
+
+class RowBatch(TypedDict):
+    """The merge batch a `landing` row's turn is in, as the row carries it."""
+    id: str
+    members: list[int]
+    phase: BatchPhase | None
+
+
+class MineRow(TypedDict):
+    """One claim of mine in the working set (`assemble_working_set`)."""
+    number: int
+    title: str | None
+    status: ClaimStatus
+    board_phase: StatusPhase | None
+    pr: int | None
+    checks: ChecksState | None
+    attempt: int
+    starting: bool
+    stopped: LandOutcome | None
+    batch: RowBatch | None
+    unbatched: Unbatched | None
+
+
+class BoardBatch(TypedDict):
+    """The merge batch a status board names: its PRs and what is being done."""
+    prs: list[int]
+    phase: BatchPhase
+
+
+class Stacked(BatchMember):
+    """A member whose PR is on the batch's stack, with the commit that put it there."""
+    commit: str
+
+
+class Batch(TypedDict):
+    """A merge batch on record on my claims' PRs, mine or a dead fleet's."""
+    id: str
+    instance: str
+    members: list[BatchMember]
+    phase: BatchPhase | None
+    at: int | None
+
+
+class Dispatchable(TypedDict):
+    number: int
+    title: str | None
+
+
+class Excluded(TypedDict):
+    number: int
+    reason: str
+
+
+class Frontier(TypedDict):
+    dispatch: list[Dispatchable]
+    excluded: list[Excluded]
+
+
+class PeerClaim(TypedDict):
+    number: int
+    instance: str | None
+
+
+class StaleClaim(TypedDict):
+    number: int
+    instance: str | None
+    sha: str | None         # what `--expect-sha` takes
+
+
+class WorkingSet(TypedDict):
+    """The tick's whole working set (`assemble_working_set`)."""
+    frontier: Frontier
+    mine: list[MineRow]
+    merge_order: list[int]
+    batches: list[Batch]
+    peer_live: list[PeerClaim]
+    stale: list[StaleClaim]
+    stale_closed: list[StaleClaim]
+    free_slots: int
+    fingerprint: str
+    now: float
 
 
 def assert_never(value: NoReturn) -> NoReturn:
@@ -406,7 +550,7 @@ def _renamed(dotted: str) -> str | None:
     return f"config: {dotted!r} was renamed to {new!r} — {why}"
 
 
-def validate_config(cfg: Obj) -> Obj:
+def validate_config(cfg: Config) -> Config:
     """
     The semantic checks a per-key type cannot express, run on the CANONICAL config
     every time one is resolved — first at load time (`afk config`), at bootstrap,
@@ -430,7 +574,7 @@ def validate_config(cfg: Obj) -> Obj:
     return cfg
 
 
-def verifies(config: Obj) -> bool:
+def verifies(config: Config) -> bool:
     """Whether a PR owes an adversarial verify of its head before it lands: the
     repo said what a verifier checks (`gate.adversarial_verify_prompt`)."""
     return bool(config["gate"]["adversarial_verify_prompt"].strip())
@@ -537,12 +681,12 @@ def parse_config_yaml(text: str) -> Obj:
     return partial
 
 
-def resolve_config(partial: Obj) -> Obj:
+def resolve_config(partial: Obj) -> Config:
     """Partial config → the complete canonical config: every key present,
     defaults filled from CONFIG_DEFAULTS (one level deep for gate), and the
     settled field beside them. Idempotent — resolving an already-canonical
     config is a no-op."""
-    out = {}
+    out: Obj = {}
     for k, dv in {**CONFIG_DEFAULTS, **CONFIG_SETTLED}.items():
         if isinstance(dv, dict):
             merged = dict(dv)
@@ -552,16 +696,17 @@ def resolve_config(partial: Obj) -> Obj:
             out[k] = partial[k]
         else:
             out[k] = list(dv) if isinstance(dv, list) else dv
-    return out
+    return cast("Config", out)      # every key of the two tables: that is what a Config is
 
 
-def override_config(cfg: Obj, assignments: Iterable[str] | None) -> Obj:
+def override_config(cfg: Config, assignments: Iterable[str] | None) -> Config:
     """Lay `key=value` overrides (the CLI's `--set`) onto a canonical config, in
     place, and return it. Keys are the config file's own — dotted for a section
     (`gate.ci=local`), plus the settled `claim_namespace` — and values are typed
     by the key's default exactly as the file's are, except that a string is taken
     verbatim (the shell already unquoted it). An unknown key, or an item with no `=`, raises ValueError; a
     renamed or removed one raises with its migration note, as the file does."""
+    keyed = cast(Obj, cfg)          # written by a key read off the command line
     for item in assignments or []:
         dotted, eq, raw = item.partition("=")
         if _renamed(dotted.strip()):
@@ -572,7 +717,7 @@ def override_config(cfg: Obj, assignments: Iterable[str] | None) -> Obj:
             raise ValueError(f"--set: expected <config key>=<value>, got {item!r}")
         default = table[key]
         value = raw if isinstance(default, str) else _coerce(dotted.strip(), raw.strip(), default)
-        (cfg[section] if section else cfg)[key] = value
+        (keyed[section] if section else keyed)[key] = value
     return cfg
 
 # --------------------------------------------------------------------------- #
@@ -1112,7 +1257,7 @@ def verdict_marker_format(n: int) -> str:
                          optional=("blocked_by", "reason"))
 
 
-def latest_verdict(comments: Iterable[Obj] | None) -> Obj:
+def latest_verdict(comments: Iterable[Obj] | None) -> Verdict:
     """
     The worker's verdict on an issue, from its comments ([{"body", "url"}...],
     oldest first, the gh default) — `latest_record`'s. Returns:
@@ -1140,7 +1285,7 @@ _CLOSED_UNDONE = {"not_planned": "was closed as not planned",
 
 
 def _blocker_standing(blocker: Obj | None, claimed: bool, has_open_pr: bool,
-                      config: Obj) -> tuple[BlockerStanding, str | None]:
+                      config: Config) -> tuple[BlockerStanding, str | None]:
     """One named blocker's `(standing, reason)`, before the cycle check."""
     if blocker is None:
         return _UNMET, "could not be read (it may not exist)"
@@ -1171,7 +1316,7 @@ def depends_on(start: int, target: int, edges: Mapping[int, list[int]]) -> bool:
     return False
 
 
-def blocker_standings(number: int, named: Iterable[int], config: Obj, *,
+def blocker_standings(number: int, named: Iterable[int], config: Config, *,
                       blockers: Mapping[int, Obj | None] | None, claimed: Collection[int],
                       open_pr: Collection[int],
                       edges: Mapping[int, list[int]] | None) -> list[Obj]:
@@ -1229,7 +1374,7 @@ def blocked_route(named: list[int], standings: Mapping[int, str] | None) -> Obj:
     return {"action": "park" if pending else "redispatch", "pending_blockers": pending}
 
 
-def park_refusal(verdict: Obj, standings: list[Obj]) -> str | None:
+def park_refusal(verdict: Verdict, standings: list[Obj]) -> str | None:
     """
     Why a claim cannot be parked, or None when it can — `afk park`'s own
     check of what `afk no-pr` told the tick, worded so the tick knows what to do
@@ -1353,26 +1498,25 @@ def settled_by_worker_state(reading: Obj, now: float, grace_seconds: float,
     return None
 
 
-def single_turn_held(turn: Obj | None) -> bool:
+def single_turn_held(turn: Turn | None) -> bool:
     """Is `turn` (`latest_turn`, or {} / None) ONE PR's landing turn, held — `at`
     set, not `released`, no merge batch's? A no_pr claim has no turn, so never."""
-    turn = turn or {}
-    return bool(turn.get("at") is not None and not turn.get("released")
+    return bool(turn and turn.get("at") is not None and not turn.get("released")
                 and not turn.get("batch"))
 
 
-def restartable_turn(turn: Obj | None) -> bool:
+def restartable_turn(turn: Turn | None) -> bool:
     """Is `turn` one PR's held landing turn whose silent worker may still be
     restarted onto it — one that has not had its one restart (`restarted`)?
     ADR-0035. Past the restart the same silence escalates the claim with
     everything kept (`silent_past_restart`)."""
-    return single_turn_held(turn) and not (turn or {}).get("restarted")
+    return bool(turn and single_turn_held(turn) and not turn.get("restarted"))
 
 
 def classify_stopped(progress: Obj | None, terminal_idle_seconds: float | None,
-                     worker_verdict: Obj | None, blocker_states: Mapping[int, str] | None,
+                     worker_verdict: Verdict | None, blocker_states: Mapping[int, str] | None,
                      now: float, grace_seconds: float, nudged_at: float | None = None,
-                     can_nudge: bool = True, turn: Obj | None = None) -> Obj:
+                     can_nudge: bool = True, turn: Turn | None = None) -> Obj:
     """
     The classification of one of MY claims that is waiting on a worker which has
     STOPPED — a `no_pr` claim, or a `landing` one, that `settled_by_worker_state`
@@ -1412,9 +1556,10 @@ def classify_stopped(progress: Obj | None, terminal_idle_seconds: float | None,
     (ADR-0013). `pending_blockers` is `blocked_route`'s: the blocked_by not yet
     done, [] for any other verdict.
     """
-    progress, turn = progress or {}, turn or {}
+    progress = progress or {}
+    told, stopped = (turn.get("at"), turn.get("stopped")) if turn else (None, None)
     idle_seconds = _idle_seconds(now, terminal_idle_seconds, progress.get("last_commit_ts"),
-                                 progress.get("worktree_mtime_ts"), nudged_at, turn.get("at"))
+                                 progress.get("worktree_mtime_ts"), nudged_at, told)
     if idle_seconds is not None and idle_seconds < grace_seconds:
         return _seen("within_grace", idle_seconds)
 
@@ -1422,7 +1567,7 @@ def classify_stopped(progress: Obj | None, terminal_idle_seconds: float | None,
     verdict = worker_verdict or {}
     if not verdict.get("found"):
         # …or, having declared nothing, why it is quiet
-        if turn.get("stopped") in LAND_WAITS:
+        if stopped in LAND_WAITS:
             return _seen("awaiting_tick", idle_seconds)
         if single_turn_held(turn) and (nudged_at is not None or not can_nudge):
             # one PR's landing turn climbs its own ladder: restart, then escalate
@@ -1611,7 +1756,7 @@ def _whole_turn(fields: Obj) -> Obj:
             **({} if fields.get("batch") else {"members": [], "phase": None})}
 
 
-def next_turn(prev: Obj | None, **changed: Any) -> Obj:
+def next_turn(prev: Turn | None, **changed: Any) -> Turn:
     """The record a turn marker is REWRITTEN from: `prev` — the record as it was
     read (`latest_turn`), None when the PR has none — plus what changed. A field
     nobody names survives, `comment_id` among them: the rewrite replaces the
@@ -1619,14 +1764,14 @@ def next_turn(prev: Obj | None, **changed: Any) -> Obj:
     unknown = sorted(set(changed) - set(_NO_TURN))
     if unknown:
         raise ValueError(f"not a field of a turn record: {', '.join(unknown)}")
-    turn = {**_NO_TURN, **(prev or {}), **changed}
+    turn: Obj = {**_NO_TURN, **(prev or {}), **changed}
     if turn["at"] is not None:
         turn["at"] = int(turn["at"])
-    return turn
+    return cast("Turn", turn)       # _NO_TURN's keys, and `changed` names no other
 
 
-def single_turn(prev: Obj | None, instance: str, at: float, verified: str | None = None,
-                allow_no_checks: bool = False, restarted: int | None = None) -> Obj:
+def single_turn(prev: Turn | None, instance: str, at: float, verified: str | None = None,
+                allow_no_checks: bool = False, restarted: int | None = None) -> Turn:
     """The record of ONE PR's landing turn, granted now (or granted again) over
     `prev`: the worker is told to land, so it has not stopped, and the turn is
     no batch's.
@@ -1647,8 +1792,8 @@ def single_turn(prev: Obj | None, instance: str, at: float, verified: str | None
                      restarted=restarted, batch=None, members=[], phase=None, released=False)
 
 
-def batch_turn(prev: Obj | None, instance: str, at: float, batch: str,
-               members: Iterable[Obj], phase: BatchPhase) -> Obj:
+def batch_turn(prev: Turn | None, instance: str, at: float, batch: str,
+               members: Iterable[BatchMember], phase: BatchPhase) -> Turn:
     """The record of a MERGE BATCH's landing turn on one member PR, over that
     PR's `prev` — the same on every member (ADR-0029).
 
@@ -1661,8 +1806,8 @@ def batch_turn(prev: Obj | None, instance: str, at: float, batch: str,
                      released=False)
 
 
-def unbatched_turn(prev: Obj | None, instance: str, at: float, batch: str,
-                   why: Unbatched) -> Obj:
+def unbatched_turn(prev: Turn | None, instance: str, at: float, batch: str,
+                   why: Unbatched) -> Turn:
     """The record that replaces a batch's turn on a PR that left it without
     landing. It holds no turn (`released`): the PR is back to waiting, takes a
     single landing turn, and is never batched again.
@@ -1673,7 +1818,7 @@ def unbatched_turn(prev: Obj | None, instance: str, at: float, batch: str,
                      unbatched=why, of=batch, released=True)
 
 
-def turn_comment(turn: Obj) -> str:
+def turn_comment(turn: Turn) -> str:
     """The PR comment that records a landing turn, from its record (`latest_turn`,
     or one of `next_turn` / `single_turn` / `batch_turn` / `unbatched_turn`): the
     marker `latest_turn` reads back — every field the record holds — then the
@@ -1682,15 +1827,16 @@ def turn_comment(turn: Obj) -> str:
     batch's turn (`batch`), or one PR's turn.
     """
     instance, batch, stopped = turn["instance"], turn["batch"], turn["stopped"]
+    why = turn["unbatched"]
     if batch and turn["phase"] not in BATCH_PHASES:
         raise ValueError(f"not a batch phase: {turn['phase']!r}")
-    if turn["released"] and turn["unbatched"] not in UNBATCHED:
-        raise ValueError(f"not a reason a PR leaves a batch: {turn['unbatched']!r}")
-    if turn["released"]:
+    if turn["released"] and (why is None or why not in UNBATCHED):
+        raise ValueError(f"not a reason a PR leaves a batch: {why!r}")
+    if turn["released"] and why:
         said = {"left_out": "it conflicted with the PRs stacked before it, and was left out",
                 "abandoned": "the batch was abandoned, and nothing landed",
                 "dissolved": "fewer than two PRs were left in the batch, so it was dissolved"
-                }[turn["unbatched"]]
+                }[why]
         text = (f"**afk-fleet: this PR was in merge batch `{turn['of']}`** — {said}. It now "
                 f"waits for a landing turn of its own, on which its worker lands it, and it is "
                 f"not batched again.")
@@ -1712,11 +1858,12 @@ def turn_comment(turn: Obj) -> str:
                 f"The worker that wrote the branch lands it with `afk land` — sync with the target, "
                 f"gate, merge — and the next PR's turn comes when this one has landed, failed or been escalated. "
                 f"{state}{again}")
-    fields = _whole_turn({name: turn[name] for name in TURN_RECORD.fields})
+    stated = cast(Obj, turn)
+    fields = _whole_turn({name: stated[name] for name in TURN_RECORD.fields})
     return record_comment(TURN_RECORD, fields, text)
 
 
-def latest_turn(comments: Iterable[Obj] | None) -> Obj | None:
+def latest_turn(comments: Iterable[Obj] | None) -> Turn | None:
     """
     The landing turn recorded on a PR, from its comments ([{"id", "body"}...],
     oldest first) → every field of TURN_RECORD — one the marker does not state
@@ -1729,10 +1876,10 @@ def latest_turn(comments: Iterable[Obj] | None) -> Obj | None:
     record, comment = latest_record(TURN_RECORD, comments)
     if record is None or comment is None:
         return None
-    return {**_whole_turn({**_NO_TURN, **record}), "comment_id": comment.get("id")}
+    return cast("Turn", {**_whole_turn({**_NO_TURN, **record}), "comment_id": comment.get("id")})
 
 
-def held_turn(turn: Obj | None, owner: str | None) -> Obj | None:
+def held_turn(turn: Turn | None, owner: str | None) -> Turn | None:
     """`turn` (`latest_turn`) when it is held by the claim's owner, else None.
 
       owner: the instance id the claim ref is stamped with; None or "" when
@@ -1742,8 +1889,9 @@ def held_turn(turn: Obj | None, owner: str | None) -> Obj | None:
     from — is nobody's: the new owner grants its own. So is a marker that only
     says the PR left a batch (`released`).
     """
-    held = turn and owner and turn["instance"] == owner and not turn.get("released")
-    return turn if held else None
+    if turn and owner and turn["instance"] == owner and not turn.get("released"):
+        return turn
+    return None
 
 
 def turn_gate(ci_mode: GateCiMode, checks_state: ChecksState | None, allow_no_checks: bool,
@@ -1775,7 +1923,7 @@ def turn_gate(ci_mode: GateCiMode, checks_state: ChecksState | None, allow_no_ch
     return "ready"
 
 
-def turn_order(rows: list[Obj]) -> list[int]:
+def turn_order(rows: list[MineRow]) -> list[int]:
     """
     The order landing turns are granted in — the merge queue: the issue numbers
     of the `mine` rows whose PR is ready, a PR that already holds a turn first,
@@ -1863,7 +2011,7 @@ def batch_worktrees(worktrees: Iterable[Obj] | None, repo: str | None,
     return [row for _, row in sorted(hits, key=lambda h: -h[0])]
 
 
-def batches_form(config: Obj) -> bool:
+def batches_form(config: Config) -> bool:
     """Whether this config's PRs may land as merge batches at all: the stack is
     gated by ONE run of `gate.local_command`, which only `gate.ci: local` has,
     and with an adversarial verify every PR owes one of its own head before
@@ -1871,7 +2019,7 @@ def batches_form(config: Obj) -> bool:
     return config["gate"]["ci"] == "local" and not verifies(config)
 
 
-def batch_candidates(mine: list[Obj], merge_order: list[int], config: Obj,
+def batch_candidates(mine: list[MineRow], merge_order: list[int], config: Config,
                      busy: Iterable[int] = ()) -> list[int]:
     """
     The claims a merge batch is formed from — their issue numbers, in merge
@@ -1898,7 +2046,7 @@ def batch_candidates(mine: list[Obj], merge_order: list[int], config: Obj,
     return picked if len(picked) >= 2 else []
 
 
-def turn_holder(ws: Obj,
+def turn_holder(ws: WorkingSet,
                 instance: str) -> tuple[Literal["dead", "mine", "single"] | None, Any]:
     """Who holds this fleet's landing turn, as far as a merge batch goes → (who,
     what), the first of these that is so — the one precedence `tick_plan` and
@@ -2585,7 +2733,7 @@ _BATCH_DOING: dict[BatchPhase, str] = {"stacking": "正在把各 PR 叠放到目
 
 def render_status_board(phase: StatusPhase, gate_ci: GateCiMode, retry_max: int,
                         instance: str | None = None, pr: int | None = None, attempt: int = 0,
-                        blocked_by: Iterable[int] = (), batch: Obj | None = None) -> str:
+                        blocked_by: Iterable[int] = (), batch: BoardBatch | None = None) -> str:
     """
     Render the human-facing progress *status board* comment body. Pure: a function
     of the discrete lifecycle state the tick already derived from fleet state; no
@@ -2726,7 +2874,7 @@ def escalation_comment(reason: str | None, attempt: int, pr: int | None = None) 
 
 
 def escalation_labels(labels: Iterable[str] | None,
-                      config: Obj) -> tuple[list[str], list[str]]:
+                      config: Config) -> tuple[list[str], list[str]]:
     """The label edit that hands an issue to a human: `(add, remove)`. Removes
     `ready_label` and every attempt label the issue actually carries (never one it
     does not — gh refuses to remove an absent label), adds `escalate_label`."""
@@ -3001,7 +3149,7 @@ def reason_judgment(call: Obj, number: int, sub: Literal["fail", "escalate"], de
                     {"where": where, **(context or {})}, command, command, bulky=bulky)
 
 
-def asks_after(mine: list[Obj]) -> list[int]:
+def asks_after(mine: list[MineRow]) -> list[int]:
     """The claims a tick asks `afk no-pr` about, in one call: every `no_pr` row,
     and every `landing` row whose worker has not stopped for the tick. A row in
     a merge batch is not one of them: its own worker has nothing to do, and the
@@ -3012,7 +3160,7 @@ def asks_after(mine: list[Obj]) -> list[int]:
                 and r["stopped"] not in LAND_WAITS)]
 
 
-def turn_due(mine: list[Obj], merge_order: list[int]) -> int | None:
+def turn_due(mine: list[MineRow], merge_order: list[int]) -> int | None:
     """The ONE issue a tick runs `afk turn` on, or None: the head of the merge
     queue — unless its PR holds the turn and its worker is at it."""
     row = next((r for r in mine if merge_order and r["number"] == merge_order[0]), None)
@@ -3021,14 +3169,14 @@ def turn_due(mine: list[Obj], merge_order: list[int]) -> int | None:
     return row["number"]
 
 
-def failure_judgment(call: Obj, row: Obj) -> Obj:
+def failure_judgment(call: Obj, row: MineRow) -> Obj:
     """The judgment for a `failure` row — its PR's checks are red: the reason
     lives in a CI log, which is bulky to read."""
     return reason_judgment(call, row["number"], "fail", f"the checks of PR #{row['pr']} are red",
                            f"the failing checks of PR #{row['pr']}", {"pr": row["pr"]}, bulky=True)
 
 
-def turn_step(call: Obj, result: Obj, config: Obj,
+def turn_step(call: Obj, result: Obj, config: Config,
               restart: bool = False) -> tuple[Literal["granted", "leave", "judge"], Obj | None]:
     """
     What a tick does with `afk turn`'s result → (do, judgment):
@@ -3079,7 +3227,7 @@ def turn_step(call: Obj, result: Obj, config: Obj,
     assert_never(outcome)
 
 
-def _reason_on_record(cause: WorkerCause, row: Obj, worker: Obj) -> tuple[str, bool]:
+def _reason_on_record(cause: WorkerCause, row: MineRow, worker: Obj) -> tuple[str, bool]:
     """The words a tick fails or escalates a claim with, for a cause that ends
     in one → (the words, whether they are the reason itself — False when the
     reason is not on record and must be asked for, and these stand in for it
@@ -3115,7 +3263,7 @@ def _reason_on_record(cause: WorkerCause, row: Obj, worker: Obj) -> tuple[str, b
                      f"{cause!r}")
 
 
-def worker_step(call: Obj, row: Obj, worker: Obj, config: Obj) -> tuple[WorkerStep, Any]:
+def worker_step(call: Obj, row: MineRow, worker: Obj, config: Config) -> tuple[WorkerStep, Any]:
     """
     What a tick does about one claim it asked after → (do, detail). `do` is the
     `step` of the cause its worker was classified with (WORKER_CAUSES), which
@@ -3234,9 +3382,9 @@ class TickBooks:
     WRITES_BOARD: tuple[TickDid, ...] = ("granted", "abandoned", "retried", "dispatched",
                                          "reclaimed", "restarted")
 
-    def __init__(self, ws: Obj) -> None:
+    def __init__(self, ws: WorkingSet) -> None:
         self.ws = ws
-        self.mine: dict[int, Obj] = {r["number"]: r for r in ws["mine"]}
+        self.mine: dict[int, MineRow] = {r["number"]: r for r in ws["mine"]}
         self.judgments: list[Obj] = []
         self.errors: list[Obj] = []
         self.starting = True            # False once a start failed to begin
@@ -3324,7 +3472,7 @@ class TickBooks:
                 "in_flight": self.in_flight, "frontier_remaining": self.frontier_remaining}
 
 
-def tick_plan(ws: Obj, call: Obj, config: Obj) -> Plan:
+def tick_plan(ws: WorkingSet, call: Obj, config: Config) -> Plan:
     """
     One reconciliation pass over the working set `ws`, as the steps to run — a
     generator: each value it yields is ONE step ({"do": a TICK_STEPS key,
@@ -3448,7 +3596,7 @@ def tick_plan(ws: Obj, call: Obj, config: Obj) -> Plan:
             "held": tick.held}
 
 
-def _turn_plan(tick: TickBooks, call: Obj, config: Obj) -> Plan:
+def _turn_plan(tick: TickBooks, call: Obj, config: Config) -> Plan:
     """The landing-turn stage of `tick_plan` → the ids of the merge batches that
     hold a turn when it is done; what it did and what it could not decide go
     into `tick`. One turn is out at a time, held by one PR or by one batch
@@ -3464,7 +3612,7 @@ def _turn_plan(tick: TickBooks, call: Obj, config: Obj) -> Plan:
                                               the turn, as before"""
     ws, run, instance = tick.ws, tick.run, call["instance"]
 
-    def abandon(batch: Obj) -> Plan:
+    def abandon(batch: Batch) -> Plan:
         gone = yield from run("abandon", batch=batch["id"])
         if gone:
             tick.did("abandoned", *gone["issues"])
@@ -3791,7 +3939,7 @@ def closing_pr(prs: Iterable[Obj], number: int) -> Obj | None:
     return _closing_pr_map(prs).get(number)
 
 
-def unseen_prs(mine: list[Obj], prs: Iterable[Obj]) -> list[int]:
+def unseen_prs(mine: list[MineRow], prs: Iterable[Obj]) -> list[int]:
     """The claims whose PR a tick did not act on: the issue numbers of the `mine`
     rows it worked from whose closing PR, among the open PRs `prs` read as it
     ended, is not the one the row names — opened, or replaced, while it ran."""
@@ -3812,9 +3960,9 @@ def superseded_prs(prs: Iterable[Obj] | None, number: int) -> list[Obj]:
 
 
 def assemble_working_set(issues: list[Obj], prs: list[Obj], claims: list[Obj],
-                         heartbeats: Mapping[str, float], me: str, now: float, config: Obj,
+                         heartbeats: Mapping[str, float], me: str, now: float, config: Config,
                          closed: Iterable[int] = (),
-                         turns: Mapping[int, Obj] | None = None) -> Obj:
+                         turns: Mapping[int, Turn] | None = None) -> WorkingSet:
     """
     The tick's whole working set from the raw observables. Pure — afk.py's
     `rebuild` gathers, this assembles, and a fixture pins the join.
@@ -3872,31 +4020,35 @@ def assemble_working_set(issues: list[Obj], prs: list[Obj], claims: list[Obj],
     by_num = {i.get("number"): i for i in issues}
     pr_for = _closing_pr_map(prs)
 
-    frontier = select_frontier(_eligibility_rows(issues, prs, claims),
-                               config["ready_label"], config["epic_labels"])
-    frontier["dispatch"] = [{"number": n, "title": by_num.get(n, {}).get("title")}
-                            for n in frontier["dispatch"]]
+    ready = select_frontier(_eligibility_rows(issues, prs, claims),
+                            config["ready_label"], config["epic_labels"])
+    frontier: Frontier = {
+        "dispatch": [{"number": n, "title": by_num.get(n, {}).get("title")}
+                     for n in ready["dispatch"]],
+        "excluded": ready["excluded"]}
 
     part = classify_claims(claims, heartbeats, me, now, ttl)
     by_claim = {c.get("number"): c for c in claims}
     closed = set(closed)
 
-    def stale_rows(numbers: Iterable[int]) -> list[Obj]:
+    def stale_rows(numbers: Iterable[int]) -> list[StaleClaim]:
         return [{"number": n, "instance": by_claim.get(n, {}).get("instance"),
                  "sha": by_claim.get(n, {}).get("sha")} for n in numbers]
 
     turns = turns or {}
-    mine, batches = [], {}
+    mine: list[MineRow] = []
+    batches: dict[str, Batch] = {}
     for n in part["mine"]:
         pr = pr_for.get(n)
         checks = pr_checks_state(pr.get("statusCheckRollup")) if pr else None
         issue = by_num.get(n, {})
-        turn = turns.get(n) or {}
-        held = held_turn(turn, me) or {}
+        turn = turns.get(n)
+        held = held_turn(turn, me)
         status = claim_status(pr is not None, checks, ci_mode,
                               closed=n in closed, landing=bool(held))
-        batch = held.get("batch") if status == "landing" else None
-        if turn.get("batch") and not turn.get("released") and n not in closed:
+        landing = held if status == "landing" else None
+        batch = landing["batch"] if landing else None
+        if turn and turn["batch"] and not turn["released"] and n not in closed:
             seen = batches.setdefault(turn["batch"], {
                 "id": turn["batch"], "instance": turn["instance"], "members": turn["members"],
                 "phase": turn["phase"], "at": turn["at"]})
@@ -3906,10 +4058,10 @@ def assemble_working_set(issues: list[Obj], prs: list[Obj], claims: list[Obj],
                      "pr": pr.get("number") if pr else None, "checks": checks,
                      "attempt": current_attempt(issue.get("labels")),
                      "starting": attempt_starting(issue.get("labels")),
-                     "stopped": held.get("stopped") if status == "landing" else None,
-                     "batch": {"id": batch, "members": [m["issue"] for m in held["members"]],
-                               "phase": held["phase"]} if batch else None,
-                     "unbatched": turn.get("unbatched")})
+                     "stopped": landing["stopped"] if landing else None,
+                     "batch": {"id": batch, "members": [m["issue"] for m in landing["members"]],
+                               "phase": landing["phase"]} if landing and batch else None,
+                     "unbatched": turn["unbatched"] if turn else None})
 
     return {"frontier": frontier,
             "mine": mine,
