@@ -3307,3 +3307,14 @@ def test_a_closed_vocabulary_and_its_table_list_the_same_words():
                               (d.BatchPhase, d._BATCH_DOING), (d.TickDid, d.TICK_DID),
                               (d.TickStep, d.TICK_STEPS)):
         assert set(typing.get_args(vocabulary)) == set(table), vocabulary
+
+
+
+def test_issues_closed_by_reads_the_links_and_the_closing_keywords_of_the_body():
+    assert d.issues_closed_by(None, None) == []
+    assert d.issues_closed_by("Closes #7\n", []) == [{"number": 7}]
+    assert d.issues_closed_by("Closes #7", [{"number": 7}, {"number": 3}]) == \
+        [{"number": 3}, {"number": 7}]
+    assert d.issues_closed_by("fixes: #2, Resolved #10 and closed #4.", None) == \
+        [{"number": 2}, {"number": 4}, {"number": 10}]
+    assert d.issues_closed_by("see #7; encloses #8; closes o/r#9", None) == []

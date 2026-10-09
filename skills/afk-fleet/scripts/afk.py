@@ -343,10 +343,16 @@ _PR_FIELDS = ("number,title,headRefName,headRefOid,updatedAt,statusCheckRollup,"
 def _open_prs(repo: str, fresh: bool = False) -> list[PullRequest]:
     """Every open PR, with the fields the working set, the merge and a fresh
     start all read. `fresh`: read now, whatever this process read before."""
+    def read() -> list[PullRequest]:
+        rows = json.loads(_gh(["pr", "list", "--repo", repo, "--state", "open",
+                               "--json", _PR_FIELDS + ",body"]).stdout)
+        for row in rows:
+            row["closingIssuesReferences"] = afk_decide.issues_closed_by(
+                row.pop("body"), row["closingIssuesReferences"])
+        return rows
     if fresh:
         _forget(("prs", repo))
-    return _once(("prs", repo), lambda: json.loads(
-        _gh(["pr", "list", "--repo", repo, "--state", "open", "--json", _PR_FIELDS]).stdout))
+    return _once(("prs", repo), read)
 
 
 def _issue_comments(repo: str, number: int) -> list[Comment]:
@@ -427,12 +433,13 @@ def _close_pr(repo: str, rem: str, number: int, comment: str) -> None:
 def _merge_pr(repo: str, rem: str, pr: PullRequest, head: str) -> None:
     """Merge an open PR — a merge commit, never a squash or a rebase — only
     while its head is still `head`, and delete its branch. The issues it closes
-    are closed by GitHub with it."""
+    are closed here: GitHub closes them itself only when the PR landed on the
+    repo's default branch."""
     _gh(["pr", "merge", str(pr["number"]), "--repo", repo, "--merge",
          "--match-head-commit", head, "--delete-branch"])
     _forget(("prs", repo), ("heads", rem))
     for ref in pr["closingIssuesReferences"] or []:
-        _issue_written(repo, ref["number"])
+        _close_issue(repo, ref["number"])
 
 
 def _blocker(repo: str, number: int) -> IssueRead | None:

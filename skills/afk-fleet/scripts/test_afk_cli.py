@@ -142,6 +142,17 @@ if any(part in " ".join(argv) for part in st.get("garble", [])):
 if argv[0] in ("issue", "pr", "label") and opt("--repo") != st["repo"]:
     finish(code=1, err="fake gh: unknown repo %%s\n" %% opt("--repo"))
 
+def on_default():
+    """Whether the fleet's base is the repo's default branch — the only base on
+    which GitHub links a PR to the issues its body names, and closes them."""
+    return st.get("default_branch", st["base"]) == st["base"]
+
+def close_issues_of(row):
+    for ref_issue in row["closingIssuesReferences"] if on_default() else []:
+        for i in st["issues"]:
+            if i["number"] == ref_issue["number"]:
+                i["state"] = "closed"
+
 # GitHub marks a PR merged by itself once a push puts its head on the base: the
 # PR's own commits reached it, whoever pushed them. (`pushes_never_merge` holds
 # that back — GitHub can be slow, or the head moved after it was stacked.)
@@ -154,10 +165,7 @@ if not st.get("pushes_never_merge"):
                             ref, "refs/heads/" + st["base"]])
         if p.returncode == 0:
             row.update(state="merged", merged={"pushed": True, "head": head_of(row)})
-            for ref_issue in row["closingIssuesReferences"]:
-                for i in st["issues"]:
-                    if i["number"] == ref_issue["number"]:
-                        i["state"] = "closed"
+            close_issues_of(row)
 
 if argv[:2] == ["pr", "list"]:
     assert opt("--state") == "open", argv
@@ -166,6 +174,8 @@ if argv[:2] == ["pr", "list"]:
         if r.get("rollups"):
             r["statusCheckRollup"] = r["rollups"].pop(0)
     rows = [{**r, "headRefOid": head_of(r)} for r in rows]
+    if not on_default():             # GitHub links an issue only on the default branch
+        rows = [{**r, "closingIssuesReferences": []} for r in rows]
     fields = opt("--json").split(",")
     finish(json.dumps([{k: r[k] for k in fields} for r in rows]))
 
@@ -177,12 +187,12 @@ if argv[:2] == ["label", "create"]:
 
 if argv[0] == "issue" and argv[1] in ("edit", "close"):
     row = next((r for r in st["issues"] if str(r["number"]) == argv[2]), None)
-    if row is None or row.get("state", "open") != "open":
-        finish(code=1, err="fake gh: no open issue %%s\n" %% argv[2])
-    if argv[1] == "close":
+    if argv[1] == "close" and row is not None:           # closing a closed issue is no error
         assert opt("--reason") == "completed", argv
         row["state"] = "closed"
         finish()
+    if row is None or row.get("state", "open") != "open":
+        finish(code=1, err="fake gh: no open issue %%s\n" %% argv[2])
     have = [lb["name"] for lb in row["labels"]]
     for name in opts("--add-label"):
         if name not in known_labels():
@@ -228,10 +238,7 @@ if argv[0] == "pr" and argv[1] in ("merge", "close", "comment"):
                                        "delete_branch": "--delete-branch" in argv})
     if "--delete-branch" in argv:
         bare("update-ref", "-d", ref)
-    for ref_issue in row["closingIssuesReferences"]:
-        for i in st["issues"]:
-            if i["number"] == ref_issue["number"]:
-                i["state"] = "closed"
+    close_issues_of(row)
     finish()
 
 assert argv[0] == "api", argv
@@ -538,7 +545,7 @@ def pr(n, closes, conclusion="SUCCESS", **extra):
         checks = [{"name": "ci", "status": "IN_PROGRESS", "conclusion": None}]
     return {"number": n, "title": f"feature {closes}",
             "headRefName": f"tester/issue-{closes}-x", "headRefOid": f"sha{n}",
-            "updatedAt": f"P{n}", "statusCheckRollup": checks,
+            "updatedAt": f"P{n}", "statusCheckRollup": checks, "body": f"Closes #{closes}\n",
             "closingIssuesReferences": [{"number": closes, "url": "u"}], **extra}
 
 
@@ -1273,6 +1280,20 @@ def test_a_merged_pr_and_the_issue_it_closed_are_gone_from_the_reads_after_it():
             assert afk._open_prs(REPO) == [] and d["branch"] not in afk._remote_heads(rem)
             assert afk._issue_state(REPO, 1) == "closed" and afk._issue(REPO, 1)["state"] == "closed"
             assert [i["number"] for i in afk._open_issues(REPO)] == [2]
+
+
+def test_a_pr_against_a_base_that_is_not_the_default_branch_still_closes_its_issue():
+    """Off the default branch GitHub links no issue to a PR and closes none when
+    it merges: the PR is found by the `Closes #n` in its body, and merging it
+    closes the issue."""
+    with world(issues=[issue(1, "ready-for-agent")]) as w:
+        d, head = with_pr(w, 1, 10)
+        w.set(default_branch="some-other-branch")
+        with inside(w) as rem:
+            prs = afk._open_prs(REPO)
+            assert afk_decide.closing_pr(prs, 1)["number"] == 10
+            afk._merge_pr(REPO, rem, prs[0], head)
+            assert afk._issue_state(REPO, 1) == "closed"
 
 
 def test_a_pr_comment_is_in_the_comments_read_after_it():
