@@ -147,6 +147,17 @@ def _heartbeat_ref(cfg: Config, instance: str) -> str:
     return f"{afk_decide.CLAIM_NAMESPACES[cfg['claim_namespace']][1]}/{instance}"
 
 
+def _base(cfg: Config) -> str:
+    """The base branch of the run: what workers cut from, open their PR against
+    and land on. Raises on a config no launch has settled one in (ADR-0042) —
+    nothing is ever cut from, or landed on, a branch nobody confirmed."""
+    if not cfg["base_branch"]:
+        raise ValueError("the config names no base branch: it is settled at bootstrap, by "
+                         "`afk probe --base-branch <name>` (ADR-0042) — pass the config that "
+                         "returned")
+    return cfg["base_branch"]
+
+
 def _remote(a: argparse.Namespace) -> str:
     """The git push/fetch target. `--repo owner/name` → its GitHub URL, so any ref
     op works from anywhere the gh commands do — no clone-with-the-right-origin
@@ -336,7 +347,7 @@ def _open_issues(repo: str) -> list[Issue]:
     return issues
 
 
-_PR_FIELDS = ("number,title,headRefName,headRefOid,updatedAt,statusCheckRollup,"
+_PR_FIELDS = ("number,title,headRefName,headRefOid,baseRefName,updatedAt,statusCheckRollup,"
               "closingIssuesReferences")
 
 
@@ -428,6 +439,16 @@ def _close_pr(repo: str, rem: str, number: int, comment: str) -> None:
     branch off the remote with it."""
     _gh(["pr", "close", str(number), "--repo", repo, "--comment", comment, "--delete-branch"])
     _forget(("prs", repo), ("comments", repo, number), ("heads", rem))
+
+
+def _aim_pr(run: _Run, pr: PullRequest) -> None:
+    """Point an open PR at the run's base branch, if it is open against another:
+    one opened before the base branch changed (ADR-0042). GitHub merges a PR
+    into, and shows it merged on, the branch it is open against — so a landing
+    aims it first, and then syncs with and gates on the base it will land on."""
+    if pr["baseRefName"] != _base(run.cfg):
+        _gh(["pr", "edit", str(pr["number"]), "--repo", run.repo, "--base", _base(run.cfg)])
+        _forget(("prs", run.repo))
 
 
 def _merge_pr(repo: str, rem: str, pr: PullRequest, head: str) -> None:
@@ -606,7 +627,7 @@ def _scan(run: _Run) -> tuple[list[Claim], dict[str, int]]:
     read every record. Returns (claims, heartbeats). Raises when the remote cannot
     be read: a fleet whose claims are unreadable must not look like one holding none."""
     def read() -> tuple[list[Claim], dict[str, int]]:
-        claim_ns, hb_ns = afk_decide.CLAIM_NAMESPACES[run.cfg["claim_namespace"]]
+        claim_ns, hb_ns, _ = afk_decide.CLAIM_NAMESPACES[run.cfg["claim_namespace"]]
         _git(["fetch", "--prune", run.rem,
               f"+{claim_ns}/*:{_LOCAL_SCAN}/claim/*",
               f"+{hb_ns}/*:{_LOCAL_SCAN}/heartbeat/*"])
@@ -843,7 +864,7 @@ def _sync_checkout(run: _Run) -> Obj:
     local branch that diverged, changes in the way, no such local branch, no
     orca — each is `skipped` and nothing is changed: SOFT, a checkout that
     cannot follow never fails the release it rides on."""
-    target = run.cfg["base_branch"]
+    target = _base(run.cfg)
     try:
         orca_repo = _Worktree.source(run.repo)
         if not orca_repo:
@@ -971,7 +992,7 @@ def _usable_namespace(rem: str, wanted: str, now: int) -> tuple[str, str | None]
 
 
 def cmd_probe(a: argparse.Namespace) -> Obj:
-    """The bootstrap compatibility probe — three questions, all answered with the
+    """The bootstrap compatibility probe — four questions, all answered with the
     human present so a misfit is fixed here rather than mid-run (ADR-0009's tradition):
 
     1. **Claim namespace** — can we push under the config's `claim_namespace`
@@ -980,12 +1001,20 @@ def cmd_probe(a: argparse.Namespace) -> Obj:
        then fire `on: push` CI. The result's `config` is the canonical config with
        the namespace that actually works: the launcher holds THAT config from here
        on, so every later call inherits the namespace through `--config`.
-    2. **Branch protection** (only when `gate.ci: local`, ADR-0012) — does the merge
+    2. **Base branch** (ADR-0042) — which branch does every PR of this run land
+       on? Never assumed: `--base-branch <name>` is the human's answer at this
+       launch. Without it the result's `base` is `{"status": "ask", "recorded",
+       "default_branch"}` — what the remote has on record from the last launch,
+       and the repo's default branch — questions 3 and 4 are not asked, and the
+       probe is run again with the answer. With it, the answer is checked
+       (`afk_decide.base_refusal`), put on record on the remote, and returned in
+       `config`: `base` is `{"status": "settled", "branch", …}`.
+    3. **Branch protection** (only when `gate.ci: local`, ADR-0012) — does the merge
        target REQUIRE status checks? Then `gh pr merge` is rejected however green the
        local gate is, so that combination is a hard `error` at bootstrap; an
        inconclusive read is a `warn`. Where merge batches form, so is a target
        that refuses a direct push — a merge batch lands by pushing (ADR-0029).
-    3. **Gate records** (only when `gate.ci: local`, ADR-0030) — can a green gate
+    4. **Gate records** (only when `gate.ci: local`, ADR-0030) — can a green gate
        run be put on record on the remote? A `warn` if not: every landing then
        runs the gate itself. Records past their day are swept here."""
     run = _run(a)
@@ -996,7 +1025,11 @@ def cmd_probe(a: argparse.Namespace) -> Obj:
     if rejection:
         result["detail"] = rejection
 
-    ci_mode, target = cfg["gate"]["ci"], cfg["base_branch"]
+    result["base"] = _settle_base(run, a.base_branch)
+    if result["base"]["status"] == "ask":
+        return result       # nothing is checked against a base nobody confirmed
+
+    ci_mode, target = cfg["gate"]["ci"], _base(cfg)
     if ci_mode == "local":
         if not run.repo:
             result["protection"] = {"branch": target, "verdict": "warn", "required_checks": [],
@@ -1009,6 +1042,43 @@ def cmd_probe(a: argparse.Namespace) -> Obj:
                                                                     batch=afk_decide.batches_form(cfg))}
         result["gate_records"] = _probe_gate_records(run.rem, run.now())
     return result
+
+
+def _settle_base(run: _Run, answer: str | None) -> Obj:
+    """The base branch of this run (`cmd_probe`'s second question), written into
+    `run.cfg` → `base`. With no `answer` it is only read: the config carries what
+    the remote has on record — none: "" — which is enough to look (`--plan`) and
+    never to launch on. With one, the record on the remote becomes the answer —
+    or the probe fails, saying why it cannot (`afk_decide.base_refusal`)."""
+    rem, ref = run.rem, afk_decide.CLAIM_NAMESPACES[run.cfg["claim_namespace"]][2]
+    was = _remote_sha(rem, ref)
+    record = None
+    if was:
+        _git(["fetch", "--quiet", "--no-tags", rem, ref])
+        record = _read_record(afk_decide.BASE_RECORD, "FETCH_HEAD")
+    recorded = record["branch"] if record else None
+    default = _gh(["repo", "view", run.repo, "--json", "defaultBranchRef",
+                   "--jq", ".defaultBranchRef.name"]).stdout.strip() if run.repo else None
+    found = {"recorded": recorded, "default_branch": default}
+    if answer is None:
+        run.cfg["base_branch"] = recorded or ""
+        return {"status": "ask", **found}
+    now = run.now()
+    claims, heartbeats = _scan(run)
+    live = [i for i, ts in heartbeats.items() if now - ts < afk_decide.CLAIM_LEASE_TTL_SECONDS]
+    refusal = afk_decide.base_refusal(answer, recorded, _remote_heads(rem), len(claims), live)
+    if refusal:
+        raise ValueError(refusal)
+    if answer != recorded:
+        sha = _record_commit(afk_decide.BASE_RECORD, {"branch": answer, "ts": now})
+        # only while the record is still the one read: two launches answering at once
+        p = _git(["push", rem, f"--force-with-lease={ref}:{was}", f"{sha}:{ref}"], check=False)
+        if p.returncode != 0:
+            raise RuntimeError(f"the base branch's record ({ref}) moved while this launch was "
+                               f"settling it — another launch answered too. Run the probe "
+                               f"again: {p.stderr.strip()}")
+    run.cfg["base_branch"] = answer
+    return {"status": "settled", "branch": answer, **found}
 
 
 def _probe_gate_records(rem: str, now: int) -> Obj:
@@ -1723,7 +1793,7 @@ def _worker_outcome(run: _Run, number: int, worker: _Worker) -> WorkerRow:
         return {**settled, "worktree": path, "progress": None, "worker_verdict": None,
                 "blockers": [], "nudged_at": nudged_at, "turn_at": None}
     now, grace = worker.now, worker.grace
-    progress = _worktree_progress(path, run.rem, cfg["base_branch"]) if path else None
+    progress = _worktree_progress(path, run.rem, _base(cfg)) if path else None
     declared = afk_decide.latest_verdict(_issue_comments(run.repo, number))
     prs = _open_prs(run.repo)
     blockers = _blocker_standings(run, number, declared["blocked_by"], prs)
@@ -1850,7 +1920,7 @@ def _recovery(run: _Run, number: int, path: str | None = None, branch: str | Non
     tier: a *pristine* worktree over a branch that carries pushed commits still has
     something to continue, and the honest prompt depends on knowing that."""
     cfg, rem, repo = run.cfg, run.rem, run.repo
-    base = cfg["base_branch"]
+    base = _base(cfg)
 
     # --- tier-1 signal: a worktree for this issue, still on this machine ---
     if path is None and not no_worktree:
@@ -1920,7 +1990,7 @@ def _discard_attempt(run: _Run, number: int) -> Obj:
 
 def _landing_fields(cfg: Config, pr: PullRequest) -> Obj:
     """The LANDING_FIELDS of a landing brief, from the config and the PR."""
-    return {"pr": pr["number"], "pr_branch": pr["headRefName"], "target": cfg["base_branch"]}
+    return {"pr": pr["number"], "pr_branch": pr["headRefName"], "target": _base(cfg)}
 
 
 def _prompt_fields(run: _Run, issue: IssueRead, path: str | None, branch: str | None) -> Obj:
@@ -1931,7 +2001,7 @@ def _prompt_fields(run: _Run, issue: IssueRead, path: str | None, branch: str | 
     `afk land` is run with: the worker lands on the settings the tick ran on."""
     cfg = run.cfg
     return {"n": issue["number"], "title": issue["title"], "repo": run.repo,
-            "base_branch": cfg["base_branch"], "local_command": cfg["gate"]["local_command"],
+            "base_branch": _base(cfg), "local_command": cfg["gate"]["local_command"],
             "afk_path": os.path.abspath(__file__),
             "config": json.dumps(cfg, ensure_ascii=False), "branch": branch,
             "worktree_path": path,
@@ -1986,7 +2056,7 @@ def _begin_worker(run: _Run, instance: str, agent: _Agent, issue: IssueRead, sta
         branch = wt.checked_out()
     else:
         if plan["action"] == "dispatch_fresh":
-            tip = cfg["base_branch"]
+            tip = _base(cfg)
         else:                            # recreate_at_tip: the PR's head, else the pushed branch
             tip = landing["headRefName"] if landing else rec["branch"]["name"]
         wt = _Worktree.cut(run, tip, issue=issue)
@@ -2055,6 +2125,7 @@ def _begin_dispatch(run: _Run, instance: str, host: str, agent: _Agent, number: 
     when a peer holds the issue, with that result itself. A start that fails
     raises. A claim the scan already shows as `instance`'s is not pushed again;
     one that is pushed is stamped with `host`."""
+    _base(run.cfg)                         # before the claim: nothing is claimed for no base
     issue = _issue(run.repo, number)
     if issue["state"] != "open":           # before the claim: never lock a closed issue
         raise RuntimeError(f"issue #{number} is {issue['state']}, not open — nothing to dispatch")
@@ -2515,8 +2586,9 @@ def cmd_land(a: argparse.Namespace) -> Obj:
         raise RuntimeError(f"PR #{pr['number']} does not hold the landing turn of the fleet "
                            f"instance that holds issue #{a.number}'s claim; nothing was changed. "
                            f"Do not land it any other way — you are told when its turn comes")
-    branch, target = pr["headRefName"], cfg["base_branch"]
+    branch, target = pr["headRefName"], _base(cfg)
     pr_number: int = pr["number"]
+    _aim_pr(run, pr)
     out = {"issue": a.number, "pr": pr_number}
 
     def stop(outcome: afk_decide.LandOutcome, **more: Any) -> Obj:
@@ -2745,7 +2817,7 @@ def _start_batch_worker(run: _Run, instance: str, agent: _Agent, batch: str,
     `granted`. Recorded before delivered: a start that then fails leaves a batch
     whose worker has no terminal, which the next cycle continues."""
     cfg, rem = run.cfg, run.rem
-    target = cfg["base_branch"]
+    target = _base(cfg)
     _record_batch(run, instance, batch, members, phase)
     wt = _Worktree.of_batch(run.repo, batch)
     if wt.path:
@@ -2815,7 +2887,7 @@ def _batch_worker(run: _Run, batch: str, worker: _Worker) -> BatchWorkerRow:
         now, grace = worker.now, worker.grace
         turns = (_turn(run.repo, m["pr"]) for m in _members_of_batch(run, batch))
         turn_at = max((t["at"] for t in turns if t and t["at"]), default=None)
-        progress = _worktree_progress(path, run.rem, cfg["base_branch"]) if path else None
+        progress = _worktree_progress(path, run.rem, _base(cfg)) if path else None
         # a batch's worker declares no verdict and names no blocker — and a batch's
         # turn is never restarted: its second silence abandons the batch
         seen = afk_decide.classify_stopped(progress, worker.reading["terminal_idle_seconds"],
@@ -2853,7 +2925,7 @@ def _close_landed_pr(run: _Run, number: int) -> int | None:
     turn = _turn(run.repo, pr["number"]) if pr else None
     if not pr or not turn or not turn["batch"] or turn["released"]:
         return None
-    target = run.cfg["base_branch"]
+    target = _base(run.cfg)
     commit = _landed_commit(".", _fetch_tip(run.rem, target), pr["number"])
     if not commit:
         return None
@@ -2865,7 +2937,7 @@ def _close_batched_pr(run: _Run, pr: PullRequest, commit: str, batch: str, prs: 
     """Close one PR a batch landed, with the comment that names its commit."""
     cfg = run.cfg
     _close_pr(run.repo, run.rem, pr["number"],
-              afk_decide.batch_landed_comment(commit, cfg["base_branch"], batch, prs))
+              afk_decide.batch_landed_comment(commit, _base(cfg), batch, prs))
 
 
 def _stack_pr(rem: str, path: str, pr: PullRequest,
@@ -2965,7 +3037,7 @@ def _land_batch(run: _Run, batch: str, limits: _GateLimits, merged_timeout: floa
     (`_members_of_batch`): the worktree keeps no list, so one recreated from the
     batch's pushed branch lands the same members."""
     cfg, rem = run.cfg, run.rem
-    target = cfg["base_branch"]
+    target = _base(cfg)
     path = _git(["rev-parse", "--show-toplevel"]).stdout.strip()
     branch = _git(["-C", path, "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
     if not afk_decide.batch_branches([branch], batch):
@@ -2998,6 +3070,8 @@ def _land_batch(run: _Run, batch: str, limits: _GateLimits, merged_timeout: floa
                            f"files — what would be gated is not what would land. Commit your "
                            f"fix (or discard it) and run this again:\n{dirty}")
     prs = {p["number"]: p for p in _open_prs(run.repo)}
+    for m in members:
+        _aim_pr(run, prs[m["pr"]])
     closed = [m["pr"] for m in members if m["pr"] not in prs]
     if closed:
         raise RuntimeError(f"PR(s) {closed} of merge batch {batch} are no longer open; nothing "
@@ -3144,7 +3218,7 @@ def _workless_worktree(run: _Run, number: int) -> _Worktree | None:
     all. A worktree with work in it is evidence, and is never removed here."""
     wt = _Worktree.of_issue(run.repo, number)
     path = wt.path
-    progress = _worktree_progress(path, run.rem, run.cfg["base_branch"]) if path else None
+    progress = _worktree_progress(path, run.rem, _base(run.cfg)) if path else None
     empty = bool(progress and progress["commits_ahead"] == 0 and not progress["dirty"])
     return wt if empty else None
 
@@ -3396,9 +3470,13 @@ def build_parser() -> _Parser:
     p.add_argument("--file", default=None, metavar="path", help="path to the target repo's docs/agents/afk-fleet.md")
     p.add_argument("--defaults", action="store_true", help="print the pure defaults table")
 
-    command("probe", cmd_probe, remote="refs",
-            help="bootstrap probe: the usable claim namespace (folded into the returned "
-                 "config), and target-branch protection when gate.ci is local")
+    p = command("probe", cmd_probe, remote="refs",
+                help="bootstrap probe: the usable claim namespace and the base branch (both "
+                     "folded into the returned config), and that branch's protection when "
+                     "gate.ci is local")
+    p.add_argument("--base-branch", default=None, metavar="name",
+                   help="the branch every PR of this run lands on, as the human confirmed it "
+                        "at this launch (ADR-0042); without it the probe reports what to ask")
 
     p = command("worker-command", cmd_worker_command, needs_config=False,
                 help="settle the command workers are started with: ask-or-not + candidates, "

@@ -57,14 +57,28 @@ ME = ("--instance", "me")
 NO_CONFIG = ("config", "worker-command")
 
 
+def settled(config):
+    """A `--config` JSON with the sandbox's `main` as its base branch, unless it
+    is not JSON at all (a test of that refusal)."""
+    try:
+        return json.dumps({"base_branch": "main", **json.loads(config)})
+    except json.JSONDecodeError:
+        return config
+
+
 def run_afk(cwd, *args, env=None, bare=False):
     """One afk subcommand in `cwd` → (exit code, its parsed JSON object).
 
     The CLI refuses a call without `--config`; a test that does not care which
     config it runs on says so here, once — it gets `{}`, i.e. the defaults table
-    (lease = TTL). `bare=True` sends exactly `args`, for the tests of that refusal."""
+    (lease = TTL). And no config has a base branch until a launch settles one
+    (`afk probe`, ADR-0042): a call that names none runs on the sandbox's `main`.
+    `bare=True` sends exactly `args`, for the tests of those refusals."""
     if not bare and args[0] not in NO_CONFIG and "--config" not in args:
         args = (*args, "--config", "{}")
+    if not bare and args[0] not in (*NO_CONFIG, "probe"):
+        at = args.index("--config") + 1
+        args = (*args[:at], settled(args[at]), *args[at + 1:])
     p = subprocess.run([sys.executable, AFK, *args], cwd=cwd,
                        capture_output=True, text=True, env=env or ENV)
     try:
@@ -357,7 +371,7 @@ def test_probe_prefers_the_hidden_namespace_and_cleans_up():
         before = sb.all_refs()
         r = afk(w, "probe", "--now", str(T0))
         # one fact, said once: `blocked`. Where the refs live is in the config.
-        assert set(r) == {"blocked", "config"} and r["blocked"] is False, r
+        assert set(r) == {"blocked", "config", "base"} and r["blocked"] is False, r
         # the config it hands back is canonical, with the namespace that works
         assert r["config"]["claim_namespace"] == "refs/afk"
         assert r["config"] == afk(w, "config", "--defaults")
@@ -371,7 +385,8 @@ def test_probe_says_whether_gate_runs_can_be_recorded_and_sweeps_the_expired():
     never an error — and sweeps the records past their day."""
     with sandbox() as sb:
         w = sb.clones[0]
-        local = ("--set", "gate.ci=local", "--set", "gate.local_command=make test", "--now", str(T0))
+        local = ("--set", "gate.ci=local", "--set", "gate.local_command=make test", "--now", str(T0),
+                 "--base-branch", sb.base)
         tree = git(w, "rev-parse", "HEAD^{tree}")
 
         def record(command, at, message=None):
@@ -393,7 +408,9 @@ def test_probe_says_whether_gate_runs_can_be_recorded_and_sweeps_the_expired():
         before = sb.all_refs()
         r = afk(w, "probe", *local)["gate_records"]
         assert (r["verdict"], r["pruned"]) == ("ok", 3) and "refs/afk/gate" in r["detail"], r
-        assert sb.all_refs() == before - {stale, unreadable, junk} and fresh in sb.all_refs()
+        # … and the base branch it was given is on record (ADR-0042)
+        assert sb.all_refs() == before - {stale, unreadable, junk} | {"refs/afk/base"}
+        assert fresh in sb.all_refs()
         assert not git(w, "for-each-ref", "refs/afk-gate")           # no mirror left behind
 
         # a remote that refuses the records: said, and the launch goes on
@@ -414,7 +431,7 @@ def test_probe_falls_back_when_the_server_rejects_the_hidden_namespace():
         sb.forbid("refs/afk/")
         before = sb.all_refs()
         r = afk(w, "probe", "--now", str(T0))
-        assert set(r) == {"blocked", "detail", "config"} and r["blocked"] is True, r
+        assert set(r) == {"blocked", "detail", "config", "base"} and r["blocked"] is True, r
         assert "remote rejected" in r["detail"]
         assert r["config"]["claim_namespace"] == "refs/heads"
         assert sb.all_refs() == before

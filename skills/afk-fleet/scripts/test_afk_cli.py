@@ -51,7 +51,7 @@ from contextlib import contextmanager
 
 import afk
 import afk_decide
-from test_afk_refs import ENV, NO_CONFIG, T0, TTL, afk as run, afk_error, git, sandbox
+from test_afk_refs import ENV, NO_CONFIG, T0, TTL, afk as run, afk_error, git, sandbox, settled
 
 REPO = "acme/widgets"
 LAUNCHER = "term_launcher"      # the orca terminal the launcher runs in (ADR-0020)
@@ -167,9 +167,18 @@ if not st.get("pushes_never_merge"):
             row.update(state="merged", merged={"pushed": True, "head": head_of(row)})
             close_issues_of(row)
 
+if argv[:2] == ["repo", "view"]:
+    assert argv[2] == st["repo"] and opt("--json") == "defaultBranchRef", argv
+    finish(st.get("default_branch", st["base"]) + "\n")
+
+if argv[:2] == ["pr", "edit"]:
+    row = next(r for r in st["prs"] if str(r["number"]) == argv[2])
+    row["baseRefName"] = opt("--base")
+    finish()
+
 if argv[:2] == ["pr", "list"]:
     assert opt("--state") == "open", argv
-    rows = [r for r in st["prs"] if r.get("state", "open") == "open"]
+    rows = [{"baseRefName": st["base"], **r} for r in st["prs"] if r.get("state", "open") == "open"]
     for r in rows:                   # a PR whose checks a test scripted: one step per read
         if r.get("rollups"):
             r["statusCheckRollup"] = r["rollups"].pop(0)
@@ -1397,16 +1406,16 @@ def test_a_turn_marker_write_is_in_the_turn_read_after_it():
 _KNOWS_THE_READS = {
     "_once", "_forget",
     "_open_issues", "_open_prs", "_gather", "_comment", "_claim_written",
-    "_issue_written", "_pr_comment", "_close_pr", "_merge_pr", "_push_branch", "_delete_branch",
-    "_claim", "_force_take",
+    "_issue_written", "_pr_comment", "_close_pr", "_aim_pr", "_merge_pr", "_push_branch",
+    "_delete_branch", "_claim", "_force_take",
 }
 _WRITES = {
-    ("gh", "pr"): {"_pr_comment", "_close_pr", "_merge_pr"},
+    ("gh", "pr"): {"_pr_comment", "_close_pr", "_aim_pr", "_merge_pr"},
     ("gh", "issue"): {"_edit_labels", "_close_issue"},
     ("gh", "label"): {"_ensure_label"},
     ("gh", "--method"): {"_comment", "_add_blocker"},
     ("git", "push"): {"_push_branch", "_delete_branch", "_claim", "_force_take", "_release",
-                      "_clear", "_beat", "_usable_namespace", "_probe_gate_records",
+                      "_clear", "_beat", "_usable_namespace", "_settle_base", "_probe_gate_records",
                       "_write_gate_record", "_drop_gate_record"},
 }
 
@@ -1601,7 +1610,8 @@ def test_a_claim_a_peer_won_mid_tick_is_answered_as_lost_not_as_a_failure(monkey
         for name, value in w.env.items():          # orca is run on the process's own environment
             monkeypatch.setenv(name, value)
         with inside(w) as rem:
-            run = afk._Run(repo=REPO, rem=rem, cfg=afk_decide.resolve_config({}), clock=T0)
+            run = afk._Run(repo=REPO, rem=rem, clock=T0,
+                           cfg=afk_decide.resolve_config({"base_branch": w.sb.base}))
             ws = afk._rebuild(run, "me")
             w.afk("claim", "1", "--instance", "peer", *NOW, *R)
             did, judgments, errors = afk._tick(run, "me", "host", afk._Agent(WORKER, 30), ws)
@@ -2299,7 +2309,8 @@ def test_config_file_loads_validates_and_round_trips():
         for bad, why in (("retyr: 4", "unknown key"),
                          ("gate:\n  ci: local", "local_command"),
                          ("claim_namespace: refs/heads", "`afk probe` settles"),
-                         ("merge:\n  target: main", "renamed to 'base_branch'"),
+                         ("merge:\n  target: main", "ADR-0042"),
+                         ("base_branch: main", "confirmed at every launch"),
                          ("merge:\n  delete_branch: false", "was removed"),
                          ("fingerprint_gate: false", "was removed"),
                          ("claim_lease_ttl_seconds: 60", "was removed"),
@@ -2374,7 +2385,9 @@ def _told(term):
 def _prompt_fields(w, n, title, started, *cfg):
     """The PROMPT_FIELDS of the prompt a worker was started (or told to land) with,
     under the config a call's `cfg` arguments resolve to."""
-    config = afk._cfg(afk.build_parser().parse_args(["scan", "--config", "{}", *cfg]))
+    argv = ["scan", "--config", "{}", *cfg]
+    argv = [settled(x) if before == "--config" else x for before, x in zip([None, *argv], argv)]
+    config = afk._cfg(afk.build_parser().parse_args(argv))
     return {"n": n, "title": title, "repo": REPO, "base_branch": w.sb.base,
             "local_command": config["gate"]["local_command"], "afk_path": AFK,
             "config": json.dumps(config, ensure_ascii=False), "branch": started["branch"],
@@ -4300,7 +4313,7 @@ def test_bootstrap_refuses_a_merge_batch_the_target_would_not_take():
 
         def verdict(protection, *cfg):
             w.set(protection={w.sb.base: protection} if protection is not None else {})
-            return w.afk("probe", *R, *NOW, *cfg)["protection"]
+            return w.afk("probe", *R, *NOW, "--base-branch", w.sb.base, *cfg)["protection"]
 
         assert verdict(None, *gate)["verdict"] == "ok"
         for prot, word in (({"required_pull_request_reviews": {"required_approving_review_count": 1}},
@@ -4314,6 +4327,67 @@ def test_bootstrap_refuses_a_merge_batch_the_target_would_not_take():
             assert verdict(prot, *gate, "--set", "gate.adversarial_verify_prompt=re-derive it")["verdict"] == "ok"
         assert verdict({"lock_branch": {"enabled": False}, "enforce_admins": {"enabled": True}},
                        *gate)["verdict"] == "ok"
+
+
+def test_the_base_branch_is_confirmed_at_a_launch_and_kept_on_the_remote():
+    """ADR-0042: no file names the base branch and nothing defaults it. A probe
+    without the human's answer says what to ask and settles nothing; with it, the
+    answer goes on record on the remote, where the next launch reads it back. It
+    must be a branch the remote has, and it becomes another one only while no
+    claim and no live fleet instance stands on the recorded one."""
+    with world(issues=[issue(1, "ready-for-agent")]) as w:
+        w.set(default_branch="trunk")
+        base = w.sb.base
+
+        def probe(*extra):
+            return w.afk("probe", *R, *NOW, *extra)
+
+        def refused(branch):
+            return w.error("probe", *R, *NOW, "--base-branch", branch)
+
+        r = probe()
+        assert r["base"] == {"status": "ask", "recorded": None, "default_branch": "trunk"}
+        assert r["config"]["base_branch"] == ""
+        # ... a config nothing is dispatched on, nor claimed for
+        assert "names no base branch" in w.error(*dispatch(1), "--config", json.dumps(r["config"]))
+        assert w.claimed_by(1) is None
+
+        assert "no branch 'gone' on the remote" in refused("gone")
+        r = probe("--base-branch", base)
+        assert r["base"] == {"status": "settled", "branch": base, "recorded": None,
+                             "default_branch": "trunk"}
+        assert r["config"]["base_branch"] == base
+        # the next launch is asked all the same, with that on record
+        r = probe()
+        assert (r["base"]["status"], r["base"]["recorded"]) == ("ask", base)
+        assert r["config"]["base_branch"] == base
+
+        # another branch, while nothing stands on the recorded one
+        git(w.cwd, "push", "-q", "origin", f"origin/{base}:refs/heads/release")
+        assert probe("--base-branch", "release")["base"]["recorded"] == base
+        assert probe()["base"]["recorded"] == "release"
+        # ... not while a claim does — whoever holds it. Confirming it is no change
+        w.afk("claim", "1", "--instance", "peer", *NOW, *R)
+        assert "1 claim(s)" in refused(base) and "'release'" in refused(base)
+        assert probe("--base-branch", "release")["base"]["status"] == "settled"
+        w.afk("release", "1", "--instance", "peer", *R)
+        # ... nor while a fleet instance is live
+        w.afk("heartbeat", "--instance", "peer-live", "--now", str(T0 - 60), *R)
+        assert "peer-live" in refused(base)
+        assert probe()["base"]["recorded"] == "release"
+
+
+def test_a_landing_aims_a_pr_open_against_an_earlier_base_at_the_base_branch():
+    """A PR opened before the base branch changed is still open against the old
+    one, and GitHub merges a PR into the branch it is open against: the landing
+    points it at the run's base branch first (ADR-0042)."""
+    with world(issues=[issue(3, "ready-for-agent")]) as w:
+        gate = local_gate("true")
+        d, _ = with_pr(w, 3, 30, gate=gate)
+        w.set(prs=[{**w.pr(30), "baseRefName": "an-earlier-base"}])
+        w.afk(*_turn(3, *gate))
+        assert _land(w, 3, d["worktree"], *gate)["outcome"] == "merged"
+        assert (w.pr(30)["baseRefName"], w.pr(30)["state"]) == (w.sb.base, "merged")
 
 
 # --------------------------------------------------------------------------- #
@@ -5102,12 +5176,13 @@ def test_the_docs_spell_a_claim_ref_as_the_code_lays_it_out():
     hidden, branches = (afk_decide.CLAIM_NAMESPACES[ns] for ns in ("refs/afk", "refs/heads"))
     kinds = {p.rpartition("/")[2] for p in (*hidden, afk_decide.GATE_RECORD_NAMESPACE)}
     short = [p[len(afk_decide.BRANCH_NAMESPACE) + 1:] for p in branches]
-    assert kinds == {"claim", "heartbeat", "gate"} and short == ["afk-claim", "afk-heartbeat"]
+    assert kinds == {"claim", "heartbeat", "base", "gate"}
+    assert short == ["afk-claim", "afk-heartbeat", "afk-base"]
 
     named = set()
     for name, text in docs.items():
-        for kind in re.findall(r"refs/afk/([a-z-]+)/", text):
-            assert kind in kinds, f"{name}: refs/afk/{kind}/ is not a ref the fleet writes"
+        for kind in re.findall(r"refs/afk/([a-z-]+)", text):
+            assert kind in kinds, f"{name}: refs/afk/{kind} is not a ref the fleet writes"
             named.add(kind)
         for line in text.splitlines():
             for m in re.finditer(r"(?<![\w/])(%s)/" % "|".join(short), line):
@@ -5130,7 +5205,7 @@ def test_this_repos_own_config_loads_and_restates_no_default():
                 for sk in (v if isinstance(v, dict) else [None])
                 if (v[sk] == defaults[k][sk] if isinstance(v, dict) else v == defaults[k])]
     assert not restated, restated
-    assert partial["gate"]["ci"] == "local" and partial["base_branch"] == "master"
+    assert partial["gate"]["ci"] == "local"
 
 
 def test_every_flow_anchor_still_names_something():
