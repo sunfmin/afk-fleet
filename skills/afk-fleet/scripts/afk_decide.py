@@ -98,7 +98,8 @@ class IssueRef(TypedDict):
 
 
 class PullRequest(TypedDict):
-    """One open PR, as `gh pr list` returns the fields asked for."""
+    """One open PR, as `gh pr list` returns the fields asked for — but for
+    `closingIssuesReferences`, which is `issues_closed_by` of the PR."""
     number: int
     title: str
     headRefName: str
@@ -4133,6 +4134,20 @@ def pr_checks_state(rollup: Iterable[Obj] | None) -> ChecksState | None:
         if concl not in _CHECK_OK:
             state = "pending"
     return state
+
+
+_CLOSING_KEYWORD = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+#(\d+)\b", re.I)
+
+
+def issues_closed_by(body: str | None, linked: Iterable[IssueRef] | None) -> list[IssueRef]:
+    """The issues a PR closes: the ones GitHub links to it, and the ones its body
+    names with a closing keyword (`Closes #7`). GitHub reads the keyword only on
+    a PR against the repo's default branch — against any other base it links
+    nothing and closes nothing — so the body is read here, and the answer is the
+    same whatever branch the fleet lands on."""
+    numbers = {ref["number"] for ref in linked or []}
+    numbers.update(int(n) for n in _CLOSING_KEYWORD.findall(body or ""))
+    return [{"number": n} for n in sorted(numbers)]
 
 
 def _closing_pr_map(prs: Iterable[PullRequest]) -> dict[int, PullRequest]:
