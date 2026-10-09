@@ -3,16 +3,15 @@
 Per-repo config consumed by `/afk-fleet` at bootstrap via `afk config --file <this file>`, which
 validates every key against the one schema (unknown key or wrong shape → error) and emits the
 canonical JSON every tick and tool consumes (ADR-0009). Anything omitted uses the default — so this
-file sets only the keys where this repo differs, and a default that moves is followed. This repo's
-trunk is not `main`, so `base_branch` is set accordingly. The worker
-launch command is intentionally NOT here (settled at bootstrap; ADR-0010).
+file sets only the keys where this repo differs, and a default that moves is followed. The base
+branch (ADR-0042) and the worker launch command (ADR-0010) are intentionally NOT here: both are
+settled at bootstrap.
 
 ```yaml
 # Only what differs from the defaults (`afk config --defaults` prints those; the
 # annotated list is skills/afk-fleet/references/config-template.md).
 
 # --- workers ---
-base_branch: master
 concurrency: 10
 
 # --- completion gate ---
@@ -40,5 +39,5 @@ gate:
 - **Sync, not rebase.** A landing merges `base_branch` into the branch before its re-gate
   (ADR-0012, ADR-0027) — always: there is no key for it (ADR-0038).
 - **Reserved surfaces.** The fleet manages the `afk-attempt/<n>` labels, the `refs/afk/*` ref
-  namespace (`refs/afk/claim/*`, `refs/afk/heartbeat/*`), the single `<!--afk:status-->` status-board
+  namespace (`refs/afk/claim/*`, `refs/afk/heartbeat/*`, `refs/afk/base`), the single `<!--afk:status-->` status-board
   comment, and the `<!--afk:turn …-->` landing-turn comment on a PR. Don't hand-edit them.

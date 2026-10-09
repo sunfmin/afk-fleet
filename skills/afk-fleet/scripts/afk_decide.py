@@ -104,6 +104,7 @@ class PullRequest(TypedDict):
     title: str
     headRefName: str
     headRefOid: str
+    baseRefName: str            # the branch it is open against
     updatedAt: str
     statusCheckRollup: list[Obj] | None
     closingIssuesReferences: list[IssueRef]
@@ -148,7 +149,7 @@ class GateConfig(TypedDict):
 
 class Config(TypedDict):
     """The canonical config (`resolve_config`): every key of CONFIG_DEFAULTS,
-    and the settled one beside them."""
+    and the settled ones beside them."""
     ready_label: str
     epic_labels: list[str]
     base_branch: str
@@ -395,7 +396,7 @@ def assert_never(value: NoReturn) -> NoReturn:
 # what keeps them out of files.
 #
 # A key is here because repos really differ in it (ADR-0038): which labels the
-# repo triages with, its trunk, how many workers the machine carries, what its
+# repo triages with, how many workers the machine carries, what its
 # gate is, how often a failure is retried. What every fleet does alike is not a
 # key — it is the constants under this table, or simply what the code does.
 
@@ -404,7 +405,6 @@ CONFIG_DEFAULTS: Obj = {
     "ready_label": "ready-for-agent",
     "epic_labels": ["epic", "prd", "wayfinder:map"],
     # workers
-    "base_branch": "main",
     "concurrency": 3,
     # completion gate
     "gate": {
@@ -417,10 +417,17 @@ CONFIG_DEFAULTS: Obj = {
     "escalate_label": "ready-for-human",
 }
 
-# The one field of the canonical config that no file sets: where this run's claim
-# and heartbeat refs live. `afk probe` settles it at bootstrap and returns it in
-# the config the launcher holds from then on, so every later call agrees with it.
-CONFIG_SETTLED = {"claim_namespace": "refs/afk"}
+# The fields of the canonical config that no file sets: `afk probe` settles each
+# at bootstrap and returns it in the config the launcher holds from then on, so
+# every later call agrees with it.
+#
+#   claim_namespace  where this run's claim and heartbeat refs live.
+#   base_branch      the branch every worker cuts from, opens its PR against, and
+#                    lands on. It has no default: the human confirms it at every
+#                    launch, and it is kept on the remote (`BASE_RECORD`), where
+#                    every launcher on the repo reads the same one (ADR-0042).
+#                    "" is a config no launch has settled yet.
+CONFIG_SETTLED = {"claim_namespace": "refs/afk", "base_branch": ""}
 
 # What a fleet does the same in every repo. Each was a config key once, and no
 # repo ever set one to anything else (ADR-0038).
@@ -434,14 +441,15 @@ FORCE_TICK_AFTER_SKIPS = 6                  # a full tick at least every N skipp
 
 
 # The two places claim + heartbeat refs can live, as namespace → (claim ref prefix,
-# heartbeat ref prefix). `refs/afk` is hidden from branch listings and `on: push`
-# CI; `refs/heads` is the fallback for a remote whose rules forbid non-branch refs,
-# where the same markers are ordinary `afk-claim/*` / `afk-heartbeat/*` branches
-# (ADR-0003). A closed set: any other prefix would be a third layout no probe,
-# warning or doc describes.
+# heartbeat ref prefix, the ref of the base branch's record). `refs/afk` is hidden
+# from branch listings and `on: push` CI; `refs/heads` is the fallback for a remote
+# whose rules forbid non-branch refs, where the same markers are ordinary
+# `afk-claim/*` / `afk-heartbeat/*` branches and an `afk-base` one (ADR-0003). A
+# closed set: any other prefix would be a third layout no probe, warning or doc
+# describes.
 CLAIM_NAMESPACES = {
-    "refs/afk": ("refs/afk/claim", "refs/afk/heartbeat"),
-    "refs/heads": ("refs/heads/afk-claim", "refs/heads/afk-heartbeat"),
+    "refs/afk": ("refs/afk/claim", "refs/afk/heartbeat", "refs/afk/base"),
+    "refs/heads": ("refs/heads/afk-claim", "refs/heads/afk-heartbeat", "refs/heads/afk-base"),
 }
 BRANCH_NAMESPACE = "refs/heads"
 
@@ -531,6 +539,8 @@ HEARTBEAT_RECORD = RecordKind("afk-heartbeat", {"instance": str, "ts": int}, ("t
 GATE_RUN_RECORD = RecordKind("afk-gate", {"tree": str, "command": str, "at": int}, ("at",))
 # What the bootstrap probe pushes to learn whether a namespace takes a push.
 PROBE_RECORD = RecordKind("afk-probe", {"ts": int}, ("ts",))
+# The repo's base branch, as the human last confirmed it at a launch (ADR-0042).
+BASE_RECORD = RecordKind("afk-base", {"branch": str, "ts": int}, ("branch",))
 
 def _field_type(kind: RecordKind, name: str) -> FieldType:
     declared = kind.fields[name]
@@ -656,18 +666,19 @@ GATE_CI_MODES: dict[GateCiMode, str] = {"required": "CI", "local": "本地门"}
 # Keys that were renamed, and why. A file still carrying the old name must fail
 # LOUDLY with the migration note rather than be silently defaulted — a config that
 # lies to its author is the failure mode ADR-0009 exists to prevent.
-CONFIG_RENAMED = {
-    "merge.target": (
-        "base_branch",
-        "the branch workers cut from and open their PR against is the branch that PR lands "
-        "on, so it is named once (ADR-0038). Set base_branch, and delete the merge: section."),
-}
+CONFIG_RENAMED: dict[str, tuple[str, str]] = {}
+
+# Why no file names the branch the fleet lands on — said of each key that did.
+_BASE_NOTE = ("the base branch is not set in a file (ADR-0042): it is confirmed at every launch "
+              "— asked for, or passed as `/afk-fleet --base-branch <name>` — and kept on the "
+              "remote, where every launcher on the repo reads the same one.")
 
 # What ADR-0038 says of every key that turned out to be the same in every repo.
 _ALWAYS = "(ADR-0038). Delete the key."
 
 # Keys that were removed, and why — refused as loudly as a renamed one.
 CONFIG_REMOVED = {
+    "merge.target": f"{_BASE_NOTE} Delete the merge: section.",
     "gate.trust_recorded_run": (
         "a recorded gate run is always trusted now (ADR-0030): the landing skips its own run "
         "whenever a green run of the configured command is on record for the tree that lands. "
@@ -724,10 +735,13 @@ _RETIRED_SECTIONS = {key.partition(".")[0] for key in (*CONFIG_RENAMED, *CONFIG_
                      if "." in key} - set(CONFIG_DEFAULTS)
 
 
-# Why a file may not set the settled field — said where a file tries to.
-_SETTLED_NOTE = ("config: 'claim_namespace' is not set in a file — `afk probe` settles where claim "
-                 "refs live at every bootstrap, and falls back to refs/heads by itself when the "
-                 "remote refuses refs/afk (ADR-0038). Delete the key.")
+# Why a file may not set a settled field — said where a file tries to.
+_SETTLED_NOTES = {
+    "claim_namespace": ("config: 'claim_namespace' is not set in a file — `afk probe` settles "
+                        "where claim refs live at every bootstrap, and falls back to refs/heads "
+                        "by itself when the remote refuses refs/afk (ADR-0038). Delete the key."),
+    "base_branch": f"config: 'base_branch' is not set in a file — {_BASE_NOTE} Delete the key.",
+}
 
 
 def _renamed(dotted: str) -> str | None:
@@ -854,7 +868,7 @@ def parse_config_yaml(text: str) -> Obj:
                 section = key           # read on: each key under it has its own note
                 continue
             if key in CONFIG_SETTLED:
-                raise ValueError(_SETTLED_NOTE)
+                raise ValueError(_SETTLED_NOTES[key])
             if key not in CONFIG_DEFAULTS:
                 raise ValueError(_renamed(key)
                                  or f"config: unknown key {key!r} (note: the instance id and "
@@ -875,7 +889,7 @@ def parse_config_yaml(text: str) -> Obj:
 def resolve_config(partial: Obj) -> Config:
     """Partial config → the complete canonical config: every key present,
     defaults filled from CONFIG_DEFAULTS (one level deep for gate), and the
-    settled field beside them. Idempotent — resolving an already-canonical
+    settled fields beside them. Idempotent — resolving an already-canonical
     config is a no-op."""
     out: Obj = {}
     for k, dv in {**CONFIG_DEFAULTS, **CONFIG_SETTLED}.items():
@@ -893,7 +907,7 @@ def resolve_config(partial: Obj) -> Config:
 def override_config(cfg: Config, assignments: Iterable[str] | None) -> Config:
     """Lay `key=value` overrides (the CLI's `--set`) onto a canonical config, in
     place, and return it. Keys are the config file's own — dotted for a section
-    (`gate.ci=local`), plus the settled `claim_namespace` — and values are typed
+    (`gate.ci=local`), plus the settled fields — and values are typed
     by the key's default exactly as the file's are, except that a string is taken
     verbatim (the shell already unquoted it). An unknown key, or an item with no `=`, raises ValueError; a
     renamed or removed one raises with its migration note, as the file does."""
@@ -1199,6 +1213,28 @@ def gate_record_void(record: Obj | None, now: float) -> str | None:
         return (f"the recorded run is {age}s old — a record is trusted for "
                 f"{GATE_RECORD_TTL}s")
     return None
+
+
+def base_refusal(answer: str, recorded: str | None, heads: Iterable[str], claims: int,
+                 live: list[str]) -> str | None:
+    """Why `answer` cannot be the repo's base branch, or None when it can
+    (ADR-0042). It must be a branch of the remote (`heads`) — the fleet never
+    makes one. And it may differ from the `recorded` one only while nothing
+    stands on that: no claim (`claims`, how many the remote holds — each is work
+    cut from the recorded base, whoever holds it) and no `live` fleet instance."""
+    if answer not in heads:
+        return (f"no branch {answer!r} on the remote — the base branch must exist before a "
+                f"launch; the fleet does not create it")
+    if recorded is None or answer == recorded:
+        return None
+    standing = [f"{claims} claim(s)"] if claims else []
+    standing += [f"live fleet instance(s) {', '.join(sorted(live))}"] if live else []
+    if not standing:
+        return None
+    return (f"the base branch is {recorded!r} and {' and '.join(standing)} stand on it, so it "
+            f"cannot become {answer!r} now. Launch on {recorded!r}, or let that work finish "
+            f"first (stop the other launchers; `/afk-fleet --takeover` inherits a dead one's "
+            f"claims), then launch again")
 
 
 def protection_verdict(ci_mode: GateCiMode, protection: Obj | None,

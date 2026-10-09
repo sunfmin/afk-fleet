@@ -20,6 +20,11 @@ the worktree name, that a landing syncs with `base_branch` before it gates, that
 worktree are removed, that every claimed issue carries a status board and every escalation a comment,
 and where claim refs live (`afk probe` settles that at every bootstrap).
 
+Nor is the **base branch** — the branch workers cut from, open their PR against and land on. It has
+no default and is in no file: the human confirms it at every launch (asked, or passed as
+`/afk-fleet --base-branch <name>`), and it is kept on the remote, where every launcher on the repo
+reads the same one (ADR-0042). `base_branch` below means that branch.
+
 ```yaml
 # --- dispatch contract ---
 ready_label: ready-for-agent          # a child issue is dispatchable when it carries this
@@ -28,9 +33,6 @@ epic_labels: [epic, prd, wayfinder:map]   # never dispatched (a PRD is not a wor
                                       #   issue blocked by one is never waited on
 
 # --- workers ---
-base_branch: main                     # the repo's trunk: workers cut their branch from it, open
-                                      #   their PR against it, and the PR lands on it — the fleet
-                                      #   stops there; deploy is a separate human-gated step
 concurrency: 3                        # max workers running at once
 
 # --- completion gate ---
@@ -110,10 +112,10 @@ escalate_label: ready-for-human        # applied (with ready_label removed, clai
   (secrets, live infra) is never done by the fleet.
 - **Reserved labels, refs & the status comment.** The fleet manages, durably in GitHub, the
   `afk-attempt/<n>` labels (retry count) and `afk-attempt/starting` (a retry under way), the hidden `refs/afk/*` ref namespace — `refs/afk/claim/<n>` (the
-  claim, one per owned issue) and `refs/afk/heartbeat/<id>` (per-instance liveness) — and the single status-board comment tagged `<!--afk:status-->` (found and
+  claim, one per owned issue), `refs/afk/heartbeat/<id>` (per-instance liveness) and `refs/afk/base` (the base branch, as last confirmed) — and the single status-board comment tagged `<!--afk:status-->` (found and
   overwritten by that marker each tick). This is what keeps ticks stateless and lets fleets cooperate
   (see the skill's "Why it runs forever" and ADR-0003). Don't hand-edit them or reuse the
   `afk-attempt/*` / `refs/afk/*` prefixes or the `<!--afk:status-->` marker. If an org ruleset forbids
   non-branch refs, bootstrap's `afk probe` falls back to `refs/heads/afk-claim/*` for the run (the
-  config it returns carries that as `claim_namespace`, the one field no file sets) and warns that
+  config it returns carries that as `claim_namespace`, a field no file sets) and warns that
   `on: push` CI will then fire.

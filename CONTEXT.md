@@ -9,8 +9,8 @@ several may land together, as one **merge batch** behind a single gate run.
 ## Language
 
 **Launcher**:
-The interactive session `/afk-fleet` is invoked in. Invoking it is the launch: it asks for no
-confirmation, mints a **fleet-instance** id, then loops: run one cycle (`afk cycle`, whose **tick** runs in code),
+The interactive session `/afk-fleet` is invoked in. Invoking it is the launch: it has the human
+confirm the **base branch** and nothing else, mints a **fleet-instance** id, then loops: run one cycle (`afk cycle`, whose **tick** runs in code),
 answer the **judgments** it returns, keep the **cycle state**, sleep, repeat. It is the one session that
 runs each tick, and the one LLM a judgment reaches. Its context is bounded by ordinary
 auto-compaction, which is safe by construction: after any compaction it needs only the repo, the
@@ -99,12 +99,23 @@ in its environment — the wrapper's name is gone by the time the process exists
 identical to a stock `claude` — while a worker starts in a fresh login shell that inherits none of it
 and would otherwise fall back to stock Anthropic, silently, for days. Undetectable by construction, it
 is therefore **supplied by the human** — passed with the invocation (`--worker-command`) or asked for at
-bootstrap, the one question a launch can ask — but only when it can matter: a launcher with no custom
+bootstrap, one of the two questions a launch can ask (the other is the **base branch**) — but only when it can matter: a launcher with no custom
 provider is never asked. Code still settles everything
 around the answer: which wrappers exist to offer, whether the answer resolves to something runnable,
 and whether an unattended flag is visible in it (ADR-0010).
 _Avoid_: worker command (ambiguous with what the worker itself runs), agent command, provider profile
 (the fleet deliberately does not model the provider — only the command), launch wrapper
+
+**Base branch**:
+The one branch a repo's fleet work goes to: every **worker** cuts its branch from it, opens its PR
+against it, and its **landing** merges into it — where the fleet's mandate ends. It has no default
+and belongs to no file: the human **confirms it at every launch** — read back and answered, or
+passed with the invocation (`--base-branch`) — and it is kept on the remote, so every **launcher**
+on the repo reads the same one. It may become another branch only while nothing stands on it: no
+**claim**, and no live **fleet instance**. A **takeover** therefore inherits the dead fleet's. It
+need not be the repo's default branch, and the fleet never creates it (ADR-0042).
+_Avoid_: trunk, main (it may be neither), default branch (that is GitHub's, and only offered as
+an answer)
 
 **Local gate**:
 The repo-local build/test command (`gate.local_command`) that, in `gate.ci: local` mode, *is* the
@@ -269,7 +280,7 @@ the owner's **heartbeat** to expire past the claim lease (the only machine-visib
 a takeover is initiated by a present human who *is* the proof of death — the oracle that knows, before
 the lease lapses, that the fleet hard-stopped (quota exhausted, process killed). It is a **launcher**
 bootstrap variant (`afk-fleet --takeover`): the new instance runs the full bootstrap (config, instance
-id, **worker launch command**), then lists the instances
+id, **base branch**, **worker launch command**), then lists the instances
 discoverable in the claim markers and heartbeat refs and, on the human's selection, force-takes the
 chosen instance's claims with the *same* atomic `--force-with-lease` push as a stale reclaim — only
 skipping the staleness gate. A target whose heartbeat is still fresh prompts an explicit confirm,

@@ -24,5 +24,5 @@ The config these steps read is the resolved one — `skills/afk-fleet/scripts/af
 
 1. **Gate**: run that config's `gate.local_command` on the head that will land. This repo has no GitHub checks (`gate.ci: local`), so this run is the only thing that can be red — the suite also holds the docs to the code. Red -> fix it first; never merge red.
 2. **Merge**: `gh pr merge <n> --merge` — a merge commit, as the fleet itself lands every PR (ADR-0034) — with `--delete-branch`, as the fleet always deletes a landed branch (ADR-0038). A merge conflict -> fix it first, then gate again.
-3. **Sync local**: check out `base_branch`, then `git pull --ff-only`.
+3. **Sync local**: check out the branch the PR landed on (`gh pr view <n> --json baseRefName`), then `git pull --ff-only`.
 4. **Install the skill**: `npx skills update afk-fleet -g -y`, so `~/.agents/skills/afk-fleet/` runs what just merged. Confirm `updatedAt` moved in `~/.agents/.skill-lock.json` — unless the PR left `skills/afk-fleet/` untouched, where "All global skills are up to date" is the expected answer.

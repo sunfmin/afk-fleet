@@ -2,7 +2,9 @@
 
 **Status:** accepted — amends the bootstrap of [ADR-0002](0002-launcher-and-disposable-ticks.md)
 (drops the preview and the per-run authorization) and the asking rule of
-[ADR-0010](0010-worker-launch-command.md).
+[ADR-0010](0010-worker-launch-command.md). Amended by
+[ADR-0042](0042-the-base-branch-is-confirmed-at-every-launch-and-kept-on-the-remote.md): a launch
+confirms the base branch, the one thing whose answer can differ from the request.
 
 ## Context
 

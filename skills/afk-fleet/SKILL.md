@@ -60,12 +60,15 @@ is safe because **nothing the launcher must remember lives only in its context**
 ## Modes
 
 - `/afk-fleet` — **launcher** (default): bootstrap, then loop, one cycle after another. The main entry.
-  **Invoking it is the launch** — no preview, no confirmation (ADR-0023). `--worker-command "<cmd>"`
-  answers bootstrap's one possible question up front.
+  **Invoking it is the launch** — no preview, and one confirmation: the base branch every PR will
+  land on (ADR-0023, ADR-0042). `--base-branch <name>` and `--worker-command "<cmd>"` answer
+  bootstrap's two possible questions up front.
 - `/afk-fleet --plan` — **dry-run**: a **tick short-circuited before the Act phase**. It does the full
   rebuild (frontier + in-flight + stale classification), prints the dispatch plan, and exits —
   grants/dispatches/reclaims **nothing**: the way to look before launching. Same rebuild code path as `--tick`,
-  so the plan can't drift from what a live tick would do (ADR-0002).
+  so the plan can't drift from what a live tick would do (ADR-0002). Its bootstrap probes without
+  `--base-branch` and asks nothing: print `base.recorded` as where a launch would land (or that no
+  launch has settled a base branch yet).
 - `/afk-fleet --tick` — **one cycle**, cold, and exit with its progress line: the
   [Bootstrap](#bootstrap-once), then `afk cycle` with no `state` — a first cycle, which always
   ticks — then its judgments answered, and no sleep. It acts exactly as a cycle of the loop does,
@@ -81,9 +84,11 @@ is safe because **nothing the launcher must remember lives only in its context**
 
 **Invoking the skill is the launch** (ADR-0023): the invocation is itself the go-ahead to push worker
 branches and **auto-merge** green PRs to `base_branch`, unattended, for this run. Bootstrap shows no
-preview and asks for no confirmation — go straight from step 3 into the [Loop](#loop). It stops only
+preview and asks for no go-ahead — go straight from step 3 into the [Loop](#loop). It stops only
 on what makes the run impossible (a config error, a merge target that would reject every merge), and
-asks only the one thing code cannot derive (step 3, and only when it was not passed in).
+asks only the two things code cannot derive, each only when it was not passed in: **which branch
+everything lands on** (step 2 — confirmed at every launch, never assumed: ADR-0042) and the worker
+launch command (step 3).
 
 1. **Load config** — `afk config --file <target repo>/docs/agents/afk-fleet.md` parses + validates
    the file against the one schema (unknown key or wrong shape → **error: stop and report it,
@@ -94,8 +99,9 @@ asks only the one thing code cannot derive (step 3, and only when it was not pas
    guessed settings.
 2. **Establish this fleet instance** — mint a short unique **instance id** (this launcher run's
    identity, passed to the first cycle and carried in the cycle `state` from then on). Then
-   `afk probe --repo <repo> --config '<config>'`, which answers three compatibility questions and
-   returns the run's config — **hold its `config` from here on, in place of step 1's**:
+   `afk probe --repo <repo> --config '<config>' [--base-branch <name>]`, which answers four
+   compatibility questions and returns the run's config — **hold its `config` from here on, in
+   place of step 1's**:
    - **Claim namespace** — the returned `config` carries the `claim_namespace` that actually works, so
      every later call inherits it through `--config` with nothing extra to pass. If it reports
      `"blocked": true` (an org ruleset forbids `refs/afk/*`; `detail` is the server's rejection), that
@@ -103,6 +109,20 @@ asks only the one thing code cannot derive (step 3, and only when it was not pas
      may trigger `on: push` CI. See
      [Cooperative multi-fleet](references/cooperative-multi-fleet.md). An `{"error": …}` here means the
      remote could not be pushed to at all (auth, network) — fix that; it is not a namespace question.
+   - **Base branch** (ADR-0042) — the branch every worker cuts from, opens its PR against and
+     lands on. It is in no config file and has no default: **the human confirms it at every
+     launch.** If the skill was invoked with `--base-branch <name>`, pass that to the probe — it is
+     the confirmation; ask nothing. Otherwise run the probe without it: it returns
+     `base.status == "ask"` with `base.recorded` (the branch the last launch on this repo
+     confirmed, or `null`) and `base.default_branch`, and answers nothing further. **Ask the
+     human**: "Every change this run makes will be merged into `<recorded>` — confirm?", offering
+     `recorded` first when there is one, then `default_branch`, then any other branch they name.
+     With nothing recorded, recommend none: nobody should land on `main` by reflex. Then **run the
+     probe again with `--base-branch <answer>`**; `base.status == "settled"` and its `config`
+     carries the branch. An `{"error": …}` is the answer refused — no such branch on the remote
+     (the fleet creates none), or a branch other than the recorded one while a claim or a live
+     fleet instance still stands on that: **report it and stop**. Never run a cycle on a config
+     whose probe was not given `--base-branch`.
    - **Branch protection** (only when `gate.ci: local`) — `protection.verdict == "error"` means
      `base_branch` **requires status checks**, so `gh pr merge` would be rejected however green the
      local gate is: **stop here** — drop the required checks on that branch or
@@ -150,8 +170,9 @@ standing right there. The lease will hand its claims to a peer, but only after
 The present human is the oracle that knows *now*; the dying fleet cannot help, since a hard stop runs no
 code at all (no drain, no release) — [ADR-0011](../../docs/adr/0011-takeover-and-progress-preservation.md).
 
-Run the **full** [Bootstrap](#bootstrap-once) above — config, a *new* instance id,
-the worker launch command — so this is a real fleet instance. Only
+Run the **full** [Bootstrap](#bootstrap-once) above — config, a *new* instance id, the base
+branch, the worker launch command — so this is a real fleet instance. The base branch is still
+read back and confirmed, and cannot be another than the dead fleet's: its claims stand on it. Only
 the opening working set differs:
 
 1. **List what GitHub still remembers.** The dead launcher forgot its own id; the claim markers
@@ -546,8 +567,8 @@ touch shared root config are naturally throttled by the DAG — chain them with 
 
 - **The invocation is the authorization, and it covers only this.** Running the skill is the human's
   go-ahead to push worker branches and land green PRs on `base_branch`, for this repo, for
-  this run — ask for no further confirmation, and read it as permission for nothing else
-  (ADR-0023). `--plan` is how to look without acting.
+  this run — once the base branch is confirmed (ADR-0042) ask for no further confirmation, and
+  read it as permission for nothing else (ADR-0023). `--plan` is how to look without acting.
 - **Keep every credential inside the worker's own shell.** Push only to worker branches and the merge
   to `base_branch`; deploying, secrets, and every other remote stay out of scope. Carry no credential
   to a worker — no copied `ANTHROPIC_*` (or any) env, no env file, no token from a secret manager: the

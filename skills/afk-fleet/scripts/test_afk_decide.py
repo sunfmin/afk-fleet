@@ -2003,7 +2003,7 @@ def _declared(phase=None, reason=None, blocked_by=()):
 
 
 def test_worker_step_routes_every_cause_or_returns_the_judgment():
-    cfg = d.resolve_config({})
+    cfg = d.resolve_config({"base_branch": "main"})
 
     def step(cause, row=None, **worker):
         return d.worker_step(CALL, row or _mine(4), _worker(cause, **worker), cfg)
@@ -3040,13 +3040,15 @@ retry: 3
         except ValueError:
             pass
 
-    # a RENAMED key fails loudly with its migration note — never silently defaulted,
-    # which would leave a config file quietly lying to its author (ADR-0009/ADR-0012)
-    try:
-        d.parse_config_yaml("merge:\n  target: trunk")
-        assert False, "expected ValueError for the renamed merge.target key"
-    except ValueError as e:
-        assert "renamed to 'base_branch'" in str(e) and "ADR-0038" in str(e)
+    # a key that named the base branch fails loudly with its note — never silently
+    # dropped, which would leave a config file quietly lying to its author
+    # (ADR-0009/ADR-0012): no file names the branch a launch confirms (ADR-0042)
+    for retired in ("merge:\n  target: trunk", "base_branch: trunk"):
+        try:
+            d.parse_config_yaml(retired)
+            assert False, f"expected ValueError for {retired!r}"
+        except ValueError as e:
+            assert "not set in a file" in str(e) and "ADR-0042" in str(e)
 
 
 def test_resolve_config():
@@ -3056,9 +3058,10 @@ def test_resolve_config():
     assert r["concurrency"] == 5
     # deep-merge keeps sibling defaults; untouched keys stay whole
     assert r["gate"]["local_command"] == "make test" and r["gate"]["ci"] == "required"
-    assert r["base_branch"] == "main"
-    # the settled field rides in the canonical config, though no file sets it
+    # the settled fields ride in the canonical config, though no file sets them —
+    # and the base branch has no default: "" until a launch settles it (ADR-0042)
     assert r["claim_namespace"] == "refs/afk" and "claim_namespace" not in d.CONFIG_DEFAULTS
+    assert r["base_branch"] == "" and "base_branch" not in d.CONFIG_DEFAULTS
     # idempotent: resolving canonical config is a no-op
     assert d.resolve_config(r) == r
 
@@ -3077,7 +3080,7 @@ def test_override_config_types_every_key_like_the_file_does():
     samples = {bool: ("false", False), int: ("123", 123), list: ("[a, b]", ["a", "b"]),
                str: ("some value", "some value")}
     seen = 0
-    for dotted, default in _leaves({**d.CONFIG_DEFAULTS, "claim_namespace": "refs/afk"}):
+    for dotted, default in _leaves({**d.CONFIG_DEFAULTS, **d.CONFIG_SETTLED}):
         raw, want = samples[type(default)]
         if default == want:                               # make the override visible
             raw, want = ("true", True) if isinstance(default, bool) else (raw + "x", want + "x")
@@ -3091,7 +3094,7 @@ def test_override_config_types_every_key_like_the_file_does():
         (other[section] if section else other)[key] = want
         assert cfg == other, dotted
         seen += 1
-    assert seen == len(list(_leaves(d.CONFIG_DEFAULTS))) + 1 == 10
+    assert seen == len(list(_leaves(d.CONFIG_DEFAULTS))) + len(d.CONFIG_SETTLED) == 10
 
     cfg = d.resolve_config({})
     assert d.override_config(cfg, None) == d.resolve_config({}) == d.override_config(cfg, [])
@@ -3318,3 +3321,14 @@ def test_issues_closed_by_reads_the_links_and_the_closing_keywords_of_the_body()
     assert d.issues_closed_by("fixes: #2, Resolved #10 and closed #4.", None) == \
         [{"number": 2}, {"number": 4}, {"number": 10}]
     assert d.issues_closed_by("see #7; encloses #8; closes o/r#9", None) == []
+
+
+def test_base_refusal_lets_the_base_branch_change_only_while_nothing_stands_on_it():
+    heads = ["main", "release"]
+    assert d.base_refusal("main", None, heads, 3, ["peer"]) is None      # the first one settled
+    assert d.base_refusal("main", "main", heads, 3, ["peer"]) is None    # confirmed, not changed
+    assert d.base_refusal("release", "main", heads, 0, []) is None
+    assert "no branch 'gone'" in d.base_refusal("gone", None, heads, 0, [])
+    assert "2 claim(s)" in d.base_refusal("release", "main", heads, 2, [])
+    said = d.base_refusal("release", "main", heads, 0, ["b", "a"])
+    assert "a, b" in said and "'main'" in said and "'release'" in said
