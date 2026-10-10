@@ -54,7 +54,8 @@ gate:
 # --- failure handling ---
 retry: 2                               # per-issue retries; count tracked via an afk-attempt/<n> label on the issue
 escalate_label: ready-for-human        # applied (with ready_label removed, claim ref deleted) on give-up,
-                                      #   with a comment naming the stuck-point + PR/log links
+                                      #   with a comment naming the stuck-point + PR/log links. Never
+                                      #   ready_label itself, nor a label under afk-attempt/ (load-time error)
 ```
 
 ## Notes
@@ -113,7 +114,7 @@ escalate_label: ready-for-human        # applied (with ready_label removed, clai
 - **Reserved labels, refs & the status comment.** The fleet manages, durably in GitHub, the
   `afk-attempt/<n>` labels (retry count) and `afk-attempt/starting` (a retry under way), the hidden `refs/afk/*` ref namespace — `refs/afk/claim/<n>` (the
   claim, one per owned issue), `refs/afk/heartbeat/<id>` (per-instance liveness) and `refs/afk/base` (the base branch, as last confirmed) — and the single status-board comment tagged `<!--afk:status-->` (found and
-  overwritten by that marker each tick). This is what keeps ticks stateless and lets fleets cooperate
+  overwritten by that marker each tick), beside the `<!--afk:escalation …-->` marker that leads an escalation's comment. This is what keeps ticks stateless and lets fleets cooperate
   (see the skill's "Why it runs forever" and ADR-0003). Don't hand-edit them or reuse the
   `afk-attempt/*` / `refs/afk/*` prefixes or the `<!--afk:status-->` marker. If an org ruleset forbids
   non-branch refs, bootstrap's `afk probe` falls back to `refs/heads/afk-claim/*` for the run (the

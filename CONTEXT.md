@@ -184,7 +184,7 @@ One change of a **claim**'s state, performed as a single `afk` call that runs it
 sequence in code: **dispatch** (claim → worktree at the right commit → worker started → prompt
 delivered → status board), **turn** (grant the **landing turn**: the tick's judgments checked → the
 brief written → the turn recorded on the PR → the worker told, or continued onto it → status board), **fail** (count the attempt, then a fresh retry or an escalation), **escalate**
-(status board → relabel → comment → release, the release last), **park** (dependency edge → status
+(status board → comment → relabel → release, the release last), **park** (dependency edge → status
 board → release → cleanup), **close** (status board → close → release → cleanup). A transition stops with an **outcome** exactly where the next move is judgment —
 a PR with no checks, a verification still owed — and takes the tick's judgment as an
 argument (a reason, a verified head, "start fresh"). The tick therefore types no raw `git`, `gh` or
@@ -215,6 +215,7 @@ _Avoid_: coordinator memory, session state
 The set of currently-dispatchable issues — `open` + `ready_label` + not an epic + **unclaimed** (no
 claim ref) + **no open linked PR** + zero open `blocked_by`. Recomputed from GitHub every tick, over
 every open issue: the issue list carries each one's open-blocker count, and the pull requests GitHub lists among them are left out.
+Dispatched in issue-number order, lowest first — the issues' own order, never the one a read happened to list them in.
 It is also what does the waiting for a **parked** issue: nothing else remembers that one is parked.
 _Avoid_: queue, backlog (the backlog is the whole issue set; the frontier is only the ready edge)
 
@@ -233,8 +234,8 @@ _Avoid_: assignee (dropped as a claim signal), assignment, lock (too generic)
 
 **Heartbeat** (and its lease):
 The liveness signal a **fleet instance** publishes for itself — one ref `refs/afk/heartbeat/<id>` carrying
-a timestamp, refreshed while it holds any claim (per instance, not per claim; roughly once per
-a third of the claim lease, not once per tick). A claim is leased-live while its owner's heartbeat is within
+a timestamp, refreshed before it takes a claim and while it holds any (per instance, not per claim; roughly once per
+a third of the claim lease, not once per tick) — so a claim is never on the remote ahead of its owner's heartbeat. A claim is leased-live while its owner's heartbeat is within
 the claim lease (`CLAIM_LEASE_TTL_SECONDS`, the same in every repo); its freshness is the only thing that lets a peer tell a live owner from a dead one.
 _Avoid_: ping, keepalive, liveness probe, **worker state** (that is per worker, read from orca — a
 different thing, at a different granularity)
@@ -314,7 +315,10 @@ counted **once**: the edit that raises the number also adds `afk-attempt/startin
 counted, its fresh worker has not started — and starting a worker removes it, so an `afk fail` that
 was cut short after counting and runs again (by hand, or from the next **tick**, which reads the
 label as the row's `starting`) finishes the same retry instead of spending another. A new failure
-of the fresh attempt finds no such label and is counted.
+of the fresh attempt finds no such label and is counted. An escalation cut short is finished the
+same way: its comment records whose it is — the **claim**'s — and after how many retries, before
+the relabel strips the count, so the same failure failed again escalates, with no second comment,
+and never starts the retries over (ADR-0033).
 _Avoid_: re-dispatch (that is a **continuation**: nothing discarded, nothing counted), nudge,
 restart (a silent worker on a **landing turn** is restarted onto it by continuation — nothing
 discarded, nothing counted; ADR-0035), attempt (the attempt is the thing that failed; the retry is
@@ -391,7 +395,9 @@ What a **worker** does on its **landing turn**, with one command in its own work
 gated head. It stops with an outcome the worker acts on itself: a **sync** conflict is left in
 progress and resolved in place, a red gate is fixed in place, and the worker lands again — no round
 trip through the tick, no **retry** spent, the PR and the turn kept. Checks that must run on the head
-it pushed are waited for by the landing itself, up to a bound. Where the next move is the
+it pushed are waited for by the landing itself, up to a bound. A gate run or that wait is long, so
+right before the merge the landing reads the turn and the target's tip again: a turn no longer its
+own lands nothing, and a target that moved is synced with and gated by the next run. Where the next move is the
 tick's (checks still running when that bound runs out, a verify owed on a moved head, absent checks) the
 worker **wakes** the launcher and stops, and the tick tells it to land again. The claim and the
 worktree are settled by the next cycle, from the claim whose issue is now closed (ADR-0027).
@@ -407,7 +413,9 @@ its members and its phase — `stacking`, `gating` or `fixing` — and it is the
 are kept: the batch's worktree holds no list of them. A **batch worker** stacks the members
 on the target's tip with one merge commit per PR, in **merge queue** order, gates the stack once, and
 pushes it to the target as a fast-forward: that push is the only lock, and a target that moved
-refuses it. Each PR's own head is then on the target, so GitHub shows it *merged* by itself. A red stack is repaired with a fix commit on top, never
+refuses it. Each PR's own head is then on the target, so GitHub shows it *merged* by itself. What is
+on the target has landed, whatever cut the batch worker short after the push: a member whose issue is
+still open is settled by the next **tick** from its commit there, and an abandon leaves it alone. A red stack is repaired with a fix commit on top, never
 bisected. Whether the turn goes to a batch or to one PR is decided in code
 (`afk_decide.batch_candidates`): never while a turn is out, never a PR that owes an adversarial
 verify, whose own worker is still working, or that is a peer's. A PR that leaves a batch without
@@ -430,7 +438,8 @@ whether to batch at all are the tick's, in code)
 **Merge queue**:
 The order **landing turns** are granted in (ADR-0027): among a **fleet instance**'s ready PRs, the
 one that already holds a turn first, then one that left a **merge batch** without landing, then the
-lower PR number. `afk rebuild` returns it as
+lower PR number, then — one PR closing several issues — the lower issue number: a total order,
+whatever order the claims were read in. `afk rebuild` returns it as
 `merge_order`, and the **tick** grants the turn to its first PR only when none of its claims is
 landing. Every other ready PR waits as `awaiting_turn` — not synced, not told anything, holding its
 slot, its **status board** saying so — so PRs that conflict with each other are each resolved once,

@@ -40,4 +40,5 @@ gate:
   (ADR-0012, ADR-0027) — always: there is no key for it (ADR-0038).
 - **Reserved surfaces.** The fleet manages the `afk-attempt/<n>` labels, the `refs/afk/*` ref
   namespace (`refs/afk/claim/*`, `refs/afk/heartbeat/*`, `refs/afk/base`), the single `<!--afk:status-->` status-board
-  comment, and the `<!--afk:turn …-->` landing-turn comment on a PR. Don't hand-edit them.
+  comment, the `<!--afk:escalation …-->` marker leading an escalation's comment, and the
+  `<!--afk:turn …-->` landing-turn comment on a PR. Don't hand-edit them.
