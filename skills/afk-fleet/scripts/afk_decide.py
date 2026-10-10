@@ -2311,32 +2311,35 @@ def stack_message(title: str | None, pr: int, issue: int) -> str:
     return f"{(title or '').strip() or f'PR {pr}'} (#{pr})\n\nCloses #{issue}\n"
 
 
-def stacked_pr(subject: str | None) -> int | None:
-    """The PR a commit subject names the way `stack_message` writes it — its
-    trailing ` (#<pr>)` — or None."""
-    m = re.search(r" \(#(\d+)\)$", subject or "")
+def stacked_pr(parents: str, subject: str | None) -> int | None:
+    """The PR a commit was stacked with, or None: a merge commit — `parents` is
+    its `git log --format=%P`, two hashes — whose subject ends ` (#<pr>)`, the
+    way `stack_message` writes it. The subject alone decides, never the body;
+    and a commit with one parent is never a member's, whatever its subject says
+    — a fix titled `… (#<pr>)` is a fix."""
+    m = re.search(r" \(#(\d+)\)$", subject or "") if len(parents.split()) > 1 else None
     return int(m.group(1)) if m else None
 
 
-def read_stack(commits: Iterable[tuple[str, str]],
+def read_stack(commits: Iterable[tuple[str, str, str]],
                prs: Collection[int]) -> tuple[dict[int, str], list[str]]:
     """
     A batch worktree's commits above the target, read back → (stacked, fixes):
 
-      commits: [(sha, subject)...] oldest first — `git log --first-parent
-               <target tip>..HEAD`: the stack's own line, without the commits
-               each PR brought
+      commits: [(sha, parents, subject)...] oldest first — `git log
+               --first-parent <target tip>..HEAD`: the stack's own line, without
+               the commits each PR brought
       prs:     the member PR numbers
 
       stacked: {pr: sha} — the merge commit each member was stacked with
-               (`stack_message`'s subject ends ` (#<pr>)`)
+               (`stacked_pr`)
       fixes:   [sha...] — every other commit, oldest first: what the batch
                worker committed to turn a red stack green
     """
     stacked: dict[int, str] = {}
     fixes: list[str] = []
-    for sha, subject in commits:
-        pr = stacked_pr(subject)
+    for sha, parents, subject in commits:
+        pr = stacked_pr(parents, subject)
         if pr is not None and pr in prs and pr not in stacked:
             stacked[pr] = sha
         else:

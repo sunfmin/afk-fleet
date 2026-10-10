@@ -2929,23 +2929,36 @@ def _batch_worker(run: _Run, batch: str, worker: _Worker) -> BatchWorkerRow:
             "nudged_at": nudged_at, "turn_at": turn_at, "worker_state": worker.reading["state"]}
 
 
+def _own_line(path: str, revs: str, *limits: str) -> list[tuple[str, str, str]]:
+    """The commits of `revs` in `path` on its own line — not the ones a merge
+    brought — oldest first → [(sha, parents, subject)...], as
+    `afk_decide.stacked_pr` and `afk_decide.read_stack` read them. `limits`
+    narrow the walk (`--grep`); they never decide what a commit is."""
+    log = _git(["-C", path, "log", "--first-parent", "--reverse", "--format=%H%x09%P%x09%s",
+                *limits, revs]).stdout
+    return [(sha, parents, subject) for sha, parents, subject
+            in (ln.split("\t", 2) for ln in log.splitlines())]
+
+
 def _landed_pr(path: str, tip: str, issue: int) -> int | None:
-    """The PR whose merge commit on the target's own line (`tip`, already
-    fetched into `path`) closes `issue` — `afk_decide.stack_message`'s
-    `Closes #<issue>` under a subject ending ` (#<pr>)` — or None."""
-    subject = _git(["-C", path, "log", "-1", "--first-parent", "--format=%s", "-E",
-                    f"--grep=^Closes #{issue}$", tip]).stdout.strip()
-    return afk_decide.stacked_pr(subject)
+    """The PR a merge batch landed `issue` with, read from the target's own line
+    (`tip`, already fetched into `path`): the newest commit stacked with a PR
+    (`afk_decide.stacked_pr`) whose message says `Closes #<issue>`, as
+    `afk_decide.stack_message` writes it — or None. A later commit that only
+    says so is not one."""
+    closing = _own_line(path, tip, "-E", f"--grep=^Closes #{issue}$")
+    prs = [pr for _, parents, subject in closing
+           for pr in [afk_decide.stacked_pr(parents, subject)] if pr is not None]
+    return prs[-1] if prs else None
 
 
 def _landed_commit(path: str, tip: str, pr_number: int) -> str | None:
     """The commit on the target (`tip`, already fetched into `path`) that landed
-    a batched PR — the one on the target's own line whose subject ends
-    ` (#<pr>)` — or None."""
-    out = _git(["-C", path, "log", "-1", "--first-parent", "--format=%H%x09%s", "--fixed-strings",
-                f"--grep= (#{pr_number})", tip]).stdout.strip()
-    sha, _, subject = out.partition("\t")
-    return sha if sha and subject.endswith(f" (#{pr_number})") else None
+    a batched PR — the oldest one on the target's own line stacked with it
+    (`afk_decide.stacked_pr`) — or None. Whatever came after it — a revert, a
+    fix, a message that mentions the PR — hides nothing."""
+    naming = _own_line(path, tip, "--fixed-strings", f"--grep= (#{pr_number})")
+    return afk_decide.read_stack(naming, {pr_number})[0].get(pr_number)
 
 
 def _close_landed_pr(run: _Run, number: int) -> int | None:
@@ -3110,11 +3123,7 @@ def _land_batch(run: _Run, batch: str, limits: _GateLimits, merged_timeout: floa
                            f"was changed — send your wake and stop")
 
     # --- stack: every member on the target's tip, then the fixes carried so far ---
-    log = _git(["-C", path, "log", "--first-parent", "--reverse", "--format=%H%x09%s",
-                f"{tip}..HEAD"]).stdout
-    commits = [(sha, subject) for sha, _, subject
-               in (ln.partition("\t") for ln in log.splitlines())]
-    _, fixes = afk_decide.read_stack(commits, {m["pr"] for m in listed})
+    _, fixes = afk_decide.read_stack(_own_line(path, f"{tip}..HEAD"), {m["pr"] for m in listed})
     _git(["-C", path, "reset", "-q", "--hard", tip])
     stacked: list[Stacked] = []
     for m in members:
