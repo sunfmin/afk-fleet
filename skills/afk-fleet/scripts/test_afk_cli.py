@@ -4538,6 +4538,7 @@ def test_a_batch_cut_after_its_push_is_settled_by_the_next_cycle_from_the_target
         assert rows == {1: ("landed", None, None), 2: ("landed", None, None),
                         3: ("no_pr", None, None)}
 
+        w.worker(output=T0 + 9_999, state="working", since=T0, n=2)    # #3's, still at it
         c = tick(w, None, *gate, now=T0 + 10_000)                     # long past every grace
         assert c["progress"].startswith("cleared #1, #2; ") and "errors" not in c, c
         assert c["judgments"] == []
