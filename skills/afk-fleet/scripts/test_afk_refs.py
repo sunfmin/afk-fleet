@@ -456,6 +456,72 @@ def test_probe_falls_back_when_the_server_rejects_the_hidden_namespace():
         assert "--config" in err
 
 
+def test_probes_run_at_once_agree_on_the_namespace():
+    """The claim is a lock only while every fleet on a repo keeps it in the same
+    place, so the namespace a probe answers is the remote's alone: launches probing
+    at the same instant all get it, and none of them leaves a ref behind. Probes
+    that met on one ref had one keep `refs/afk` while another fell back to
+    branches — two fleets, two locks. The same for whether gate runs can be put
+    on record."""
+    local = ("--set", "gate.ci=local", "--set", "gate.local_command=make test",
+             "--now", str(T0), "--base-branch", "main")
+    for _ in range(3):
+        with sandbox(clones=4) as sb:
+            before = sb.all_refs()
+            # the base branch is on record already: launches that put it there at
+            # the same instant are told to probe again, which is not this test's
+            afk(sb.clones[0], "probe", *local)
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                probes = [f.result() for f in
+                          [pool.submit(afk, clone, "probe", *local) for clone in sb.clones]]
+            for r in probes:
+                assert r["blocked"] is False and r["config"]["claim_namespace"] == "refs/afk", r
+                assert (r["gate_records"]["verdict"], r["gate_records"]["pruned"]) == ("ok", 0), r
+            assert sb.all_refs() == before | {"refs/afk/base"}
+
+        # …and on a remote that forbids the hidden namespace, they all fall back
+        with sandbox(clones=4) as sb:
+            sb.forbid("refs/afk/")
+            before = sb.all_refs()
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                probes = [f.result() for f in
+                          [pool.submit(afk, clone, "probe", "--now", str(T0))
+                           for clone in sb.clones]]
+            for r in probes:
+                assert r["blocked"] is True and r["config"]["claim_namespace"] == "refs/heads", r
+            assert sb.all_refs() == before
+
+
+def test_a_probe_ref_left_by_a_killed_launch_changes_no_later_probe():
+    """A launch killed between its probe's push and its delete leaves the ref. The
+    next probe answers as if it were not there — it pushes to a ref of its own —
+    and deletes it, so nobody has to by hand."""
+    with sandbox() as sb:
+        w = sb.clones[0]
+        local = ("--set", "gate.ci=local", "--set", "gate.local_command=make test",
+                 "--now", str(T0), "--base-branch", sb.base)
+        before = sb.all_refs()
+        # `…/probe` is the one ref every probe used to push to
+        for left in ("refs/afk/claim/probe", "refs/afk/claim/probe-killed",
+                     "refs/afk/gate/probe", "refs/afk/gate/probe-killed"):
+            git(w, "push", "-q", "origin", f"HEAD:{left}")
+        r = afk(w, "probe", *local)
+        assert r["blocked"] is False and r["config"]["claim_namespace"] == "refs/afk", r
+        assert (r["gate_records"]["verdict"], r["gate_records"]["pruned"]) == ("ok", 0), r
+        assert sb.all_refs() == before | {"refs/afk/base"}
+
+        # the same where the claim refs are branches
+        sb.forbid("refs/afk/")
+        before = sb.all_refs()
+        hook = os.path.join(sb.bare, "hooks", "update")
+        os.rename(hook, hook + ".off")
+        git(w, "push", "-q", "origin", "HEAD:refs/heads/afk-claim/probe-killed")
+        os.rename(hook + ".off", hook)
+        r = afk(w, "probe", "--now", str(T0))
+        assert r["blocked"] is True and r["config"]["claim_namespace"] == "refs/heads", r
+        assert sb.all_refs() == before
+
+
 def test_probe_errors_when_no_namespace_is_usable_or_the_remote_is_unreachable():
     with sandbox() as sb:
         w = sb.clones[0]
