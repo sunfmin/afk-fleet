@@ -360,7 +360,7 @@ def _open_prs(repo: str, fresh: bool = False) -> list[PullRequest]:
                                "--json", _PR_FIELDS + ",body"]).stdout)
         for row in rows:
             row["closingIssuesReferences"] = afk_decide.issues_closed_by(
-                row.pop("body"), row["closingIssuesReferences"])
+                row.pop("body"), row["closingIssuesReferences"], repo)
         return rows
     if fresh:
         _forget(("prs", repo))
