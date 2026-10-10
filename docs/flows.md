@@ -68,8 +68,9 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 14. It merges the PR, pinned to the gated head, which closes the issue, and upserts the status
     board to "merged"; the worker wakes the launcher and stops.
     `skills/afk-fleet/scripts/afk.py:cmd_land`
-15. The next tick finds a claim of its own whose issue is closed and releases it, which also has
-    orca remove the worktree, freeing the slot — and the landing turn goes to the next PR.
+15. The next tick finds a claim of its own whose issue is closed and releases it: orca removes
+    the worktree, then the claim is deleted, freeing the slot — and the landing turn goes to the
+    next PR.
     `skills/afk-fleet/scripts/afk.py:cmd_release`
 
 **Where it forks.**
@@ -205,7 +206,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 - The peer's heartbeat is fresh: the claim is left strictly alone, ADR-0003.
 - The dead fleet had already merged or closed the issue: the claim is a phantom lock with no work
   behind it, listed as `stale_closed` and deleted under the same lease instead of taken,
-  `skills/afk-fleet/scripts/afk.py:_clear`.
+  `skills/afk-fleet/scripts/afk.py:_release`.
 - Two peers reclaim at once: one push wins, the other reports a lost race,
   `skills/afk-fleet/scripts/afk.py:_force_take`.
 
@@ -272,13 +273,16 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   `test_a_peer_scanning_mid_tick_reads_a_first_claim_as_live`)
 - A claim is deleted at every terminal transition (escalate, park, close, release) and as its
   last step — after the relabel, after the dependency edge; a landed PR's claim by the next cycle's
-  release, which also removes its worktree — and a release that
-  left the ref on the remote is an error, never "released". (ADR-0016, ADR-0017;
+  release, after its worktree is removed, so a settling that raised leaves the claim held — and a
+  release that left the ref on the remote is an error, never "released". (ADR-0016, ADR-0017;
   `test_a_release_that_did_not_delete_the_claim_is_an_error`,
-  `test_escalate_relabels_before_it_releases`)
+  `test_escalate_relabels_before_it_releases`,
+  `test_a_landed_claim_whose_settling_failed_is_still_held_and_settled_by_the_next_tick`)
 - A release deletes only the caller's own claim, or — shown its sha — a dead peer's claim on a closed
-  issue; a stale claim on a closed issue is never reclaimed or dispatched.
-  (`test_release_deletes_only_my_claim_or_the_exact_claim_it_was_shown`,
+  issue, and either only while the ref still points at the sha it read: a claim a peer took since
+  survives. A stale claim on a closed issue is never reclaimed or dispatched. (ADR-0003;
+  `test_a_claim_a_peer_took_after_the_scan_survives_every_way_a_claim_ends`,
+  `test_release_deletes_only_my_claim_or_the_exact_claim_it_was_shown`,
   `test_rebuild_sets_a_dead_peers_claim_on_a_closed_issue_apart_from_work_to_reclaim`)
 - A dependency a worker discovers is recorded on GitHub and waited on, never handed to a human, while
   the backlog will resolve it; a parked issue keeps its ready label, costs no attempt, and cannot be

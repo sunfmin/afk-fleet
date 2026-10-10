@@ -307,7 +307,8 @@ one gate run came to), `giving-up` for an issue nobody could do as written
 **Retry**:
 What a failed attempt costs and gets: the failure is counted on the issue — its `afk-attempt/<n>`
 label goes up by one — the failed attempt is discarded (its PR closed, its branch deleted, its
-worktree removed) and a fresh **worker** starts from the base under the same **claim**, told why the
+worktree removed — the branches the fleet recorded on the issue as it cut them, never one a person
+gave a like name: ADR-0043) and a fresh **worker** starts from the base under the same **claim**, told why the
 last attempt failed — the branch is never handed on as-is (ADR-0017; the sentence of ADR-0013 that
 said otherwise is superseded). Config `retry` is how many an issue gets; the failure after the last one is
 escalated to a human instead. One **transition** (`afk fail`), and its one writer. A failure is

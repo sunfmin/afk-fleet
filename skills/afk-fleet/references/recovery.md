@@ -12,15 +12,24 @@ while progress exists. Workers push after every completed step (see
 [worker-prompt](worker-prompt.md)), so that progress is real and reachable: the local
 worktree if it is still on this machine, else the branch tip on GitHub ([ADR-0011](../../../docs/adr/0011-takeover-and-progress-preservation.md)).
 
-`afk dispatch` asks `orca worktree list` whether a worktree for this issue is still here, recognises
-the issue's branch on the remote by its name, `issue-<n>-…` (the claim ref records the issue, not the
-branch), compares it against the remote's `base_branch`, and then acts:
+`afk dispatch` asks `orca worktree list` whether a worktree for this issue is still here, finds the
+issue's branch on the remote among the fleet's own (below), compares it against the remote's
+`base_branch`, and then acts:
 
 | tier | action | what `afk dispatch` does | prompt |
 |---|---|---|---|
 | **1** | `reuse_worktree` | The worktree is still on this machine: it is **kept**. The dead worker's terminal is closed and a new worker started *inside it*, on the same branch. Lossless: even uncommitted work survives. | continue |
 | **2** | `recreate_at_tip` | No local worktree, but the branch is ahead of base: orca recreates one at the **pushed branch tip** and the worker continues there (on a new branch name — orca never reuses one — which the prompt carries). Loss is bounded to "since the last push". | continue |
 | **3** | `dispatch_fresh` | Nothing survived: a new worktree at the remote base tip. | fresh |
+
+**What marks a branch as the fleet's.** The fleet says so on the issue: each time it has orca cut a
+worktree for the issue — a first dispatch, a tier-2 recreation, a retry — it posts one comment there
+carrying `<!--afk:branch name=<branch>-->`, the name orca gave (`<user>/issue-<n>-<slug>`, with a
+`-2`, `-3`… suffix when the name was taken — a continuation's branch is a new one, recorded the same
+way). The branches recorded on the issue, plus the branch of the worktree orca links to the issue on
+this machine, are the fleet's own for it ([ADR-0043](../../../docs/adr/0043-a-branch-is-the-fleets-because-the-fleet-recorded-it.md)). **Nothing is read off the name**: a branch a person pushed as
+`hotfix/issue-<n>-…` is not continued from, and not deleted when the attempt is discarded; neither
+is a PR opened from it closed. Deleting that comment is how to take a branch away from the fleet.
 
 Nothing is torn down on any tier. `prompt` names the [worker-prompt](worker-prompt.md) variant that
 was delivered: its **continue-mode variant** (inspect the existing progress first, treat it as partial
@@ -47,7 +56,8 @@ deliberately a **separate call, not part of `rebuild`**: `rebuild` is the one ma
 observation the launcher's cycle gate shares (ADR-0008), while this asks *this machine* what it still
 has. If what it shows plainly is not worth continuing (a wrecked tree, a branch carrying a wrong
 approach), discard it and start over: `afk dispatch --issue <n> --start fresh` closes the fleet's PR
-for the issue, deletes its work branches, removes the worktree, and starts from base.
+for the issue, deletes the fleet's own branches for it (and no other), removes the worktree, and
+starts from base.
 
 **A landing turn is continued the same way.** When the claim's PR holds the fleet's landing turn
 (ADR-0027), the worker `afk dispatch` starts is put **on the turn**: in the worktree still here, else

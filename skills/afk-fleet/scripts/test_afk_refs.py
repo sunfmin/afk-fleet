@@ -408,7 +408,7 @@ def test_release_deletes_only_my_claim_or_the_exact_claim_it_was_shown():
         taken = afk(w, "reclaim", "9", "--instance", "third", "--expect-sha", peer["sha"],
                     "--now", str(T0 + 1))
         err = afk_error(w, "release", "9", *ME, "--expect-sha", peer["sha"])
-        assert "moved" in err and "nothing was changed" in err
+        assert "moved" in err and "it was left alone" in err
         assert sb.remote_ref("refs/afk/claim/9") == taken["sha"]
 
         # shown the sha it has now, the phantom lock is gone — and stays gone, quietly
@@ -825,74 +825,3 @@ def test_takeover_lists_and_force_takes_a_dead_fleet():
                 afk(w, "takeover", "--list", "--instance", "x",
                     "--now", str(T0 + TTL + 1))["instances"]}
         assert rows["live-fleet"]["fresh"] is False
-
-
-def test_recovery_reads_pushed_progress_from_the_remote_alone():
-    """`afk recovery` (ADR-0011) tier 2 vs tier 3: with no local worktree, the only
-    evidence a dead worker left is its pushed branch, which has to be recognised
-    from the issue number — the claim ref never records a branch name."""
-    with sandbox() as sb:
-        w = sb.clones[0]
-        cfg = json.dumps({"base_branch": sb.base})
-
-        # nothing pushed → tier 3, the old fresh re-dispatch
-        r = afk(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg)
-        assert r["tier"] == 3 and r["action"] == "dispatch_fresh" and r["prompt"] == "fresh"
-        assert r["branch"]["name"] is None and r["worktree"]["present"] is False
-
-        # a dead worker's branch, orca-shaped (<user>/ prefix), two commits ahead
-        git(w, "checkout", "-q", "-b", "sunfmin/issue-31-continuation")
-        for i in (1, 2):
-            with open(os.path.join(w, f"step{i}.txt"), "w") as f:
-                f.write(f"step {i}\n")
-            git(w, "add", "-A")
-            git(w, "commit", "-qm", f"step {i}")
-        git(w, "push", "-q", "origin", "HEAD")
-
-        r = afk(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg)
-        assert (r["tier"], r["action"], r["prompt"]) == (2, "recreate_at_tip", "continue"), r
-        assert r["branch"]["name"] == "sunfmin/issue-31-continuation"
-        assert r["branch"]["commits_ahead"] == 2
-        assert r["branch"]["candidates"] == ["sunfmin/issue-31-continuation"]
-
-        # another issue's branch is never mistaken for this one
-        assert afk(w, "recovery", "--issue", "3", "--no-worktree", "--config", cfg)["tier"] == 3
-
-        # a worktree still on this machine wins: tier 1, reused in place, never removed
-        r = afk(w, "recovery", "--issue", "31", "--worktree", w, "--config", cfg)
-        assert (r["tier"], r["action"], r["prompt"]) == (1, "reuse_worktree", "continue"), r
-        assert r["worktree"]["present"] is True and r["worktree"]["commits_ahead"] == 2
-
-        # an earlier attempt left a second, shorter branch behind: the one FURTHEST
-        # ahead is the progress worth continuing, whatever its name sorts as
-        git(w, "checkout", "-q", "-b", "aaa/issue-31-first-try", sb.base)
-        with open(os.path.join(w, "old.txt"), "w") as f:
-            f.write("old\n")
-        git(w, "add", "-A")
-        git(w, "commit", "-qm", "old attempt")
-        git(w, "push", "-q", "origin", "HEAD")
-        r = afk(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg)
-        assert r["branch"]["candidates"] == ["aaa/issue-31-first-try",
-                                             "sunfmin/issue-31-continuation"]
-        assert r["branch"]["name"] == "sunfmin/issue-31-continuation"
-        assert r["branch"]["commits_ahead"] == 2 and r["tier"] == 2
-        # a branch named outright is measured as given, with no discovery
-        r = afk(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg,
-                "--branch", "aaa/issue-31-first-try")
-        assert (r["branch"]["name"], r["branch"]["commits_ahead"]) == ("aaa/issue-31-first-try", 1)
-        assert r["branch"]["candidates"] == []
-
-        # a branch that was never pushed has nothing ahead — measured as unknown, tier 3
-        r = afk(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg,
-                "--branch", "sunfmin/issue-31-never-pushed")
-        assert (r["branch"]["commits_ahead"], r["tier"]) == (None, 3)
-        # …but a remote that cannot be READ is not "nothing pushed": tier 3 is the one
-        # tier that tears a worktree down, so "could not look" must never select it
-        for how in ((), ("--branch", "sunfmin/issue-31-continuation")):
-            err = afk_error(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg,
-                            "--remote", "no-such-remote", *how)
-            assert "no-such-remote" in err, err
-        # a base branch the remote does not have is a config mistake, said as one
-        err = afk_error(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg,
-                        "--set", "base_branch=no-such-base")
-        assert "no-such-base" in err

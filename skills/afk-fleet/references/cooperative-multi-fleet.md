@@ -69,7 +69,9 @@ each one runs is shown so the mechanism is legible, but the tick calls the tool.
   `ready_label` would be back on the frontier for a peer to dispatch), `afk park` (after the
   `blocked_by` edge is recorded — for the same reason), `afk close`. `afk release <n> --instance <id>`
   (idempotent: a claim already gone counts as released; a claim another instance holds is refused) is
-  the same step on its own, for an **orphan-release**, a `closed` row — which is what every landed PR leaves, since `afk land` runs in the worker's worktree and holds no instance id: releasing it also removes that worktree — and the drain. A delete that fails with the claim still on the
+  the same step on its own, for an **orphan-release**, a `closed` row — which is what every landed PR leaves, since `afk land` runs in the worker's worktree and holds no instance id: releasing it also removes that worktree, before the claim is deleted, so a settling that raised leaves the claim held and the next tick finishes it — and the drain. Every one of these deletes rides the lease above, on the sha
+  of the claim the scan showed as mine: a claim a peer took since (a takeover of a fleet that was
+  slow, not dead) is left alone, and the release exits 3 — the claim is no longer the caller's. A delete that fails with the claim still on the
   remote exits 3 — `released` is never reported for a claim that is still there. On **graceful stop**, the drain — `afk cycle --drain`, the run's last cycle — releases claims with **no PR yet** and
   **retains** those with an open PR (a peer inherits it once the lease expires — giving it a landing turn if it is
   finished, **continuing** it if it is not).

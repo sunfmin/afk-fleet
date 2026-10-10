@@ -647,6 +647,15 @@ class World:
         assert len(rows) <= 1, rows
         return rows[0] if rows else ""
 
+    def fleet_branch(self, n, name):
+        """Record `name` on issue n as a branch the fleet cut for it — what
+        `afk dispatch` does for the one orca names."""
+        every = self.state()["comments"]
+        every.setdefault(str(n), []).append(
+            {"id": 9000 + len(every.get(str(n), [])), "html_url": "u",
+             "body": afk_decide.branch_comment(name)})
+        self.set(comments=every)
+
     def open_pr(self, number, closes, branch, conclusion="SUCCESS"):
         self.set(prs=self.state()["prs"] + [pr(number, closes, conclusion, headRefName=branch)])
 
@@ -1399,9 +1408,9 @@ def test_a_claim_ref_write_is_in_the_scan_made_before_it():
             assert owners() == {1: "me", 2: "me"}
             assert afk._beat(dataclasses.replace(run, clock=T0 + TTL), "me")["refreshed"]
             assert afk._scan(run)[1] == {"peer": T0, "me": T0 + TTL}
-            afk._release(run, 1)
+            afk._release_mine(run, "me", 1)
             mine = next(c["sha"] for c in scan[0] if c["number"] == 2)
-            afk._clear(run, 2, mine)
+            afk._release(run, 2, mine)
             assert owners() == {} and afk._scan(run) is scan          # one scan, kept in step
             # a claim it lost was not in the scan: that one is made again
             w.afk("claim", "3", "--instance", "peer", *NOW, *R)
@@ -1432,7 +1441,7 @@ _KNOWS_THE_READS = {
     "_once", "_forget",
     "_open_issues", "_open_prs", "_issue_comments", "_scan", "_gather", "_comment", "_claim_written",
     "_issue_written", "_pr_comment", "_close_pr", "_aim_pr", "_merge_pr", "_push_branch",
-    "_delete_branch", "_claim", "_force_take",
+    "_delete_branch", "_claim", "_force_take", "_release",
 }
 _WRITES = {
     ("gh", "pr"): {"_pr_comment", "_close_pr", "_aim_pr", "_merge_pr"},
@@ -1440,7 +1449,7 @@ _WRITES = {
     ("gh", "label"): {"_ensure_label"},
     ("gh", "--method"): {"_comment", "_add_blocker"},
     ("git", "push"): {"_push_branch", "_delete_branch", "_claim", "_force_take", "_release",
-                      "_clear", "_beat", "_push_probe", "_drop_probes", "_settle_base", "_probe_gate_records",
+                      "_beat", "_push_probe", "_drop_probes", "_settle_base", "_probe_gate_records",
                       "_write_gate_record", "_drop_gate_record"},
 }
 
@@ -1645,6 +1654,72 @@ def test_a_claim_a_peer_won_mid_tick_is_answered_as_lost_not_as_a_failure(monkey
                        "in_flight": 1, "frontier_remaining": 0}
         assert [w.claimed_by(n) for n in (1, 2)] == ["peer", "me"]
         assert len(w.terminals()) == 1 and _told(w.terminals()[0])
+
+
+def test_a_claim_a_peer_took_after_the_scan_survives_every_way_a_claim_ends(monkeypatch):
+    """Whose a claim is, is read off the one scan a process makes; the delete
+    comes later. A peer that took the claim in between — a takeover of a fleet
+    that was slow, not dead — holds it now, with a worker on it: every path
+    that ends a claim deletes only the claim it read, so the peer's survives
+    and the slow fleet is told the claim is no longer its own."""
+    closed = [issue(n, "ready-for-agent", state="closed") for n in (2, 6)]
+    ends = {
+        "release": lambda run, mine: afk._release_claim(run, mine, 1),
+        "settle": lambda run, mine: afk._release_claim(run, mine, 2),
+        "close": lambda run, mine: afk._close_claim(run, mine, 3),
+        "park": lambda run, mine: afk._park_claim(run, mine, 4),
+        "escalate": lambda run, mine: afk._escalate_claim(run, mine, 5, "nothing resolves it"),
+        "drain": lambda run, mine: afk._drain(run, mine, afk._rebuild(run, mine)),
+    }
+    with world(issues=[issue(n, "ready-for-agent") for n in range(1, 8)]) as w:
+        for name, value in w.env.items():          # orca is run on the process's own environment
+            monkeypatch.setenv(name, value)
+        for n in range(1, 7):
+            w.afk(*dispatch(n))
+        w.set(issues=[issue(n, "ready-for-agent") for n in (1, 3, 4, 5, 7)] + closed)
+        verdict(w, 4, "blocked", 7)
+        slow = "me"
+        for path, end in ends.items():
+            peer = f"peer-{path}"
+            with inside(w) as rem:
+                run = afk._Run(repo=REPO, rem=rem, clock=T0,
+                               cfg=afk_decide.resolve_config({"base_branch": w.sb.base}))
+                afk._scan(run)                                       # the slow fleet's one scan
+                taken = w.afk("takeover", "--from", slow, "--instance", peer, "--yes", *NOW, *R)
+                assert taken["taken"] == [1, 2, 3, 4, 5, 6] and taken["lost"] == [], path
+                told = _refusals(end, run, slow)        # the drain: of each claim it held
+                assert "no longer the caller's to release" in told[0], path
+                # asked again, it reads the claim as the peer's and touches nothing
+                assert all("not this fleet's claim" in e for e in _refusals(end, run, slow)), path
+            assert [w.claimed_by(n) for n in range(1, 7)] == [peer] * 6, path
+            slow = peer
+
+
+def _refusals(end, run, mine):
+    """What one way of ending a claim refuses with: raised, or — the drain, which
+    goes on to its next claim — listed."""
+    try:
+        return [e["error"] for e in end(run, mine)[2]]
+    except RuntimeError as e:
+        return [str(e)]
+
+
+def test_a_landed_claim_whose_settling_failed_is_still_held_and_settled_by_the_next_tick():
+    """The claim is what names a landed issue as this fleet's to settle, so it
+    is deleted after the settling, not before: a settling that raised leaves
+    the claim held, and the next tick finds the same `closed` row and finishes."""
+    with world(issues=[issue(3, "ready-for-agent")]) as w:
+        wt = w.afk(*dispatch(3))["worktree"]
+        w.set(issues=[issue(3, "ready-for-agent", state="closed")], fail=["pr list"])
+        assert "gh pr list failed" in w.error("release", "3", *ME, *R)
+        assert w.claimed_by(3) == "me" and os.path.isdir(wt)
+
+        w.set(fail=[])
+        r = tick(w)
+        assert r["progress"].startswith("cleared #3") and "errors" not in r
+        assert w.claimed_by(3) is None and not os.path.isdir(wt)
+        # released again, it is gone already: harmless
+        assert w.afk("release", "3", *ME, *R)["released"] is True
 
 
 def test_what_changed_while_a_tick_ran_still_gets_a_tick():
@@ -2350,11 +2425,80 @@ def test_config_file_loads_validates_and_round_trips():
 # recovery via orca                                                            #
 # --------------------------------------------------------------------------- #
 
+def test_recovery_reads_pushed_progress_from_the_remote_alone():
+    """`afk recovery` (ADR-0011) tier 2 vs tier 3: with no local worktree, the only
+    evidence a dead worker left is its pushed branch — the one the fleet recorded
+    on the issue as orca cut it (ADR-0043): the claim ref never records a branch
+    name, and a name alone says nothing of whose the branch is."""
+    with world() as w:
+        cfg = ("--config", json.dumps({"base_branch": w.sb.base}))
+        gone = ("recovery", "--issue", "31", "--no-worktree", *R, *cfg)
+
+        def push(branch, *names):
+            git(w.cwd, "checkout", "-q", "-b", branch, w.sb.base)
+            for name in names:
+                w.commit(name)
+            git(w.cwd, "push", "-q", "origin", "HEAD")
+
+        # nothing pushed → tier 3, the old fresh re-dispatch
+        r = w.afk(*gone)
+        assert r["tier"] == 3 and r["action"] == "dispatch_fresh" and r["prompt"] == "fresh"
+        assert r["branch"]["name"] is None and r["worktree"]["present"] is False
+
+        # a dead worker's branch, two commits ahead — and a person's, further ahead,
+        # under a name orca could have given: only the recorded one is the issue's
+        push("sunfmin/issue-31-continuation", "step1.txt", "step2.txt")
+        push("hotfix/issue-31-my-manual-fix", "a.txt", "b.txt", "c.txt")
+        assert w.afk(*gone)["tier"] == 3                   # nothing says either is the fleet's
+        w.fleet_branch(31, "sunfmin/issue-31-continuation")
+        r = w.afk(*gone)
+        assert (r["tier"], r["action"], r["prompt"]) == (2, "recreate_at_tip", "continue"), r
+        assert r["branch"] == {"name": "sunfmin/issue-31-continuation", "commits_ahead": 2,
+                               "candidates": ["sunfmin/issue-31-continuation"]}
+
+        # another issue's branch is never mistaken for this one
+        assert w.afk("recovery", "--issue", "3", "--no-worktree", *R, *cfg)["tier"] == 3
+
+        # a worktree still on this machine wins: tier 1, reused in place, never removed
+        git(w.cwd, "checkout", "-q", "sunfmin/issue-31-continuation")
+        r = w.afk("recovery", "--issue", "31", "--worktree", w.cwd, *R, *cfg)
+        assert (r["tier"], r["action"], r["prompt"]) == (1, "reuse_worktree", "continue"), r
+        assert r["worktree"]["present"] is True and r["worktree"]["commits_ahead"] == 2
+
+        # an earlier worktree of the issue left a second, shorter branch behind — a
+        # continuation's branch is a new name, wherever orca put it: the one FURTHEST
+        # ahead is the progress worth continuing, whatever its name sorts as
+        push("aaa/issue-31-continuation-2", "old.txt")
+        w.fleet_branch(31, "aaa/issue-31-continuation-2")
+        r = w.afk(*gone)
+        assert r["branch"]["candidates"] == ["aaa/issue-31-continuation-2",
+                                             "sunfmin/issue-31-continuation"]
+        assert r["branch"]["name"] == "sunfmin/issue-31-continuation"
+        assert r["branch"]["commits_ahead"] == 2 and r["tier"] == 2
+        # a branch named outright is measured as given, with no discovery
+        r = w.afk(*gone, "--branch", "aaa/issue-31-continuation-2")
+        assert (r["branch"]["name"], r["branch"]["commits_ahead"]) == \
+            ("aaa/issue-31-continuation-2", 1)
+        assert r["branch"]["candidates"] == []
+
+        # a branch that was never pushed has nothing ahead — measured as unknown, tier 3
+        r = w.afk(*gone, "--branch", "sunfmin/issue-31-never-pushed")
+        assert (r["branch"]["commits_ahead"], r["tier"]) == (None, 3)
+        # a base branch the remote does not have is a config mistake, said as one
+        assert "no-such-base" in w.error(*gone, "--set", "base_branch=no-such-base")
+        # …and a remote that cannot be READ is not "nothing pushed": tier 3 is the one
+        # tier that tears a worktree down, so "could not look" must never select it
+        os.rename(w.sb.bare, w.sb.bare + ".away")
+        for how in ((), ("--branch", "sunfmin/issue-31-continuation")):
+            assert w.sb.bare in w.error(*gone, *how), how
+
+
 def test_recovery_finds_this_machines_worktree_through_orca():
     with world() as w:
         cfg = ("--config", json.dumps({"base_branch": w.sb.base}))
         w.commit("step1.txt", branch="sunfmin/issue-31-x")
         git(w.cwd, "push", "-q", "origin", "HEAD")
+        w.fleet_branch(31, "sunfmin/issue-31-x")
         with open(os.path.join(w.cwd, "wip.txt"), "w") as f:
             f.write("uncommitted\n")
 
@@ -2550,6 +2694,10 @@ def test_dispatch_continues_from_whatever_progress_survived():
         assert git(r2["worktree"], "rev-parse", "HEAD") == pushed
         assert r2["branch"] == first["branch"] + "-2"
         assert f"`{r2['branch']}`" in _told(w.terminals()[-1])
+        # each worktree cut for the issue left its branch on record there — what makes
+        # both the fleet's (ADR-0043); the worktree reused in between cut none
+        assert afk_decide.recorded_branches([{"body": body} for body in w.comments(7)]) == \
+            [first["branch"], r2["branch"]]
         w.work(r2["worktree"], "step3.txt")
 
         # --start fresh: the tick judged the recovered state unsafe to build on → the
@@ -4786,6 +4934,26 @@ def test_fail_retries_from_a_clean_base_then_escalates_when_exhausted():
         assert w.orca_calls() == []
 
 
+def test_a_retry_discards_the_attempts_own_branch_and_no_other():
+    """A retry throws away what the fleet's attempt made. A person's branches for
+    the same issue — `hotfix/issue-5-…` is shaped exactly like one orca cuts — and
+    the PR they opened from one are theirs: none of it is the fleet's to discard."""
+    theirs, proposed = "hotfix/issue-5-my-manual-fix", "alice/issue-5-another-way"
+    with world(issues=[issue(5, "ready-for-agent")]) as w:
+        first, _ = with_pr(w, 5, 50, conclusion="FAILURE")
+        fix = git(w.cwd, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "a person's fix")
+        for branch in (theirs, proposed):
+            git(w.cwd, "push", "-q", "origin", f"{fix}:refs/heads/{branch}")
+        w.open_pr(49, closes=5, branch=proposed)
+
+        r = w.afk(*_fail(5, "CI red"))["worker"]
+        assert r["discarded"]["closed_prs"] == [50]
+        assert not w.sb.remote_ref(f"refs/heads/{first['branch']}")
+        assert w.sb.remote_ref(f"refs/heads/{theirs}") == fix
+        assert w.sb.remote_ref(f"refs/heads/{proposed}") == fix
+        assert w.pr(49).get("state", "open") == "open"
+
+
 def _refuse_branch_deletes(w, refuse, under="refs/heads"):
     """The remote refuses (or takes again) the deletion of a branch — or of any
     ref `under` another namespace."""
@@ -4820,6 +4988,7 @@ def _a_failure_cut_short(w, cut):
     first, _ = with_pr(w, 5, 50, conclusion="FAILURE")
     left = "tester/issue-5-left-behind"
     git(first["worktree"], "push", "-q", "origin", f"HEAD:refs/heads/{left}")
+    w.fleet_branch(5, left)
     breaks(w)
     assert says in w.error(*_fail(5, "CI red: TestNames fails")), cut
     # the failure is counted, and nothing is settled: the claim is still held
