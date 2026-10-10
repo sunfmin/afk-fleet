@@ -215,6 +215,7 @@ _Avoid_: coordinator memory, session state
 The set of currently-dispatchable issues — `open` + `ready_label` + not an epic + **unclaimed** (no
 claim ref) + **no open linked PR** + zero open `blocked_by`. Recomputed from GitHub every tick, over
 every open issue: the issue list carries each one's open-blocker count, and the pull requests GitHub lists among them are left out.
+Dispatched in issue-number order, lowest first — the issues' own order, never the one a read happened to list them in.
 It is also what does the waiting for a **parked** issue: nothing else remembers that one is parked.
 _Avoid_: queue, backlog (the backlog is the whole issue set; the frontier is only the ready edge)
 

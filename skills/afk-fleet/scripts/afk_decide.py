@@ -990,10 +990,13 @@ def select_frontier(issues: list[EligibleIssue], ready_label: str, epic_labels: 
     ready_label · no epic label · not claimed · no open linked PR · zero open
     blocking dependencies.
 
-    Returns {"dispatch": [num...], "excluded": [{"number","reason"}...]}.
+    Returns {"dispatch": [num...], "excluded": [{"number","reason"}...]}, each
+    by issue number, lowest first — the order the free slots are filled in. It is
+    the issues' own order, never the one their rows arrived in: two reads of one
+    backlog dispatch the same issues (ADR-0007).
     """
     dispatch, excluded = [], []
-    for issue in issues:
+    for issue in sorted(issues, key=lambda i: i["number"]):
         num = issue["number"]
         bars = label_bars(issue["labels"], ready_label, epic_labels)
         if bars:
@@ -4165,11 +4168,16 @@ def resolve_worker_command(base_url: str | None, supplied: str | None = None,
 def fingerprint(issues: Iterable[Issue], prs: Iterable[PullRequest],
                 claims: Iterable[Claim]) -> str:
     """
-    Digest the observable fleet inputs — open issues (number + labels +
-    updatedAt + open-blocker count, so label churn, closes, fresh blocker
-    comments and a dependency edge all move it), open PRs (number + head sha +
+    Digest the observable fleet inputs — open issues (number + title + labels +
+    updatedAt + open-blocker count, so a retitle, label churn, closes, fresh
+    blocker comments and a dependency edge all move it), open PRs (number + head sha +
     updatedAt + `pr_checks_state` + the issues it closes, so pushes, CI finishing
-    and a PR becoming an issue's all move it), and claim refs (number + sha, so peer claims/releases/reclaims move it).
+    and a PR becoming an issue's all move it), and claim refs (number + sha +
+    owning instance, so peer claims/releases/reclaims move it).
+
+    It holds everything `assemble_working_set` reads of those three lists: two
+    gathers with one digest assemble one working set, whatever order their rows
+    came in. What the working set reads besides them is OUTSIDE_THE_DIGEST.
 
     A PR's checks enter as the ONE word a tick acts on — green / red / pending /
     none — not check by check: a check going queued → in progress, or the first
@@ -4190,17 +4198,35 @@ def fingerprint(issues: Iterable[Issue], prs: Iterable[PullRequest],
     fields never move the digest. Returns a 16-hex digest.
     """
     canon = {
-        "issues": sorted([i["number"], sorted(i["labels"] or []), i["updatedAt"] or "",
-                          int(i["blocked_by"] or 0)]
+        "issues": sorted([i["number"], i["title"] or "", sorted(i["labels"] or []),
+                          i["updatedAt"] or "", int(i["blocked_by"] or 0)]
                          for i in issues),
         "prs": sorted([p["number"], p["headRefOid"] or "", p["updatedAt"] or "",
                        pr_checks_state(p["statusCheckRollup"]) or "none",
                        sorted(ref["number"] for ref in p["closingIssuesReferences"] or [])]
                       for p in prs),
-        "claims": sorted([c["number"], c["sha"] or ""] for c in claims),
+        "claims": sorted([c["number"], c["sha"] or "", c["instance"]] for c in claims),
     }
     blob = json.dumps(canon, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+# Every input of `assemble_working_set` the digest does NOT hold → why a skipped
+# cycle may go without it. Two gathers with one digest assemble one working set
+# only when these are equal too; ADR-0007 lists them, and a test holds both the
+# function's parameters and that list to these names.
+OUTSIDE_THE_DIGEST: dict[str, str] = {
+    "now": "time alone moves it: a lease lapsing is seen by the forced tick",
+    "heartbeats": "this instance's own beat on a skipped cycle would move the digest every "
+                  "cycle; a peer's going stale is time passing, seen by the forced tick",
+    "turns": "a landing-turn marker is a comment on a PR, read once per claim that has one: "
+             "writing it moves that PR's `updatedAt`, which the digest holds",
+    "closed": "asked only of a claim whose issue is missing from the open list: the issue "
+              "leaving that list moved the digest; a read that failed is retried by the "
+              "forced tick",
+    "me": "the run's own instance id: no cycle changes it",
+    "config": "the run's own config: no cycle changes it",
+}
 
 
 def fingerprint_gate(last: str | None, current: str, skips: int, force_after: int) -> Obj:
