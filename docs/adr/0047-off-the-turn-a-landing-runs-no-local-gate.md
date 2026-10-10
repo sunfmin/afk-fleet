@@ -1,5 +1,7 @@
 # ADR-0047 — Off the turn a landing runs no local gate
 
+**Amended by [ADR-0048](0048-finished-prs-join-a-landing-train-gated-whenever-the-gate-is-free.md) (#157):** where a landing train runs there is no "off the turn" — `afk land` joins the train and runs no gate at all. This ADR stands for `gate.ci: local` with an adversarial verify, the one local config where a PR still lands on a turn.
+
 **Status:** accepted — amends
 [ADR-0045](0045-a-landing-that-stops-on-a-conflict-or-a-red-gate-gives-its-turn-up.md) (item 3,
 "off the turn `afk land` syncs and gates"; item 4, "that turn is usually short"; and its rejected

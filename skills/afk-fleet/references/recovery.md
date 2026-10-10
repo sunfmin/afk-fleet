@@ -67,16 +67,16 @@ this path when the worker's terminal is already gone. A claim whose PR gave its 
 being fixed (`fixing`, ADR-0045) is continued onto that same brief: off the turn `afk land` syncs,
 runs no local gate (ADR-0047) and merges nothing.
 
-**A merge batch is continued too** (ADR-0029). Its worker has no claim, so `afk dispatch` is not
-its path: the pass asks after it with `afk no-pr --batch`, and when its terminal is gone
-`afk turn --batch` starts a new batch worker — in the batch's worktree if it is on this machine (fix
-commits and all), else in one cut from the batch's pushed branch, which holds the stack as of its
-last `afk land --batch`; a batch that had stacked nothing yet starts again at the target's tip. The
-result says which (`delivery: worktree | branch | fresh`, `again: true`). The command it is briefed
-with rebuilds the stack from the target's tip every time and reads the batch's members from the
-turn markers on its PRs, so a continued batch needs nothing remembered and nothing copied into its
-new worktree. A batch recorded by a fleet that **died** is different: the fleet that takes its claims
-abandons it (`afk turn --abandon`), and the PRs land on that fleet's single turns.
+**Joining the landing train is continued the same way** (ADR-0048). A claim whose PR is still to
+join (`joining`) gets the join brief — `afk land`, which there takes no turn and runs no gate — in
+its worktree or one recreated at the PR's head. The train's own worker has no claim, so
+`afk dispatch` is not its path: while a PR of this fleet is on the train the pass runs
+`afk turn --train`, which starts a train worker whenever none is there — in the train's worktree,
+which is the repo's and is kept (fix commits and all), or in one cut at the target when this
+machine has none. The command it is briefed with reads everything from the train's ref and the
+target, so a continued train needs nothing remembered: a fleet that takes a dead one's claims
+simply tends the same train. Only a train whose worker stays **silent** is given up
+(`afk turn --abandon`), and its PRs join the next one.
 
 **This is not the retry path.** A red gate / adversarial refute / `giving-up` verdict goes through
 `afk fail`, which discards the attempt and starts *fresh* with the failure reason (see

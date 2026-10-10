@@ -1,5 +1,7 @@
 # ADR-0045 — A landing that stops on a conflict or a red gate gives its turn up, once
 
+**Amended by [ADR-0048](0048-finished-prs-join-a-landing-train-gated-whenever-the-gate-is-free.md) (#157):** where a landing train runs there is no turn to give up — a conflict is resolved against the train before joining, and a red gate is the train worker's to fix. This ADR stands where a PR lands on a turn (`gate.ci: required`, or an adversarial verify), and "a batch forms beside it" no longer applies anywhere.
+
 **Status:** accepted — narrows what a **landing turn** covers to the bounded part of a landing.
 Amends [ADR-0027](0027-a-worker-lands-its-own-pr-on-a-landing-turn.md) ("No outcome … gives the
 turn up", and "each PR of a conflicting group is resolved once"),

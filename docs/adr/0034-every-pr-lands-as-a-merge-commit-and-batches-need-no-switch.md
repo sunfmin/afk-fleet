@@ -1,5 +1,7 @@
 # ADR-0034 — Every PR lands as a merge commit, and merge batches need no switch
 
+**Amended by [ADR-0048](0048-finished-prs-join-a-landing-train-gated-whenever-the-gate-is-free.md) (#157):** the merge batch is replaced by the landing train. Every PR still lands as one merge commit, and there is still no switch: `merge.batch` stays removed.
+
 **Status:** accepted — removes two config keys, `merge.strategy` and `merge.batch`. Amends
 [ADR-0029](0029-a-merge-batch-lands-n-prs-behind-one-gate-run.md): a batch is no longer opt-in, its
 stack is made of merge commits instead of squash commits, and a batched PR reads *merged* on GitHub

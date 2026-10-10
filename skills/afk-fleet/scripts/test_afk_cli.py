@@ -414,7 +414,7 @@ if cmd == ["worktree", "create"]:
     if repo is None:
         finish(error="selector_not_found")
     assert "--no-parent" in argv, argv
-    linked = int(opt("--issue")) if "--issue" in argv else None        # a merge batch's has none
+    linked = int(opt("--issue")) if "--issue" in argv else None        # the landing train's has none
     if linked in fake.get("create_fails", []):
         finish(error="worktree_create_failed")
     taken = git(repo["path"], "for-each-ref", "--format=%%(refname:short)", "refs/heads").splitlines()
@@ -4993,8 +4993,7 @@ def test_a_worker_put_where_an_agent_already_is_closes_that_agent_first():
 
 # What the worker module replaced: none of these is a name any more.
 _REPLACED_BY_THE_WORKER_MODULE = {
-    "_orca_worktree_rows", "_issue_worktree", "_live_worktree", "_batch_worktree",
-    "_batch_worktrees", "_create_worktree", "_cut_worktree", "_remove_worktree", "_live_terminal",
+    "_orca_worktree_rows", "_issue_worktree", "_live_worktree", "_create_worktree", "_cut_worktree", "_remove_worktree", "_live_terminal",
     "_tui_idle", "_terminal_tail", "_open_terminal", "_submit_prompt", "_write_brief", "_nudge"}
 
 
@@ -5817,15 +5816,26 @@ def test_the_docs_name_exactly_the_words_the_code_returns():
     for kind in afk_decide.JUDGMENT_KINDS:
         assert f"`{kind}`" in row("cycle"), kind
     prompt = docs["worker-prompt.md"]
-    land = re.search(r"<!--afk:block landing-->\n(.*?)<!--/afk:block-->", prompt, re.S).group(1)
-    batch = re.search(r"<!--afk:block batch-->\n(.*?)<!--/afk:block-->", prompt, re.S).group(1)
-    assert re.findall(r"^\| `(\w+)` \|", land, re.M) == ["outcome", *afk_decide.LAND_OUTCOMES]
-    # …and the batch worker's, for `afk land --batch`, in the batch brief
-    assert re.findall(r"^\| `(\w+)` \|", batch, re.M) == ["outcome", *afk_decide.BATCH_OUTCOMES]
-    assert re.findall(r"^\| `(\w+)` \|", prompt, re.M) == \
-        ["outcome", *afk_decide.LAND_OUTCOMES, "outcome", *afk_decide.BATCH_OUTCOMES]
-    assert "{land_command}" in land and "{batch_land_command}" in batch
-    for outcome in (*afk_decide.LAND_OUTCOMES, *afk_decide.BATCH_OUTCOMES):
+    def block(name):
+        return re.search(r"<!--afk:block %s-->\n(.*?)<!--/afk:block-->" % name, prompt, re.S).group(1)
+
+    def rows(text):
+        return re.findall(r"^\| `(\w+)` \|", text, re.M)
+
+    # a landing on a turn, and one that joins the landing train: between them
+    # the two tables are every outcome `afk land --issue` has, each in the brief
+    # of the worker that can meet it
+    land, join, train = block("landing"), block("join"), block("train")
+    on_a_turn = [o for o in afk_decide.LAND_OUTCOMES if o != "joined"]
+    assert rows(land) == ["outcome", *on_a_turn]
+    assert rows(join) == ["outcome", "joined", "conflict", "merged"]
+    assert set(rows(land)) | set(rows(join)) == {"outcome", *afk_decide.LAND_OUTCOMES}
+    # …and the train worker's, for `afk land --train`, in the train brief
+    assert sorted(rows(train)) == sorted(["outcome", *afk_decide.TRAIN_OUTCOMES])
+    assert rows(prompt) == [*rows(land), *rows(join), *rows(train)]
+    assert "{land_command}" in land and "{land_command}" in join
+    assert "{train_land_command}" in train
+    for outcome in (*afk_decide.LAND_OUTCOMES, *afk_decide.TRAIN_OUTCOMES):
         assert outcome in row("land"), outcome
 
     # the routing words are the reference's: every one a subcommand can answer with
@@ -5834,10 +5844,8 @@ def test_the_docs_name_exactly_the_words_the_code_returns():
         assert f"`{status}`" in row("rebuild"), status
     for outcome, _ in afk_decide.NO_PR_ROUTES:
         assert outcome in row("no-pr"), outcome
-    for outcome in (*afk_decide.TURN_OUTCOMES, *afk_decide.BATCH_TURN_OUTCOMES):
+    for outcome in (*afk_decide.TURN_OUTCOMES, *afk_decide.TRAIN_TURN_OUTCOMES):
         assert outcome in row("turn"), outcome
-    for phase in afk_decide.BATCH_PHASES:
-        assert f"`{phase}`" in row("rebuild"), phase
     # nothing a tick or a worker reads names a way to land that no longer exists,
     # or a summary handed between two calls
     for name, text in docs.items():
@@ -5903,7 +5911,7 @@ def test_the_tools_table_is_the_one_the_parser_generates():
         ("afk dispatch --issue <n> --instance <id> --worker-command <cmd> "
          "[--ready-timeout <s>] [--start <auto\\|fresh>]")
     assert gen_tools_doc.usage("land", subs["land"]) == \
-        ("afk land [--issue <n>] [--batch <batch>] [--gate-timeout <s>] [--excerpt-lines <k>] "
+        ("afk land [--issue <n>] [--train] [--gate-timeout <s>] [--excerpt-lines <k>] "
          "[--merged-timeout <s>] [--checks-timeout <s>] [--checks-poll <s>]")
 
 
@@ -6051,8 +6059,8 @@ def test_the_docs_spell_a_claim_ref_as_the_code_lays_it_out():
     hidden, branches = (afk_decide.CLAIM_NAMESPACES[ns] for ns in ("refs/afk", "refs/heads"))
     kinds = {p.rpartition("/")[2] for p in (*hidden, afk_decide.GATE_RECORD_NAMESPACE)}
     short = [p[len(afk_decide.BRANCH_NAMESPACE) + 1:] for p in branches]
-    assert kinds == {"claim", "heartbeat", "base", "gate"}
-    assert short == ["afk-claim", "afk-heartbeat", "afk-base"]
+    assert kinds == {"claim", "heartbeat", "base", "train", "gate"}
+    assert short == ["afk-claim", "afk-heartbeat", "afk-base", "afk-train"]
 
     named = set()
     for name, text in docs.items():

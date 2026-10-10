@@ -1,5 +1,7 @@
 # ADR-0046 — Where merge batches form, a PR that lands alone is stacked on the target like a batch of one
 
+**Superseded by [ADR-0048](0048-finished-prs-join-a-landing-train-gated-whenever-the-gate-is-free.md) (#157):** the configs this ADR changed are the ones where a landing train runs now, and a PR alone is a train of one. The stacked single landing (`_land_stacked`) is removed; with `gate.ci: local` and an adversarial verify a PR lands as ADR-0027 decided, synced into its branch.
+
 **Status:** accepted — changes how one PR lands in `gate.ci: local` with no adversarial verify, the
 configs where merge batches form (`afk_decide.batches_form`). Amends
 [ADR-0027](0027-a-worker-lands-its-own-pr-on-a-landing-turn.md) (there the landing's order is

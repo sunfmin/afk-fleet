@@ -37,10 +37,10 @@ gate:
   (Mac16,8). That is a snapshot, not a promise — the suite grows. It is a real gate for the code-touching issues and a no-op pass for
   prompt/docs-only issues.
 - **Sync, not rebase.** A worker merges `base_branch` into its branch before its pre-PR gate
-  (ADR-0012) — always: there is no key for it (ADR-0038). A landing here stacks the PR on the base
-  instead, one merge commit per PR, and merges the base into the branch only for a PR that
-  conflicts with it or whose landing's gate was red (ADR-0046).
+  (ADR-0012) — always: there is no key for it (ADR-0038). A landing here joins the landing train
+  instead, one merge commit per PR, and merges the train into the branch only for a PR that
+  conflicts with it (ADR-0048).
 - **Reserved surfaces.** The fleet manages the `afk-attempt/<n>` labels, the `refs/afk/*` ref
-  namespace (`refs/afk/claim/*`, `refs/afk/heartbeat/*`, `refs/afk/base`), the single `<!--afk:status-->` status-board
+  namespace (`refs/afk/claim/*`, `refs/afk/heartbeat/*`, `refs/afk/base`, `refs/afk/train/*`), the single `<!--afk:status-->` status-board
   comment, the `<!--afk:escalation …-->` marker leading an escalation's comment, and the
   `<!--afk:turn …-->` landing-turn comment on a PR. Don't hand-edit them.
