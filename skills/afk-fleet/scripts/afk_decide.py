@@ -802,26 +802,92 @@ def _yaml_block(text: str) -> str:
     return text
 
 
-def _strip_comment(line: str) -> str:
-    """Cut an unquoted trailing `# …` comment; quotes are respected."""
-    out, quote = [], None
-    for ch in line:
+# How the file writes a value — the whole of the dialect, and the one place it is
+# read. A value is read the way its author wrote it:
+#
+#   a comment  starts at a `#` that follows whitespace and is outside quotes;
+#              a `#` glued to a word (`http://h/#frag`) is the value's own.
+#   quotes     delimit only when they wrap the WHOLE value (or a whole list
+#              item): `"a b"` is `a b`, and `echo "hi"` is `echo "hi"`. Wrapped,
+#              a value holds anything but its own quote character — there is no
+#              escape — and keeps its edge spaces and its ` #`.
+#   a list     is `[a, b]` on one line; a quoted item keeps its comma.
+#
+# What that cannot hold is refused by the key's name (`_unrepresentable`), never
+# read as something else: a value that opens with a quote which does not close
+# at its end, and a ` #` after a quote that never closes.
+_QUOTES = "\"'"
+
+
+def _unrepresentable(key: str, raw: str, why: str) -> ValueError:
+    """The refusal of a value the dialect cannot hold, naming its key."""
+    return ValueError(f"config key {key!r}: cannot read {raw!r} — {why}. Quotes delimit a "
+                      f"value only when they wrap all of it, and a wrapped value cannot "
+                      f"hold its own quote character")
+
+
+def _cut_comment(key: str, text: str) -> str:
+    """`text` — what follows a key's colon — without its trailing comment, stripped."""
+    quote, opened = None, 0
+    for i, ch in enumerate(text):
         if quote:
-            out.append(ch)
             if ch == quote:
                 quote = None
-        elif ch in "\"'":
-            quote = ch
-            out.append(ch)
-        elif ch == "#":
-            break
+        elif ch in _QUOTES:
+            quote, opened = ch, i
+        elif ch == "#" and i and text[i - 1].isspace():
+            return text[:i].strip()
+    if quote and re.search(r"\s#", text[opened:]):
+        raise _unrepresentable(key, text.strip(),
+                               f"the {quote} never closes, so the # after it is either a "
+                               f"comment or part of the value")
+    return text.strip()
+
+
+def _closing(key: str, raw: str, start: int) -> int:
+    """Where the quote opening at `raw[start]` closes; refused when it never does."""
+    end = raw.find(raw[start], start + 1)
+    if end < 0:
+        raise _unrepresentable(key, raw, f"the {raw[start]} it opens with never closes")
+    return end
+
+
+def _string(key: str, raw: str) -> str:
+    """One string as its author wrote it: the inside of the quotes that wrap all
+    of `raw`, else `raw` itself — quotes within it and at its end included."""
+    if not raw or raw[0] not in _QUOTES:
+        return raw
+    if _closing(key, raw, 0) != len(raw) - 1:
+        raise _unrepresentable(key, raw, f"the {raw[0]} it opens with closes before its end")
+    return raw[1:-1]
+
+
+def _items(key: str, body: str) -> list[str]:
+    """The items between a list's brackets: split at the commas outside a quoted
+    item. An empty unquoted item — `[a, ]` — is no item."""
+    items, i = [], 0
+    while i < len(body):
+        if body[i].isspace():
+            i += 1
+        elif body[i] in _QUOTES:
+            end = _closing(key, body, i)
+            comma = body.find(",", end)
+            if body[end + 1:comma if comma >= 0 else len(body)].strip():
+                raise _unrepresentable(key, f"[{body}]",
+                                       f"the {body[i]} that opens an item closes before its end")
+            items.append(body[i + 1:end])
+            i = len(body) if comma < 0 else comma + 1
         else:
-            out.append(ch)
-    return "".join(out).strip()
+            comma = body.find(",", i)
+            end = len(body) if comma < 0 else comma
+            if body[i:end].strip():
+                items.append(body[i:end].strip())
+            i = end + 1
+    return items
 
 
 def _coerce(key: str, raw: str, default: object) -> bool | int | list[str] | str:
-    """One scalar, typed by its default: bool, int, [a, b] list, or string."""
+    """One value, typed by its default: bool, int, [a, b] list, or string."""
     if isinstance(default, bool):
         if raw in ("true", "True"):
             return True
@@ -836,8 +902,8 @@ def _coerce(key: str, raw: str, default: object) -> bool | int | list[str] | str
     if isinstance(default, list):
         if not (raw.startswith("[") and raw.endswith("]")):
             raise ValueError(f"config key {key!r}: expected [a, b, ...], got {raw!r}")
-        return [i.strip().strip("'\"") for i in raw[1:-1].split(",") if i.strip()]
-    return raw.strip("'\"")
+        return _items(key, raw[1:-1])
+    return _string(key, raw)
 
 
 def parse_config_yaml(text: str) -> Obj:
@@ -845,8 +911,8 @@ def parse_config_yaml(text: str) -> Obj:
     Read the per-repo config — the ```yaml block in docs/agents/afk-fleet.md
     (a whole markdown file or a bare block both work). Schema-aware, zero-dep:
     it parses only the dialect this schema uses (`key: value` scalars, one
-    inline `[a, b]` list, the one-level `gate:` section), and every key
-    and type is checked against CONFIG_DEFAULTS — so parsing IS validation. An
+    inline `[a, b]` list, the one-level `gate:` section — a value is read as
+    written, by the rules above `_cut_comment`), and every key and type is checked against CONFIG_DEFAULTS — so parsing IS validation. An
     unknown key raises (a typo silently ignored would be a config that lies to
     its author, and a launcher-held fact in a file is refused by construction); so does
     a wrong shape. Returns the PARTIAL config — only the keys present.
@@ -857,13 +923,11 @@ def parse_config_yaml(text: str) -> Obj:
         if not ln.strip() or ln.lstrip().startswith("#"):
             continue
         indented = ln[0] in " \t"
-        s = _strip_comment(ln)
-        if not s:
-            continue
-        if ":" not in s:
+        key, colon, rest = ln.partition(":")
+        key = key.strip()
+        if not colon or "#" in key:
             raise ValueError(f"config: unparseable line {ln.strip()!r}")
-        key, _, raw = s.partition(":")
-        key, raw = key.strip(), raw.strip()
+        raw = _cut_comment(f"{section}.{key}" if indented and section else key, rest)
         if indented:
             if section is None:
                 raise ValueError(f"config: indented key {key!r} outside a gate: section")
@@ -917,8 +981,9 @@ def override_config(cfg: Config, assignments: Iterable[str] | None) -> Config:
     """Lay `key=value` overrides (the CLI's `--set`) onto a canonical config, in
     place, and return it. Keys are the config file's own — dotted for a section
     (`gate.ci=local`), plus the settled fields — and values are typed
-    by the key's default exactly as the file's are, except that a string is taken
-    verbatim (the shell already unquoted it). An unknown key, or an item with no `=`, raises ValueError; a
+    by the key's default exactly as the file's are, with two exceptions: a string is
+    taken verbatim (the shell already unquoted it, so its quotes are the value's
+    own), and nothing is a comment (the shell cut that too). An unknown key, or an item with no `=`, raises ValueError; a
     renamed or removed one raises with its migration note, as the file does."""
     keyed = cast(Obj, cfg)          # written by a key read off the command line
     for item in assignments or []:

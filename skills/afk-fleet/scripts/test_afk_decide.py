@@ -3467,6 +3467,122 @@ def test_override_config_types_every_key_like_the_file_does():
             pass
 
 
+# A value as its author wrote it, and what it is read as (None: refused, by the
+# key's name). Strings are written under `gate.local_command`, lists under
+# `epic_labels`.
+_STRINGS_AS_WRITTEN = [
+    # the issue's examples: a quote at the end, a # glued to a word
+    ('echo "hi"', 'echo "hi"'),
+    ("pytest -k 'a or b'", "pytest -k 'a or b'"),
+    ("curl http://h/#frag", "curl http://h/#frag"),
+    # quotes delimit only when they wrap the whole value
+    ('"pnpm build && pnpm test"', "pnpm build && pnpm test"),
+    ("'single'", "single"),
+    ('""', ""),
+    ('" kept edges "', " kept edges "),
+    ('"it\'s"', "it's"),                        # the other quote, inside a wrapped value
+    ("'say \"hi\"'", 'say "hi"'),
+    ('make X="a b" test', 'make X="a b" test'),         # embedded
+    ("it's", "it's"),                           # an apostrophe opens nothing to be closed
+    ('say "hi" twice', 'say "hi" twice'),
+    # a comment starts only at whitespace-then-#, outside quotes
+    ("make test   # the suite", "make test"),
+    ("make test\t# the suite", "make test"),
+    ("make#test", "make#test"),
+    ("a#b # c", "a#b"),
+    ('"needs #human"  # why', "needs #human"),
+    ('"a#b"#c', None),                          # glued: no comment, so the quote closes early
+    ("echo 'a # b'", "echo 'a # b'"),           # an embedded quote holds its #
+    ("echo 'a # b' # c", "echo 'a # b'"),
+    ("echo \"it's # in\" # c", "echo \"it's # in\""),
+    # what the dialect cannot hold
+    ('"a" and "b"', None),                      # opens with a quote that closes early
+    ('"$PY" -m pytest', None),
+    ('"unclosed', None),
+    ("'", None),
+    ("it's # comment or value?", None),         # a # after a quote that never closes
+]
+_LISTS_AS_WRITTEN = [
+    ('[a, "b,c"]', ["a", "b,c"]),               # the issue's example
+    ("[a, b]", ["a", "b"]),
+    ("[]", []),
+    ("[a, ]", ["a"]),
+    ("['a, b', c]", ["a, b", "c"]),
+    ('["a" , \'b\']', ["a", "b"]),
+    ('[""]', [""]),
+    ('[" a "]', [" a "]),
+    ("[wayfinder:map, it's]", ["wayfinder:map", "it's"]),   # a quote inside an item is its own
+    ('[a"b", c]', ['a"b"', "c"]),
+    ("[a#b, c]   # why", ["a#b", "c"]),
+    ('["a # b", c] # why', ["a # b", "c"]),
+    ('["a" b, c]', None),                       # an item's quote closes before its end
+    ('["a, b]', None),
+    ("a, b", None),                             # not a list
+]
+
+
+def _refused(read, key):
+    try:
+        got = read()
+    except ValueError as e:
+        assert repr(key) in str(e), e           # the message names the key
+        return
+    assert False, f"expected ValueError, got {got!r}"
+
+
+def test_a_config_value_is_read_as_written():
+    for written, want in _STRINGS_AS_WRITTEN:
+        def read():
+            return d.parse_config_yaml(f"gate:\n  local_command: {written}")["gate"]["local_command"]
+        if want is None:
+            _refused(read, "gate.local_command")
+        else:
+            assert read() == want, written
+    for written, want in _LISTS_AS_WRITTEN:
+        def read():
+            return d.parse_config_yaml(f"epic_labels: {written}\nretry: 1")["epic_labels"]
+        if want is None:
+            _refused(read, "epic_labels")
+        else:
+            assert read() == want, written
+
+    # a comment after any other kind of value, and after a section's own line
+    assert d.parse_config_yaml("retry: 4 # few\ngate:  # the gate\n  ci: local # ours") == {
+        "retry": 4, "gate": {"ci": "local"}}
+    for bad in ("retry: 4#few", 'retry: "4"'):
+        _refused(lambda: d.parse_config_yaml(bad), "retry")
+    try:
+        d.parse_config_yaml("retry # how many: 4")      # no comment before the colon
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "unparseable line" in str(e)
+
+
+def test_set_and_the_file_agree_on_a_value():
+    """`--set` types a value as the file does. The two exceptions are documented
+    (`override_config`): a string is verbatim, and nothing is a comment."""
+    def by_set(key, written):
+        section, _, leaf = key.rpartition(".")
+        cfg = d.override_config(d.resolve_config({}), [f"{key}={written}"])
+        return (cfg[section] if section else cfg)[leaf]
+
+    for written, want in _LISTS_AS_WRITTEN:
+        if " #" in written.split("]")[-1]:      # a comment is the file's, not the value's
+            continue
+        if want is None:
+            _refused(lambda: by_set("epic_labels", written), "epic_labels")
+        else:
+            assert by_set("epic_labels", written) == want, written
+    for written in ("3", " 3 ", "-1"):
+        assert by_set("retry", written) == d.parse_config_yaml(f"retry: {written}")["retry"]
+    for bad in ("soon", '"3"', "3#x", ""):
+        _refused(lambda: by_set("retry", bad), "retry")
+        _refused(lambda: d.parse_config_yaml(f"retry: {bad}"), "retry")
+    # a string is the exception: the shell already unquoted it, so every character is its own
+    for written, _ in _STRINGS_AS_WRITTEN:
+        assert by_set("gate.local_command", written) == written
+
+
 KIMI = "https://api.kimi.com/coding/"
 
 # real `alias` output, both dialects
