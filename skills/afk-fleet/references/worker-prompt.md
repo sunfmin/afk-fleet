@@ -328,13 +328,13 @@ run one command, which gates the train as it stands and lands it on `{target}`, 
 it says — again and again, until the train is empty.
 
 **Your train:** in `{repo}`, landing on `{target}`.
-**Your worktree:** `{worktree_path}` — work only here. It is on a detached HEAD: that is expected.
+**Your worktree:** `{worktree_path}` — work only here.
 
 **This command is the only way the train lands.** Run it in your worktree, exactly as written:
 ```bash
 {train_land_command}
 ```
-It checks out the train's tip (your own commits are kept on top), merges `{target}` in if it moved,
+It takes the train's tip (your own commits are kept on top), merges `{target}` in if it moved,
 runs the gate once on that commit, and pushes the commit to `{target}` as a fast-forward. It ends with
 one JSON object. An `"error"` saying the worktree is **not the commit that would land** means the
 gate could not prove the train: there were uncommitted or untracked files here, or the gate's run

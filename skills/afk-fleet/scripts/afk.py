@@ -1532,8 +1532,8 @@ def _train_path(rows: list[Obj], repo: str) -> str | None:
     """The path of the landing train's worktree that is really on this machine's
     disk, None when there is none — from orca's worktree `rows` however they
     were read."""
-    return next((path for hit in afk_decide.train_worktrees(rows, repo)
-                 for path in [_on_disk(hit["path"])] if path), None)
+    return next((path for path in afk_decide.train_worktrees(rows, repo) if _on_disk(path)),
+                None)
 
 
 _WORKER_BRIEF = "afk-worker-prompt.md"
@@ -1723,14 +1723,13 @@ class _Worktree:
     def clear(self, at: str) -> Obj:
         """Empty the train's worktree for the next train, and keep it: every
         terminal closed, a merge in progress and anything uncommitted
-        discarded, the commit `at` checked out. Ignored files — what a gate
+        discarded, its branch moved to the commit `at`. Ignored files — what a gate
         run built — are left: they are why the worktree is kept. Soft, like
         `remove`: a worktree that is not here has nothing to clear."""
         if not self.path:
             return {"cleared": False, "path": self.remembered}
         self._close_terminals()
-        for args in (["merge", "--abort"], ["reset", "-q", "--hard"], ["clean", "-qfd"],
-                     ["checkout", "-q", "--detach", at]):
+        for args in (["merge", "--abort"], ["reset", "-q", "--hard", at], ["clean", "-qfd"]):
             _git(["-C", self.path, *args], check=False)
         for mark in (_NUDGE_MARK, _TOLD_MARK):
             name = _worker_file(self.path, mark)
@@ -3371,8 +3370,9 @@ def _land_train(run: _Run, limits: _GateLimits, merged_timeout: float) -> Obj:
         base = _git(["-C", path, "merge-base", here, train.tip], check=False).stdout.strip()
         own = here != train.tip and not _within(path, here, train.tip)
         if not train.ahead or not own or not base or _within(path, base, train.target):
-            # nothing of this worktree's own on this train: start from its tip
-            _git(["-C", path, "checkout", "-q", "--detach", train.tip])
+            # nothing of this worktree's own on this train: start from its tip,
+            # on the branch the worktree was cut with
+            _git(["-C", path, "reset", "-q", "--hard", train.tip])
         else:
             files = _merge_in(path, train.tip, "the landing train")
             if files:
