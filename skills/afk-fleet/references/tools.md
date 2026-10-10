@@ -18,7 +18,9 @@ function in `afk_decide.py` (fixture-tested); `afk.py` only gathers their inputs
   exists). Resolution is one order everywhere: `--set` → `--config` → the defaults table for keys
   the JSON omits (ADR-0009), and the result is validated like the config file is.
 - `--set <key>=<value>` (repeatable) overrides one config key for one call, by the config file's own
-  key name — `--set concurrency=1`, `--set gate.ci=local`. It is for tests and
+  key name — `--set concurrency=1`, `--set gate.ci=local`. Its value is typed as the file's is,
+  except that a string is taken verbatim, quotes and `#` included: the shell already unquoted
+  it and cut its comment. It is for tests and
   hand-debugging; a tick passes the run's `--config` and nothing else.
 - `afk …` in this table is shorthand for the executable `<skill>/scripts/afk.py …` — one word, no
   interpreter in front, so it survives being held in a shell variable under zsh.
