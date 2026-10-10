@@ -422,6 +422,10 @@ adversarial verify or switching a repo to `gate.ci: local`. `afk gate` and `afk 
 **Nobody but its worker merges a PR.** A finished PR is landed by the worker that wrote it, with
 `afk land`, in its own worktree — sync with `base_branch` (by **merging, never rebasing** —
 ADR-0012) → push → the machine gate on that exact head → `gh pr merge` **pinned to the gated head**.
+The merge is pinned to the PR's head, not to the target, and a gate run is long: right before it
+the landing reads its turn and the target's tip again, and merges only if the turn is still the one
+it started on and the gated head still holds that tip (`target_moved` otherwise — it lands again,
+synced and gated on the new tip).
 A sync conflict or a red gate at landing is fixed where the context is: by that worker, in place,
 with no round trip through the launcher
 ([ADR-0027](../../docs/adr/0027-a-worker-lands-its-own-pr-on-a-landing-turn.md)). What the fleet

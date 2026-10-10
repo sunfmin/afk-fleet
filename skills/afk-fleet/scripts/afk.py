@@ -501,6 +501,20 @@ def _claim_turns(repo: str, prs: list[PullRequest], claims: list[Claim],
     return turns
 
 
+def _single_turn(run: _Run, number: int, pr_number: int,
+                 fresh: bool = False) -> tuple[str | None, Turn | None]:
+    """(the instance that holds issue <number>'s claim, the landing turn ONE PR
+    holds from it) — the turn is None when PR `pr_number` holds none from that
+    instance, or holds a merge batch's (`afk_decide.held_turn`). `fresh`: the
+    claims and the PR's comments are read now, whatever this process read
+    before — what a landing asks again once its gate has run."""
+    if fresh:
+        _forget(_scan_key(run), ("comments", run.repo, pr_number))
+    owner = _claim_owner(run, number)
+    turn = afk_decide.held_turn(_turn(run.repo, pr_number), owner)
+    return owner, None if turn is None or turn["batch"] else turn
+
+
 def _record_turn(repo: str, pr_number: int, turn: Turn) -> int:
     """Write PR `pr_number`'s ONE landing-turn comment from its record → its id.
     `turn` is the record read from the PR (`_turn`) plus what changed
@@ -2532,8 +2546,9 @@ def cmd_land(a: argparse.Namespace) -> Obj:
     guards against a worker that strays, not a malicious one — worker and launcher
     share one `gh` credential. Then, in order: sync by merging the target in
     (never a rebase) → push → the machine gate on that exact head (in `required`
-    mode, the PR's checks on it, waited for) → the verify check → `gh pr merge`
-    pinned to the gated head → status board. It stops with an `outcome`:
+    mode, the PR's checks on it, waited for) → the verify check → the turn and
+    the target's tip, read again → `gh pr merge` pinned to the gated head →
+    status board. It stops with an `outcome`:
 
       merged        landed. The worker sends its wake and stops.
       conflict      the sync conflicted; the merge is left in progress with
@@ -2542,6 +2557,11 @@ def cmd_land(a: argparse.Namespace) -> Obj:
       gate_red      local mode: the gate was red on the synced head (`gate.excerpt`,
                     also a PR comment). required mode: the PR's checks are red.
                     The worker fixes the code, commits, and runs this again.
+      target_moved  the target moved while the gate ran (or the checks were
+                    waited for): the head that was gated no longer holds its
+                    tip, so merging it would land a tree no gate saw. Nothing
+                    was merged. The worker runs this again, which syncs with
+                    the new tip and gates that.
       awaiting_ci   required mode: the checks on the head that would land were
                     still running when `--checks-timeout` ran out. Up to then
                     this waits for them itself — after a sync that pushed a
@@ -2555,12 +2575,18 @@ def cmd_land(a: argparse.Namespace) -> Obj:
     stops, the turn stays its own, and it is told to run this again (`afk turn`).
     No outcome spends an attempt, closes the PR or gives the turn up; every one
     but `merged` is written onto the PR's turn comment (`stopped`), which is what
-    `afk rebuild` reports. The claim is NOT released and the worktree is not
+    `afk rebuild` reports. A turn that is no longer this landing's once the gate
+    has run — the claim was released or taken over, the turn granted afresh — is
+    refused like one never held: exit 3, nothing merged, nothing written. The claim is NOT released and the worktree is not
     removed here — this runs inside that worktree, and a worker holds no instance
     id: the next cycle sees a claim whose issue is closed and settles both.
 
     The invariant every path keeps: what lands on the target was gated in the form
-    it lands (ADR-0012). In local mode `gate.source` says where that proof came
+    it lands (ADR-0012). The merge is pinned to the PR's head and to nothing on
+    the target, so the target's tip is read again right before it; what is left
+    is the instant between that read and GitHub making the merge commit, in
+    which only someone outside this fleet instance's turns can move the target
+    (ADR-0027). In local mode `gate.source` says where that proof came
     from: "run" — the gate ran here, `gate.not_trusted` saying why no record
     stood in for it — or "recorded" — a green run of the configured command is on
     record on the remote for the tree of `gate.head`, so it was not run again,
@@ -2580,9 +2606,8 @@ def cmd_land(a: argparse.Namespace) -> Obj:
     if pr is None:
         raise RuntimeError(f"no open PR closes issue #{a.number} — there is nothing to land (if "
                            f"it has already merged, send your wake and stop)")
-    owner = _claim_owner(run, a.number)
-    turn = afk_decide.held_turn(_turn(run.repo, pr["number"]), owner)
-    if turn is None or turn["batch"]:
+    owner, turn = _single_turn(run, a.number, pr["number"])
+    if turn is None:
         raise RuntimeError(f"PR #{pr['number']} does not hold the landing turn of the fleet "
                            f"instance that holds issue #{a.number}'s claim; nothing was changed. "
                            f"Do not land it any other way — you are told when its turn comes")
@@ -2632,7 +2657,9 @@ def cmd_land(a: argparse.Namespace) -> Obj:
         out["gate"] = gate
     else:
         checks = afk_decide.pr_checks_state(pr["statusCheckRollup"])
-        if pushed or checks == "pending":
+        # the listing was read before the sync: its checks are this head's only if
+        # its head is — a listing still at an earlier head is waited out like a push
+        if pushed or checks == "pending" or pr["headRefOid"] != head:
             checks = _await_checks(run.repo, pr["number"], head, had_checks=checks is not None,
                                    timeout=a.checks_timeout, poll=a.checks_poll)
         checks_say = afk_decide.checks_gate(checks, turn["allow_no_checks"])
@@ -2652,6 +2679,21 @@ def cmd_land(a: argparse.Namespace) -> Obj:
         return stop("needs_verify",
                     detail="the head that would land is not the one that was verified — send "
                            "your wake and stop; you are told to run this again once it is")
+
+    # --- a gate run or a wait for checks is long: what the merge rests on is read
+    # again. The turn first — a refusal there writes nothing, the turn not being
+    # this landing's to write on ---
+    if _single_turn(run, a.number, pr_number, fresh=True) != (owner, turn):
+        raise RuntimeError(f"PR #{pr_number} no longer holds the landing turn this landing "
+                           f"started on (it was released, taken over or granted afresh while "
+                           f"the gate ran); nothing was merged. Do not land it any other way — "
+                           f"you are told when its turn comes")
+    tip = _remote_sha(rem, f"refs/heads/{target}")
+    if _git(["-C", path, "merge-base", "--is-ancestor", tip, head], check=False).returncode != 0:
+        return stop("target_moved",
+                    detail=f"{target} moved while the gate ran: the head that was gated does "
+                           f"not hold its tip, and nothing was merged — run this again; it "
+                           f"syncs with the new tip and gates that")
 
     # --- land it. The claim and this worktree are the next cycle's to settle ---
     _merge_pr(run.repo, rem, pr, head)

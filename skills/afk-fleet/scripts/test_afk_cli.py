@@ -182,7 +182,8 @@ if argv[:2] == ["pr", "list"]:
     for r in rows:                   # a PR whose checks a test scripted: one step per read
         if r.get("rollups"):
             r["statusCheckRollup"] = r["rollups"].pop(0)
-    rows = [{**r, "headRefOid": head_of(r)} for r in rows]
+    # …and one whose listing lags its branch: the head each read shows, while any are left
+    rows = [{**r, "headRefOid": r["heads"].pop(0) if r.get("heads") else head_of(r)} for r in rows]
     if not on_default():             # GitHub links an issue only on the default branch
         rows = [{**r, "closingIssuesReferences": []} for r in rows]
     fields = opt("--json").split(",")
@@ -3029,6 +3030,109 @@ def test_in_required_mode_the_turn_waits_for_checks_on_the_head_that_lands():
         checks_run(5, "PENDING", "PENDING", "FAILURE")
         r = land(5, *wait)
         assert (r["outcome"], r["checks"], r["synced"]) == ("gate_red", "red", False), r
+
+
+def _during_gate(w, name, *lines):
+    """A gate command that is green, and on its FIRST run only does `lines` (Python)
+    while it runs — what somebody else did while the landing was gating."""
+    script, done = os.path.join(w.sb.root, f"{name}.py"), os.path.join(w.sb.root, f"{name}.done")
+    with open(script, "w") as f:
+        f.write("\n".join(["import json, os, subprocess, sys",
+                           f"if os.path.exists({done!r}): sys.exit(0)",
+                           f"open({done!r}, 'w').close()", *lines]) + "\n")
+    return local_gate(f"{shlex.quote(sys.executable)} {shlex.quote(script)}")
+
+
+def test_a_target_that_moves_while_the_gate_runs_refuses_the_merge():
+    """#126. The merge is pinned to the PR's head, not to the target: a target
+    that moved after the sync would make the merge commit a tree no gate run saw.
+    The landing reads the target's tip again before it merges, and the next
+    `afk land` syncs with it and gates that."""
+    with world(issues=[issue(3, "ready-for-agent")]) as w:
+        seed = os.path.join(w.sb.root, "seed")
+        push = f"HEAD:refs/heads/{w.sb.base}"
+        gate = _during_gate(
+            w, "moves",
+            f"git = lambda *a: subprocess.run(['git', '-C', {seed!r}, *a], check=True)",
+            f"git('pull', '-q', 'origin', {w.sb.base!r})",
+            f"open(os.path.join({seed!r}, 'landed-during-gate.txt'), 'w').close()",
+            "git('add', '-A'); git('commit', '-qm', 'base: landed during the gate')",
+            f"git('push', '-q', 'origin', {push!r})")
+        d, pr_head = with_pr(w, 3, 30, gate=gate)
+        wt = d["worktree"]
+        w.afk(*_turn(3, *gate))
+        r = _land(w, 3, wt, *gate)
+        assert (r["outcome"], r["head"], r["synced"], r["gate"]["status"]) == \
+            ("target_moved", pr_head, False, "green"), r
+        # nothing was merged: the PR is open, and the target holds only what moved it
+        assert w.pr(30).get("state", "open") == "open" and w.issue(3)["state"] == "open"
+        moved = w.sb.remote_ref(f"refs/heads/{w.sb.base}")
+        assert "feature3.txt" not in w.remote_files(w.sb.base)
+        assert _mine(w, gate, 3) == ("landing", "landing", "target_moved")
+        # run again: synced with the new tip, gated on THAT tree, merged
+        r = _land(w, 3, wt, *gate)
+        assert (r["outcome"], r["synced"], r["gate"]["source"]) == ("merged", True, "run"), r
+        assert r["head"] != pr_head and w.pr(30)["merged"]["head"] == r["head"]
+        assert {"feature3.txt", "landed-during-gate.txt"} <= w.remote_files(w.sb.base)
+        git(w.cwd, "fetch", "-q", "origin", w.sb.base)
+        assert git(w.cwd, "merge-base", moved, r["head"]) == moved
+
+
+def test_a_turn_revoked_while_the_gate_runs_refuses_the_merge_and_changes_nothing():
+    """#126. A gate run is long: a turn the landing held when it started may be
+    gone when the gate is green — the claim released (an escalation) or taken
+    over, the turn granted afresh to a restarted worker. The turn is read again
+    before the merge, and a turn that is no longer this landing's lands nothing
+    and writes nothing."""
+    def update_ref(w, *args):
+        return f"subprocess.run(['git', '--git-dir', {w.sb.bare!r}, 'update-ref', *{args!r}], check=True)"
+
+    for how in ("released", "taken over"):
+        with world(issues=[issue(1, "ready-for-agent"), issue(2, "ready-for-agent")]) as w:
+            w.afk("claim", "2", "--instance", "peer", *NOW, *R)
+            gate = _during_gate(w, "revoked", update_ref(w, "-d", "refs/afk/claim/1")
+                                if how == "released" else
+                                update_ref(w, "refs/afk/claim/1", "refs/afk/claim/2"))
+            d, head = with_pr(w, 1, 10, gate=gate)
+            w.afk(*_turn(1, *gate))
+            marker, base_tip = _turns(w, 10), w.sb.remote_ref(f"refs/heads/{w.sb.base}")
+            assert "no longer holds the landing turn" in _land_error(w, 1, d["worktree"], *gate), how
+            assert w.pr(10).get("state", "open") == "open" and _turns(w, 10) == marker, how
+            assert w.sb.remote_ref(f"refs/heads/{w.sb.base}") == base_tip
+            assert w.sb.remote_ref(f"refs/heads/{d['branch']}") == head
+            # and it stays refused: the gate is green on record, the turn is nobody's here
+            assert "does not hold the landing turn" in _land_error(w, 1, d["worktree"], *gate)
+
+    regranted = afk_decide.turn_comment(
+        afk_decide.single_turn(None, "me", T0 + 500, restarted=T0 + 500))
+    with world(issues=[issue(3, "ready-for-agent")]) as w:
+        gate = _during_gate(w, "regranted",
+                            f"st = json.load(open({w.gh_file!r}))",
+                            f"st['comments']['30'][0]['body'] = {regranted!r}",
+                            f"json.dump(st, open({w.gh_file!r}, 'w'))")
+        d, head = with_pr(w, 3, 30, gate=gate)
+        w.afk(*_turn(3, *gate))
+        assert "no longer holds the landing turn" in _land_error(w, 3, d["worktree"], *gate)
+        assert w.pr(30).get("state", "open") == "open" and _turns(w, 30) == [regranted]
+        # the worker the turn was granted to afresh lands it, on the run on record
+        r = _land(w, 3, d["worktree"], *gate)
+        assert (r["outcome"], r["gate"]["source"]) == ("merged", "recorded"), r
+
+
+def test_in_required_mode_the_checks_judged_are_those_of_the_head_that_merges():
+    """#126. A landing that pushed nothing judges the checks from the listing it
+    read first — whose head may not be the one being merged: the worker pushed a
+    fix itself, and GitHub still lists the head before it, green."""
+    with world(issues=[issue(1, "ready-for-agent")]) as w:
+        d, old = with_pr(w, 1, 10)
+        w.afk(*_turn(1))
+        fixed = w.work(d["worktree"], "fix1.txt")                     # pushed by the worker
+        green, red = (pr(10, 1, c)["statusCheckRollup"] for c in ("SUCCESS", "FAILURE"))
+        w.set(prs=[{**p, "heads": [old], "rollups": [green, red]} for p in w.state()["prs"]])
+        r = _land(w, 1, d["worktree"], "--checks-poll", "0.05")
+        assert (r["outcome"], r["checks"], r["head"], r["synced"]) == \
+            ("gate_red", "red", fixed, False), r
+        assert w.pr(10).get("state", "open") == "open"
 
 
 def test_the_adversarial_verify_is_settled_before_the_turn_and_pinned_to_the_head():

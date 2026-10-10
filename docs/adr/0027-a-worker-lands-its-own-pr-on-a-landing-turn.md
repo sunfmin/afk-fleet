@@ -24,6 +24,9 @@ has run out.
 worker still silent after its nudge on the turn is restarted onto the turn once, not failed, and
 silent again past that restart it is escalated with the PR kept — see
 [What bounds a turn](#what-bounds-a-turn).
+**Amended (#126):** a landing reads its turn and the target's tip again right before it merges — see
+[the amendment](#amendment-126--a-landing-reads-its-turn-and-the-target-again-before-it-merges) at
+the end, which also states the window that remains.
 
 ## Context
 
@@ -95,6 +98,7 @@ It stops with an `outcome`:
 | `merged` | wakes the launcher and stops |
 | `conflict` — the merge is left in progress, `files` unmerged | resolves in place, commits, lands again |
 | `gate_red` — excerpt returned, and posted on the PR | fixes the code, commits, lands again |
+| `target_moved` — the target moved while the gate ran; nothing merged (#126) | lands again: synced with the new tip, gated on it |
 | `awaiting_ci` / `needs_verify` / `no_checks` — the sync moved the head, and the next move is the tick's | wakes the launcher and stops; the turn is kept |
 
 Every stop short of `merged` is written onto the turn marker (`stopped`, `head`), which is what
@@ -165,9 +169,11 @@ The tick's summary counts `granted` where it counted
   to recover that.
 - The landing after a `merged` wake takes one more cycle to release the claim and the worktree.
 - Two fleet instances on one repo each grant their own turns, so two landings can still race for
-  the target: the later merge is pinned to the head it gated, but that head was not gated against
-  what the other fleet landed in between — as it was with two ticks merging. Cross-instance turn
-  coordination is not built.
+  the target. As first written the later merge went through — pinned to the head it gated, a head
+  not gated against what the other fleet landed in between. Since #126 the landing reads the
+  target's tip again before it merges and refuses when it moved, which leaves only
+  [the instant after that read](#amendment-126--a-landing-reads-its-turn-and-the-target-again-before-it-merges).
+  Cross-instance turn coordination is not built.
 
 ## Considered and rejected
 
@@ -208,3 +214,47 @@ never answers them. The turn check, the pin of the merge to the gated head, and 
 gated in the form it lands" are as they were; the only thing that moved is who does the waiting.
 A landing can therefore run for as long as CI does, inside the worker — the same place a long
 local gate run already happens.
+
+## Amendment (#126) — a landing reads its turn and the target again before it merges
+
+`afk land` checked its turn once, at the start, and then ran the gate or waited for checks — up to
+half an hour each — and merged without looking again. Two things it rested on could have moved by
+then:
+
+- **The target.** `gh pr merge --match-head-commit` pins the merge to the PR's head and to nothing
+  on the target. A target that moved after the sync makes the merge commit a merge of the gated head
+  with a tip it never met: a tree no gate run saw, which is exactly what "what lands on the target
+  was gated in the form it lands" forbids.
+- **The turn.** An escalation releases the claim and frees the turn; a takeover restamps the claim;
+  `afk turn --restart` grants the turn afresh to a second worker. In each the next landing may
+  already be under way while the first one is still gating.
+
+The batch path already asked again before its push (ADR-0029), and its push is a fast-forward the
+remote refuses on a moved target. The single path had neither.
+
+**Right before the merge, the landing reads again what the merge rests on**, and merges only if
+none of it moved:
+
+| read again | moved means | the landing |
+|---|---|---|
+| the claim's owner and the PR's turn marker | not the turn this landing started on — released, taken over, or granted afresh | exit 3, as for a turn never held: nothing merged, **nothing written** (the marker is no longer its to write on) |
+| the target's tip | the gated head does not contain it | `target_moved`, written on the turn marker — the worker's own to act on: the same command again syncs with the new tip and gates that tree |
+| in `required`, the head the checks belong to | the PR as first read was at another head than the one that would merge | waited out like a head just pushed (the #51 wait), so the checks judged are always those of the head merged |
+
+"Contains", not "equals": a head that holds the target's tip merges to its own tree, whatever the
+tip is, and that tree is the one the gate passed on. An undisturbed landing costs one `ls-remote`,
+one read of the claims and one of the PR's comments more than before, and behaves as it did —
+recorded gate run included.
+
+### The window that remains
+
+The check and the merge are two calls, and GitHub offers no merge pinned to the target's tip. So
+between the landing's read of the target and GitHub making the merge commit — seconds, where it was
+the length of a gate run — the target can still move, and a turn can still be revoked, and the
+merge goes through. Within one fleet instance nothing moves the target in that instant: turns go
+out one at a time, and the instance's only other landing is one this check has just refused. What
+can is outside its turns — a peer fleet instance's landing, or a person pushing or merging by hand.
+The merge commit is then of a tree no gate ran on, and nothing here detects it afterwards. Closing
+it needs what the batch path has, a fast-forward the remote itself refuses; a single PR lands
+through `gh pr merge` on purpose (ADR-0036: `required` repos never accept a direct push), so the
+window is narrowed, not closed.
