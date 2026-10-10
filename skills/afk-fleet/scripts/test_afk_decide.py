@@ -721,6 +721,89 @@ def test_records_kept_in_comments_share_the_encoding_of_records_on_refs():
         {"instance": "a", "at": 1, "released": True}
 
 
+# The pieces a generated value is made of: everything that separates, closes or
+# encodes something in a record, and text that needs none of it.
+_VALUE_PIECES = (",", "-->", "--", ">", "<!--", "%", "%2C", "%4", "=", " ", "\t", "\n", "\r\n",
+                 "\u3000", "\u2028", "\x00", "#", "é", "进度", "reason=", "ts=5", "a", "Z", "9", "-")
+
+
+def _generated_text(rng):
+    return "".join(rng.choice(_VALUE_PIECES) for _ in range(rng.randint(1, 8)))
+
+
+def _generated_members(rng):
+    return [{"issue": rng.randrange(10**6), "pr": rng.randrange(10**6)}
+            for _ in range(rng.randint(0, 4))]
+
+
+# One generator per way a field's value is spelled. A kind that declares a type
+# with none here fails the test below until it is given one.
+_GENERATED = {
+    str: _generated_text,
+    int: lambda rng: rng.randrange(10**12),
+    d.FLAG: lambda rng: rng.random() < 0.5,
+    d.INTS: lambda rng: [rng.randrange(10**6) for _ in range(rng.randint(0, 4))],
+    d.TURN_RECORD.fields["members"]: _generated_members,
+    d.TURN_RECORD.fields["stopped"]: lambda rng: rng.choice(d.LAND_OUTCOMES),
+    d.TURN_RECORD.fields["phase"]: lambda rng: rng.choice(d.BATCH_PHASES),
+    d.TURN_RECORD.fields["unbatched"]: lambda rng: rng.choice(d.UNBATCHED),
+}
+
+
+def test_every_record_value_round_trips_on_both_carriers():
+    """Writing a record and reading it back is the identity — for every declared
+    kind, on a ref and in a comment, over values made of what the encoding itself
+    uses (`,`, `-->`, `%`, `=`, whitespace, line breaks) and of other scripts. A
+    field left out reads as its type's `empty`, which is what writing nothing
+    says."""
+    kinds = {name: kind for name, kind in vars(d).items() if isinstance(kind, d.RecordKind)}
+    assert {"CLAIM_RECORD", "GATE_RUN_RECORD", "BASE_RECORD", "TURN_RECORD", "VERDICT_RECORD",
+            "ESCALATION_RECORD"} <= set(kinds)
+    rng = random.Random(114)
+    for name, kind in kinds.items():
+        blank = d.blank_record(kind)
+        for _ in range(400):
+            record = {field: _GENERATED[declared](rng) for field, declared in kind.fields.items()
+                      if field in kind.required or rng.random() < 0.7}
+            said = {**blank, **record}
+            message = d.record_message(kind, record)
+            assert "\n" not in message and "\r" not in message, (name, record)
+            on_ref = d.read_record(kind, message + "\n\nany body at all")
+            assert on_ref is not None and {**blank, **on_ref} == said, (name, record, message)
+            body = d.record_comment(kind, record, "worded for a human --> a=1, b=2")
+            in_comment = d.read_marker(kind, body)
+            assert in_comment is not None and {**blank, **in_comment} == said, (name, record, body)
+
+    # the two values that did not (#114), by name: a trailing comma took the next
+    # field with it, and `-->` in a value closed the marker
+    base = {"branch": "release,", "ts": 5}
+    assert d.read_record(d.BASE_RECORD, d.record_message(d.BASE_RECORD, base)) == base
+    gate = d.gate_record("abc123", "make test,", 7)
+    assert d.read_record(d.GATE_RUN_RECORD, d.record_message(d.GATE_RUN_RECORD, gate)) == gate
+    marker = d.verdict_marker(9, "giving-up", reason="it --> broke")
+    assert marker.count("-->") == 1 and _verdict_in(marker)["reason"] == "it --> broke"
+    turn = {"instance": "fl-1", "of": "a-->b,"}
+    assert d.read_marker(d.TURN_RECORD, d.record_marker(d.TURN_RECORD, turn)) == turn
+
+
+def test_a_hand_written_blocked_by_reads_as_the_issues_it_names():
+    """A worker types its verdict, and names issues the way issues are named: a
+    list spelled with `#`, or spread over words, is still those issues — never
+    a `blocked` verdict that names nobody, which would be escalated, not parked."""
+    for spelled in ("3,4", "#3,#4", "3 4", "#3 #4", "3, 4", "#3, #4", "#3 and #4", "3 ,4"):
+        for rest in ("", " reason=needs pages from #3"):
+            body = f"<!--afk:verdict n=12 phase=blocked blocked_by={spelled}{rest}-->"
+            assert _verdict_in(body)["blocked_by"] == [3, 4], body
+    # only a list runs over words: a stray word after any other value is read past
+    assert d.read_marker(d.VERDICT_RECORD, "<!--afk:verdict n=5 6 phase=blocked now-->") == \
+        {"n": 5, "phase": "blocked"}
+    assert d.read_record(d.BASE_RECORD, "afk-base branch=release, ts=5") == \
+        {"branch": "release,", "ts": 5}
+    # a batch's members are a list too
+    assert d.read_marker(d.TURN_RECORD, "<!--afk:turn instance=x members=1:10, 2:20 at=3-->") == \
+        {"instance": "x", "members": [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}], "at": 3}
+
+
 def test_each_record_in_a_comment_round_trips_through_its_own_reader():
     """What the fleet's own writers put in a comment — a turn in each of its
     shapes, a verdict, a status board — is found again by the kind it was
