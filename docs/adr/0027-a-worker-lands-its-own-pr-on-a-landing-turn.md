@@ -30,6 +30,11 @@ turn covers only sync, gate and merge. The first time a PR's landing stops with 
 the text below says such a stop keeps the turn, that no outcome gives the turn up, or that each PR
 of a conflicting group is resolved exactly once, read ADR-0045: that holds only from a PR's second
 turn on.
+**Amended by [ADR-0046](0046-a-single-landing-stacks-on-the-target-like-a-batch-of-one.md) (#154):** where merge
+batches form — `gate.ci: local`, no adversarial verify — a PR landing alone is not synced: it is
+stacked on the target's tip with one merge commit, gated there, and pushed as a fast-forward. Read
+"sync → push → gate → `gh pr merge`" below as what happens in `required`, with the verify on, and
+for a PR that conflicts with the target's tip.
 **Amended (#126):** a landing reads its turn and the target's tip again right before it merges — see
 [the amendment](#amendment-126--a-landing-reads-its-turn-and-the-target-again-before-it-merges) at
 the end, which also states the window that remains.

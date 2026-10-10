@@ -423,18 +423,30 @@ adversarial verify or switching a repo to `gate.ci: local`. `afk gate` and `afk 
 ## Landing — the worker lands its own PR, on its turn
 
 **Nobody but its worker merges a PR.** A finished PR is landed by the worker that wrote it, with
-`afk land`, in its own worktree — sync with `base_branch` (by **merging, never rebasing** —
-ADR-0012) → push → the machine gate on that exact head → `gh pr merge` **pinned to the gated head**.
-The merge is pinned to the PR's head, not to the target, and a gate run is long: right before it
-the landing reads its turn and the target's tip again, and merges only if the turn is still the one
-it started on and the gated head still holds that tip (`target_moved` otherwise — it lands again,
-synced and gated on the new tip).
-A sync conflict or a red gate at landing is fixed where the context is: by that worker, in place,
+`afk land`, in its own worktree, one of two ways:
+
+- **Where merge batches form** (`gate.ci: local`, no adversarial verify) it lands **like a batch of
+  one**: the PR's head is merged onto `base_branch`'s tip with ONE merge commit → the machine gate
+  on that commit → the turn read again → the commit pushed to `base_branch` as a **fast-forward**.
+  The branch itself is not synced, so a landing leaves no `Merge commit '<sha>' into <branch>` on
+  the history, however often it is repeated; a target that moved while the gate ran refuses the
+  push (`target_moved` — it lands again, stacked and gated on the new tip). Only a PR that
+  **conflicts** with the tip, or whose stack was **red**, has `base_branch` merged into its branch,
+  for its worker to resolve or fix there
+  ([ADR-0046](../../docs/adr/0046-a-single-landing-stacks-on-the-target-like-a-batch-of-one.md)).
+- **Everywhere else** — checks and verifications are of the PR's head: sync with `base_branch` (by
+  **merging, never rebasing** — ADR-0012) → push → the machine gate on that exact head →
+  `gh pr merge` **pinned to the gated head**. That merge is pinned to the PR's head, not to the
+  target, and a gate run is long: right before it the landing reads its turn and the target's tip
+  again, and merges only if the turn is still the one it started on and the gated head still holds
+  that tip (`target_moved` otherwise — it lands again, synced and gated on the new tip).
+
+A conflict or a red gate at landing is fixed where the context is: by that worker, in place,
 with no round trip through the launcher
 ([ADR-0027](../../docs/adr/0027-a-worker-lands-its-own-pr-on-a-landing-turn.md)). What the fleet
 gives is the **landing turn**: `afk land` merges nothing until its PR has the turn, and turns go out
 **one at a time**, so no PR is merged against a tip that is about to move. A turn covers the
-bounded part of a landing — sync, gate, merge: a PR whose landing stops on a conflict or a red gate
+bounded part of a landing — sync or stack, gate, merge: a PR whose landing stops on a conflict or a red gate
 **gives its turn up**, once, and is fixed off it
 ([ADR-0045](../../docs/adr/0045-a-landing-that-stops-on-a-conflict-or-a-red-gate-gives-its-turn-up.md)).
 
@@ -462,7 +474,7 @@ stopped on the PR:
   the turn**: the landing writes on the turn marker that the PR gave its turn up (`given_up`), the
   claim is `fixing`, and the next cycle grants the turn to the next PR of the merge queue, or to a
   merge batch. The worker is told nothing new: it fixes, commits and runs `afk land` again, which
-  off the turn still syncs and gates and merges nothing; green there is `awaiting_turn` — the
+  off the turn still gates what would land and merges nothing; green there is `awaiting_turn` — the
   worker wakes the launcher and stops, the PR is ready again, and it is granted its next turn
   ahead of every PR that never held one. A PR gives its turn up **once**: on that next turn a
   `conflict` or a `gate_red` is fixed with the turn held, so the landings that pass a PR cannot

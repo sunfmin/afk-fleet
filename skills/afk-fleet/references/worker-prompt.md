@@ -173,10 +173,12 @@ your PR holds the landing turn:
 ```bash
 {land_command}
 ```
-It syncs your branch with the merge target (a merge, never a rebase), pushes, runs the gate on that
-exact head — or waits for the PR's checks on it, which can take as long as CI does: let it run — and,
-once it has read again that the turn is still yours and the target has not moved, merges the PR
-pinned to the head it gated. It ends with one JSON object, whose `turn` says whether the PR still
+It pushes what you committed, puts your PR together with the merge target — where the fleet lands
+by stacking, your PR's head merged onto the target's tip as one merge commit, this worktree on a
+detached HEAD while the gate runs and back on your branch when the command ends; otherwise the
+target merged into your branch (a merge, never a rebase) and pushed — runs the gate on exactly that,
+or waits for the PR's checks on it, which can take as long as CI does: let it run — and, once it
+has read again that the turn is still yours, lands exactly what it gated. It ends with one JSON object, whose `turn` says whether the PR still
 holds the turn (`held`) or has given it up (`given_up` — see below the table). An
 `"error"` saying the PR does **not hold the landing turn** means it is not your turn: nothing was
 changed — stop and wait to be told; do not land it any other way. An `"error"` saying the worktree
@@ -188,19 +190,19 @@ and run the command again. Otherwise act on its `outcome`:
 | `outcome` | what happened | what you do |
 |---|---|---|
 | `merged` | The PR landed. | Wake the coordinator and stop. You are done — the fleet removes this worktree. |
-| `conflict` | Merging the target into your branch conflicted. The merge is **left in progress** here, with `files` unmerged. | Resolve every file so both sides' intent survives (read what landed first: `git log HEAD..MERGE_HEAD`), `git add` it, **commit the merge**, and run the command again. Never rebase, never abort the merge, never drop the other change to make yours fit. |
-| `gate_red` | The gate is red on the synced head — `gate.excerpt` is the tail of its log (or, with required checks, the PR's checks are red). | Fix the code, **commit**, and run the command again. |
-| `target_moved` | The merge target moved while the gate ran (or the checks were waited for), so what was gated is no longer what would land. Nothing was merged. | Run the command again: it syncs with the new tip and gates that. |
+| `conflict` | Your PR conflicts with the target's tip. The target was merged into your branch, and that merge is **left in progress** here, with `files` unmerged. | Resolve every file so both sides' intent survives (read what landed first: `git log HEAD..MERGE_HEAD`), `git add` it, **commit the merge**, and run the command again. Never rebase, never abort the merge, never drop the other change to make yours fit. |
+| `gate_red` | The gate is red on your PR together with the target — `gate.excerpt` is the tail of its log (or, with required checks, the PR's checks are red). The target is merged into your branch, so the tree here is the one that was red. | Fix the code, **commit**, and run the command again. |
+| `target_moved` | The merge target moved while the gate ran (or the checks were waited for), so what was gated is no longer what would land. Nothing was merged. | Run the command again: it gates on the new tip. |
 | `awaiting_ci` | The command waited for the PR's checks on the head that would land, and they had not finished when its wait ran out. | Wake the coordinator and stop. The turn stays yours; you are told to run the command again. |
 | `needs_verify` | The head that would land is not the one that was verified — the sync moved it. | Wake the coordinator and stop. The turn stays yours; you are told to run the command again. |
 | `no_checks` | The PR has no checks at all, and that has not been waived. | Wake the coordinator and stop. The turn stays yours; you are told to run the command again. |
-| `awaiting_turn` | The PR gave its turn up, and your fix holds: this run synced it and found the gate green, and merged nothing. | Wake the coordinator and stop. You are told when the PR's next turn comes; then run the command again. |
+| `awaiting_turn` | The PR gave its turn up, and your fix holds: this run found the gate green on what would land now, and merged nothing. | Wake the coordinator and stop. You are told when the PR's next turn comes; then run the command again. |
 
-**A turn covers only the sync, the gate and the merge.** The first time the command stops with
+**A turn covers only putting the PR together with the target, the gate and the merge.** The first time the command stops with
 `conflict` or `gate_red`, the PR **gives its turn up** — the result says `"turn": "given_up"` — so
 that other finished PRs land while you fix this one. Nothing else changes for you: wake the
 coordinator once, right away and without waiting for an answer, then do exactly what the table says —
-fix it here, commit, run the command again. Off the turn the command still syncs and gates, and
+fix it here, commit, run the command again. Off the turn the command still gates what would land, and
 stops with `conflict` or `gate_red` as often as it takes; it merges nothing, and ends with
 `awaiting_turn` once your fix holds. (Just started here, and the first result already says
 `given_up`? The PR gave its turn up before you came: the same applies.) A PR gives its turn up **once**: on its next turn a `conflict` or

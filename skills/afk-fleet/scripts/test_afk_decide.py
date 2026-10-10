@@ -304,7 +304,11 @@ def test_a_batchs_turn_is_one_marker_on_every_member_and_leaving_it_is_remembere
     for other in ({"ts": 501}, {"instance": "fl-2"}, {"instance": None, "ts": None}):
         assert not d.landed_under(rec, {**claim, **other}), other
     assert not d.landed_under(None, claim)
-    assert not d.landed_under(d.single_turn(None, "fl-1", 600), claim)     # no batch landed it
+    # …and so did a PR stacked alone, on a turn of its own (ADR-0046) — but not on
+    # a marker that holds no turn: it gave that turn up, and landed nothing on it
+    own = d.single_turn(None, "fl-1", 600)
+    assert d.landed_under(own, claim)
+    assert not d.landed_under(d.given_up_turn(own, 700, "conflict", "h"), claim)
 
     # leaving: the marker holds NO turn, whoever reads it — and remembers why
     for why in d.UNBATCHED:
@@ -559,7 +563,7 @@ def test_a_stack_is_read_back_from_its_commits():
     # a fix titled like member 14's commit is still a fix: 14 is not on this stack
     assert stacked == {12: "a1", 13: "b2"} and fixes == ["c3", "d4", "e5", "f6"]
     assert d.read_stack([], {12}) == ({}, [])
-    said = d.batch_landed_comment("abc123", "main", "fl-1-5", [12, 13])
+    said = d.landed_comment("abc123", "main", "fl-1-5", [12, 13])
     assert "landed on `main` as abc123" in said and "#12, #13" in said and "did not mark this PR merged" in said
 
 

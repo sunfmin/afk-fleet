@@ -122,8 +122,8 @@ an answer)
 The repo-local build/test command (`gate.local_command`) that, in `gate.ci: local` mode, *is* the
 completion gate — promoted from the worker's optional pre-PR filter to the only machine verification
 a PR must pass (ADR-0012). It runs twice in a PR's life: the **worker** runs it after its pre-PR
-**sync**, so it tests "my code + current base"; and the worker's **landing** runs it again, after the
-landing's **sync**, in the same worktree. The invariant both runs serve: *what lands on the target
+**sync**, so it tests "my code + current base"; and the worker's **landing** runs it again, on what
+it is about to land, in the same worktree. The invariant both runs serve: *what lands on the target
 branch was tested in the form it lands.* A green run on a committed tree becomes a **recorded gate
 run**, and a landing skips its own run when one stands for the tree that would land. A run is on a
 committed tree only when the worktree is exactly its commit before the run and after it — nothing
@@ -155,7 +155,7 @@ The one way a worker branch catches up with its base: merging `origin/<base>` in
 never rebasing (ADR-0012). It happens twice in a PR's life: the **worker** syncs and pushes right
 before its pre-PR **local gate**, so integration conflicts surface inside the worker's own session,
 where they are cheapest to fix; and the worker's **landing** syncs again, on its **landing turn**, picking up
-whatever the base gained since — a conflict there is left in progress for the same worker to resolve, off the turn the first time (ADR-0045). Merge rather than rebase because a rebase drops
+whatever the base gained since — a conflict there is left in progress for the same worker to resolve, off the turn the first time (ADR-0045). Where **merge batches** form, that second sync is made only for a PR that needs one — it conflicts with the base's tip, or its landing's gate was red: a PR that merges cleanly is stacked on the base instead, and its branch gains no merge (ADR-0046). Merge rather than rebase because a rebase drops
 merge commits and re-ignites the conflicts already resolved inside them — and those merge commits
 land on the target as they are: a PR lands as a merge commit, never squashed (ADR-0034). It is not an option: there is no config key for it (ADR-0038).
 _Avoid_: rebase (retired from the merge path), rebase onto latest, update branch
@@ -409,16 +409,18 @@ itself; nobody takes it)
 **Landing**:
 What a **worker** does on its **landing turn**, with one command in its own worktree (`afk land`):
 **sync** with the merge target → push → the machine gate on that exact head → merge pinned to the
-gated head. It stops with an outcome the worker acts on itself: a **sync** conflict is left in
+gated head. Where **merge batches** form it lands as a batch of one instead, with no sync of the
+branch: the PR's head is merged onto the target's tip with one merge commit, that commit is gated,
+and it is pushed to the target as a fast-forward — the push a moved target refuses (ADR-0046). It stops with an outcome the worker acts on itself: a **sync** conflict is left in
 progress and resolved in place, a red gate is fixed in place, and the worker lands again — no round
 trip through the tick, no **retry** spent, the PR kept. The turn is kept only from a PR's second turn
 on: the first such stop **gives the turn up**, and the worker fixes off it. Run off the turn, the
-same command still syncs and gates and merges nothing; green there, the PR is **ready again**
+same command still gates what would land and merges nothing; green there, the PR is **ready again**
 (`awaiting_turn`), the worker **wakes** the launcher and stops, and the PR waits for its next turn at
 the head of the **merge queue**. Nothing lands off a turn (ADR-0045). Checks that must run on the head
 it pushed are waited for by the landing itself, up to a bound. A gate run or that wait is long, so
 right before the merge the landing reads the turn and the target's tip again: a turn no longer its
-own lands nothing, and a target that moved is synced with and gated by the next run. Where the next move is the
+own lands nothing, and a target that moved is gated on by the next run. Where the next move is the
 tick's (checks still running when that bound runs out, a verify owed on a moved head, absent checks) the
 worker **wakes** the launcher and stops, and the tick tells it to land again. The claim and the
 worktree are settled by the next cycle, from the claim whose issue is now closed (ADR-0027).
@@ -429,7 +431,8 @@ merge-time gate run (the gate run is the landing's)
 **Merge batch**:
 One **landing turn** held by several finished PRs of a **fleet instance** at once, so that they land
 behind ONE run of the **local gate** instead of one each (ADR-0029; `gate.ci: local` only, and
-never an option: where it can form it does, ADR-0034). Its whole record is the turn marker on every member PR, naming the batch,
+never an option: where it can form it does, ADR-0034). Where it can form, a PR that lands alone lands
+the same way — stacked, gated, pushed — by its own worker, on a turn that is still a single PR's (ADR-0046). Its whole record is the turn marker on every member PR, naming the batch,
 its members and its phase — `stacking`, `gating` or `fixing` — and it is the only place the members
 are kept: the batch's worktree holds no list of them. A **batch worker** stacks the members
 on the target's tip with one merge commit per PR, in **merge queue** order, gates the stack once, and

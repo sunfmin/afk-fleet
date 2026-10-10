@@ -2943,9 +2943,10 @@ def _close_terminals(w):
 
 def test_a_worker_lands_its_own_pr_on_the_turn_the_fleet_grants():
     """gate.ci: local, the whole landing: the tick grants the turn, and the worker
-    — in its own worktree, with the one command its brief gives it — syncs, pushes,
-    gates and merges. What merges is the SYNCED tree, and it is that tree the gate
-    ran on. The claim and the worktree are the next cycle's to settle."""
+    — in its own worktree, with the one command its brief gives it — stacks its PR
+    on the target's tip, gates that commit and pushes it. What lands is the STACKED
+    tree, and it is that tree the gate ran on; the branch gains no sync merge
+    (ADR-0046). The claim and the worktree are the next cycle's to settle."""
     with world(issues=[issue(3, "ready-for-agent")]) as w:
         # green ONLY on the combined tree: the worker's file and what landed meanwhile
         gate = local_gate("test -f feature3.txt && test -f landed-meanwhile.txt")
@@ -2993,14 +2994,6 @@ def test_a_worker_lands_its_own_pr_on_the_turn_the_fleet_grants():
         assert w.afk(*_turn(3, *gate, now=T0 + 90))["outcome"] == "landing"
         assert w.comments(30) == [note] and len(w.terminals()[0]["sent"]) == 2
 
-        # gh refusing the merge is an error, and nothing is settled on it
-        w.set(fail=["pr merge"])
-        assert "pr merge" in _land_error(w, 3, wt, *gate)
-        assert w.pr(30).get("state", "open") == "open" and "已合并,完成" not in w.board(3)
-        synced = w.sb.remote_ref(f"refs/heads/{branch}")
-        assert synced != pr_head                               # …though the sync was pushed
-        w.set(fail=[])
-
         # the brief names ONE command to land with, carrying the run's config — and
         # that line lands the PR as written
         [line] = [ln.strip() for ln in brief.splitlines() if " land --issue " in ln]
@@ -3009,19 +3002,24 @@ def test_a_worker_lands_its_own_pr_on_the_turn_the_fleet_grants():
                            text=True, env=w.env)
         r = json.loads(p.stdout)
         assert p.returncode == 0 and (r["outcome"], r["pr"], r["synced"], r["head"]) == \
-            ("merged", 30, False, synced), r
-        # the landing gh refused had gated this very head, green: that run is on
-        # record, so this one does not gate it again (ADR-0030)
-        assert r["gate"] == {"status": "green", "source": "recorded", "head": synced,
+            ("merged", 30, False, pr_head), r
+        # what was gated is the commit that landed: the PR stacked on the target's tip
+        synced = r["commit"]
+        assert r["gate"] == {"status": "green", "source": "run", "head": synced,
                              "command": "test -f feature3.txt && test -f landed-meanwhile.txt",
-                             "recorded_at": r["gate"]["recorded_at"]}
-        # gh was pinned to the gated head, and asked for a merge commit
-        assert w.pr(30)["merged"] == {"head": synced, "delete_branch": True}
-        # what landed contains both sides, by MERGE (the base tip is an ancestor)
+                             "not_trusted": r["gate"]["not_trusted"]}
         assert w.sb.remote_ref(f"refs/heads/{w.sb.base}") == synced
         assert {"feature3.txt", "landed-meanwhile.txt"} <= w.remote_files(w.sb.base)
+        # ONE merge commit on the target's own line: the tip it was stacked on, then
+        # the PR's own head — unmoved, so the branch carries no sync merge, and
+        # GitHub shows the PR merged by itself
         git(w.cwd, "fetch", "-q", "origin", w.sb.base)
-        assert git(w.cwd, "merge-base", base_tip, synced) == base_tip
+        assert git(w.cwd, "log", "-1", "--format=%P%n%s%n%b", synced).splitlines() == \
+            [f"{base_tip} {pr_head}", "feature 3 (#30)", "Closes #3"]
+        assert w.pr(30)["merged"] == {"pushed": True, "head": pr_head}
+        # the worker's worktree is back on its branch, as it left it
+        assert git(wt, "rev-parse", "--abbrev-ref", "HEAD") == branch
+        assert git(wt, "rev-parse", "HEAD") == pr_head and git(wt, "status", "--porcelain") == ""
         assert "已合并,完成" in w.board(3) and "#30" in w.board(3) and "`me`" in w.board(3)
         assert w.issue(3)["state"] == "closed" and not w.sb.remote_ref(f"refs/heads/{branch}")
 
@@ -3100,13 +3098,17 @@ def test_a_red_gate_on_the_turn_is_the_workers_to_fix_and_spends_nothing():
                          "echo 'FAIL TestNames' >&2 && test -f fixed.txt")
         assert w.afk(*_turn(4, *red))["outcome"] == "granted"
 
-        # it runs IN the worktree, on the synced tree; stderr is part of the log
+        # it runs IN the worktree, on the PR stacked on the target; stderr is part of the log
         r = _land(w, 4, wt, *red, now=T0 + 10)
         assert (r["outcome"], r["synced"], r["pr"]) == ("gate_red", True, 40), r
         assert (r["gate"]["status"], r["gate"]["exit_code"], r["gate"]["excerpt"]) == \
             ("red", 1, "FAIL TestNames")
-        # the sync was pushed (the PR shows what was gated); the target was not touched
+        # a red stack is the one case a clean PR's branch is synced: the target is
+        # merged into it and pushed, so the worker fixes the tree that was red
+        # (ADR-0046); the target was not touched
         assert r["head"] == w.sb.remote_ref(f"refs/heads/{branch}") != pr_head
+        assert r["head"] == git(wt, "rev-parse", "HEAD") and git(wt, "status", "--porcelain") == ""
+        assert git(wt, "log", "-1", "--format=%P").split() == [pr_head, base_tip]
         assert w.sb.remote_ref(f"refs/heads/{w.sb.base}") == base_tip
         # the failure is durable where a later tick — and a human — can re-read it
         [note] = w.state()["pr_comments"]["40"]
@@ -3147,7 +3149,7 @@ def test_a_red_gate_on_the_turn_is_the_workers_to_fix_and_spends_nothing():
         r = _land(w, 4, wt, *red)
         assert (r["outcome"], r["synced"], r["head"], r["gate"]["source"]) == \
             ("merged", False, fixed, "recorded"), r
-        assert w.pr(40)["merged"] == {"head": fixed, "delete_branch": True}
+        assert w.pr(40)["merged"] == {"pushed": True, "head": fixed}
 
 
 def test_a_sync_conflict_on_the_turn_is_resolved_in_place_by_the_worker():
@@ -3205,14 +3207,15 @@ def test_a_sync_conflict_on_the_turn_is_resolved_in_place_by_the_worker():
         assert "uncommitted" in _land_error(w, 2, wt, *gate)
         git(wt, "commit", "-qm", "merge main: keep both")
 
-        # fixed: off the turn the landing syncs — with what landed meanwhile too —
-        # and gates, and merges NOTHING; the PR is ready again
+        # fixed: off the turn the landing pushes the resolution, gates the PR stacked on
+        # the target — what landed meanwhile included, with no second sync of the
+        # branch — and merges NOTHING; the PR is ready again
         r = _land(w, 2, wt, *gate, now=T0 + 30)
         assert (r["outcome"], r["turn"], r["synced"], r["gate"]["status"]) == \
             ("awaiting_turn", "given_up", True, "green"), r
         assert w.sb.remote_ref(f"refs/heads/{w.sb.base}") == tip and "merged" not in w.pr(20)
         assert w.sb.remote_ref(f"refs/heads/{d['branch']}") == r["head"]
-        assert os.path.exists(os.path.join(wt, "feature3.txt"))
+        assert not os.path.exists(os.path.join(wt, "feature3.txt"))
         [mark] = _turns(w, 20)
         assert mark.startswith(f"<!--afk:turn instance=me at={T0 + 30} stopped=awaiting_turn "
                                f"head={r['head']} given_up={T0 + 10} released=1-->\n"), mark
@@ -3444,10 +3447,10 @@ def _during_gate(w, name, *lines):
 
 
 def test_a_target_that_moves_while_the_gate_runs_refuses_the_merge():
-    """#126. The merge is pinned to the PR's head, not to the target: a target
-    that moved after the sync would make the merge commit a tree no gate run saw.
-    The landing reads the target's tip again before it merges, and the next
-    `afk land` syncs with it and gates that."""
+    """#126, as ADR-0046 keeps it: what is gated is the PR stacked on the target's
+    tip, and it lands by a fast-forward push — the only lock. A target that
+    moved while the gate ran refuses the push, nothing lands, and the next
+    `afk land` stacks on the new tip and gates that."""
     with world(issues=[issue(3, "ready-for-agent")]) as w:
         seed = os.path.join(w.sb.root, "seed")
         push = f"HEAD:refs/heads/{w.sb.base}"
@@ -3469,13 +3472,15 @@ def test_a_target_that_moves_while_the_gate_runs_refuses_the_merge():
         moved = w.sb.remote_ref(f"refs/heads/{w.sb.base}")
         assert "feature3.txt" not in w.remote_files(w.sb.base)
         assert _mine(w, gate, 3) == ("landing", "landing", "target_moved")
-        # run again: synced with the new tip, gated on THAT tree, merged
+        assert git(wt, "rev-parse", "HEAD") == pr_head == w.sb.remote_ref(f"refs/heads/{d['branch']}")
+        # run again: stacked on the new tip, gated on THAT tree, landed — and the
+        # branch was never synced for either run
         r = _land(w, 3, wt, *gate)
-        assert (r["outcome"], r["synced"], r["gate"]["source"]) == ("merged", True, "run"), r
-        assert r["head"] != pr_head and w.pr(30)["merged"]["head"] == r["head"]
+        assert (r["outcome"], r["synced"], r["gate"]["source"]) == ("merged", False, "run"), r
+        assert r["head"] == pr_head == w.pr(30)["merged"]["head"]
         assert {"feature3.txt", "landed-during-gate.txt"} <= w.remote_files(w.sb.base)
         git(w.cwd, "fetch", "-q", "origin", w.sb.base)
-        assert git(w.cwd, "merge-base", moved, r["head"]) == moved
+        assert git(w.cwd, "log", "-1", "--format=%P", r["commit"]).split() == [moved, pr_head]
 
 
 def test_a_turn_revoked_while_the_gate_runs_refuses_the_merge_and_changes_nothing():
@@ -3611,7 +3616,8 @@ def test_a_recorded_worker_gate_run_is_not_repeated_by_the_landing():
         r = _land(w, 3, wt, *gate, now=int(time.time()))
         assert (r["outcome"], r["synced"], r["head"]) == ("merged", False, head), r
         # the outcome says the gate was trusted, not run, and names the head that landed
-        assert r["gate"] == {"status": "green", "source": "recorded", "head": head,
+        # — the PR stacked on a target that had not moved holds the tree the worker gated
+        assert r["gate"] == {"status": "green", "source": "recorded", "head": r["commit"],
                              "command": command, "recorded_at": r["gate"]["recorded_at"]}
         assert count() == 1 and w.pr(30)["merged"]["head"] == head
 
@@ -3629,7 +3635,7 @@ def test_a_recorded_worker_gate_run_is_not_repeated_by_the_landing():
         assert head != gated
         w.afk(*_turn(4, *gate))
         r = _land(w, 4, wt, *gate)
-        assert (r["outcome"], r["gate"]["source"], r["gate"]["head"]) == ("merged", "recorded", head), r
+        assert (r["outcome"], r["gate"]["source"], r["head"]) == ("merged", "recorded", head), r
         assert count() == 2
 
 
@@ -4183,11 +4189,13 @@ def test_a_turn_with_no_terminal_is_delivered_by_continuation_never_from_base():
         told = _told(w.terminals()[-1])
         assert f"**Your branch:** `{d7['branch']}-2`" in told and f"`{d7['branch']}`" in told
         r = _land(w, 7, wt7, *gate)
-        assert (r["outcome"], r["synced"]) == ("merged", True), r
-        assert w.pr(70)["merged"] == {"head": r["head"], "delete_branch": True} and r["head"] != head7
+        assert (r["outcome"], r["synced"], r["head"]) == ("merged", False, head7), r
+        assert w.pr(70)["merged"] == {"pushed": True, "head": head7}
         assert {"feature7.txt", "landed-later.txt"} <= w.remote_files(w.sb.base)
         git(w.cwd, "fetch", "-q", "origin", w.sb.base)
-        assert git(w.cwd, "merge-base", base_tip, r["head"]) == base_tip
+        assert git(w.cwd, "log", "-1", "--format=%P", r["commit"]).split() == [base_tip, head7]
+        # the stack was made and gated in this worktree, which is back on ITS branch
+        assert git(wt7, "rev-parse", "--abbrev-ref", "HEAD") == f"{d7['branch']}-2"
 
     # a delivery that fails AFTER the record is repaired by the paths that exist: the
     # claim is already `landing`, and the orphan's continuation is started on the turn
@@ -4374,6 +4382,86 @@ def test_a_merge_batch_lands_three_prs_behind_one_gate_run():
         assert [x["linkedIssue"] for x in w.worktrees()] == [4] and not os.path.isdir(bwt)
         assert not [ref for ref in w.sb.all_refs() if "afk-batch" in ref]
         assert w.afk("rebuild", *ME, *R, *NOW, *gate)["mine"] == []
+
+
+def test_prs_landed_one_after_another_leave_one_merge_commit_each_and_no_sync_merge():
+    """ADR-0046. Where merge batches form, a PR that lands alone lands like a
+    batch of one: stacked on the target's tip, gated there, pushed as a
+    fast-forward. Three clean PRs landed one after another — the target moving
+    under the second and the third — put three merge commits on the target's own
+    line and not one sync merge on a branch."""
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2, 3)]) as w:
+        # green only on everything landed so far: each run is of a stack, not a branch
+        gate = _counted(w, "test -f feature1.txt")
+        d = {n: with_pr(w, n, n * 10, gate=gate) for n in (1, 2, 3)}
+        base0 = _target(w)
+        # a landing killed mid-gate left #3's worktree on its stack: the next one
+        # starts from the branch all the same
+        git(d[3][0]["worktree"], "checkout", "-q", "--detach", base0)
+        for n in (1, 2, 3):
+            (started, head), tip = d[n], _target(w)
+            assert w.afk(*_turn(n, *gate))["outcome"] == "granted"
+            r = _land(w, n, started["worktree"], *gate)
+            assert (r["outcome"], r["synced"], r["head"], r["commit"]) == \
+                ("merged", False, head, _target(w)), r
+            # the PR's head was never moved, and is the merge's second parent: GitHub
+            # shows the PR merged, its issue is closed and its branch deleted
+            assert w.pr(n * 10)["merged"] == {"pushed": True, "head": head}
+            assert w.issue(n)["state"] == "closed"
+            assert not w.sb.remote_ref(f"refs/heads/{started['branch']}")
+            git(w.cwd, "fetch", "-q", "origin", w.sb.base)
+            assert git(w.cwd, "log", "-1", "--format=%P", r["commit"]).split() == [tip, head]
+            assert git(started["worktree"], "rev-parse", "--abbrev-ref", "HEAD") == started["branch"]
+            # …and the next pass releases the claim, as for a batch member
+            assert _mine(w, gate, n)[0] == "closed"
+            assert w.afk("release", str(n), *ME, *R, *gate)["released"] is True
+            assert w.claimed_by(n) is None
+        assert _gate_runs(w) == 3
+        # the target's own line: three merge commits, one per PR…
+        assert [(s, b) for _, s, b in _history(w, base0)] == \
+            [(f"feature {n} (#{n * 10})", f"Closes #{n}") for n in (1, 2, 3)]
+        # …and everything they brought is the PRs' own work: no `Merge commit '<sha>'
+        # into <branch>`, no merge at all but those three
+        everything = git(w.cwd, "log", "--format=%s", f"{base0}..{_target(w)}").splitlines()
+        assert sorted(everything) == sorted(
+            [f"feature {n} (#{n * 10})" for n in (1, 2, 3)] +
+            [f"work: feature{n}.txt" for n in (1, 2, 3)]), everything
+        assert len(git(w.cwd, "rev-list", "--merges", f"{base0}..{_target(w)}").split()) == 3
+
+
+def test_a_pr_stacked_alone_whose_finishing_was_cut_is_settled_by_the_next_pass():
+    """A PR stacked alone lands by a push, like a batch member, so what follows
+    the push can be cut the same two ways — and is settled the same way, from the
+    commit on the target (ADR-0046)."""
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
+        gate = _counted(w)
+        d = {n: with_pr(w, n, n * 10, gate=gate) for n in (1, 2)}
+
+        # GitHub never shows the PR merged: its branch is left, and the release
+        # closes the PR with the commit that landed it
+        w.afk(*_turn(1, *gate))
+        w.set(pushes_never_merge=True)
+        r = _land(w, 1, d[1][0]["worktree"], *gate, "--merged-timeout", "0")
+        assert r["outcome"] == "merged" and r["commit"] == _target(w), r
+        assert w.issue(1)["state"] == "closed" and w.pr(10).get("state", "open") == "open"
+        assert w.sb.remote_ref(f"refs/heads/{d[1][0]['branch']}") == d[1][1]
+        assert w.afk("release", "1", *ME, *R, *gate)["closed_pr"] == 10
+        [said] = w.state()["pr_comments"]["10"]
+        assert r["commit"] in said and "stacked on it as one merge commit" in said
+        assert w.pr(10)["state"] == "closed"
+        assert not w.sb.remote_ref(f"refs/heads/{d[1][0]['branch']}")
+        w.set(pushes_never_merge=False)
+
+        # cut after the push, before the issue was closed — on a target GitHub
+        # closes no issue for: the claim reads `landed`, never a worker to ask after
+        w.afk(*_turn(2, *gate))
+        w.set(default_branch="some-other-branch", fail=["issue close"])
+        assert "issue close" in _land_error(w, 2, d[2][0]["worktree"], *gate)
+        w.set(fail=[])
+        assert w.pr(20)["state"] == "merged" and w.issue(2)["state"] == "open"
+        assert _mine(w, gate, 2)[0] == "landed"
+        assert w.afk("release", "2", *ME, *R, *gate)["released"] is True
+        assert w.issue(2)["state"] == "closed" and w.claimed_by(2) is None
 
 
 def test_a_batched_pr_github_does_not_show_merged_keeps_its_branch_and_is_closed_by_the_next_cycle():
