@@ -1870,16 +1870,17 @@ def test_a_hand_edited_attempt_label_costs_no_edit_and_no_attempt():
     """`afk-attempt/<n>` is the fleet's to write, but a human can: a count spelled
     another way, or a label under the prefix that is no count at all."""
     starting = d.ATTEMPT_STARTING
-    assert d.current_attempt(["afk-attempt/01"]) == 1
+    # neither is an attempt (`fleet_number`): the issue reads as never retried
+    assert d.current_attempt(["afk-attempt/01"]) == 0
     assert d.current_attempt(["afk-attempt/²", "afk-attempt/x"]) == 0     # a digit, not a number
-    # counted once more: the odd spelling goes out in the edit that writes the next count
+    # the odd spellings go out in the edit that writes the first count
     step = d.next_attempt(d.current_attempt(["afk-attempt/01", "afk-attempt/x"]), 2)
-    assert step == {"action": "retry", "attempt": 2, "to_label": "afk-attempt/2"}
+    assert step == {"action": "retry", "attempt": 1, "to_label": "afk-attempt/1"}
     assert d.retry_labels(["afk-attempt/01", "afk-attempt/x"], step["to_label"]) == \
-        (["afk-attempt/2", starting], ["afk-attempt/01", "afk-attempt/x"])
+        (["afk-attempt/1", starting], ["afk-attempt/01", "afk-attempt/x"])
     # the same failure again: the attempt it already made, and no edit — the count is
-    # the number `to_label` says, however it is spelled and whatever sits beside it
-    for labels in (["afk-attempt/01", starting], ["afk-attempt/1", starting, "afk-attempt/x"]):
+    # the number `to_label` says, whatever sits beside it
+    for labels in (["afk-attempt/1", starting], ["afk-attempt/1", starting, "afk-attempt/x"]):
         again = d.next_attempt(d.current_attempt(labels), 2, counted=d.attempt_starting(labels))
         assert (again["action"], again["attempt"]) == ("retry", 1), labels
         assert d.retry_labels(labels, again["to_label"]) == ([], []), labels
@@ -1887,6 +1888,64 @@ def test_a_hand_edited_attempt_label_costs_no_edit_and_no_attempt():
     cfg = d.resolve_config({})
     assert d.escalation_labels(["afk-attempt/01", "afk-attempt/x", starting], cfg)[1] == \
         ["afk-attempt/01", starting, "afk-attempt/x"]
+
+
+# Text that is not a number the fleet wrote, though a digit test or `int()` takes
+# each for one: too long (19 digits, and past the length `int()` itself refuses),
+# spelled with leading zeros, in digits outside ASCII, or dressed as a number.
+NOT_FLEET_NUMBERS = ["9" * 19, "1" + "0" * 200, "7" * 4301, "007", "00", "٧", "١٢", "７", "²", "1²",
+                     "৩", "+7", "-7", "1_0", "1.5", "1e3", "0x7", "x", "7x"]
+
+
+def test_a_number_is_one_only_as_the_fleet_writes_it():
+    rng = random.Random(108)
+    for n in [0, 1, 7, 10, 10 ** 17, 10 ** 18 - 1, *(rng.randrange(10 ** rng.randint(1, 18))
+                                                    for _ in range(200))]:
+        assert d.fleet_number(str(n)) == n
+    for junk in [*NOT_FLEET_NUMBERS, "", " 7", "7 ", "7\n", "\n7"]:
+        assert d.fleet_number(junk) is None, junk
+    # any text at all is answered, never raised on
+    alphabet = "0123456789٧７²৩+-_ .ex\n"
+    for _ in range(500):
+        text = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 24)))
+        n = d.fleet_number(text)
+        assert n is None or str(n) == text, text
+
+
+def test_no_number_from_outside_the_fleet_takes_a_record_reader_down():
+    """A comment, a commit subject and a label are anyone's to write. A number
+    the fleet did not write is a field that is missing — which is no record when
+    the kind requires it — and never an exception or another number's alias."""
+    for junk in NOT_FLEET_NUMBERS:
+        # on a ref: required → not a record; optional → absent
+        assert d.read_record(d.HEARTBEAT_RECORD, f"afk-heartbeat instance=a ts={junk}") is None, junk
+        assert d.read_record(d.CLAIM_RECORD, f"afk-claim instance=a host=h ts={junk}") == \
+            {"instance": "a", "host": "h"}, junk
+        # in a comment, and the valid record beside it is still the record — whichever came last
+        bad = {"id": 2, "body": f"<!--afk:escalation claim=c2 attempt={junk}-->"}
+        good = {"id": 3, "body": "<!--afk:escalation claim=c1 attempt=2-->"}
+        assert d.read_marker(d.ESCALATION_RECORD, bad["body"]) is None, junk
+        for comments in ([good, bad], [bad, good]):
+            assert d.latest_record(d.ESCALATION_RECORD, comments) == \
+                ({"claim": "c1", "attempt": 2}, good), junk
+        assert d.read_marker(d.VERDICT_RECORD, f"<!--afk:verdict n={junk} phase=blocked-->") == \
+            {"phase": "blocked"}, junk
+        # in a list: dropped, and the numbers around it kept
+        assert d.read_marker(d.VERDICT_RECORD, f"<!--afk:verdict n=5 blocked_by=3,{junk},4-->") == \
+            {"n": 5, "blocked_by": [3, 4]}, junk
+        assert "blocked_by" not in d.read_marker(d.VERDICT_RECORD,
+                                                 f"<!--afk:verdict n=5 blocked_by={junk}-->"), junk
+        # a batch's members: a pair with such a number on either side is no member
+        turn = d.read_marker(d.TURN_RECORD, "<!--afk:turn instance=a at=1 batch=a-1 "
+                                            f"members=1:10,{junk}:20,3:{junk},4:40-->")
+        assert turn["members"] == [{"issue": 1, "pr": 10}, {"issue": 4, "pr": 40}], junk
+        # an attempt label: not an attempt
+        assert d.current_attempt([f"afk-attempt/{junk}"]) == 0, junk
+        assert d.current_attempt([f"afk-attempt/{junk}", "afk-attempt/2"]) == 2, junk
+        # a commit subject and a PR body: no PR stacked, no issue closed
+        assert d.stacked_pr("p1 p2", f"feature (#{junk})") is None, junk
+    for junk in ("9" * 19, "7" * 4301, "٧", "１２", "²"):
+        assert d.issues_closed_by(f"Closes #{junk}", None, "o/r") == [], junk
 
 
 def test_render_status_board():
