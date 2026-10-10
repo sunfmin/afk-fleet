@@ -2322,9 +2322,9 @@ def turn_comment(turn: Turn) -> str:
                  f"worker is fixing that in place, off the turn — meanwhile other PRs land."
                  if fixing_off_turn(turn) else
                  "Its worker has fixed what the landing stopped on, and the PR is ready again: "
-                 "it waits for its next landing turn.")
+                 "it waits for its next landing turn, ahead of PRs that never held one.")
         text = (f"**afk-fleet: this PR gave its landing turn up** (fleet instance `{instance}`) "
-                f"— a turn covers only the bounded part of a landing. {state} A PR gives its "
+                f"— a turn covers only the sync, the gate and the merge. {state} A PR gives its "
                 f"turn up once: on its next turn a conflict or a red gate is fixed with the turn "
                 f"held.")
     else:
