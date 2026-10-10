@@ -102,7 +102,8 @@ escalate_label: ready-for-human        # applied (with ready_label removed, clai
   of the same tree since, or a record more than a day old, and the landing runs the gate itself.
   There is no switch: what this gives up is a second, independent sample of a flaky or
   machine-dependent gate on unchanged content. A gate that leaves untracked, un-ignored files
-  behind makes every run "not on a committed tree" — ignore its artifacts. A remote that refuses
+  behind — or rewrites a tracked one — makes every run "not on a committed tree": never recorded,
+  and refused by the landing. Ignore its artifacts, and keep fixers out of the gate. A remote that refuses
   `refs/afk/gate/*` is a bootstrap warning: nothing is recorded and every landing gates.
 - **Fingerprint gate.** Each cycle, `afk cycle` (code, zero LLM tokens) runs its reconciliation pass
   only when the digest of observable state moved. On a skipped cycle no tick runs — its only cost is

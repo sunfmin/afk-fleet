@@ -124,7 +124,9 @@ a PR must pass (ADR-0012). It runs twice in a PR's life: the **worker** runs it 
 **sync**, so it tests "my code + current base"; and the worker's **landing** runs it again, after the
 landing's **sync**, in the same worktree. The invariant both runs serve: *what lands on the target
 branch was tested in the form it lands.* A green run on a committed tree becomes a **recorded gate
-run**, and a landing skips its own run when one stands for the tree that would land. GitHub checks
+run**, and a landing skips its own run when one stands for the tree that would land. A run is on a
+committed tree only when the worktree is exactly its commit before the run and after it — nothing
+uncommitted, nothing untracked; a landing refuses to merge on any other run. GitHub checks
 are never read in this mode — the repo is
 expected to scope remote CI away from worker branches, and a target branch whose protection requires
 checks is rejected at bootstrap. A red run at landing is the worker's to fix in place; its log

@@ -2314,27 +2314,69 @@ def _drop_gate_record(rem: str, path: str, tree: str, command: str) -> None:
           afk_decide.gate_record_ref(tree, command)], check=False)
 
 
-def _run_and_record_gate(run: _Run, path: str, limits: _GateLimits,
-                         live: bool = False) -> tuple[Obj, str, list[str], str | None]:
+def _off_commit(path: str, head: str | None = None) -> list[str]:
+    """What keeps a worktree from being exactly a commit: its uncommitted and
+    untracked paths, as `git status --porcelain` lists them, and — given the
+    commit it was at — a HEAD that is no longer `head`. [] when it is the commit
+    and nothing else. Ignored files are not listed: a gate's own artifacts
+    belong in `.gitignore`. A worktree that is gone is not its commit either."""
+    status = _git(["-C", path, "status", "--porcelain"], check=False)
+    if status.returncode != 0:
+        return [f"the worktree {path} is gone"]
+    now = _git(["-C", path, "rev-parse", "HEAD"], check=False).stdout.strip()
+    moved = [f"HEAD moved from {head} to {now}"] if head and now != head else []
+    return moved + status.stdout.splitlines()
+
+
+# Why a run of the local gate was not a run of the committed tree — the two
+# halves of one rule, each said to whoever ran it (`afk gate`'s `detail`, a
+# landing's refusal).
+_DIRTY_BEFORE = ("the worktree had uncommitted or untracked files when the run started, so it "
+                 "tested a tree no commit holds")
+_DIRTY_AFTER = ("the run left the worktree other than the commit it started on, so the commit "
+                "may be red where the tree the run left is green")
+
+
+def _run_and_record_gate(run: _Run, path: str, limits: _GateLimits, live: bool = False
+                         ) -> tuple[Obj, str, tuple[str, list[str]] | None, str | None]:
     """One run of the local gate in a worktree, put on record when green →
-    (`_run_gate_command`'s verdict, the head it ran on, the uncommitted paths,
-    why the run is NOT on record — None when it is). Only a green run on a committed tree
-    is recorded: over uncommitted or untracked files it tested a tree no commit
-    holds. A red or timed-out run on a committed tree takes that tree's record
-    away — the latest run of a tree is the one believed. The record is `afk`'s,
-    made from an exit code it saw (ADR-0030)."""
+    (`_run_gate_command`'s verdict, the head it ran on, why it was NOT a run of
+    the committed tree — (`_DIRTY_BEFORE` | `_DIRTY_AFTER`, the paths) — or None,
+    why the run is NOT on record — None when it is).
+
+    A run is of the committed tree only when the worktree was exactly `head`
+    before it — nothing uncommitted, nothing untracked — and is exactly `head`
+    after it: a command that rewrites a tracked file passes on what it wrote,
+    not on what is committed. Only such a run, green, is recorded, and only such
+    a run is one a landing may merge on (`_gated`). A red or timed-out run that
+    started on a committed tree takes that tree's record away — the latest run
+    of a tree is the one believed. The record is `afk`'s, made from an exit
+    code it saw (ADR-0030)."""
     rem = run.rem
     head = _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip()
     tree = _git(["-C", path, "rev-parse", "HEAD^{tree}"]).stdout.strip()
-    dirty = _git(["-C", path, "status", "--porcelain"]).stdout.splitlines()
+    before = _off_commit(path)
+    off = (_DIRTY_BEFORE, before) if before else None
     gate = _run_gate_command(run.cfg, path, limits, live=live)
     if gate["status"] != "green":
-        if not dirty:
+        if not off:
             _drop_gate_record(rem, path, tree, gate["command"])
-        return gate, head, dirty, "the gate is red"
-    if dirty or _git(["-C", path, "rev-parse", "HEAD"], check=False).stdout.strip() != head:
-        return gate, head, dirty, "the run was not on a committed tree"
-    return gate, head, dirty, _write_gate_record(rem, path, tree, gate["command"], run.now())
+        return gate, head, off, "the gate is red"
+    after = [] if off else _off_commit(path, head)
+    if after:
+        off = (_DIRTY_AFTER, after)
+    if off:
+        return gate, head, off, "the run was not on a committed tree"
+    return gate, head, None, _write_gate_record(rem, path, tree, gate["command"], run.now())
+
+
+def _not_gated(path: str, why: str, paths: list[str]) -> RuntimeError:
+    """A landing's refusal of a gate run that was not of the committed tree."""
+    return RuntimeError(f"the worktree {path} is not the commit that would land — {why}. "
+                        f"Nothing was merged and nothing is on record. Commit what belongs to "
+                        f"the change, have the gate's own artifacts ignored (`.gitignore`), "
+                        f"discard the rest (`git status`), and run this again:\n"
+                        + "\n".join(paths[:20]))
 
 
 def _gated(run: _Run, path: str, limits: _GateLimits) -> Obj:
@@ -2349,7 +2391,14 @@ def _gated(run: _Run, path: str, limits: _GateLimits) -> Obj:
       {**`_run_gate_command`'s red verdict, "source": "run", "head", "not_trusted"}
 
     `head` is the commit that was asked about; `not_trusted` is why no record
-    stood in for the run."""
+    stood in for the run.
+
+    A run made now answers the question only when it was a run of the committed
+    tree — the rule a record is written by. Otherwise this raises, and nothing
+    lands: before the run, on a worktree with uncommitted or untracked files
+    (the gate is not run at all); after a green one that left the worktree other
+    than `head`. A record needs neither: it is of the tree, whatever lies around
+    it in the worktree."""
     command = run.cfg["gate"]["local_command"]
     head, tree = _git(["-C", path, "rev-parse", "HEAD", "HEAD^{tree}"]).stdout.split()
     record = _read_gate_record(run.rem, path, tree, command)
@@ -2357,9 +2406,16 @@ def _gated(run: _Run, path: str, limits: _GateLimits) -> Obj:
     if record and void is None:
         return {"status": "green", "source": "recorded", "head": head, "command": command,
                 "recorded_at": record["at"]}
-    gate, *_ = _run_and_record_gate(run, path, limits)
+    strays = _off_commit(path)
+    if strays:
+        raise _not_gated(path, "it has uncommitted or untracked files, and a run of the gate "
+                               "over them would test a tree no commit holds", strays)
+    gate, _, off, _ = _run_and_record_gate(run, path, limits)
     if gate["status"] != "green":
         return {**gate, "source": "run", "head": head, "not_trusted": void}
+    # a worktree removed under the run (a batch abandoned) is the caller's to report
+    if off and os.path.isdir(path):
+        raise _not_gated(path, *off)
     return {"status": "green", "source": "run", "head": head, "command": command,
             "not_trusted": void}
 
@@ -2380,17 +2436,18 @@ def cmd_gate(a: argparse.Namespace) -> Obj:
     if not cfg["gate"]["local_command"].strip():
         raise ValueError("gate.local_command is empty — there is no local gate to run")
     path = _git(["rev-parse", "--show-toplevel"]).stdout.strip()
-    gate, head, dirty, unrecorded = _run_and_record_gate(
+    gate, head, off, unrecorded = _run_and_record_gate(
         run, path, _GateLimits(a.gate_timeout, excerpt_lines=0), live=True)
     out = {k: gate[k] for k in ("status", "exit_code", "timed_out", "command")}
     if gate["status"] != "green":
         return {**out, "head": head, "recorded": False,
                 "detail": "the gate is red — nothing is on record; fix it and run this again"}
-    if dirty:
-        return {**out, "head": head, "recorded": False, "uncommitted": dirty[:20],
-                "detail": "green, but not on a committed tree — the worktree had uncommitted or "
-                          "untracked files, so this run proves nothing about a commit. Commit "
-                          "them (or ignore the gate's own artifacts) and run this again"}
+    if off:
+        why, paths = off
+        return {**out, "head": head, "recorded": False, "uncommitted": paths[:20],
+                "detail": f"green, but not on a committed tree — {why}. This run proves nothing "
+                          f"about a commit, and a landing refuses one like it. Commit them (or "
+                          f"ignore the gate's own artifacts) and run this again"}
     if unrecorded:
         return {**out, "head": head, "recorded": False, "not_recorded": unrecorded,
                 "detail": f"green on {head}, but the record could not be written — push it and "

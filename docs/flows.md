@@ -290,7 +290,10 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   `test_in_required_mode_the_turn_waits_for_checks_on_the_head_that_lands`) The local gate is not run
   twice on one tree, and only on a record `afk` itself made of that tree, wherever it was made.
   (ADR-0030; `test_a_recorded_worker_gate_run_is_not_repeated_by_the_landing`,
-  `test_a_recorded_gate_run_is_void_unless_it_is_of_the_tree_that_lands`)
+  `test_a_recorded_gate_run_is_void_unless_it_is_of_the_tree_that_lands`) A run counts — for a
+  record and for a landing alike — only when the worktree is exactly its commit before the run and
+  after it. (ADR-0030; `test_a_landing_accepts_only_a_gate_run_of_the_committed_tree`,
+  `test_a_batch_lands_only_on_a_gate_run_of_the_committed_stack`)
 - A worker starts from the commit the remote has, never a stale local branch, and is told the branch
   orca actually created. (ADR-0017;
   `test_dispatch_starts_a_worker_on_the_remote_base_tip_and_submits_its_prompt`)

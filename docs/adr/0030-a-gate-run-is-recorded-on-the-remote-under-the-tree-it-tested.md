@@ -58,6 +58,26 @@ tree with no record, and the gate runs on the combined tree — the defense agai
 each green and break each other is intact. What is trusted is one run, of one command, on the tree
 that lands, byte for byte.
 
+## Amendment (2026-10-10) — a landing merges only on a run of the committed tree
+
+Decision 4 kept an off-commit run out of the *record*; the landing that made the run still merged on
+it, and "committed" was measured only before the run. Both holes let a tree no commit holds stand
+behind a landing ([#109](https://github.com/sunfmin/afk-fleet/issues/109)). Now one rule, in one
+place (`_run_and_record_gate`), decides both what is recorded and what a landing accepts:
+
+- **A run is of the committed tree only when the worktree is exactly its commit before the run and
+  after it** — nothing uncommitted, nothing untracked, HEAD where it was. A gate that rewrites a
+  tracked file (a fixer), commits, or leaves an un-ignored artifact passed on what it left, not on
+  what is committed.
+- **`afk land` and `afk land --batch` refuse any other run** — an error naming the paths, nothing
+  merged, nothing recorded, the turn kept, no attempt spent. With files lying around the gate is not
+  run at all: the answer is known and the run is the lane's whole cost.
+- **A record needs neither check.** It is of a tree; what lies around the commit in the worktree
+  that reads it does not change what was tested.
+
+A refusal rather than a `gate_red` outcome: the gate was not red, and the fix is not in the code.
+It is the refusal an uncommitted change to a tracked file already got before the sync.
+
 ## What is given up
 
 - **The second sample on another machine.** A gate that depends on a toolchain version, a local

@@ -48,8 +48,16 @@ A PR may land only when **all** configured gates are green. Which **machine gate
   a worktree recreated from the pushed branch, another machine, another commit holding the same
   files. Anything else and the landing runs the gate exactly as above: the sync moved the head, the
   worker committed afterwards, the command changed, the worker typed the bare command (no record),
-  the run was over uncommitted or untracked files (no record), the same tree was run red or timed
-  out since (that deletes the record), the remote refused the ref. The outcome says which happened:
+  the run was over uncommitted or untracked files or left a tracked file changed (no record), the
+  same tree was run red or timed out since (that deletes the record), the remote refused the ref.
+  **The landing's own run is held to the rule a record is written by** — `afk land` and
+  `afk land --batch` alike: a green run counts only when the worktree was exactly its commit before
+  the run (nothing uncommitted, nothing untracked) and is exactly its commit after it. Otherwise the
+  landing **refuses** — an `"error"` naming the paths, nothing merged, nothing recorded, no attempt
+  spent: with files lying around it does not run the gate at all, and a run that rewrote a tracked
+  file, committed, or littered passed on something other than the commit that would land. The
+  worker commits or discards them and lands again. A recorded run needs neither check: it is of the
+  tree, whatever lies around it. The outcome says which happened:
   `gate.source: recorded` with `recorded_at`, or `gate.source: run` with `not_trusted: <why>`. The
   record is `afk`'s own, made from an exit code it observed; a worker reporting "the gate is
   green" proves nothing and leaves none. There is no switch. What is given up is a second,
