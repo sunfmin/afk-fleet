@@ -33,7 +33,8 @@ epic_labels: [epic, prd, wayfinder:map]   # never dispatched (a PRD is not a wor
                                       #   issue blocked by one is never waited on
 
 # --- workers ---
-concurrency: 3                        # max workers running at once
+concurrency: 3                        # max claims held at once, a worker each: a stale claim or a
+                                      #   frontier issue is taken only into a free slot under it
 
 # --- completion gate ---
 gate:

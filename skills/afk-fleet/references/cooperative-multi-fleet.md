@@ -48,8 +48,10 @@ each one runs is shown so the mechanism is legible, but the tick calls the tool.
   only keeps it there. A claim attempt that loses its race has still beaten — harmless: a heartbeat
   with no claim behind it protects nothing.
 - **Reclaim a stale peer claim → `afk reclaim <n> --instance <id> --expect-sha <sha>`.** Only the
-  `stale` list is reclaimable — a stale claim whose issue is still open. The takeover is atomic (two
-  reclaimers can't both win), and beats first, like a claim:
+  `stale` list is reclaimable — a stale claim whose issue is still open — and a tick reclaims one
+  only into a free slot under `concurrency`, lowest issue number first: the rest stay stale, for a
+  later tick or another fleet. The takeover is atomic (two reclaimers can't both win), and beats
+  first, like a claim:
   ```bash
   git push origin --force-with-lease="refs/afk/claim/$n:$sha_i_read" "$my_sha:refs/afk/claim/$n"
   ```

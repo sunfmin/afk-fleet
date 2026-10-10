@@ -1014,6 +1014,15 @@ def select_frontier(issues: list[EligibleIssue], ready_label: str, epic_labels: 
     return {"dispatch": dispatch, "excluded": excluded}
 
 
+def free_slots(concurrency: int, held: int) -> int:
+    """How many more claims a fleet holding `held` of them may take: `concurrency`
+    bounds the claims a fleet holds — a claim holds its slot whatever its worker
+    is doing — so it is what is left under the bound, and nothing at or over it.
+    The one count a tick takes a claim against, a stale peer's or a frontier
+    issue's alike."""
+    return max(0, concurrency - held)
+
+
 # --------------------------------------------------------------------------- #
 # Claim ownership + owner-liveness — the correctness-critical partition        #
 # --------------------------------------------------------------------------- #
@@ -3748,8 +3757,9 @@ class TickBooks:
     WRITES_BOARD: tuple[TickDid, ...] = ("granted", "abandoned", "retried", "dispatched",
                                          "reclaimed", "restarted")
 
-    def __init__(self, ws: WorkingSet) -> None:
+    def __init__(self, ws: WorkingSet, concurrency: int) -> None:
         self.ws = ws
+        self.concurrency = concurrency
         self.mine: dict[int, MineRow] = {r["number"]: r for r in ws["mine"]}
         self.judgments: list[Judgment] = []
         self.errors: list[Obj] = []
@@ -3817,9 +3827,11 @@ class TickBooks:
 
     @property
     def slots(self) -> int:
-        """The dispatch slots still free for the frontier."""
-        return (self.ws["free_slots"] + len(self.settled) - len(self._took)
-                - len(self._fresh))
+        """The slots still free for a claim this fleet does not hold yet — a stale
+        one, then the frontier. A frontier issue takes its slot when its start is
+        begun; none is free while the fleet holds `concurrency` claims or more."""
+        return free_slots(self.concurrency, len(self.mine) - len(self.settled)
+                          + len(self._took) + len(self._fresh))
 
     @property
     def in_flight(self) -> int:
@@ -3863,19 +3875,25 @@ def tick_plan(ws: WorkingSet, call: Call, config: Config) -> Plan:
     one PR or to one merge batch (`_turn_plan`) → nudge / restart / fail / park /
     escalate where the reason is on record, or the judgment that stands in for one →
     release `closed` and `landed` rows and `stale_closed` phantom locks → begin the starts:
-    continuations of claims already held, each `stale` claim reclaimed, then the
+    continuations of claims already held, then the `stale` claims and then the
     frontier into the free slots → finish every start begun, at once → heartbeat
     → status boards → what a finished batch left behind.
 
     A step that fails is recorded in `errors` and settles nothing: its claim is
     still held and the rest of the tick goes on. A start that fails to BEGIN
     ends the starting for this tick — it is orca or the remote that is unwell,
-    and every further dispatch would take a claim it cannot staff. A claim
-    settled earlier in the tick frees its slot for the frontier; a stale claim
-    taken uses one; a frontier issue a peer won comes off the frontier and uses
-    none.
+    and every further dispatch would take a claim it cannot staff.
+
+    `concurrency` bounds the claims this fleet holds, and a tick takes a claim
+    only into a free slot (`free_slots`): a continuation is of a claim already
+    held and takes none; a stale claim taken uses one, lowest issue number
+    first, and the ones past the slots stay stale for a later tick; then the
+    frontier, in its order. A claim settled earlier in the tick frees its slot;
+    a stale claim or a frontier issue a peer won uses none. A fleet holding
+    more claims than `concurrency` — after a takeover, or once the key is
+    lowered — takes nothing until it is back under.
     """
-    tick = TickBooks(ws)
+    tick = TickBooks(ws, config["concurrency"])
     run = tick.run
 
     # --- observe: the claims waiting on their worker ---
@@ -3932,8 +3950,9 @@ def tick_plan(ws: WorkingSet, call: Call, config: Config) -> Plan:
         if do == "dispatch":
             yield from begin(number, "dispatched")
     for row in ws["stale"]:
-        took = (yield from run("reclaim", issue=row["number"], sha=row["sha"])) \
-            if tick.starting else None
+        if tick.slots <= 0 or not tick.starting:
+            break
+        took = yield from run("reclaim", issue=row["number"], sha=row["sha"])
         if took and took["won"]:
             tick.take(row["number"])
             yield from begin(row["number"], "reclaimed")
@@ -4429,7 +4448,7 @@ def assemble_working_set(issues: list[Issue], prs: list[PullRequest], claims: li
        "peer_live": [{"number","instance"}...],
        "stale": [{"number","instance","sha"}...],   # sha feeds reclaim --expect-sha
        "stale_closed": [{"number","instance","sha"}...],  # sha feeds release --expect-sha
-       "free_slots": <how many workers may be dispatched: concurrency - len(mine)>,
+       "free_slots": <how many more claims I may take: `free_slots` of len(mine)>,
        "fingerprint": <digest of the same observables the gate hashes>,
        "now": now}
 
@@ -4508,6 +4527,6 @@ def assemble_working_set(issues: list[Issue], prs: list[PullRequest], claims: li
                           for n in part["peer_live"]],
             "stale": stale_rows(n for n in part["stale"] if n not in closed),
             "stale_closed": stale_rows(n for n in part["stale"] if n in closed),
-            "free_slots": max(0, int(config["concurrency"]) - len(mine)),
+            "free_slots": free_slots(int(config["concurrency"]), len(mine)),
             "fingerprint": fingerprint(issues, prs, claims),
             "now": now}
