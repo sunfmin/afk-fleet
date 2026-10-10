@@ -26,6 +26,8 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
+import pytest
+
 import afk_decide
 
 AFK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "afk.py")
@@ -819,3 +821,62 @@ def test_recovery_reads_pushed_progress_from_the_remote_alone():
         err = afk_error(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg,
                         "--set", "base_branch=no-such-base")
         assert "no-such-base" in err
+
+
+def _translating_locale():
+    """An installed locale git answers in a language other than English under, or
+    None when this machine has none (git built without its translations)."""
+    for name in ("zh_CN.UTF-8", "de_DE.UTF-8", "fr_FR.UTF-8", "es_ES.UTF-8"):
+        env = {**ENV, "LC_ALL": name, "LANGUAGE": name.split(".")[0]}
+        p = subprocess.run(["git", "fetch", os.devnull], capture_output=True, text=True,
+                           env=env, cwd=tempfile.gettempdir())
+        if p.returncode != 0 and "fatal: " not in p.stderr:
+            return env
+    return None
+
+
+def test_gits_answers_are_read_the_same_in_every_locale():
+    """What git says is read under one fixed message locale, so a machine set to
+    Chinese or German tells "the branch is absent" from "could not look" exactly as
+    an English one does."""
+    foreign = _translating_locale()
+    if foreign is None:
+        pytest.skip("no installed locale makes this git answer in another language")
+    with sandbox() as sb:
+        w = sb.clones[0]
+        cfg = json.dumps({"lease_ttl_seconds": TTL})
+        git(w, "push", "-q", "origin", f"{sb.base}:refs/heads/sunfmin/issue-31-pushed")
+        for env in (ENV, foreign):
+            # absent: a branch never pushed has nothing ahead, in any language
+            r = afk(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg,
+                    "--branch", "sunfmin/issue-31-never-pushed", env=env)
+            assert (r["branch"]["commits_ahead"], r["tier"]) == (None, 3), r
+            # could not look: an unreachable remote is an error, in any language
+            err = afk_error(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg,
+                            "--branch", "sunfmin/issue-31-never-pushed",
+                            "--remote", "no-such-remote", env=env)
+            assert "no-such-remote" in err, err
+            # …and so is a base the remote lacks, said in the words the scripts read
+            err = afk_error(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg,
+                            "--branch", "sunfmin/issue-31-pushed",
+                            "--set", "base_branch=no-such-base", env=env)
+            assert "couldn't find remote ref refs/heads/no-such-base" in err, err
+
+
+def test_a_present_branch_is_not_read_as_absent_for_prefixing_a_missing_base():
+    """Absent-versus-error is decided on the exact ref asked for: git naming the
+    missing base `main-gone` says nothing about the branch `main-g`, which is there."""
+    with sandbox() as sb:
+        w = sb.clones[0]
+        cfg = json.dumps({"lease_ttl_seconds": TTL})
+        git(w, "checkout", "-q", "-b", "main-g", sb.base)
+        with open(os.path.join(w, "work.txt"), "w") as f:
+            f.write("work\n")
+        git(w, "add", "-A")
+        git(w, "commit", "-qm", "work")
+        git(w, "push", "-q", "origin", "HEAD")
+        recover = ("recovery", "--issue", "31", "--no-worktree", "--config", cfg,
+                   "--branch", "main-g")
+        assert afk(w, *recover)["branch"]["commits_ahead"] == 1
+        err = afk_error(w, *recover, "--set", "base_branch=main-gone")
+        assert "main-gone" in err, err
