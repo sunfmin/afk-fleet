@@ -4139,6 +4139,111 @@ def test_a_dead_fleets_batch_is_abandoned_by_the_fleet_that_takes_its_claims():
         assert c["progress"].startswith("landing turn to #1; "), c
 
 
+def _cut_after_the_push(w, b, gate):
+    """`afk land --batch` cut after its push to a target that is not the default
+    branch — where GitHub closes no issue itself — and before it closed one."""
+    w.set(default_branch="some-other-branch", fail=["issue close"])
+    assert "issue close" in w.error("land", "--batch", b["batch"], *R, *NOW, *gate,
+                                    cwd=b["worktree"])
+    w.set(fail=[])
+
+
+def test_a_batch_cut_after_its_push_is_settled_by_the_next_cycle_from_the_target():
+    """The batch's stack is on the target and its worker was cut before it closed
+    an issue. GitHub shows the PRs merged, so no open PR carries the batch's
+    marker and nothing lists the batch — yet the work landed. The next cycle
+    reads that off the target: each member's issue is closed, its claim released
+    and its worktree removed; no worker is asked after, nudged or failed."""
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2, 3)]) as w:
+        gate = _counted(w)
+        d = {n: with_pr(w, n, n * 10, gate=gate)[0] for n in (1, 2)}
+        w.afk(*dispatch(3, *gate))                                    # still coding: never landed
+        base0 = _target(w)
+        b = w.afk(*_turn_batch(*gate))
+        _cut_after_the_push(w, b, gate)
+        assert [s for _, s, _ in _history(w, base0)] == ["feature 1 (#10)", "feature 2 (#20)"]
+        told = [len(t["sent"]) for t in w.terminals()]
+
+        # GitHub shows both PRs merged; both issues are open, both claims held
+        rows, order, batches = _batch_rows(w, gate)
+        assert [w.pr(p)["state"] for p in (10, 20)] == ["merged"] * 2
+        assert [w.issue(n)["state"] for n in (1, 2)] == ["open"] * 2
+        assert (order, batches) == ([], [])
+        assert rows == {1: ("landed", None, None), 2: ("landed", None, None),
+                        3: ("no_pr", None, None)}
+
+        c = tick(w, None, *gate, now=T0 + 10_000)                     # long past every grace
+        assert c["progress"].startswith("cleared #1, #2; ") and "errors" not in c, c
+        assert c["judgments"] == []
+        for n in (1, 2):
+            assert w.issue(n) == {"state": "closed", "labels": ["ready-for-agent"]}   # no attempt
+            assert w.claimed_by(n) is None and "已合并,完成" in w.board(n)
+            assert not os.path.isdir(d[n]["worktree"])
+        # nobody was nudged, and the batch's worktree and branch went with it
+        assert [len(t["sent"]) for t in w.terminals()][:len(told)] == told
+        assert [x["linkedIssue"] for x in w.worktrees()] == [3]
+        assert not os.path.isdir(b["worktree"])
+        assert not [ref for ref in w.sb.all_refs() if "afk-batch" in ref]
+        assert [m["number"] for m in w.afk("rebuild", *ME, *R, *NOW, *gate)["mine"]] == [3]
+
+    # an issue reopened after its landing, and claimed again, did not land again
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
+        gate = _counted(w)
+        for n in (1, 2):
+            with_pr(w, n, n * 10, gate=gate)
+        b = w.afk(*_turn_batch(*gate))
+        w.set(default_branch="some-other-branch")
+        assert _land_batch(w, b, *gate)["outcome"] == "landed"
+        tick(w, None, *gate)
+        w.set(issues=[{**i, "state": "open"} for i in w.state()["issues"]])
+        w.afk(*dispatch(1, *gate, "--now", str(T0 + 50)))
+        assert _batch_rows(w, gate)[0] == {1: ("no_pr", None, None)}
+
+
+def test_an_abandon_after_the_batchs_push_abandons_nothing_that_landed():
+    """The batch's worker was cut after its push and GitHub does not show the PRs
+    merged, so the batch is still listed — and an abandon reaches it. What landed
+    is not handed back to single landing: its issue is closed instead, and the
+    next cycle settles it. A batch that landed nothing is abandoned whole."""
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
+        gate = _counted(w)
+        d = {n: with_pr(w, n, n * 10, gate=gate)[0] for n in (1, 2)}
+        base0 = _target(w)
+        b = w.afk(*_turn_batch(*gate))
+        w.set(pushes_never_merge=True)
+        _cut_after_the_push(w, b, gate)
+        landed = _history(w, base0)
+        assert [s for _, s, _ in landed] == ["feature 1 (#10)", "feature 2 (#20)"]
+        assert _batch_rows(w, gate)[0] == {n: ("landing", "gating", None) for n in (1, 2)}
+        marked = [_turns(w, p) for p in (10, 20)]
+
+        r = w.afk(*_abandon(b["batch"], *gate, now=T0 + 600))
+        assert (r["outcome"], r["issues"], r["prs"], r["landed"]) == ("abandoned", [], [], [1, 2]), r
+        assert [_turns(w, p) for p in (10, 20)] == marked             # no marker says abandoned
+        for n in (1, 2):
+            assert w.issue(n)["state"] == "closed" and "已合并,完成" in w.board(n)
+        assert not os.path.isdir(b["worktree"])
+        c = tick(w, None, *gate, now=T0 + 700)
+        assert c["progress"].startswith("cleared #1, #2; ") and "errors" not in c, c
+        for i, n in enumerate((1, 2)):
+            assert w.pr(n * 10)["state"] == "closed" and w.claimed_by(n) is None
+            assert landed[i][0] in w.state()["pr_comments"][str(n * 10)][0]
+            assert not os.path.isdir(d[n]["worktree"])
+
+    # nothing landed: every member goes back to single landing, as before
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
+        gate = _counted(w)
+        for n in (1, 2):
+            with_pr(w, n, n * 10, gate=gate)
+        base0 = _target(w)
+        b = w.afk(*_turn_batch(*gate))
+        r = w.afk(*_abandon(b["batch"], *gate, now=T0 + 600))
+        assert (r["issues"], r["prs"], r["landed"]) == ([1, 2], [10, 20], []), r
+        assert _target(w) == base0 and [w.issue(n)["state"] for n in (1, 2)] == ["open"] * 2
+        assert _batch_rows(w, gate) == ({n: ("awaiting_turn", None, "abandoned") for n in (1, 2)},
+                                        [1, 2], [])
+
+
 def test_a_batch_is_formed_only_from_prs_that_are_free_to_land_together():
     """Who is batched. Never with the option off, in `required` mode, or while
     every PR owes an adversarial verify of its own; never a PR whose own worker

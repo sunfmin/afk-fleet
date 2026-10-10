@@ -134,19 +134,31 @@ def test_claim_status():
     assert d.claim_status(False, None, "local") == "no_pr"
 
     # every board phase a status is shown as is one the board renders — the tick
-    # never translates — and only a `closed` row has none
-    assert {st for st, phase in d.BOARD_PHASE_OF.items() if phase is None} == {"closed"}
+    # never translates — and only a row the tick releases has none: its board is
+    # final already (`closed`), or the release writes it (`landed`)
+    assert {st for st, phase in d.BOARD_PHASE_OF.items() if phase is None} == {"closed", "landed"}
     assert {p for p in d.BOARD_PHASE_OF.values() if p} <= set(d.STATUS_PHASES)
     assert (d.BOARD_PHASE_OF["failure"], d.BOARD_PHASE_OF["awaiting_ci"],
             d.BOARD_PHASE_OF["no_pr"]) == ("ci_failed", "pr_open", "claimed")
 
     # CLAIM_STATUSES is exactly what it can return: no status the docs were never
     # held to, and none listed that cannot happen
-    seen = {d.claim_status(has_pr, checks, ci, closed=closed, landing=landing)
+    seen = {d.claim_status(has_pr, checks, ci, closed=closed, landing=landing, landed=landed)
             for ci in d.GATE_CI_MODES for has_pr in (True, False)
             for checks in ("green", "red", "pending", None)
-            for closed in (True, False) for landing in (True, False)}
+            for closed in (True, False) for landing in (True, False)
+            for landed in (True, False)}
     assert seen == set(d.CLAIM_STATUSES)
+
+    # no open PR, the issue open, and its landing on the target: a merge batch
+    # pushed it and was cut before it closed the issue. Never `no_pr` — nobody is
+    # asked why work that landed has no PR. An open PR is still landing, and a
+    # closed issue is closed
+    for ci in d.GATE_CI_MODES:
+        assert d.claim_status(False, None, ci, landed=True) == "landed"
+        assert d.claim_status(False, None, ci, closed=True, landed=True) == "closed"
+        assert d.claim_status(True, "green", ci, landed=True) == "awaiting_turn"
+        assert d.claim_status(True, "green", ci, landing=True, landed=True) == "landing"
 
     # the issue is CLOSED but the claim is still mine — its worker landed the PR, or
     # an `afk close` crashed before releasing. Nothing else about it matters, and
@@ -235,6 +247,15 @@ def test_a_batchs_turn_is_one_marker_on_every_member_and_leaving_it_is_remembere
     assert (rec["unbatched"], rec["released"], rec["stopped"]) == (None, False, None)
     # held like any turn: by the instance that holds the claim, and by no other
     assert d.held_turn(rec, "fl-1") is rec and d.held_turn(rec, "fl-2") is None
+    # the PR landed its issue under a claim made before the batch's turn, by the
+    # instance that granted it — not one made since (the issue was reopened), not
+    # another instance's, not a claim that names nobody
+    claim = {"number": 1, "instance": "fl-1", "host": "h", "ts": 500, "sha": "c"}
+    assert d.landed_under(rec, claim) and d.landed_under(rec, {**claim, "ts": 100})
+    for other in ({"ts": 501}, {"instance": "fl-2"}, {"instance": None, "ts": None}):
+        assert not d.landed_under(rec, {**claim, **other}), other
+    assert not d.landed_under(None, claim)
+    assert not d.landed_under(d.single_turn(None, "fl-1", 600), claim)     # no batch landed it
 
     # leaving: the marker holds NO turn, whoever reads it — and remembers why
     for why in d.UNBATCHED:
@@ -2373,6 +2394,11 @@ def test_a_claim_settled_this_tick_frees_its_slot_for_a_dispatch_in_the_same_tic
     # three claims fill the fleet. One is parked, one escalated, one outlived its
     # issue: three slots, filled from the frontier before the tick ends — and a
     # dead peer's phantom lock, which was never a slot of mine, frees none
+    for settled in ("closed", "landed"):        # a `landed` row is released like a `closed` one
+        ws = _working_set(mine=[_row(3, settled)])
+        steps, done = _play(ws)
+        assert _brief(steps) == [("release", 3)] and done["did"]["cleared"] == [3], settled
+        assert d.asks_after(ws["mine"]) == [] and d.turn_order(ws["mine"]) == []
     mine = [_row(1), _row(2), _row(3, "closed")]
     ws = _working_set(mine=mine, frontier=[11, 12, 13, 14], stale_closed=[9])
     blocked = {1: "blockers_waiting", 2: "blocker_unmet"}

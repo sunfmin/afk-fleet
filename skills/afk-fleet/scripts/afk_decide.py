@@ -1063,11 +1063,12 @@ def classify_claims(claims: list[Claim], heartbeats: Mapping[str, float], me: st
 # re-rendered. The keys are the vocabulary the tick's instructions route on (a
 # test holds the docs to it). `merged` / `escalated` / `parked`, the board's
 # terminal phases, are written by the transitions that reach them.
-ClaimStatus = Literal["awaiting_turn", "landing", "awaiting_ci", "failure", "no_pr", "closed"]
+ClaimStatus = Literal["awaiting_turn", "landing", "awaiting_ci", "failure", "no_pr", "landed",
+                      "closed"]
 BOARD_PHASE_OF: dict[ClaimStatus, Optional[StatusPhase]] = {
     "awaiting_turn": "awaiting_turn", "landing": "landing",
     "awaiting_ci": "pr_open", "failure": "ci_failed", "no_pr": "claimed",
-    "closed": None}
+    "landed": None, "closed": None}
 CLAIM_STATUSES = tuple(BOARD_PHASE_OF)
 
 # What a PR's checks come to (`pr_checks_state`); no checks at all is None.
@@ -1075,7 +1076,8 @@ ChecksState = Literal["green", "red", "pending"]
 
 
 def claim_status(has_pr: bool, checks_state: ChecksState | None, ci_mode: GateCiMode,
-                 closed: bool = False, landing: bool = False) -> ClaimStatus:
+                 closed: bool = False, landing: bool = False,
+                 landed: bool = False) -> ClaimStatus:
     """
     Classify one of MY in-flight claims from its PR + checks → its `status`, one
     of CLAIM_STATUSES: what the tick does next.
@@ -1087,8 +1089,14 @@ def claim_status(has_pr: bool, checks_state: ChecksState | None, ci_mode: GateCi
                     (`afk land` cannot release the claim), or a human finished it
                     by hand
       landing:      the PR holds this fleet instance's landing turn (`held_turn`)
+      landed:       no open PR closes the issue, the issue is still open, and the
+                    target holds the commit a merge batch landed it with: the
+                    batch's finishing was cut short after its push (ADR-0029)
 
       closed         its leftover claim (and worktree) is released
+      landed         the same release, which closes the issue first — never the
+                     worker ladder: the work is on the target, and no attempt
+                     is spent on it
       no_pr          `afk no-pr` is asked why
       landing        `afk no-pr` is asked whether its worker is still at it — or,
                      when the landing stopped for the tick, `afk turn` again
@@ -1113,7 +1121,7 @@ def claim_status(has_pr: bool, checks_state: ChecksState | None, ci_mode: GateCi
     if closed:
         return "closed"
     if not has_pr:
-        return "no_pr"
+        return "landed" if landed else "no_pr"
     if landing:
         return "landing"
     if ci_mode == "local" or checks_state in ("green", None):
@@ -2129,6 +2137,21 @@ def held_turn(turn: Turn | None, owner: str | None) -> Turn | None:
     if turn and owner and turn["instance"] == owner and not turn["released"]:
         return turn
     return None
+
+
+def landed_under(turn: Turn | None, claim: Claim) -> bool:
+    """Did the PR that carries `turn` (`latest_turn`) land `claim`'s issue? Asked
+    of a PR whose merge commit on the target closes that issue — which a PR
+    landed long ago does too, for an issue since reopened and claimed again.
+
+    Only as a member of a merge batch (`batch`, never `released`: a PR that
+    left its batch landed nothing), whose turn the claim's own instance granted
+    (`held_turn`) no earlier than the claim was made — both times are the
+    fleet's own clock.
+    """
+    held = held_turn(turn, claim["instance"])
+    return bool(held and held["batch"] and held["at"] is not None
+                and claim["ts"] is not None and held["at"] >= claim["ts"])
 
 
 def turn_gate(ci_mode: GateCiMode, checks_state: ChecksState | None, allow_no_checks: bool,
@@ -3746,7 +3769,7 @@ def tick_plan(ws: WorkingSet, call: Call, config: Config) -> Plan:
     In order: `no-pr` for the claims waiting on a worker → the landing turn, to
     one PR or to one merge batch (`_turn_plan`) → nudge / restart / fail / park /
     escalate where the reason is on record, or the judgment that stands in for one →
-    release `closed` rows and `stale_closed` phantom locks → begin the starts:
+    release `closed` and `landed` rows and `stale_closed` phantom locks → begin the starts:
     continuations of claims already held, each `stale` claim reclaimed, then the
     frontier into the free slots → finish every start begun, at once → heartbeat
     → status boards → what a finished batch left behind.
@@ -3797,9 +3820,10 @@ def tick_plan(ws: WorkingSet, call: Call, config: Config) -> Plan:
         elif do not in ("leave", "dispatch"):       # a dispatch is begun below, with the starts
             assert_never(do)
 
-    # --- release what outlived its issue ---
+    # --- release what outlived its issue, or its landing ---
     for row in ws["mine"]:
-        if row["status"] == "closed" and (yield from run("release", issue=row["number"])):
+        if row["status"] in ("closed", "landed") and (
+                yield from run("release", issue=row["number"])):
             tick.did("cleared", row["number"])
     for row in ws["stale_closed"]:
         if (yield from run("release", issue=row["number"], expect_sha=row["sha"])):
@@ -4227,7 +4251,8 @@ def superseded_prs(prs: Iterable[PullRequest] | None, number: int) -> list[PullR
 def assemble_working_set(issues: list[Issue], prs: list[PullRequest], claims: list[Claim],
                          heartbeats: Mapping[str, float], me: str, now: float, config: Config,
                          closed: Iterable[int] = (),
-                         turns: Mapping[int, Turn] | None = None) -> WorkingSet:
+                         turns: Mapping[int, Turn] | None = None,
+                         landed: Iterable[int] = ()) -> WorkingSet:
     """
     The tick's whole working set from the raw observables. Pure — afk.py's
     `rebuild` gathers, this assembles, and a fixture pins the join.
@@ -4248,6 +4273,9 @@ def assemble_working_set(issues: list[Issue], prs: list[PullRequest], claims: li
       turns:       {number: its PR's `latest_turn`} for MY claims whose PR
                    carries a turn marker, whoever wrote it (`afk rebuild` asks
                    about each of mine that has a PR)
+      landed:      the numbers of MY claims on an open issue no open PR closes
+                   whose landing is already on the target (`afk rebuild` asks
+                   the target about each) — a `landed` row
 
     Returns:
       {"frontier": {"dispatch": [{"number","title"}...], "excluded": [...]},
@@ -4294,7 +4322,7 @@ def assemble_working_set(issues: list[Issue], prs: list[PullRequest], claims: li
 
     part = classify_claims(claims, heartbeats, me, now, ttl)
     by_claim = {c["number"]: c for c in claims}
-    closed = set(closed)
+    closed, landed = set(closed), set(landed)
 
     def stale_rows(numbers: Iterable[int]) -> list[StaleClaim]:
         return [{"number": n, "instance": by_claim[n]["instance"], "sha": by_claim[n]["sha"]}
@@ -4311,7 +4339,7 @@ def assemble_working_set(issues: list[Issue], prs: list[PullRequest], claims: li
         turn = turns.get(n)
         held = held_turn(turn, me)
         status = claim_status(pr is not None, checks, ci_mode,
-                              closed=n in closed, landing=bool(held))
+                              closed=n in closed, landing=bool(held), landed=n in landed)
         landing = held if status == "landing" else None
         batch = landing["batch"] if landing else None
         if turn and turn["batch"] and not turn["released"] and n not in closed:
