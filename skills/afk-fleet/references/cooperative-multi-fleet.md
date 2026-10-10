@@ -16,7 +16,8 @@ each one runs is shown so the mechanism is legible, but the tick calls the tool.
 - **Instance id** — minted once per launcher run at bootstrap, injected into every tick. It stamps
   every claim this fleet makes (`--instance <id>`) and names this fleet's heartbeat.
 - **Claim → the first step of `afk dispatch`** (`afk claim <n> --instance <id>` is the same step on
-  its own). Internally it creates `refs/afk/claim/<n>` pointing at a
+  its own). Internally it **first refreshes this fleet's heartbeat if due** (below), and only then
+  creates `refs/afk/claim/<n>` pointing at a
   marker commit carrying `instance=<id> host=<host>`; the ref name is the issue number *only*. Creating
   a ref that already exists is **rejected by the server** — that rejection *is* the compare-and-swap.
   Won → the dispatch goes on to start the worker; lost (the result names the current `owner`) → a peer
@@ -37,10 +38,18 @@ each one runs is shown so the mechanism is legible, but the tick calls the tool.
   on a tick, and by the gate on a cycle that skips. One ref `refs/afk/heartbeat/<id>`
   carries a timestamp; the tool refreshes it **only if due** (`now - ts > ttl/3`) by force-pushing a
   new marker (it reads the old ts itself, so this stays stateless). **Per instance, not per claim**
-  (claim refs never churn); a fleet holding no claims never beats.
+  (claim refs never churn); a fleet that holds no claims and takes none never beats.
+- **The order: heartbeat, then claim.** A missing heartbeat reads as a dead owner, so a claim that
+  reached the remote ahead of its owner's heartbeat would be `stale` to any peer scanning in
+  between — reclaimed from a live fleet, and the issue worked twice. Every push that puts a claim in
+  an instance's name therefore runs the heartbeat step itself, before the push: `afk claim` (and so
+  `afk dispatch`), `afk reclaim` and `afk takeover`. From the moment a claim is on the remote its
+  owner's heartbeat is within the lease; the heartbeat at the end of a tick and on a skipped cycle
+  only keeps it there. A claim attempt that loses its race has still beaten — harmless: a heartbeat
+  with no claim behind it protects nothing.
 - **Reclaim a stale peer claim → `afk reclaim <n> --instance <id> --expect-sha <sha>`.** Only the
   `stale` list is reclaimable — a stale claim whose issue is still open. The takeover is atomic (two
-  reclaimers can't both win):
+  reclaimers can't both win), and beats first, like a claim:
   ```bash
   git push origin --force-with-lease="refs/afk/claim/$n:$sha_i_read" "$my_sha:refs/afk/claim/$n"
   ```

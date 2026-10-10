@@ -47,6 +47,12 @@ the assignee onto an **atomic lock ref**, and liveness is carried by a **per-ins
    **peer's** claim only when that peer's heartbeat has expired (**stale claim**), via an atomic
    `git push --force-with-lease=afk-claim/<n>:<sha-it-read>` takeover so two reclaimers can't both win.
 
+   **The heartbeat comes first (#123).** "Only while it holds claims" left a window: a fleet that
+   held nothing had no fresh heartbeat, and its tick beat only after its claims were pushed — so a
+   peer scanning in between read a live fleet's new claim as stale and took it. Every push that puts
+   a claim in an instance's name (claim, reclaim, takeover) now refreshes that instance's heartbeat
+   first, if due; a fleet that holds nothing and claims nothing still writes none.
+
 4. **Open-PR guard.** An issue with an open linked PR is never in the frontier — a PR is itself
    durable in-flight evidence, independent of the claim ref. This hardens every recovery path (a
    released-but-still-finishing worker's PR is not re-dispatched) and makes the fleet correctly leave

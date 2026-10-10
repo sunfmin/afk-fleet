@@ -131,6 +131,21 @@ and make the history depend on whether batching was on.
 `afk rebuild` therefore reports a batched PR like any landed one: its issue is closed, so its claim
 is a `closed` row; none of the batch's PRs is open, failed or abandoned.
 
+### A batch cut after its push is settled from the target
+
+The push is the landing; everything after it is finishing, and a batch worker can be cut anywhere in
+it. Once GitHub shows the member PRs merged, no open PR carries the batch's marker: the batch is not
+listed, its worker is not continued, and its worktree is swept. A member whose issue was not yet
+closed — on a target that is not the default branch GitHub closes none — is then a claim with an open
+issue and no PR. `afk rebuild` asks the target about each such claim of mine: when the merge commit
+on its own line that closes the issue names a PR that was in a batch under this claim
+(`afk_decide.landed_under` — not a PR that landed the issue before it was reopened), the row is
+`landed`, never `no_pr`, and `afk release` closes the issue, releases the claim and removes the
+worktree. No worker is asked after and no attempt is spent.
+
+For the same reason `afk turn --abandon` asks the target before it hands a member back: one whose
+merge commit is there keeps its marker and has its issue closed instead.
+
 ### The fast-forward push is the lock
 
 Nothing is held on the target while the batch gates. The push in step 4 names the stack's head and

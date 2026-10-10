@@ -776,6 +776,15 @@ def validate_config(cfg: Config) -> Config:
         raise ValueError("config gate.ci: 'local' requires a non-empty gate.local_command — in "
                          "local mode that command IS the completion gate (ADR-0012), so an empty "
                          "one would merge every PR unverified")
+    escalate, ready = cfg["escalate_label"], cfg["ready_label"]
+    if escalate == ready:
+        raise ValueError(f"config escalate_label: {escalate!r} is ready_label too — an escalation "
+                         f"adds the one and removes the other in one edit, and an issue handed "
+                         f"to a human would still be one the fleet dispatches")
+    if escalate.startswith(_ATTEMPT_PREFIX):
+        raise ValueError(f"config escalate_label: {escalate!r} is under {_ATTEMPT_PREFIX!r}, the "
+                         f"fleet's own attempt labels — an escalation strips every one of those "
+                         f"in the edit that adds it")
     return cfg
 
 
@@ -981,10 +990,13 @@ def select_frontier(issues: list[EligibleIssue], ready_label: str, epic_labels: 
     ready_label · no epic label · not claimed · no open linked PR · zero open
     blocking dependencies.
 
-    Returns {"dispatch": [num...], "excluded": [{"number","reason"}...]}.
+    Returns {"dispatch": [num...], "excluded": [{"number","reason"}...]}, each
+    by issue number, lowest first — the order the free slots are filled in. It is
+    the issues' own order, never the one their rows arrived in: two reads of one
+    backlog dispatch the same issues (ADR-0007).
     """
     dispatch, excluded = [], []
-    for issue in issues:
+    for issue in sorted(issues, key=lambda i: i["number"]):
         num = issue["number"]
         bars = label_bars(issue["labels"], ready_label, epic_labels)
         if bars:
@@ -1008,7 +1020,9 @@ def select_frontier(issues: list[EligibleIssue], ready_label: str, epic_labels: 
 
 def is_stale(last_ts: float | None, now: float, ttl: float) -> bool:
     """A claim's owner is presumed dead when its heartbeat is missing or older
-    than `ttl`. Missing (None) counts as stale — an owner that never beat."""
+    than `ttl`. Missing (None) counts as stale — an owner that never beat. This
+    is the fleet's one lease comparison: whatever asks whether a fleet instance
+    is live asks here, so a heartbeat exactly `ttl` old is live to all of them."""
     if last_ts is None:
         return True
     return (now - int(last_ts)) > ttl
@@ -1063,11 +1077,12 @@ def classify_claims(claims: list[Claim], heartbeats: Mapping[str, float], me: st
 # re-rendered. The keys are the vocabulary the tick's instructions route on (a
 # test holds the docs to it). `merged` / `escalated` / `parked`, the board's
 # terminal phases, are written by the transitions that reach them.
-ClaimStatus = Literal["awaiting_turn", "landing", "awaiting_ci", "failure", "no_pr", "closed"]
+ClaimStatus = Literal["awaiting_turn", "landing", "awaiting_ci", "failure", "no_pr", "landed",
+                      "closed"]
 BOARD_PHASE_OF: dict[ClaimStatus, Optional[StatusPhase]] = {
     "awaiting_turn": "awaiting_turn", "landing": "landing",
     "awaiting_ci": "pr_open", "failure": "ci_failed", "no_pr": "claimed",
-    "closed": None}
+    "landed": None, "closed": None}
 CLAIM_STATUSES = tuple(BOARD_PHASE_OF)
 
 # What a PR's checks come to (`pr_checks_state`); no checks at all is None.
@@ -1075,7 +1090,8 @@ ChecksState = Literal["green", "red", "pending"]
 
 
 def claim_status(has_pr: bool, checks_state: ChecksState | None, ci_mode: GateCiMode,
-                 closed: bool = False, landing: bool = False) -> ClaimStatus:
+                 closed: bool = False, landing: bool = False,
+                 landed: bool = False) -> ClaimStatus:
     """
     Classify one of MY in-flight claims from its PR + checks → its `status`, one
     of CLAIM_STATUSES: what the tick does next.
@@ -1087,8 +1103,14 @@ def claim_status(has_pr: bool, checks_state: ChecksState | None, ci_mode: GateCi
                     (`afk land` cannot release the claim), or a human finished it
                     by hand
       landing:      the PR holds this fleet instance's landing turn (`held_turn`)
+      landed:       no open PR closes the issue, the issue is still open, and the
+                    target holds the commit a merge batch landed it with: the
+                    batch's finishing was cut short after its push (ADR-0029)
 
       closed         its leftover claim (and worktree) is released
+      landed         the same release, which closes the issue first — never the
+                     worker ladder: the work is on the target, and no attempt
+                     is spent on it
       no_pr          `afk no-pr` is asked why
       landing        `afk no-pr` is asked whether its worker is still at it — or,
                      when the landing stopped for the tick, `afk turn` again
@@ -1113,7 +1135,7 @@ def claim_status(has_pr: bool, checks_state: ChecksState | None, ci_mode: GateCi
     if closed:
         return "closed"
     if not has_pr:
-        return "no_pr"
+        return "landed" if landed else "no_pr"
     if landing:
         return "landing"
     if ci_mode == "local" or checks_state in ("green", None):
@@ -1147,10 +1169,10 @@ def gate_verdict(exit_code: int, output: str | None, max_lines: int = GATE_EXCER
     counts as green" — is fixture-pinned: ONLY 0 is green, and a run that timed out
     is red, never green-by-default. The excerpt is the LAST `max_lines` lines
     (where build/test runners put the failure summary), bounded so a 50k-line log
-    reaches the PR comment as a readable tail instead of flooding it.
+    reaches the PR comment as a readable tail instead of flooding it; 0 keeps none.
     """
     lines = [ln.rstrip() for ln in (output or "").splitlines()]
-    tail = lines[-max_lines:] if max_lines and max_lines > 0 else lines
+    tail = lines[-max_lines:] if max_lines > 0 else []
     return {"status": "green" if (int(exit_code) == 0 and not timed_out) else "red",
             "exit_code": int(exit_code),
             "timed_out": bool(timed_out),
@@ -1348,8 +1370,9 @@ def gate_comment(verdict: Obj, command: str) -> str:
            else f"exit {verdict['exit_code']}")
     omitted = (f"\n\n_({verdict['omitted_lines']} earlier line(s) omitted)_"
                if verdict["omitted_lines"] else "")
+    excerpt = f"\n\n```\n{verdict['excerpt']}\n```" if verdict["excerpt"] else ""
     return (f"**afk-fleet landing gate: red** — `{command}` → {how}, run after syncing "
-            f"with the merge target.\n\n```\n{verdict['excerpt']}\n```{omitted}")
+            f"with the merge target.{excerpt}{omitted}")
 
 
 # --------------------------------------------------------------------------- #
@@ -1899,7 +1922,8 @@ def stall_reason(reason: str, tail: Iterable[str] | None) -> str:
 # Every `outcome` `afk land` can stop with — the vocabulary the worker's prompt
 # routes on (a test holds the prompt and the docs to it). What each means is
 # `afk.cmd_land`'s docstring, and nowhere else in the code.
-LandOutcome = Literal["merged", "conflict", "gate_red", "awaiting_ci", "needs_verify", "no_checks"]
+LandOutcome = Literal["merged", "conflict", "gate_red", "target_moved", "awaiting_ci",
+                      "needs_verify", "no_checks"]
 LAND_OUTCOMES: tuple[LandOutcome, ...] = get_args(LandOutcome)
 
 # The landing outcomes where the next move is the TICK's, not the worker's: the
@@ -2131,6 +2155,21 @@ def held_turn(turn: Turn | None, owner: str | None) -> Turn | None:
     return None
 
 
+def landed_under(turn: Turn | None, claim: Claim) -> bool:
+    """Did the PR that carries `turn` (`latest_turn`) land `claim`'s issue? Asked
+    of a PR whose merge commit on the target closes that issue — which a PR
+    landed long ago does too, for an issue since reopened and claimed again.
+
+    Only as a member of a merge batch (`batch`, never `released`: a PR that
+    left its batch landed nothing), whose turn the claim's own instance granted
+    (`held_turn`) no earlier than the claim was made — both times are the
+    fleet's own clock.
+    """
+    held = held_turn(turn, claim["instance"])
+    return bool(held and held["batch"] and held["at"] is not None
+                and claim["ts"] is not None and held["at"] >= claim["ts"])
+
+
 def turn_gate(ci_mode: GateCiMode, checks_state: ChecksState | None, allow_no_checks: bool,
               adversarial_verify: bool, verified: str | None,
               head: str) -> Literal["ready", "awaiting_ci", "gate_red", "no_checks",
@@ -2164,14 +2203,16 @@ def turn_order(rows: list[MineRow]) -> list[int]:
     """
     The order landing turns are granted in — the merge queue: the issue numbers
     of the `mine` rows whose PR is ready, a PR that already holds a turn first,
-    then a PR that left a merge batch without landing, then the lower PR number.
+    then a PR that left a merge batch without landing, then the lower PR number,
+    then — one PR closing several issues — the lower issue number. That is a
+    total order, so the queue never depends on the order the rows came in.
 
       rows: `mine` rows {"number", "status", "pr", "unbatched"}; only `landing`
             and `awaiting_turn` ones are in the queue
     """
     ready = [r for r in rows if r["status"] in ("landing", "awaiting_turn")]
-    return [r["number"] for r in sorted(ready, key=lambda r: (r["status"] != "landing",
-                                                              not r["unbatched"], r["pr"]))]
+    return [r["number"] for r in sorted(ready, key=lambda r: (
+        r["status"] != "landing", not r["unbatched"], r["pr"], r["number"]))]
 
 
 # --------------------------------------------------------------------------- #
@@ -2311,32 +2352,35 @@ def stack_message(title: str | None, pr: int, issue: int) -> str:
     return f"{(title or '').strip() or f'PR {pr}'} (#{pr})\n\nCloses #{issue}\n"
 
 
-def stacked_pr(subject: str | None) -> int | None:
-    """The PR a commit subject names the way `stack_message` writes it — its
-    trailing ` (#<pr>)` — or None."""
-    m = re.search(r" \(#(\d+)\)$", subject or "")
+def stacked_pr(parents: str, subject: str | None) -> int | None:
+    """The PR a commit was stacked with, or None: a merge commit — `parents` is
+    its `git log --format=%P`, two hashes — whose subject ends ` (#<pr>)`, the
+    way `stack_message` writes it. The subject alone decides, never the body;
+    and a commit with one parent is never a member's, whatever its subject says
+    — a fix titled `… (#<pr>)` is a fix."""
+    m = re.search(r" \(#(\d+)\)$", subject or "") if len(parents.split()) > 1 else None
     return int(m.group(1)) if m else None
 
 
-def read_stack(commits: Iterable[tuple[str, str]],
+def read_stack(commits: Iterable[tuple[str, str, str]],
                prs: Collection[int]) -> tuple[dict[int, str], list[str]]:
     """
     A batch worktree's commits above the target, read back → (stacked, fixes):
 
-      commits: [(sha, subject)...] oldest first — `git log --first-parent
-               <target tip>..HEAD`: the stack's own line, without the commits
-               each PR brought
+      commits: [(sha, parents, subject)...] oldest first — `git log
+               --first-parent <target tip>..HEAD`: the stack's own line, without
+               the commits each PR brought
       prs:     the member PR numbers
 
       stacked: {pr: sha} — the merge commit each member was stacked with
-               (`stack_message`'s subject ends ` (#<pr>)`)
+               (`stacked_pr`)
       fixes:   [sha...] — every other commit, oldest first: what the batch
                worker committed to turn a red stack green
     """
     stacked: dict[int, str] = {}
     fixes: list[str] = []
-    for sha, subject in commits:
-        pr = stacked_pr(subject)
+    for sha, parents, subject in commits:
+        pr = stacked_pr(parents, subject)
         if pr is not None and pr in prs and pr not in stacked:
             stacked[pr] = sha
         else:
@@ -2473,33 +2517,34 @@ def plan_takeover(claims: Iterable[Claim] | None, heartbeats: Mapping[str, float
 # nothing. The selection is mechanics; "is this recovered state sane to build
 # on" stays tick judgment. Only tier 3 tears anything down.
 
-_PLACEHOLDER_RE = re.compile(r"\{(number|slug)\}")
+# What marks a branch as the fleet's: the fleet said so, on the issue, as orca cut
+# it (`afk._record_branch`). A branch is never recognised by its name — orca
+# names it, and `<anything>/issue-<n>-<anything>` is a name a person may give
+# their own. A continuation's branch is a new name, recorded the same way.
+BRANCH_RECORD = RecordKind("afk:branch", {"name": str}, ("name",))
 
 
-def branch_regex(number: int) -> re.Pattern[str]:
-    """
-    An issue number → the regex that matches the branch orca
-    ACTUALLY created for it. Two things are wildcards, by construction: orca
-    prefixes the branch with `<user>/` (ADR-0005 — the fleet reads the name back
-    rather than dictating it), and the slug is whatever the dispatching tick
-    passed. The number is not: it is the one field that identifies the issue.
-    """
-    out, pos = [], 0
-    pattern = BRANCH_PATTERN
-    for m in _PLACEHOLDER_RE.finditer(pattern):
-        out.append(re.escape(pattern[pos:m.start()]))
-        out.append(str(number) if m.group(1) == "number" else "[^/]*")
-        pos = m.end()
-    out.append(re.escape(pattern[pos:]))
-    return re.compile(r"^(?:[^/]+/)?" + "".join(out) + r"$")
+def branch_comment(name: str) -> str:
+    """The comment that records `name` as a branch the fleet cut for the issue
+    it is posted on."""
+    return record_comment(BRANCH_RECORD, {"name": name},
+                          f"afk-fleet: this issue's worker is on the branch `{name}`, cut by the "
+                          f"fleet. It is the fleet's to continue from, and to delete when the "
+                          f"attempt is discarded.")
 
 
-def branch_candidates(heads: Iterable[str] | None, number: int) -> list[str]:
-    """The remote branch names that could be issue <number>'s work branch, sorted.
-    Used when NO local worktree survived: the claim ref records the issue, not the
-    branch, so tier 2 has to recognise the branch by its name."""
-    rx = branch_regex(number)
-    return sorted(h for h in (heads or []) if h and rx.match(h))
+def recorded_branches(comments: Iterable[Comment] | None) -> list[str]:
+    """The branches the fleet recorded on one issue, from its comments — every
+    one of them, oldest first: each worktree cut for the issue left its own."""
+    records = (read_marker(BRANCH_RECORD, comment["body"]) for comment in comments or [])
+    return list(dict.fromkeys(record["name"] for record in records if record))
+
+
+def own_branches(heads: Iterable[str] | None, own: Iterable[str | None]) -> list[str]:
+    """The remote branch names that are the fleet's own for one issue, sorted:
+    the `heads` among `own`, the names the fleet knows it cut for it. Used when
+    NO local worktree survived: the claim ref records the issue, not the branch."""
+    return sorted(set(heads or []) & {name for name in own if name})
 
 
 def short_branch(ref: str | None) -> str:
@@ -3041,7 +3086,7 @@ def current_attempt(labels: Iterable[str] | None) -> int:
     for lb in labels or []:
         if isinstance(lb, str) and lb.startswith(_ATTEMPT_PREFIX):
             n = lb[len(_ATTEMPT_PREFIX):]
-            if n.isdigit():
+            if n.isascii() and n.isdigit():
                 attempts.append(int(n))
     return max(attempts)
 
@@ -3068,7 +3113,8 @@ def attempt_starting(labels: Collection[str] | None) -> bool:
     return ATTEMPT_STARTING in (labels or []) and current_attempt(labels) > 0
 
 
-def next_attempt(attempt: int, retry_max: int, counted: bool = False) -> Obj:
+def next_attempt(attempt: int, retry_max: int, counted: bool = False,
+                 escalation: Escalation | None = None) -> Obj:
     """
     Retry-or-escalate for a failed issue on attempt `attempt` (`current_attempt`).
 
@@ -3078,10 +3124,16 @@ def next_attempt(attempt: int, retry_max: int, counted: bool = False) -> Obj:
                                  when `counted` (`attempt_starting`): this failure
                                  is the one that made the attempt n — the retry
                                  is finished, and nothing is added
+      {"action":"escalate","attempt":<the escalation's>}
+                                 when `escalation` (`escalation_begun`): this
+                                 failure is the one being escalated — the labels
+                                 may already be stripped, and say nothing
 
     `afk fail` is the one caller, and the one writer of the label: it applies
     `retry_labels` of `to_label`.
     """
+    if escalation is not None:
+        return {"action": "escalate", "attempt": escalation["attempt"]}
     if counted:
         return {"action": "retry", "attempt": attempt, "to_label": f"{_ATTEMPT_PREFIX}{attempt}"}
     if attempt >= retry_max:
@@ -3094,20 +3146,55 @@ def retry_labels(labels: Iterable[str] | None, to_label: str) -> tuple[list[str]
     """The label edit that counts a failure: `(add, remove)`, made in ONE edit of
     the issue. Adds `to_label` and `ATTEMPT_STARTING` where the issue lacks them
     and removes every other attempt label it carries — so for a failure already
-    counted there is nothing to add or remove, and no edit to make."""
-    present, wanted = set(labels or []), [to_label, ATTEMPT_STARTING]
+    counted there is nothing to add or remove, and no edit to make: however a
+    hand-edit spelled the count (`afk-attempt/01`), or whatever it left beside
+    it, the number is the one `to_label` says and the next count tidies it."""
+    labels = list(labels or [])
+    if attempt_starting(labels) and current_attempt(labels) == current_attempt([to_label]):
+        return [], []
+    present, wanted = set(labels), [to_label, ATTEMPT_STARTING]
     return ([lb for lb in wanted if lb not in present],
             [lb for lb in attempt_labels(labels) if lb not in wanted])
 
 
-def escalation_comment(reason: str | None, attempt: int, pr: int | None = None) -> str:
+# An escalation, as its comment keeps it: of which claim (the sha its ref is
+# at — a claim ref is written once, so each claim of an issue has its own) and
+# after how many retries. The comment is an escalation's first write that the
+# next one cannot tell from its own, and the edit after it strips the count; so
+# this is what says "the escalation of this claim has begun" to a run that
+# finds the claim still held (ADR-0033).
+ESCALATION_RECORD = RecordKind("afk:escalation", {"claim": str, "attempt": int},
+                               ("claim", "attempt"))
+
+
+class Escalation(TypedDict):
+    """The escalation a held claim is already in: what its comment recorded."""
+    attempt: int
+    comment_id: int
+
+
+def escalation_comment(reason: str | None, attempt: int, claim: str,
+                       pr: int | None = None) -> str:
     """The durable hand-off comment an escalation appends to the issue (ADR-0006
-    keeps it apart from the status board, which only points here). The stuck-point
-    wording is the tick's; this frames it."""
+    keeps it apart from the status board, which only points here), under the
+    record of whose it is (`ESCALATION_RECORD`). The stuck-point wording is the
+    tick's; this frames it."""
     tried = f"after {attempt} retr{'y' if attempt == 1 else 'ies'}" if attempt else "without a retry"
     link = f" Last PR: #{pr}." if pr else ""
-    return (f"**afk-fleet: escalated to a human** ({tried}).{link}\n\n"
-            f"{(reason or '').strip()}")
+    return record_comment(ESCALATION_RECORD, {"claim": claim, "attempt": attempt},
+                          f"**afk-fleet: escalated to a human** ({tried}).{link}\n\n"
+                          f"{(reason or '').strip()}")
+
+
+def escalation_begun(comments: Iterable[Comment] | None, claim: str) -> Escalation | None:
+    """The escalation of the claim `claim` (its ref's sha) that an issue's
+    comments already carry — one that was cut short after its comment, with the
+    claim still held — else None. An issue's earlier escalations were of other
+    claims: each ended in a release, and the issue was claimed anew."""
+    record, comment = latest_record(ESCALATION_RECORD, comments)
+    if record is None or comment is None or record["claim"] != claim:
+        return None
+    return {"attempt": record["attempt"], "comment_id": comment["id"]}
 
 
 def escalation_labels(labels: Iterable[str] | None,
@@ -3193,9 +3280,10 @@ def cycle_state(raw: Any, instance: str | None = None,
                 worker_command: str | None = None) -> CycleState:
     """The cycle state from what the caller handed back (None / "" on the first
     cycle → CYCLE_START plus the two facts, which the first cycle must be given).
-    Raises ValueError on anything that is not a state this code produced — a
-    caller that mangled it must hear so, not run on zeros — and on a fact passed
-    again that disagrees with the one the state carries."""
+    Raises ValueError on anything that is not a state this code produced
+    (`_cycle_state_flaw`) — a caller that mangled it must hear so, not run on
+    zeros — and on a fact passed again that disagrees with the one the state
+    carries."""
     given = {"instance": instance, "worker_command": worker_command}
     if raw is None or raw == "":
         missing = [f"--{k.replace('_', '-')}" for k, v in given.items() if not v]
@@ -3203,22 +3291,48 @@ def cycle_state(raw: Any, instance: str | None = None,
             raise ValueError(f"the first cycle (no --state) needs {' and '.join(missing)}: "
                              f"they are carried in the state from then on")
         return cast("CycleState", {**CYCLE_START, "boards": {}, **given})
-    if not isinstance(raw, dict) or set(raw) != {*CYCLE_START, *CYCLE_FACTS} \
-            or not all(isinstance(raw[k], str) and raw[k] for k in CYCLE_FACTS) \
-            or not isinstance(raw["boards"], dict):
+    flaw = _cycle_state_flaw(raw)
+    if flaw:
         raise ValueError(f"--state is not a cycle state carrying the instance id and the worker "
-                         f"launch command (pass back the `state` the previous `afk cycle` "
-                         f"returned, verbatim): {raw!r}")
+                         f"launch command — {flaw} (pass back the `state` the previous "
+                         f"`afk cycle` returned, verbatim): {raw!r}")
     for key, value in given.items():
         if value and value != raw[key]:
             raise ValueError(f"--{key.replace('_', '-')} {value!r} is not the one --state carries "
                              f"({raw[key]!r}): omit it after the first cycle")
-    # the keys were just checked to be exactly a state's
-    return cast("CycleState", {
-        "fingerprint": str(raw["fingerprint"]), "unsettled": bool(raw["unsettled"]),
-        "boards": {str(n): str(key) for n, key in raw["boards"].items()},
-        **{k: int(raw[k]) for k in ("skips", "empty_streak", *TICK_COUNTS)},
-        **{k: raw[k] for k in CYCLE_FACTS}})
+    return cast("CycleState", {**raw, "boards": dict(raw["boards"])})
+
+
+def _cycle_state_flaw(raw: Any) -> str | None:
+    """Why `raw` is not a cycle state `cycle_wake`, `cycle_ticked` or
+    `cycle_drained` could have returned — None when it is one. Every field has
+    its own type, no count is negative, and the counts agree with each other the
+    way those three leave them:
+
+      skips         below FORCE_TICK_AFTER_SKIPS — the cycle that would reach it
+                    ticks, and a tick starts the count again;
+      skips > 0     only while nothing is `unsettled`: such a cycle ticks;
+      empty_streak  above 0 only with nothing in flight, nothing left on the
+                    frontier and nothing `unsettled` — else the cycle was not empty.
+    """
+    if not isinstance(raw, dict) or set(raw) != {*CYCLE_START, *CYCLE_FACTS}:
+        return "it does not have exactly a state's keys"
+    counts = ("skips", "empty_streak", *TICK_COUNTS)
+    wrong = [k for k in CYCLE_FACTS if not (isinstance(raw[k], str) and raw[k])]
+    wrong += [k for k in counts if type(raw[k]) is not int or raw[k] < 0]
+    wrong += [k for k, kind in (("fingerprint", str), ("unsettled", bool), ("boards", dict))
+              if not isinstance(raw[k], kind)]
+    if not wrong and not all(isinstance(x, str) for kv in raw["boards"].items() for x in kv):
+        wrong = ["boards"]
+    if wrong:
+        return f"{', '.join(f'`{k}`' for k in wrong)} cannot be what it holds"
+    if raw["skips"] >= FORCE_TICK_AFTER_SKIPS:
+        return f"`skips` is past the forced tick ({FORCE_TICK_AFTER_SKIPS})"
+    if raw["skips"] and raw["unsettled"]:
+        return "an `unsettled` cycle is never skipped"
+    if raw["empty_streak"] and (raw["in_flight"] or raw["frontier_remaining"] or raw["unsettled"]):
+        return "`empty_streak` counts cycles with nothing in flight, left or `unsettled`"
+    return None
 
 
 def cycle_wake(state: CycleState, current_fp: str, woke: bool = False) -> Obj:
@@ -3322,7 +3436,10 @@ def cycle_drained(state: CycleState, released: Collection[int], kept: Collection
     nothing follows a drain. One that met an error is `unsettled`, so a caller
     that does run it again is not told it has nothing to do.
     """
-    new: CycleState = {**state, "in_flight": len(kept), "unsettled": bool(errors)}
+    held = bool(kept or errors)     # a drain that leaves a claim held was not an empty cycle
+    new: CycleState = {**state, "in_flight": len(kept), "unsettled": bool(errors),
+                       "empty_streak": 0 if held else state["empty_streak"],
+                       "skips": 0 if errors else state["skips"]}
     parts = [f"{word} {', '.join(f'#{n}' for n in numbers)}"
              for word, numbers in (("released", released), ("kept", kept)) if numbers]
     parts += [f"{errors} error{'' if errors == 1 else 's'}"] if errors else []
@@ -3746,7 +3863,7 @@ def tick_plan(ws: WorkingSet, call: Call, config: Config) -> Plan:
     In order: `no-pr` for the claims waiting on a worker → the landing turn, to
     one PR or to one merge batch (`_turn_plan`) → nudge / restart / fail / park /
     escalate where the reason is on record, or the judgment that stands in for one →
-    release `closed` rows and `stale_closed` phantom locks → begin the starts:
+    release `closed` and `landed` rows and `stale_closed` phantom locks → begin the starts:
     continuations of claims already held, each `stale` claim reclaimed, then the
     frontier into the free slots → finish every start begun, at once → heartbeat
     → status boards → what a finished batch left behind.
@@ -3797,9 +3914,10 @@ def tick_plan(ws: WorkingSet, call: Call, config: Config) -> Plan:
         elif do not in ("leave", "dispatch"):       # a dispatch is begun below, with the starts
             assert_never(do)
 
-    # --- release what outlived its issue ---
+    # --- release what outlived its issue, or its landing ---
     for row in ws["mine"]:
-        if row["status"] == "closed" and (yield from run("release", issue=row["number"])):
+        if row["status"] in ("closed", "landed") and (
+                yield from run("release", issue=row["number"])):
             tick.did("cleared", row["number"])
     for row in ws["stale_closed"]:
         if (yield from run("release", issue=row["number"], expect_sha=row["sha"])):
@@ -4079,11 +4197,16 @@ def resolve_worker_command(base_url: str | None, supplied: str | None = None,
 def fingerprint(issues: Iterable[Issue], prs: Iterable[PullRequest],
                 claims: Iterable[Claim]) -> str:
     """
-    Digest the observable fleet inputs — open issues (number + labels +
-    updatedAt + open-blocker count, so label churn, closes, fresh blocker
-    comments and a dependency edge all move it), open PRs (number + head sha +
+    Digest the observable fleet inputs — open issues (number + title + labels +
+    updatedAt + open-blocker count, so a retitle, label churn, closes, fresh
+    blocker comments and a dependency edge all move it), open PRs (number + head sha +
     updatedAt + `pr_checks_state` + the issues it closes, so pushes, CI finishing
-    and a PR becoming an issue's all move it), and claim refs (number + sha, so peer claims/releases/reclaims move it).
+    and a PR becoming an issue's all move it), and claim refs (number + sha +
+    owning instance, so peer claims/releases/reclaims move it).
+
+    It holds everything `assemble_working_set` reads of those three lists: two
+    gathers with one digest assemble one working set, whatever order their rows
+    came in. What the working set reads besides them is OUTSIDE_THE_DIGEST.
 
     A PR's checks enter as the ONE word a tick acts on — green / red / pending /
     none — not check by check: a check going queued → in progress, or the first
@@ -4104,17 +4227,38 @@ def fingerprint(issues: Iterable[Issue], prs: Iterable[PullRequest],
     fields never move the digest. Returns a 16-hex digest.
     """
     canon = {
-        "issues": sorted([i["number"], sorted(i["labels"] or []), i["updatedAt"] or "",
-                          int(i["blocked_by"] or 0)]
+        "issues": sorted([i["number"], i["title"] or "", sorted(i["labels"] or []),
+                          i["updatedAt"] or "", int(i["blocked_by"] or 0)]
                          for i in issues),
         "prs": sorted([p["number"], p["headRefOid"] or "", p["updatedAt"] or "",
                        pr_checks_state(p["statusCheckRollup"]) or "none",
                        sorted(ref["number"] for ref in p["closingIssuesReferences"] or [])]
                       for p in prs),
-        "claims": sorted([c["number"], c["sha"] or ""] for c in claims),
+        "claims": sorted([c["number"], c["sha"] or "", c["instance"]] for c in claims),
     }
     blob = json.dumps(canon, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+# Every input of `assemble_working_set` the digest does NOT hold → why a skipped
+# cycle may go without it. Two gathers with one digest assemble one working set
+# only when these are equal too; ADR-0007 lists them, and a test holds both the
+# function's parameters and that list to these names.
+OUTSIDE_THE_DIGEST: dict[str, str] = {
+    "now": "time alone moves it: a lease lapsing is seen by the forced tick",
+    "heartbeats": "this instance's own beat on a skipped cycle would move the digest every "
+                  "cycle; a peer's going stale is time passing, seen by the forced tick",
+    "turns": "a landing-turn marker is a comment on a PR, read once per claim that has one: "
+             "writing it moves that PR's `updatedAt`, which the digest holds",
+    "closed": "asked only of a claim whose issue is missing from the open list: the issue "
+              "leaving that list moved the digest; a read that failed is retried by the "
+              "forced tick",
+    "landed": "asked only of a claim of mine on an open issue no open PR closes, and true "
+              "only once its PR was pushed to the target: GitHub showing that PR merged "
+              "took it off the open list, which moved the digest",
+    "me": "the run's own instance id: no cycle changes it",
+    "config": "the run's own config: no cycle changes it",
+}
 
 
 def fingerprint_gate(last: str | None, current: str, skips: int, force_after: int) -> Obj:
@@ -4237,21 +4381,23 @@ def unseen_prs(mine: list[MineRow], prs: Iterable[PullRequest]) -> list[int]:
                   if r["number"] in now and now[r["number"]]["number"] != r["pr"])
 
 
-def superseded_prs(prs: Iterable[PullRequest] | None, number: int) -> list[PullRequest]:
+def superseded_prs(prs: Iterable[PullRequest] | None, number: int,
+                   own: Iterable[str | None]) -> list[PullRequest]:
     """The open PRs a FRESH start of issue <number> supersedes: the ones that
-    close it from a branch shaped like the fleet's own (`branch_regex`). A PR a
-    human opened from some other branch is never one of them — the fleet closes
-    only what the fleet opened."""
-    rx = branch_regex(number)
+    close it from a branch that is the fleet's `own` for it (`own_branches`). A
+    PR a human opened from any other branch — whatever its name — is never one
+    of them: the fleet closes only what the fleet opened."""
+    own = {name for name in own if name}
     return [p for p in prs or []
             if any(ref["number"] == number for ref in p["closingIssuesReferences"] or [])
-            and rx.match(p["headRefName"] or "")]
+            and p["headRefName"] in own]
 
 
 def assemble_working_set(issues: list[Issue], prs: list[PullRequest], claims: list[Claim],
                          heartbeats: Mapping[str, float], me: str, now: float, config: Config,
                          closed: Iterable[int] = (),
-                         turns: Mapping[int, Turn] | None = None) -> WorkingSet:
+                         turns: Mapping[int, Turn] | None = None,
+                         landed: Iterable[int] = ()) -> WorkingSet:
     """
     The tick's whole working set from the raw observables. Pure — afk.py's
     `rebuild` gathers, this assembles, and a fixture pins the join.
@@ -4272,6 +4418,9 @@ def assemble_working_set(issues: list[Issue], prs: list[PullRequest], claims: li
       turns:       {number: its PR's `latest_turn`} for MY claims whose PR
                    carries a turn marker, whoever wrote it (`afk rebuild` asks
                    about each of mine that has a PR)
+      landed:      the numbers of MY claims on an open issue no open PR closes
+                   whose landing is already on the target (`afk rebuild` asks
+                   the target about each) — a `landed` row
 
     Returns:
       {"frontier": {"dispatch": [{"number","title"}...], "excluded": [...]},
@@ -4318,7 +4467,7 @@ def assemble_working_set(issues: list[Issue], prs: list[PullRequest], claims: li
 
     part = classify_claims(claims, heartbeats, me, now, ttl)
     by_claim = {c["number"]: c for c in claims}
-    closed = set(closed)
+    closed, landed = set(closed), set(landed)
 
     def stale_rows(numbers: Iterable[int]) -> list[StaleClaim]:
         return [{"number": n, "instance": by_claim[n]["instance"], "sha": by_claim[n]["sha"]}
@@ -4335,7 +4484,7 @@ def assemble_working_set(issues: list[Issue], prs: list[PullRequest], claims: li
         turn = turns.get(n)
         held = held_turn(turn, me)
         status = claim_status(pr is not None, checks, ci_mode,
-                              closed=n in closed, landing=bool(held))
+                              closed=n in closed, landing=bool(held), landed=n in landed)
         landing = held if status == "landing" else None
         batch = landing["batch"] if landing else None
         if turn and turn["batch"] and not turn["released"] and n not in closed:

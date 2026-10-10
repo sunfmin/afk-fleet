@@ -337,13 +337,13 @@ In this order, each step the same `afk` transition you could type yourself
    `already-satisfied`, a PR-less silence that outlasted its nudge is failed (`afk fail`); a
    `blocked` verdict is parked while the backlog will resolve its blockers (`afk park`, ADR-0022)
    and escalated when nothing will — as a `needs-decision` one is at once (`afk escalate`, ADR-0041).
-5. **Release** every claim that outlived its issue — a PR its worker landed — and delete every dead
-   peer's phantom lock, under the sha it was read at.
+5. **Release** every claim that outlived its issue — a PR its worker landed — or whose landing a
+   merge batch pushed and was cut before closing the issue; delete every dead peer's phantom lock.
 6. **Start workers** (`afk dispatch`): first by [continuation](references/recovery.md) for claims
    already held — an **orphaned claim** (always continued, never released back), one whose blockers
    have all closed, each **stale** peer claim it reclaims — then the frontier, in order, into the
    free slots (plus one for every claim this pass settled).
-7. **Heartbeat**, then the **status board** of every claim nothing above touched.
+7. **Heartbeat** (each claim push beat first), then the **status board** of every claim nothing above touched.
 
 A worker still coding, a PR whose checks are running, a finished PR waiting behind the one that
 holds the turn, a live peer's claim: all left exactly as they are.
@@ -422,6 +422,10 @@ adversarial verify or switching a repo to `gate.ci: local`. `afk gate` and `afk 
 **Nobody but its worker merges a PR.** A finished PR is landed by the worker that wrote it, with
 `afk land`, in its own worktree — sync with `base_branch` (by **merging, never rebasing** —
 ADR-0012) → push → the machine gate on that exact head → `gh pr merge` **pinned to the gated head**.
+The merge is pinned to the PR's head, not to the target, and a gate run is long: right before it
+the landing reads its turn and the target's tip again, and merges only if the turn is still the one
+it started on and the gated head still holds that tip (`target_moved` otherwise — it lands again,
+synced and gated on the new tip).
 A sync conflict or a red gate at landing is fixed where the context is: by that worker, in place,
 with no round trip through the launcher
 ([ADR-0027](../../docs/adr/0027-a-worker-lands-its-own-pr-on-a-landing-turn.md)). What the fleet
@@ -486,7 +490,8 @@ is closed. Which PRs are batched, and whether any are, is decided in code — yo
 members' own workers are told nothing, and a batch worker holds no claim and no slot. The pass
 watches the batch worker as it watches any worker on a turn: gone, it is continued; silent, it is
 nudged once and then the batch is **abandoned** (`afk turn --abandon`) with nothing landed — which
-fails no PR and spends no attempt. A PR the batch left out (it conflicts with the others) or an
+fails no PR and spends no attempt. A batch cut short after its push has landed: its members are
+settled from the target by the next pass, and an abandon does not touch them. A PR the batch left out (it conflicts with the others) or an
 abandoned batch's PRs land on single turns, as above, and are never batched again.
 
 The turn guards against a worker that **strays**, not a malicious one: worker and launcher share one
@@ -525,11 +530,15 @@ the call does the rest and reports which way it went:
   the same edit adds `afk-attempt/starting`, which the started worker removes — so if the call
   errors after counting (a PR close refused, orca down), **run it again**: it finishes the retry
   without counting twice, and the next tick does the same by itself.
-- `"action": "escalate"` — the attempts are exhausted. In one fixed order: status board → relabel
-  (add `escalate_label`, remove `ready_label` and the attempt label) → comment the reason
+- `"action": "escalate"` — the attempts are exhausted. In one fixed order: status board → comment
+  the reason → relabel (add `escalate_label`, remove `ready_label` and the attempt label)
   → release the claim. The PR and the worktree are left for the human — except a worktree whose
   branch holds no work (nothing committed, nothing uncommitted), which is removed with its idle
-  worker: there is nothing in it to read.
+  worker: there is nothing in it to read. **An escalation is one escalation however often it
+  runs**: its comment records which claim it is of and after how many retries, so if the call
+  errors with the claim still held (the relabel refused, the release refused), **run it again** —
+  `afk fail` or `afk escalate` — and it finishes: no second comment, and never a retry of an
+  issue whose count the relabel already stripped. The next tick does the same by itself.
 
 An issue that should go to a human **without** consuming a retry takes the same ordered transition
 directly: `afk escalate --issue <n> --instance <id> --reason "<…>"`. Three cases: a `blocked` verdict
@@ -611,5 +620,7 @@ touch shared root config are naturally throttled by the DAG — chain them with 
   longer reads the assignee); keep the tracker honest so a peer fleet or a human never double-takes.
 - **Stay off the reserved namespaces.** The fleet manages the `afk-attempt/<n>` labels, the
   `refs/afk/*` ref namespace (the claim and heartbeat refs), the single status-board comment tagged
-  `<!--afk:status-->`, the `<!--afk:turn …-->` marker comment on a PR (which it parses), and the
+  `<!--afk:status-->`, the `<!--afk:turn …-->` marker comment on a PR (which it parses), the
+  `<!--afk:branch …-->` marker comments on an issue (which name the branches that are the fleet's to
+  continue from and to discard), and the
   worker-authored `<!--afk:verdict …-->` markers (which it parses) — leave them to the fleet, and reuse those prefixes / markers for nothing else.
