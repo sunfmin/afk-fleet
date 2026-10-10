@@ -378,8 +378,13 @@ def test_a_batch_is_known_by_its_id_wherever_orca_puts_its_branch():
     assert d.batch_formed_by(batch, "fl-1/x") and not d.batch_formed_by(batch, "fl-1")
     assert not d.batch_formed_by(batch, "") and not d.batch_formed_by(None, "fl-1/x")
     # the PR a stacked merge commit's subject names
-    assert d.stacked_pr(d.stack_message("a title", 12, 3).splitlines()[0]) == 12
-    assert d.stacked_pr("work: fix.txt") is None and d.stacked_pr(None) is None
+    subject = d.stack_message("a title", 12, 3).splitlines()[0]
+    assert d.stacked_pr("p1 p2", subject) == 12
+    assert d.stacked_pr("p1 p2", "work: fix.txt") is None and d.stacked_pr("p1 p2", None) is None
+    # …and only a merge commit's: the same subject on a commit with one parent, or none, names no PR
+    assert d.stacked_pr("p1", subject) is None and d.stacked_pr("", subject) is None
+    # the subject ENDS with it: a revert quotes it, and names no PR
+    assert d.stacked_pr("p1 p2", f'Revert "{subject}"') is None
     assert d.batch_branches(heads, "fl-9-1") == [] and d.batch_branches(None, "fl-1-170") == []
 
     def wt(branch, at=1, **more):
@@ -451,10 +456,13 @@ def test_the_cycle_forms_a_batch_only_from_two_or_more_eligible_prs():
 def test_a_stack_is_read_back_from_its_commits():
     assert d.stack_message("Add the thing", 12, 7) == "Add the thing (#12)\n\nCloses #7\n"
     assert d.stack_message("  ", 12, 7).startswith("PR 12 (#12)\n")
-    log = [("a1", "Add the thing (#12)"), ("b2", "Fix a typo (#13)"), ("c3", "make the stack green"),
-           ("d4", "refs issue (#99)"), ("e5", "Add the thing (#12)")]
-    stacked, fixes = d.read_stack(log, {12, 13})
-    assert stacked == {12: "a1", 13: "b2"} and fixes == ["c3", "d4", "e5"]
+    m, fix = "p1 p2", "p1"                        # a member is a merge commit; a fix has one parent
+    log = [("a1", m, "Add the thing (#12)"), ("b2", m, "Fix a typo (#13)"),
+           ("c3", fix, "make the stack green"), ("d4", m, "refs issue (#99)"),
+           ("e5", m, "Add the thing (#12)"), ("f6", fix, "repair the other thing (#14)")]
+    stacked, fixes = d.read_stack(log, {12, 13, 14})
+    # a fix titled like member 14's commit is still a fix: 14 is not on this stack
+    assert stacked == {12: "a1", 13: "b2"} and fixes == ["c3", "d4", "e5", "f6"]
     assert d.read_stack([], {12}) == ({}, [])
     said = d.batch_landed_comment("abc123", "main", "fl-1-5", [12, 13])
     assert "landed on `main` as abc123" in said and "#12, #13" in said and "did not mark this PR merged" in said

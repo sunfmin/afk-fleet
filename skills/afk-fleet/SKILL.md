@@ -343,7 +343,7 @@ In this order, each step the same `afk` transition you could type yourself
    already held — an **orphaned claim** (always continued, never released back), one whose blockers
    have all closed, each **stale** peer claim it reclaims — then the frontier, in order, into the
    free slots (plus one for every claim this pass settled).
-7. **Heartbeat**, then the **status board** of every claim nothing above touched.
+7. **Heartbeat** (each claim push beat first), then the **status board** of every claim nothing above touched.
 
 A worker still coding, a PR whose checks are running, a finished PR waiting behind the one that
 holds the turn, a live peer's claim: all left exactly as they are.

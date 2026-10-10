@@ -150,6 +150,39 @@ class Sandbox:
                     f'exit 1;; esac\nexit 0\n')
         os.chmod(hook, 0o755)
 
+    def scan_as_claims_land(self, clone, instance, now):
+        """Have a peer fleet — `instance`, in `clone` — classify the claims the
+        moment a claim push lands on the bare repo, before its pusher runs another
+        line → a function returning that peer's verdict on the last claim to land
+        (`afk classify-claims`)."""
+        seen = os.path.join(self.root, f"seen-by-{instance}.json")
+        hook = os.path.join(self.bare, "hooks", "post-update")
+        with open(hook, "w") as f:
+            f.write(f'''#!/bin/sh
+case "$*" in *afk/claim/*|*afk-claim/*) ;; *) exit 0;; esac
+unset $(git rev-parse --local-env-vars)
+cd "{clone}" && exec "{sys.executable}" "{AFK}" classify-claims --instance {instance} \\
+    --now {now} --config '{settled("{}")}' > "{seen}" 2>&1
+''')
+        os.chmod(hook, 0o755)
+
+        def verdict():
+            with open(seen) as f:
+                return json.load(f)
+        return verdict
+
+
+def last_beat(cwd, instance, ts):
+    """Leave `instance` a fleet whose last heartbeat was at `ts` — None: one that
+    never beat — whatever its claims wrote since: a peer that died holding them.
+    The heartbeat is dropped behind afk's back, as it has to be: afk takes no
+    claim without beating first, and never moves a heartbeat back."""
+    ref = f"refs/afk/heartbeat/{instance}"
+    if git(cwd, "ls-remote", "origin", ref):
+        git(cwd, "push", "-q", "origin", f":{ref}")
+    if ts is not None:
+        assert afk(cwd, "heartbeat", "--instance", instance, "--now", str(ts))["refreshed"]
+
 
 @contextmanager
 def sandbox(clones=1):
@@ -194,10 +227,11 @@ def test_classify_claims_partitions_real_refs():
         for n, inst in ((1, "me"), (2, "peer-live"), (3, "peer-dead"), (4, "peer-silent")):
             assert afk(w, "claim", str(n), "--instance", inst, "--now", str(T0))["won"], n
 
-        # heartbeats written at pinned times: fresh, long expired, and (peer-silent)
-        # never written at all — an owner that never beat counts as dead
-        for inst, ts in (("me", T0), ("peer-live", T0 - 60), ("peer-dead", T0 - TTL - 60)):
-            assert afk(w, "heartbeat", "--instance", inst, "--now", str(ts))["refreshed"], inst
+        # last heartbeats at pinned times: fresh, long expired, and (peer-silent)
+        # none at all — an owner with no heartbeat counts as dead
+        for inst, ts in (("peer-live", T0 - 60), ("peer-dead", T0 - TTL - 60),
+                         ("peer-silent", None)):
+            last_beat(w, inst, ts)
 
         r = afk(w, "classify-claims", "--instance", "me", "--now", str(T0))
         assert r["mine"] == [1], r
@@ -209,6 +243,44 @@ def test_classify_claims_partitions_real_refs():
         assert claims[3]["instance"] == "peer-dead" and claims[3]["sha"]
         assert claims[3]["host"] and claims[3]["ts"] == T0
         assert afk(w, "scan")["heartbeats"]["peer-dead"] == T0 - TTL - 60
+
+
+def test_a_claim_is_never_on_the_remote_without_its_owners_fresh_heartbeat():
+    """Two fleets, and a peer that scans in the worst window there is: the instant
+    a claim lands, before its owner has run another line. An owner that beat only
+    after claiming is, in that scan, a claim nobody alive holds — stale, reclaimed,
+    and the issue worked twice with no fault anywhere. So the claim push itself
+    beats first, however the claim is taken."""
+    with sandbox(clones=2) as sb:
+        a, b = sb.clones
+        hb = "refs/afk/heartbeat/fleet-a"
+        seen_by_b = sb.scan_as_claims_land(b, "fleet-b", T0)
+
+        # a first claim: fleet-a held nothing and had never beaten
+        assert afk(a, "claim", "7", "--instance", "fleet-a", "--now", str(T0))["won"]
+        assert (seen_by_b()["peer_live"], seen_by_b()["stale"]) == ([7], [])
+        assert afk(a, "scan")["heartbeats"] == {"fleet-a": T0}
+
+        # a claim made while the beat is fresh costs no second write
+        written = sb.remote_ref(hb)
+        assert afk(a, "claim", "8", "--instance", "fleet-a", "--now", str(T0 + 60))["won"]
+        assert seen_by_b()["peer_live"] == [7, 8] and sb.remote_ref(hb) == written
+
+        # a fleet that held nothing for a whole lease: its old beat proves nothing
+        for n in (7, 8):
+            afk(a, "release", str(n), "--instance", "fleet-a")
+        later = T0 + TTL + 60
+        seen_by_b = sb.scan_as_claims_land(b, "fleet-b", later)
+        assert afk(a, "claim", "9", "--instance", "fleet-a", "--now", str(later))["won"]
+        assert (seen_by_b()["peer_live"], seen_by_b()["stale"]) == ([9], [])
+
+        # a claim taken from a dead peer is its taker's from the same instant
+        assert afk(a, "claim", "5", "--instance", "dead-peer", "--now", str(T0))["won"]
+        dead = sb.remote_ref("refs/afk/claim/5")
+        assert seen_by_b()["stale"] == [5]
+        assert afk(a, "reclaim", "5", "--instance", "fleet-c", "--expect-sha", dead,
+                   "--now", str(later))["won"]
+        assert (seen_by_b()["peer_live"], seen_by_b()["stale"]) == ([5, 9], [])
 
 
 def test_stale_reclaim_is_an_atomic_compare_and_swap():
@@ -441,15 +513,16 @@ def test_probe_falls_back_when_the_server_rejects_the_hidden_namespace():
         claim = afk(w, "claim", "12", "--instance", "me", "--now", str(T0), *cfg)
         assert claim["won"] and claim["ref"] == "refs/heads/afk-claim/12"
         hb = afk(w, "heartbeat", "--instance", "me", "--now", str(T0), *cfg)
-        assert hb["refreshed"] and hb["ref"] == "refs/heads/afk-heartbeat/me"
+        assert hb["ts"] == T0 and hb["ref"] == "refs/heads/afk-heartbeat/me"   # the claim beat
         assert afk(w, "classify-claims", "--instance", "me", "--now", str(T0), *cfg)["mine"] == [12]
         assert afk(w, "release", "12", *ME, *cfg)["released"] is True
         assert sb.remote_ref("refs/heads/afk-claim/12") == ""
 
         # on the config the probe was GIVEN, the blocked namespace is an error —
         # never a quiet "a peer won the race" that would leave the fleet idling forever
-        err = afk_error(w, "claim", "13", "--instance", "me", "--now", str(T0))
-        assert "not a lost race" in err and "refs/afk/claim/13" in err
+        # (it fails at the heartbeat a claim opens with: nothing of it reaches the remote)
+        err = afk_error(w, "claim", "13", "--instance", "new", "--now", str(T0))
+        assert "ruleset" in err and "refs/afk/heartbeat/new" in err
         # …and with no config at all there is nothing to run on: the call is refused
         # outright rather than quietly sent to the default namespace
         err = afk_error(w, "release", "12", *ME, bare=True)
@@ -542,19 +615,24 @@ def test_a_failed_push_is_an_error_not_a_lost_race():
     with sandbox() as sb:
         w = sb.clones[0]
         bad = ("--remote", "no-such-remote")
-        assert "not a lost race" in afk_error(w, "claim", "7", "--instance", "me", *bad)
+        afk_error(w, "claim", "7", "--instance", "me", *bad)
+        claim = afk(w, "claim", "8", "--instance", "dead-peer", "--now", str(T0))
+        sb.forbid("refs/afk/claim/")
+        assert "not a lost race" in afk_error(w, "claim", "7", "--instance", "me",
+                                              "--now", str(T0))
         assert sb.remote_ref("refs/afk/claim/7") == ""
 
         # same for a reclaim: the claim has NOT moved, so a failed push is not a loss
-        claim = afk(w, "claim", "8", "--instance", "dead-peer", "--now", str(T0))
-        sb.forbid("refs/afk/")
         err = afk_error(w, "reclaim", "8", "--instance", "me", "--expect-sha", claim["sha"])
         assert "has not moved" in err and "remote rejected" in err
         assert sb.remote_ref("refs/afk/claim/8") == claim["sha"]      # untouched
         # …and an unreachable remote cannot even be asked whether it moved
         afk_error(w, "reclaim", "8", "--instance", "me", "--expect-sha", claim["sha"], *bad)
-        # a heartbeat that cannot be written is an error too (a silent miss lapses the lease)
-        assert "remote rejected" in afk_error(w, "heartbeat", "--instance", "me", "--now", str(T0))
+        # a heartbeat that cannot be written is an error too (a silent miss lapses the
+        # lease) — and so is the claim that would have followed it
+        sb.forbid("refs/afk/")
+        assert "remote rejected" in afk_error(w, "heartbeat", "--instance", "new", "--now", str(T0))
+        assert "remote rejected" in afk_error(w, "claim", "9", "--instance", "new", "--now", str(T0))
 
 
 def test_every_kind_of_record_kept_on_a_ref_round_trips_through_the_remote():
@@ -632,7 +710,7 @@ def test_malformed_refs_in_the_namespace_are_ignored_not_fatal():
         timeless = git(w, "commit-tree", empty, "-m", "afk-heartbeat instance=me ts=soon")
         git(w, "push", "-q", "origin", f"{junk}:refs/afk/claim/not-a-number",
             f"{junk}:refs/afk/claim/6", f"{junk}:refs/afk/heartbeat/ghost",
-            f"{nobody}:refs/afk/claim/7", f"{timeless}:refs/afk/heartbeat/me")
+            f"{nobody}:refs/afk/claim/7", f"+{timeless}:refs/afk/heartbeat/me")
 
         scan = afk(w, "scan")
         by = {c["number"]: c for c in scan["claims"]}
@@ -672,7 +750,7 @@ def test_every_ref_op_round_trips_under_the_refs_heads_fallback():
         assert sb.remote_ref("refs/afk/claim/12") == ""          # nothing in the hidden ns
 
         hb = afk(w, "heartbeat", "--instance", "me", *NS, "--now", str(T0))
-        assert hb["refreshed"] and hb["ref"] == "refs/heads/afk-heartbeat/me"
+        assert hb["ts"] == T0 and hb["ref"] == "refs/heads/afk-heartbeat/me"   # the claim beat
 
         scan = afk(w, "scan", *NS)
         assert [c["number"] for c in scan["claims"]] == [12]
@@ -702,9 +780,8 @@ def test_takeover_lists_and_force_takes_a_dead_fleet():
         for n in (21, 22):
             assert afk(w, "claim", str(n), "--instance", "dead-fleet", "--now", str(T0))["won"]
         assert afk(w, "claim", "23", "--instance", "live-fleet", "--now", str(T0))["won"]
-        afk(w, "heartbeat", "--instance", "dead-fleet",
-            "--now", str(T0 - TTL - 99))
-        afk(w, "heartbeat", "--instance", "live-fleet", "--now", str(T0 - 10))
+        last_beat(w, "dead-fleet", T0 - TTL - 99)
+        last_beat(w, "live-fleet", T0 - 10)
 
         rows = {r["instance"]: r for r in
                 afk(w, "takeover", "--list", "--instance", "new-fleet",
