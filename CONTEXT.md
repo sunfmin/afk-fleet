@@ -415,7 +415,7 @@ and it is pushed to the target as a fast-forward — the push a moved target ref
 progress and resolved in place, a red gate is fixed in place, and the worker lands again — no round
 trip through the tick, no **retry** spent, the PR kept. The turn is kept only from a PR's second turn
 on: the first such stop **gives the turn up**, and the worker fixes off it. Run off the turn, the
-same command still gates what would land and merges nothing; green there, the PR is **ready again**
+same command syncs, runs no local gate and merges nothing (ADR-0047); merging cleanly there, the PR is **ready again**
 (`awaiting_turn`), the worker **wakes** the launcher and stops, and the PR waits for its next turn at
 the head of the **merge queue**. Nothing lands off a turn (ADR-0045). Checks that must run on the head
 it pushed are waited for by the landing itself, up to a bound. A gate run or that wait is long, so

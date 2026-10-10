@@ -64,8 +64,8 @@ starts from base.
 one recreated at the PR's head — never from base — and briefed only to land the PR with `afk land`,
 not with the task. The result says so (`prompt: landing`, `landing: <pr>`). `afk turn` itself takes
 this path when the worker's terminal is already gone. A claim whose PR gave its turn up and is still
-being fixed (`fixing`, ADR-0045) is continued onto that same brief: off the turn `afk land` gates
-what would land and merges nothing.
+being fixed (`fixing`, ADR-0045) is continued onto that same brief: off the turn `afk land` syncs,
+runs no local gate (ADR-0047) and merges nothing.
 
 **A merge batch is continued too** (ADR-0029). Its worker has no claim, so `afk dispatch` is not
 its path: the pass asks after it with `afk no-pr --batch`, and when its terminal is gone

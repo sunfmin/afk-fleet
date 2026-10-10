@@ -8,7 +8,9 @@ turn also bounds a fix off one) and
 [ADR-0029](0029-a-merge-batch-lands-n-prs-behind-one-gate-run.md) (when a batch forms). The record
 it adds is a field of the turn marker, in the encoding of
 [ADR-0032](0032-records-kept-in-comments-share-the-encoding-of-records-on-refs.md). The invariant of
-[ADR-0012](0012-local-completion-gate.md) is untouched.
+[ADR-0012](0012-local-completion-gate.md) is untouched. Amended by
+[ADR-0047](0047-off-the-turn-a-landing-runs-no-local-gate.md): off the turn the local gate is no
+longer run (items 3 and 4, and the fourth rejected alternative).
 
 ## Context
 
