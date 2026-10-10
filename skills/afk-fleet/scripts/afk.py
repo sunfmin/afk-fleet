@@ -50,6 +50,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from typing import (Any, Callable, Iterable, Iterator, Literal, Mapping, NoReturn, Sequence,
                     TypeVar)
 
@@ -978,19 +979,49 @@ def _branch_protection(repo: str, branch: str) -> tuple[Obj | None, str | None]:
     return None, err or f"gh exited {p.returncode}"
 
 
+# What a probe's ref is named, under the prefix it asks about: `probe-<a name of
+# this probe's own>`. No two probes name the same ref, so two launches probing at
+# once never meet on one — a push the server turns down is turned down for where
+# the ref is, never for a ref another probe put there — and a probe killed before
+# its delete leaves a ref no later probe pushes to. What is left that way is
+# deleted by the next probe (`_drop_probes`).
+_PROBE_LEAF = "probe"
+
+
+def _push_probe(rem: str, prefix: str, now: int) -> tuple[str, subprocess.CompletedProcess[str]]:
+    """Ask the remote whether it takes a new ref under `prefix`, by pushing one →
+    (the ref, the push). The ref is this probe's alone (`_PROBE_LEAF`)."""
+    ref = f"{prefix}/{_PROBE_LEAF}-{uuid.uuid4().hex}"
+    sha = _record_commit(afk_decide.PROBE_RECORD, {"ts": now})
+    return ref, _git(["push", "--quiet", rem, f"{sha}:{ref}"], check=False)
+
+
+def _drop_probes(rem: str, prefix: str, own: str) -> None:
+    """Delete this probe's ref, then every probe ref left under `prefix` — a
+    launch killed between its push and its delete. One of those may be a probe
+    still running: it has its answer already, and its own delete finds nothing.
+    Never raises: a ref that stays is litter the next probe deletes."""
+    _git(["push", "--quiet", rem, "--delete", own], check=False)
+    left = [row.split()[1] for row in _git(["ls-remote", rem, f"{prefix}/{_PROBE_LEAF}*"],
+                                           check=False).stdout.splitlines()]
+    if left:
+        _git(["push", "--quiet", rem, "--delete", *left], check=False)
+
+
 def _usable_namespace(rem: str, wanted: str, now: int) -> tuple[str, str | None]:
     """The first claim namespace the remote lets us push under — `wanted`, else
     the branch fallback — as (namespace, rejection|None). Only a
     push the SERVER rejected (an org ruleset forbidding `refs/afk/*`) moves on
     to the fallback; a push that never reached a verdict (auth, network) raises,
-    because that says nothing about which namespace is allowed."""
+    because that says nothing about which namespace is allowed. The answer is the
+    remote's alone: every fleet on a repo must lock in the same place, so neither
+    another probe running now nor one that died may change it (`_PROBE_LEAF`)."""
     rejection = None
     for ns in dict.fromkeys([wanted, afk_decide.BRANCH_NAMESPACE]):
-        ref = f"{afk_decide.CLAIM_NAMESPACES[ns][0]}/probe"
-        sha = _record_commit(afk_decide.PROBE_RECORD, {"ts": now})
-        p = _git(["push", rem, f"{sha}:{ref}"], check=False)
+        prefix = afk_decide.CLAIM_NAMESPACES[ns][0]
+        ref, p = _push_probe(rem, prefix, now)
         if p.returncode == 0:
-            _git(["push", rem, "--delete", ref], check=False)
+            _drop_probes(rem, prefix, ref)
             return ns, rejection
         if "[remote rejected]" not in p.stderr:
             raise RuntimeError(f"probe push to {ref} failed: {p.stderr.strip()}")
@@ -1095,23 +1126,24 @@ def _probe_gate_records(rem: str, now: int) -> Obj:
     remote that refuses the records only costs every landing its own run of the
     gate — worth a word with the human present, not worth stopping a launch."""
     ns = afk_decide.GATE_RECORD_NAMESPACE
-    sha = _record_commit(afk_decide.PROBE_RECORD, {"ts": now})
-    p = _git(["push", "--quiet", rem, f"{sha}:{ns}/probe"], check=False)
+    own, p = _push_probe(rem, ns, now)
     if p.returncode != 0:
         return {"verdict": "warn", "pruned": 0,
                 "detail": f"the remote refuses refs under {ns} ({p.stderr.strip()}): no gate "
                           f"run can be put on record, so every landing runs the gate itself"}
-    expired = [f"{ns}/probe"]
+    probes, expired = [own], []
     if _git(["fetch", "--quiet", "--no-tags", "--prune", rem, f"+{ns}/*:{_LOCAL_GATE}/*"],
             check=False).returncode == 0:
         for name in _git(["for-each-ref", "--format=%(refname)", _LOCAL_GATE]).stdout.split():
-            leaf = name[len(_LOCAL_GATE) + 1:]
+            ref = f"{ns}/{name[len(_LOCAL_GATE) + 1:]}"
             record = _read_record(afk_decide.GATE_RUN_RECORD, name)
             _git(["update-ref", "-d", name], check=False)
-            if leaf != "probe" and afk_decide.gate_record_void(record, now):
-                expired.append(f"{ns}/{leaf}")
-    _git(["push", "--quiet", rem, "--delete", *expired], check=False)
-    return {"verdict": "ok", "pruned": len(expired) - 1,
+            if ref.startswith(f"{ns}/{_PROBE_LEAF}"):
+                probes.append(ref)      # a probe's ref, ours or one left behind: no record
+            elif afk_decide.gate_record_void(record, now):
+                expired.append(ref)
+    _git(["push", "--quiet", rem, "--delete", *dict.fromkeys(probes + expired)], check=False)
+    return {"verdict": "ok", "pruned": len(expired),
             "detail": f"gate runs are put on record under {ns}"}
 
 
