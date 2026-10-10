@@ -2887,16 +2887,18 @@ def test_what_is_on_the_train_is_read_off_the_train_itself():
                                                 "refs/afk/train/red/main")
     assert d.train_refs("refs/heads", "release/2") == ("refs/heads/afk-train/line/release/2",
                                                        "refs/heads/afk-train/red/release/2")
-    # its worktree is the repo's, known by its branch — it is linked to no issue
-    rows = [{"path": "/wt/t", "branch": "refs/heads/u/afk-train", "projectId": "github:o/r",
-             "lastActivityAt": 5},
-            {"path": "/wt/t2", "branch": "afk-train-2", "projectId": "github:O/R",
+    # its worktree is the repo's, known by the name it was created under — it is
+    # linked to no issue, and orca reports no branch for one on a detached HEAD (#159)
+    rows = [{"path": "/wt/afk-train", "branch": "refs/heads/u/afk-train",
+             "projectId": "github:o/r", "lastActivityAt": 5},
+            {"path": "/wt/afk-train-2", "branch": "", "projectId": "github:O/R",
              "lastActivityAt": 9},
-            {"path": "/wt/x", "branch": "u/afk-train", "projectId": "github:o/other"},
-            {"path": "/wt/a", "branch": "u/afk-train", "projectId": "github:o/r", "isArchived": True},
-            {"path": "/wt/9", "branch": "u/issue-9-afk-train-fix", "projectId": "github:o/r"}]
-    assert d.train_worktrees(rows, "o/r") == [{"path": "/wt/t2", "branch": "afk-train-2"},
-                                              {"path": "/wt/t", "branch": "u/afk-train"}]
+            {"path": "/x/afk-train", "branch": "u/afk-train", "projectId": "github:o/other"},
+            {"path": "/a/afk-train", "branch": "u/afk-train", "projectId": "github:o/r",
+             "isArchived": True},
+            {"path": "/wt/issue-9-afk-train-fix", "branch": "u/afk-train",
+             "projectId": "github:o/r"}]
+    assert d.train_worktrees(rows, "o/r") == ["/wt/afk-train-2", "/wt/afk-train"]
     assert d.train_worktrees(None, "o/r") == []
 
     # a claim's status where a train runs: to join, on it, or — cut after the

@@ -27,7 +27,8 @@ where it actually lives — executables on PATH:
         branch in the bare repo.
   orca  a stand-in backed by one JSON document, in orca's own response shapes
         (pinned against orca 1.4). `worktree create` makes a REAL git worktree on a
-        `tester/<name>` branch; terminals record the command they were started
+        `tester/<name>` branch, and `worktree list` reports the branch checked out
+        in it now — none once its HEAD is detached; terminals record the command they were started
         with and every prompt sent to them, so a test reads what a worker was
         actually told.
   $SHELL  a stand-in login shell that knows a fixed set of aliases.
@@ -369,6 +370,20 @@ lock = locked(path)
 with open(path) as f:
     raw = f.read()
 if argv == ["worktree", "list", "--json"]:       # verbatim, so a test can make it garbage
+    try:
+        listed = json.loads(raw)
+        for row in listed["result"]["worktrees"]:
+            # as real orca: the branch checked out NOW — none on a detached HEAD.
+            # Read off the worktree's own HEAD file: a listing runs no git
+            if os.path.isdir(row["path"]):
+                with open(os.path.join(row["path"], ".git")) as f:
+                    gitdir = f.read().strip()[len("gitdir: "):]
+                with open(os.path.join(gitdir, "HEAD")) as f:
+                    head = f.read().strip()
+                row["branch"] = head[len("ref: "):] if head.startswith("ref: ") else ""
+        raw = json.dumps(listed)
+    except (ValueError, KeyError, TypeError, OSError):
+        pass
     sys.stdout.write(raw)
     sys.exit(int(os.environ.get("AFK_FAKE_ORCA_EXIT", "0")))
 
@@ -4426,6 +4441,8 @@ def test_three_prs_that_join_during_one_gate_run_land_behind_the_next():
             ("landed", tip1, [10], "run", True), r
         assert r["landed"] == [{"issue": 1, "pr": 10, "commit": tip1}] and r["unmerged"] == []
         assert _gate_runs(w) == 1 and _target(w) == tip1
+        # the train's worktree stays an ordinary one: on the branch it was cut with
+        assert git(twt, "symbolic-ref", "--short", "HEAD") == "tester/afk-train"
         assert w.pr(10)["merged"] == {"pushed": True, "head": d[1][1]}
         assert w.issue(1)["state"] == "closed" and "已合并,完成" in w.board(1)
         assert not w.sb.remote_ref(f"refs/heads/{d[1][0]['branch']}")
@@ -4882,6 +4899,9 @@ def test_a_train_is_the_repos_and_the_next_fleet_instance_tends_it():
         base0 = _target(w)
         assert _land(w, 1, d1["worktree"], *gate)["outcome"] == "joined"
         twt = w.afk(*_turn_train(*gate, instance="old"))["worktree"]
+        # a train worktree is the train's whatever is checked out in it: one left
+        # on a detached HEAD, for which orca reports no branch, is still found (#159)
+        git(twt, "checkout", "-q", "--detach")
         assert _land(w, 2, d2["worktree"], *gate)["outcome"] == "joined"
         # `old` is gone, its train worker with it: the terminal is closed
         terms = w.terminals()

@@ -2484,27 +2484,29 @@ def instance_id(text: str) -> str:
 
 
 # The name the train worker's worktree is created under — one per repo on a
-# machine, kept across launches with what its gate runs built — and so, behind
-# orca's `<user>/` prefix and a `-<k>` when the name was taken, its branch.
+# machine, kept across launches with what its gate runs built — and so, with a
+# `-<k>` when the name was taken, the name of its directory.
 TRAIN_WORKTREE = "afk-train"
-_TRAIN_BRANCH_RE = re.compile(rf"^(?:[^/]+/)?{re.escape(TRAIN_WORKTREE)}(?:-\d+)?$")
+_TRAIN_WORKTREE_RE = re.compile(rf"^{re.escape(TRAIN_WORKTREE)}(?:-\d+)?$")
 
 
-def train_worktrees(worktrees: Iterable[Obj] | None, repo: str | None) -> list[Obj]:
-    """The orca worktrees on this machine that are the train worker's, as
-    [{"path", "branch"}...], the most recently active first. Same repo check as
+def train_worktrees(worktrees: Iterable[Obj] | None, repo: str | None) -> list[str]:
+    """The paths of the orca worktrees on this machine that are the train
+    worker's, the most recently active first. Same repo check as
     `find_orca_worktree`; the train's worktree is linked to no issue, so it is
-    known by its branch."""
+    known by the name it was created under — its directory's, which it keeps
+    whatever is checked out in it. Its branch is no such name: orca reports
+    none for a worktree on a detached HEAD."""
     hits = []
     for w in worktrees or []:
-        if not _TRAIN_BRANCH_RE.match(short_branch(w.get("branch"))) \
+        path = w.get("path") or ""
+        if not _TRAIN_WORKTREE_RE.match(path.rstrip("/").rpartition("/")[2]) \
                 or w.get("isMainWorktree") or w.get("isArchived"):
             continue
         if repo and not in_orca_project(w, repo):
             continue
-        hits.append((int(w.get("lastActivityAt") or 0),
-                     {"path": w.get("path"), "branch": short_branch(w.get("branch"))}))
-    return [row for _, row in sorted(hits, key=lambda h: -h[0])]
+        hits.append((int(w.get("lastActivityAt") or 0), path))
+    return [path for _, path in sorted(hits, key=lambda h: -h[0])]
 
 
 def train_refs(namespace: str, target: str) -> tuple[str, str]:
