@@ -275,7 +275,8 @@ _Avoid_: stuck issue, dead worker, zombie
 A **peer's** claim whose owner's **heartbeat** has expired past the claim lease — evidence the owning
 instance died mid-flight. It is the only claim a fleet may take from another *unattended*: reclaimed
 by an atomic `git push --force-with-lease` takeover of the ref, and only then, then recovered by
-**continuation**. A live peer's claim is never touched — that is what keeps cooperating fleets from
+**continuation**. A tick reclaims one only into a free slot under `concurrency` — lowest issue number
+first, ahead of the frontier — and leaves the rest stale for a later tick (ADR-0044). A live peer's claim is never touched — that is what keeps cooperating fleets from
 cannibalising each other's in-flight work. The lease-bypassing, human-authorized sibling of this
 reclaim is the **Takeover**. A stale claim whose issue is already **closed** is not work to continue
 but a **phantom lock** — the owner finished the issue and died before releasing — so the rebuild

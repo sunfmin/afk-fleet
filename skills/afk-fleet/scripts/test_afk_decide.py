@@ -2559,14 +2559,13 @@ class _Raises(str):
 _row = _mine
 
 
-def _working_set(mine=(), frontier=(), stale=(), stale_closed=(), batches=(), concurrency=3):
+def _working_set(mine=(), frontier=(), stale=(), stale_closed=(), batches=()):
     mine = list(mine)
     return {"mine": mine, "merge_order": d.turn_order(mine), "batches": list(batches),
             "frontier": {"dispatch": [{"number": n, "title": f"issue {n}"} for n in frontier]},
             "stale": [{"number": n, "instance": "dead", "sha": f"sha{n}"} for n in stale],
             "stale_closed": [{"number": n, "instance": "dead", "sha": f"sha{n}"}
-                             for n in stale_closed],
-            "free_slots": max(0, concurrency - len(mine))}
+                             for n in stale_closed]}
 
 
 def _batch(members, instance="fl-1", batch="b1"):
@@ -2574,13 +2573,14 @@ def _batch(members, instance="fl-1", batch="b1"):
             "members": [{"issue": n, "pr": n * 10} for n in members]}
 
 
-def _play(ws, answers=None, causes=None, config=None):
+def _play(ws, answers=None, causes=None, config=None, concurrency=3):
     """Carry a tick's plan out against a scripted world — the way `afk._tick`
     does, with no process → (the steps it handed out, what it returned).
 
       answers: {(do, issue or batch) | do: what that step's transition returns,
                 or `_Raises`}; a step with no answer here succeeds
       causes:  {issue or batch id: the cause `afk no-pr` classifies its worker with}
+      concurrency: the config's, where no whole `config` is given
     """
     answers, causes, steps = answers or {}, causes or {}, []
     stock = {"begin": d.BEGUN, "reclaim": {"won": True}, "fail": {"action": "retry"},
@@ -2605,7 +2605,7 @@ def _play(ws, answers=None, causes=None, config=None):
             return {"issue": key, "pr": key * 10, "head": "abc", "outcome": "granted"}, None
         return said(do, key)
 
-    plan = d.tick_plan(ws, CALL, config or d.resolve_config({}))
+    plan = d.tick_plan(ws, CALL, config or d.resolve_config({"concurrency": concurrency}))
     return steps, d.follow(plan, carry_out)
 
 
@@ -2705,14 +2705,95 @@ def test_a_claim_settled_this_tick_frees_its_slot_for_a_dispatch_in_the_same_tic
     assert done["did"] == _nothing_done(dispatched=[11], in_flight=3)
 
 
+def test_a_stale_claim_is_taken_into_a_free_slot_only_and_the_rest_wait_for_a_later_tick():
+    # one slot free, three dead peer's claims: the lowest is taken, the other two
+    # are not even tried, and the frontier — behind the stale claims — gets nothing
+    ws = _working_set(mine=[_row(1)], stale=[6, 7, 8], frontier=[11])
+    steps, done = _play(ws, concurrency=2)
+    assert _brief(steps) == [("no-pr", [1]), ("reclaim", 6), ("begin", 6), ("finish", [6]),
+                             ("heartbeat",)]
+    assert done["did"] == _nothing_done(reclaimed=[6], in_flight=2, frontier_remaining=1)
+    # a reclaim a peer won, or one that raised, used no slot: the next one is tried
+    steps, done = _play(ws, {("reclaim", 6): {"won": False}, ("reclaim", 7): _Raises("push")},
+                        concurrency=2)
+    assert [s for s in _brief(steps) if s[0] in ("reclaim", "begin")] == [
+        ("reclaim", 6), ("reclaim", 7), ("reclaim", 8), ("begin", 8)]
+    # the ones left are taken by later ticks, in order, as claims settle: here one
+    # claim of mine closes before each tick, and each tick takes exactly one
+    mine, stale, taken = [1, 2], [5, 6, 7, 8, 9], []
+    while stale:
+        ws = _working_set(mine=[_row(mine[0], "closed"), *map(_row, mine[1:])], stale=stale)
+        steps, done = _play(ws, concurrency=2)
+        assert done["did"]["in_flight"] == 2
+        taken += done["did"]["reclaimed"]
+        mine, stale = sorted(done["held"]), [n for n in stale if n not in taken]
+    assert taken == [5, 6, 7, 8, 9]
+    # a fleet over the bound takes nothing — no stale claim, no frontier issue, not
+    # even into the slot of the claim it settles — until it is back under; a claim
+    # it already holds is still continued, which takes no slot
+    mine = [_row(1), _row(2), _row(3), _row(4, "closed")]
+    steps, done = _play(_working_set(mine=mine, stale=[6], frontier=[11]), causes={1: "gone"},
+                        concurrency=2)
+    assert _brief(steps) == [("no-pr", [1, 2, 3]), ("release", 4), ("begin", 1), ("finish", [1]),
+                             ("heartbeat",)]
+    assert done["did"]["in_flight"] == 3 and done["held"] == {1, 2, 3}
+
+
+def test_no_tick_ends_holding_more_claims_than_the_bound_or_than_it_began_with():
+    """Whatever the working set — stale claims, more claims than slots — and
+    however each step ends, the claims held never pass max(`concurrency`, the
+    claims held as the tick began): a tick that starts at or under the bound
+    stays there, and one that starts over it takes nothing until it is back
+    under."""
+    causes = ("working", "gone", "silent", "blockers_waiting", "blocker_unmet",
+              "satisfied_refuted")
+    ends = {"reclaim": ({"won": True}, {"won": True}, {"won": False}, _Raises("push refused")),
+            "begin": (d.BEGUN, d.BEGUN, d.BEGUN, d.LOST, _Raises("no orca")),
+            "fail": ({"action": "retry"}, {"action": "escalate"}),
+            "finish": ({"ok": True}, {"ok": True}, _Raises("not ready"))}
+    releases = {"park", "escalate", "release"}
+    over = 0
+    for seed in range(3000):
+        rng = random.Random(seed)
+        concurrency = rng.randrange(5)
+        numbers = rng.sample(range(1, 40), rng.randrange(8) + rng.randrange(8) + rng.randrange(6))
+        mine, rest = numbers[:rng.randrange(8)], numbers[8:]
+        stale = sorted(rest[:rng.randrange(8)])
+        frontier = sorted(set(rest) - set(stale))
+        ws = _working_set(mine=[_row(n, rng.choice(("no_pr", "no_pr", "closed"))) for n in mine],
+                          stale=stale, frontier=frontier)
+        answers = {(do, n): rng.choice(how) for do, how in ends.items() for n in numbers}
+        steps, done = _play(ws, answers, causes={n: rng.choice(causes) for n in mine},
+                            concurrency=concurrency)
+        held, bound = set(mine), max(concurrency, len(mine))
+        over += len(mine) > concurrency
+        for step in steps:
+            do, n = step["do"], step.get("issue")
+            answer = answers.get((do, n))
+            if isinstance(answer, _Raises):
+                continue
+            if do in releases and "expect_sha" not in step or answer == {"action": "escalate"}:
+                held.discard(n)
+            elif answer in ({"won": True}, d.BEGUN) and n not in held:
+                # a claim is taken only into a free slot: over the bound, none is
+                assert len(held) < concurrency, (seed, step, held, concurrency)
+                held.add(n)
+            assert len(held) <= bound, (seed, step, held, concurrency)
+        assert done["did"]["in_flight"] <= len(held) <= bound, seed
+        # the stale claims tried are the first ones, in order: none is skipped
+        tried = [s["issue"] for s in steps if s["do"] == "reclaim"]
+        assert tried == stale[:len(tried)], (seed, tried)
+    assert over > 300       # it did meet fleets holding more claims than slots
+
+
 def test_a_transition_that_fails_settles_nothing_and_the_rest_of_the_tick_runs():
     mine = [_row(1), _row(2), _row(3), _row(4, "closed"), _row(5, "awaiting_turn", pr=50)]
-    ws = _working_set(mine=mine, frontier=[11], concurrency=5)
+    ws = _working_set(mine=mine, frontier=[11])
     causes = {1: "blocker_unmet", 2: "satisfied_refuted", 3: "blockers_waiting"}
     broken = {"escalate": _Raises("gh issue edit failed"), "park": _Raises("TypeError: null"),
               "release": _Raises("push refused"), "turn": _Raises("gh is down"),
               "heartbeat": _Raises("push refused")}
-    steps, done = _play(ws, broken, causes=causes)
+    steps, done = _play(ws, broken, causes=causes, concurrency=5)
     # every step is still handed out, in order, whatever the one before it did
     assert _brief(steps) == [("no-pr", [1, 2, 3]), ("turn", 5), ("escalate", 1), ("fail", 2),
                              ("park", 3), ("release", 4), ("heartbeat",)]
@@ -2839,10 +2920,9 @@ def test_a_tick_runs_its_stages_in_one_order_and_writes_each_board_once():
             _row(6, "failure", pr=60, board_phase="ci_failed", attempt=1),
             _row(7, "closed"), _row(8, "awaiting_ci", pr=80, board_phase="pr_open"),
             _row(9, board_phase="claimed")]
-    ws = _working_set(mine=mine, stale=[20], stale_closed=[21], frontier=[30, 31, 32],
-                      concurrency=11)
+    ws = _working_set(mine=mine, stale=[20], stale_closed=[21], frontier=[30, 31, 32])
     causes = {1: "silent", 2: "gone", 3: "blockers_waiting", 4: "satisfied", 9: "satisfied_refuted"}
-    steps, done = _play(ws, causes=causes)
+    steps, done = _play(ws, causes=causes, concurrency=11)
     assert _brief(steps) == [
         ("no-pr", [1, 2, 3, 4, 9]), ("turn", 5), ("nudge", 1), ("park", 3), ("fail", 9),
         ("release", 7), ("release", 21), ("begin", 2), ("reclaim", 20), ("begin", 20),
