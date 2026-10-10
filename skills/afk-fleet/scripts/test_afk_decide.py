@@ -1432,23 +1432,25 @@ def test_plan_takeover():
     assert r["action"] == "take" and r["fresh"] is False and r["heartbeat_age"] is None
 
 
-def test_branch_regex_and_candidates():
-    heads = [
-        "master",
-        "sunfmin/issue-9-continuation",          # orca's real shape: <user>/ prefix
-        "issue-9-continuation-second-try",       # no prefix, same issue
-        "sunfmin/issue-90-calibration",          # a DIFFERENT issue that starts with 9
-        "sunfmin/issue-10-takeover",
-        "sunfmin/feature/issue-9-nope",          # slug never spans a slash
-    ]
-    got = d.branch_candidates(heads, 9)
-    assert got == ["issue-9-continuation-second-try", "sunfmin/issue-9-continuation"], got
+def test_a_branch_is_the_fleets_by_its_record_never_by_its_name():
+    name, again = "sunfmin/issue-9-continuation", "sunfmin/issue-9-continuation-2"
+    comments = [{"id": 1, "body": "looks like <!--afk:status-->", "url": "u"},
+                {"id": 2, "body": d.branch_comment(name), "url": "u"},
+                {"id": 3, "body": "I pushed hotfix/issue-9-my-manual-fix", "url": "u"},
+                {"id": 4, "body": d.branch_comment(again), "url": "u"},      # a continuation's
+                {"id": 5, "body": d.branch_comment(name), "url": "u"},       # said twice: one name
+                {"id": 6, "body": "<!--afk:branch-->", "url": "u"}]          # names nothing
+    assert d.branch_comment(name).startswith(f"<!--afk:branch name={name}-->\n")
+    assert d.recorded_branches(comments) == [name, again]
+    assert d.recorded_branches(None) == []
 
-    # the number is the one field that is NOT a wildcard: 9 never matches 90
-    assert d.branch_candidates(heads, 90) == \
-        ["sunfmin/issue-90-calibration"]
-    assert d.branch_candidates(heads, 11) == []
-    assert d.branch_candidates(None, 9) == []
+    heads = ["master", again, name,
+             "hotfix/issue-9-my-manual-fix",          # a person's, shaped like orca's
+             "sunfmin/issue-9-continuation-3"]        # ... down to the suffix
+    assert d.own_branches(heads, [name, again]) == [name, again]
+    # a recorded branch the remote no longer has is no branch; None is no name
+    assert d.own_branches(heads, ["sunfmin/issue-9-gone", None, name]) == [name]
+    assert d.own_branches(heads, []) == [] and d.own_branches(None, [name]) == []
 
 
 def test_find_orca_worktree():
@@ -2222,9 +2224,6 @@ def test_find_orca_repo_and_worktree_name():
 
     name = d.worktree_name(31, "Fix the  Names inspector: tab (v2)!")
     assert name == "issue-31-fix-the-names-inspector-tab-v2"
-    # the name it produces is one recovery recognises as this issue's branch
-    assert d.branch_candidates([f"sunfmin/{name}", f"sunfmin/{name}-2", "sunfmin/issue-3-x"],
-                               31) == [f"sunfmin/{name}", f"sunfmin/{name}-2"]
     assert d.worktree_name(4, "中文标题") == "issue-4-work"
     assert d.worktree_name(4, None) == "issue-4-work"
     long = d.worktree_name(4, "word " * 40)
@@ -2243,11 +2242,14 @@ def test_closing_pr_and_superseded_prs():
             "closingIssuesReferences": [{"number": 30}]}]
     assert d.closing_pr(prs, 3)["number"] == 32                          # the latest closes it
     assert d.closing_pr(prs, 4)["number"] == 32 and d.closing_pr(prs, 99) is None
-    # a fresh start closes only what the FLEET opened for THIS issue: fleet-shaped
-    # branch AND closes the issue — never a human's PR, never issue 30's
-    assert [p["number"] for p in d.superseded_prs(prs, 3)] == [30, 31]
-    assert d.superseded_prs(prs, 4) == []
-    assert d.superseded_prs(None, 3) == []
+    # a fresh start closes only what the FLEET opened for THIS issue: from a branch
+    # that is the fleet's own AND closing the issue — never a human's PR, never
+    # issue 30's, and not #31 either while its fleet-shaped branch is not the fleet's
+    own = ["sunfmin/issue-3-x", "sunfmin/issue-3-y", "sunfmin/issue-30-x", None]
+    assert [p["number"] for p in d.superseded_prs(prs, 3, own)] == [30]
+    assert [p["number"] for p in d.superseded_prs(prs, 3, [*own, "sunfmin/issue-3-x-2"])] == [30, 31]
+    assert d.superseded_prs(prs, 3, []) == [] and d.superseded_prs(prs, 4, own) == []
+    assert d.superseded_prs(None, 3, own) == []
 
 
 # --------------------------------------------------------------------------- #

@@ -2473,33 +2473,34 @@ def plan_takeover(claims: Iterable[Claim] | None, heartbeats: Mapping[str, float
 # nothing. The selection is mechanics; "is this recovered state sane to build
 # on" stays tick judgment. Only tier 3 tears anything down.
 
-_PLACEHOLDER_RE = re.compile(r"\{(number|slug)\}")
+# What marks a branch as the fleet's: the fleet said so, on the issue, as orca cut
+# it (`afk._record_branch`). A branch is never recognised by its name — orca
+# names it, and `<anything>/issue-<n>-<anything>` is a name a person may give
+# their own. A continuation's branch is a new name, recorded the same way.
+BRANCH_RECORD = RecordKind("afk:branch", {"name": str}, ("name",))
 
 
-def branch_regex(number: int) -> re.Pattern[str]:
-    """
-    An issue number → the regex that matches the branch orca
-    ACTUALLY created for it. Two things are wildcards, by construction: orca
-    prefixes the branch with `<user>/` (ADR-0005 — the fleet reads the name back
-    rather than dictating it), and the slug is whatever the dispatching tick
-    passed. The number is not: it is the one field that identifies the issue.
-    """
-    out, pos = [], 0
-    pattern = BRANCH_PATTERN
-    for m in _PLACEHOLDER_RE.finditer(pattern):
-        out.append(re.escape(pattern[pos:m.start()]))
-        out.append(str(number) if m.group(1) == "number" else "[^/]*")
-        pos = m.end()
-    out.append(re.escape(pattern[pos:]))
-    return re.compile(r"^(?:[^/]+/)?" + "".join(out) + r"$")
+def branch_comment(name: str) -> str:
+    """The comment that records `name` as a branch the fleet cut for the issue
+    it is posted on."""
+    return record_comment(BRANCH_RECORD, {"name": name},
+                          f"afk-fleet: this issue's worker is on the branch `{name}`, cut by the "
+                          f"fleet. It is the fleet's to continue from, and to delete when the "
+                          f"attempt is discarded.")
 
 
-def branch_candidates(heads: Iterable[str] | None, number: int) -> list[str]:
-    """The remote branch names that could be issue <number>'s work branch, sorted.
-    Used when NO local worktree survived: the claim ref records the issue, not the
-    branch, so tier 2 has to recognise the branch by its name."""
-    rx = branch_regex(number)
-    return sorted(h for h in (heads or []) if h and rx.match(h))
+def recorded_branches(comments: Iterable[Comment] | None) -> list[str]:
+    """The branches the fleet recorded on one issue, from its comments — every
+    one of them, oldest first: each worktree cut for the issue left its own."""
+    records = (read_marker(BRANCH_RECORD, comment["body"]) for comment in comments or [])
+    return list(dict.fromkeys(record["name"] for record in records if record))
+
+
+def own_branches(heads: Iterable[str] | None, own: Iterable[str | None]) -> list[str]:
+    """The remote branch names that are the fleet's own for one issue, sorted:
+    the `heads` among `own`, the names the fleet knows it cut for it. Used when
+    NO local worktree survived: the claim ref records the issue, not the branch."""
+    return sorted(set(heads or []) & {name for name in own if name})
 
 
 def short_branch(ref: str | None) -> str:
@@ -4213,15 +4214,16 @@ def unseen_prs(mine: list[MineRow], prs: Iterable[PullRequest]) -> list[int]:
                   if r["number"] in now and now[r["number"]]["number"] != r["pr"])
 
 
-def superseded_prs(prs: Iterable[PullRequest] | None, number: int) -> list[PullRequest]:
+def superseded_prs(prs: Iterable[PullRequest] | None, number: int,
+                   own: Iterable[str | None]) -> list[PullRequest]:
     """The open PRs a FRESH start of issue <number> supersedes: the ones that
-    close it from a branch shaped like the fleet's own (`branch_regex`). A PR a
-    human opened from some other branch is never one of them — the fleet closes
-    only what the fleet opened."""
-    rx = branch_regex(number)
+    close it from a branch that is the fleet's `own` for it (`own_branches`). A
+    PR a human opened from any other branch — whatever its name — is never one
+    of them: the fleet closes only what the fleet opened."""
+    own = {name for name in own if name}
     return [p for p in prs or []
             if any(ref["number"] == number for ref in p["closingIssuesReferences"] or [])
-            and rx.match(p["headRefName"] or "")]
+            and p["headRefName"] in own]
 
 
 def assemble_working_set(issues: list[Issue], prs: list[PullRequest], claims: list[Claim],

@@ -1479,7 +1479,8 @@ class _Worktree:
             batch: str | None = None) -> _Worktree:
         """Have orca create a worktree + branch at the REMOTE's current tip of
         `at_branch` (ADR-0005: orca owns both, and names the branch) — for
-        `issue`, linked to it, or for merge batch `batch`, linked to none. The
+        `issue`, linked to it and its branch recorded on it as the fleet's
+        (`_record_branch`), or for merge batch `batch`, linked to none. The
         tip is fetched into the checkout orca cuts worktrees from and handed over
         as a sha rather than a branch name — and then ASSERTED: the worktree must
         contain it, however orca resolved the ref. A worker started on a base
@@ -1500,13 +1501,15 @@ class _Worktree:
                     "--no-parent", "--base-branch", sha,
                     *(["--issue", str(issue["number"])] if issue is not None else [])
                     ]).get("worktree") or {}
-        path, branch = wt.get("path"), wt.get("branch")
+        path, branch = wt.get("path"), afk_decide.short_branch(wt.get("branch"))
         if not path or not os.path.isdir(path):
             raise RuntimeError(f"orca worktree create returned no usable path: {path!r}")
+        if issue is not None and branch:
+            _record_branch(run.repo, issue["number"], branch)
         if _git(["-C", path, "merge-base", "--is-ancestor", sha, "HEAD"],
                 check=False).returncode != 0:
             _git(["-C", path, "merge", "--ff-only", sha])
-        return cls(path, afk_decide.short_branch(branch), batch=batch)
+        return cls(path, branch, batch=batch)
 
     @property
     def _here(self) -> str:
@@ -1905,6 +1908,22 @@ def _stalled_reason(repo: str, number: int, reason: str) -> str:
     return afk_decide.stall_reason(reason, tail or nudge.get("tail"))
 
 
+def _record_branch(repo: str, number: int, branch: str) -> None:
+    """Record on issue <number> that `branch` is one the fleet cut for it — what
+    makes the branch the fleet's own, to continue from and to discard
+    (`afk_decide.BRANCH_RECORD`). Recorded once, however often it is asked."""
+    if branch not in afk_decide.recorded_branches(_issue_comments(repo, number)):
+        _comment(repo, number, afk_decide.branch_comment(branch))
+
+
+def _own_branches(run: _Run, number: int, worktree: _Worktree) -> list[str]:
+    """Issue <number>'s branches on the remote that are the fleet's own: the ones
+    it recorded on the issue, and the branch of `worktree` — the one orca links
+    to the issue on this machine, an attempt even where nothing recorded it."""
+    recorded = afk_decide.recorded_branches(_issue_comments(run.repo, number))
+    return afk_decide.own_branches(_remote_heads(run.rem), [*recorded, worktree.branch])
+
+
 def _recovery(run: _Run, number: int, path: str | None = None, branch: str | None = None,
               no_worktree: bool = False, landing_pr: int | None = None) -> Obj:
     """What survived a dead worker, and the tier it selects (ADR-0011).
@@ -1912,9 +1931,9 @@ def _recovery(run: _Run, number: int, path: str | None = None, branch: str | Non
     Two signals, both mechanics: (1) is a worktree for this issue still on THIS
     machine — asked of `orca worktree list` (soft: no orca → "no worktree", never
     an abort), overridable with `path` / `no_worktree`; (2) is the issue's branch
-    ahead of base on the remote — the branch is recognised from its name
-    (the claim ref records the issue, not the branch) and the compare is plain
-    git. `afk_decide.select_recovery` then picks the tier.
+    ahead of base on the remote — the branch is one the fleet recorded on the
+    issue as its own (`_own_branches`: the claim ref records the issue, not the
+    branch) and the compare is plain git. `afk_decide.select_recovery` then picks the tier.
 
     Both signals are always gathered, even when the worktree already settles the
     tier: a *pristine* worktree over a branch that carries pushed commits still has
@@ -1934,8 +1953,7 @@ def _recovery(run: _Run, number: int, path: str | None = None, branch: str | Non
         worktree = {**worktree, **_worktree_progress(wt.path, rem, base)}
 
     # --- tier-2 signal: the branch the dead worker pushed ---
-    candidates = [] if branch else afk_decide.branch_candidates(
-        _remote_heads(rem), number)
+    candidates = [] if branch else _own_branches(run, number, wt)
     ahead = {b: _branch_ahead(rem, b, base, number)
              for b in ([branch] if branch else candidates)}
     branch = branch or afk_decide.furthest_ahead(ahead)
@@ -1961,7 +1979,8 @@ def cmd_recovery(a: argparse.Namespace) -> Obj:
 
 def _discard_attempt(run: _Run, number: int) -> Obj:
     """Throw the previous attempt away, for a FRESH start: close the PRs the fleet
-    opened for the issue, delete its work branches on the remote, remove its
+    opened for the issue, delete its own branches on the remote
+    (`_own_branches` — never one that only has the name of one), remove its
     worktree. What a retry means (the previous attempt is the thing that failed),
     and why it is never done to a claim that merely lost its worker (ADR-0011).
 
@@ -1969,17 +1988,18 @@ def _discard_attempt(run: _Run, number: int) -> Obj:
     the same red PR next tick; deleting the branches is what keeps a later
     continuation from resuming the attempt that was discarded."""
     rem = run.rem
+    wt = _Worktree.of_issue(run.repo, number)
+    own = _own_branches(run, number, wt)
     closed = []
-    for pr in afk_decide.superseded_prs(_open_prs(run.repo), number):
+    for pr in afk_decide.superseded_prs(_open_prs(run.repo), number, own):
         _close_pr(run.repo, rem, pr["number"],
                   "afk-fleet: superseded — this attempt failed and the issue is being retried "
                   "from a clean base.")
         closed.append(pr["number"])
     deleted = []
-    for branch in afk_decide.branch_candidates(_remote_heads(rem), number):
+    for branch in afk_decide.own_branches(_remote_heads(rem), own):    # what the closes left
         _delete_branch(rem, branch)
         deleted.append(branch)
-    wt = _Worktree.of_issue(run.repo, number)
     path = wt.remembered
     removed = wt.remove() if path else None
     if removed and not removed["removed"]:
@@ -3594,7 +3614,7 @@ def build_parser() -> _Parser:
     p.add_argument("--worktree", default=None, metavar="path",
                    help="the worker's worktree, to override the one orca reports (one --issue)")
 
-    p = command("recovery", cmd_recovery, remote="refs",
+    p = command("recovery", cmd_recovery, remote="gh",
                 help="read-only: does a dead claim have recoverable progress, and where? → "
                      "the tiered continuation verdict `afk dispatch` would act on")
     issue(p)
