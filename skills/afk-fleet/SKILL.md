@@ -603,7 +603,8 @@ touch shared root config are naturally throttled by the DAG — chain them with 
 - **Claim before work; release on every terminal transition.** `afk dispatch` creates the
   `refs/afk/claim/<n>` ref first — if the create is rejected, a peer owns it and nothing is started.
   `afk escalate`, `afk park` and `afk close` each delete it as their last step; a claim that outlived
-  its issue — every landed PR leaves one — is released by the next pass (`afk release`). A leaked ref is a phantom lock. Reconcile only your own claims, and take a peer's
+  its issue — every landed PR leaves one — is released by the next pass (`afk release`). Every
+  release deletes only the claim it read: one a peer took since is left alone, and the call fails. A leaked ref is a phantom lock. Reconcile only your own claims, and take a peer's
   only when its heartbeat is expired (a **stale claim**) — the single exception is an explicit human
   [`--takeover`](#takeover-mode---takeover). A stale claim on a closed issue (`stale_closed`) is not
   taken at all: it is deleted, with `afk release --expect-sha`.
