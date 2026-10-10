@@ -651,9 +651,9 @@ def _scan(run: _Run, fresh: bool = False) -> tuple[list[Claim], dict[str, int]]:
         _git(["fetch", "--prune", run.rem,
               f"+{claim_ns}/*:{_LOCAL_SCAN}/claim/*",
               f"+{hb_ns}/*:{_LOCAL_SCAN}/heartbeat/*"])
-        claims = [_claim_row(int(name), sha, record) for name, sha, record
+        claims = [_claim_row(number, sha, record) for name, sha, record
                   in _mirrored_records(afk_decide.CLAIM_RECORD, f"{_LOCAL_SCAN}/claim")
-                  if name.isdigit()]
+                  if (number := afk_decide.fleet_number(name)) is not None]
         heartbeats = {name: record["ts"] for name, _, record
                       in _mirrored_records(afk_decide.HEARTBEAT_RECORD, f"{_LOCAL_SCAN}/heartbeat")
                       if record}

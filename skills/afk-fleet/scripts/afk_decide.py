@@ -501,12 +501,23 @@ class FieldType(NamedTuple):
     empty: object = None            # what a record that does not state the field reads as
 
 
-def _digits(raw: str) -> int | None:
-    return int(raw) if raw.isascii() and raw.isdigit() else None
+# A number as the fleet writes one — `str(int(n))` of an issue, a PR, an attempt
+# or a time: ASCII digits, no sign, no leading zero, and no longer than any of
+# those ever gets (18 digits holds a nanosecond clock for centuries).
+_FLEET_NUMBER = re.compile(r"0|[1-9][0-9]{0,17}")
+
+
+def fleet_number(raw: str) -> int | None:
+    """Text the fleet did not necessarily write → the number it spells, or None.
+    The ONE rule for "is this a number" wherever a comment, a label, a ref name
+    or a commit subject is read: anyone can write those, so every other spelling
+    — `007`, `٧`, `²`, a digit run of any length — is not a number, rather than
+    another name for one or a conversion that raises."""
+    return int(raw) if _FLEET_NUMBER.fullmatch(raw) else None
 
 
 _FIELD_TYPES = {str: FieldType(str, lambda raw: raw),
-                int: FieldType(lambda value: str(int(value)), _digits)}
+                int: FieldType(lambda value: str(int(value)), fleet_number)}
 
 # A fact that is either so or not: written `=1` when so, left out when not.
 FLAG = FieldType(lambda value: "1" if value else "", lambda raw: True if raw == "1" else None,
@@ -514,8 +525,8 @@ FLAG = FieldType(lambda value: "1" if value else "", lambda raw: True if raw == 
 
 # Whole numbers, comma-separated; anything else in the list is dropped.
 INTS = FieldType(lambda values: ",".join(str(int(v)) for v in values),
-                 lambda raw: [int(x) for x in re.split(r"[,\s]+", raw) if _digits(x) is not None]
-                 or None, empty=())
+                 lambda raw: [n for x in re.split(r"[,\s]+", raw)
+                              if (n := fleet_number(x)) is not None] or None, empty=())
 
 
 def one_of(vocabulary: tuple[str, ...]) -> FieldType:
@@ -1963,9 +1974,9 @@ UNBATCHED: tuple[Unbatched, ...] = get_args(Unbatched)
 def _batch_members(raw: str | None) -> list[dict[str, int]]:
     """`1:10,2:20` → [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}]; anything
     else in the list is dropped."""
-    pairs = [tok.split(":") for tok in (raw or "").split(",")]
-    return [{"issue": int(p[0]), "pr": int(p[1])} for p in pairs
-            if len(p) == 2 and p[0].isdigit() and p[1].isdigit()]
+    pairs = [[fleet_number(part) for part in tok.split(":")] for tok in (raw or "").split(",")]
+    return [{"issue": p[0], "pr": p[1]} for p in pairs
+            if len(p) == 2 and p[0] is not None and p[1] is not None]
 
 
 # The PRs a merge batch holds, in stack order, each with the issue it closes.
@@ -2358,8 +2369,8 @@ def stacked_pr(parents: str, subject: str | None) -> int | None:
     way `stack_message` writes it. The subject alone decides, never the body;
     and a commit with one parent is never a member's, whatever its subject says
     — a fix titled `… (#<pr>)` is a fix."""
-    m = re.search(r" \(#(\d+)\)$", subject or "") if len(parents.split()) > 1 else None
-    return int(m.group(1)) if m else None
+    m = re.search(r" \(#([0-9]+)\)$", subject or "") if len(parents.split()) > 1 else None
+    return fleet_number(m.group(1)) if m else None
 
 
 def read_stack(commits: Iterable[tuple[str, str, str]],
@@ -3085,9 +3096,9 @@ def current_attempt(labels: Iterable[str] | None) -> int:
     attempts = [0]
     for lb in labels or []:
         if isinstance(lb, str) and lb.startswith(_ATTEMPT_PREFIX):
-            n = lb[len(_ATTEMPT_PREFIX):]
-            if n.isascii() and n.isdigit():
-                attempts.append(int(n))
+            n = fleet_number(lb[len(_ATTEMPT_PREFIX):])
+            if n is not None:
+                attempts.append(n)
     return max(attempts)
 
 
@@ -4329,11 +4340,12 @@ _UNFORMATTED = re.compile(
 
 # A closing keyword and the ONE reference after it — `Closes #1, #2` closes #1
 # alone — in each form GitHub autolinks: `#7`, `GH-7`, `owner/repo#7`, the URL.
+# The number is ASCII digits, and few enough that no body makes reading it raise.
 _REPO_NAME = r"[\w.-]+/[\w.-]+"
 _CLOSING_REFERENCE = re.compile(
     r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+"
     rf"(?:(?P<short>{_REPO_NAME})?#|GH-|https?://github\.com/(?P<url>{_REPO_NAME})/(?:issues|pull)/)"
-    r"(?P<number>\d+)\b", re.I)
+    r"(?P<number>[0-9]{1,18})\b", re.I)
 
 
 def issues_closed_by(body: str | None, linked: Iterable[IssueRef] | None,
