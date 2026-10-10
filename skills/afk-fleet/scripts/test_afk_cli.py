@@ -647,6 +647,15 @@ class World:
         assert len(rows) <= 1, rows
         return rows[0] if rows else ""
 
+    def fleet_branch(self, n, name):
+        """Record `name` on issue n as a branch the fleet cut for it — what
+        `afk dispatch` does for the one orca names."""
+        every = self.state()["comments"]
+        every.setdefault(str(n), []).append(
+            {"id": 9000 + len(every.get(str(n), [])), "html_url": "u",
+             "body": afk_decide.branch_comment(name)})
+        self.set(comments=every)
+
     def open_pr(self, number, closes, branch, conclusion="SUCCESS"):
         self.set(prs=self.state()["prs"] + [pr(number, closes, conclusion, headRefName=branch)])
 
@@ -2350,11 +2359,80 @@ def test_config_file_loads_validates_and_round_trips():
 # recovery via orca                                                            #
 # --------------------------------------------------------------------------- #
 
+def test_recovery_reads_pushed_progress_from_the_remote_alone():
+    """`afk recovery` (ADR-0011) tier 2 vs tier 3: with no local worktree, the only
+    evidence a dead worker left is its pushed branch — the one the fleet recorded
+    on the issue as orca cut it (ADR-0043): the claim ref never records a branch
+    name, and a name alone says nothing of whose the branch is."""
+    with world() as w:
+        cfg = ("--config", json.dumps({"base_branch": w.sb.base}))
+        gone = ("recovery", "--issue", "31", "--no-worktree", *R, *cfg)
+
+        def push(branch, *names):
+            git(w.cwd, "checkout", "-q", "-b", branch, w.sb.base)
+            for name in names:
+                w.commit(name)
+            git(w.cwd, "push", "-q", "origin", "HEAD")
+
+        # nothing pushed → tier 3, the old fresh re-dispatch
+        r = w.afk(*gone)
+        assert r["tier"] == 3 and r["action"] == "dispatch_fresh" and r["prompt"] == "fresh"
+        assert r["branch"]["name"] is None and r["worktree"]["present"] is False
+
+        # a dead worker's branch, two commits ahead — and a person's, further ahead,
+        # under a name orca could have given: only the recorded one is the issue's
+        push("sunfmin/issue-31-continuation", "step1.txt", "step2.txt")
+        push("hotfix/issue-31-my-manual-fix", "a.txt", "b.txt", "c.txt")
+        assert w.afk(*gone)["tier"] == 3                   # nothing says either is the fleet's
+        w.fleet_branch(31, "sunfmin/issue-31-continuation")
+        r = w.afk(*gone)
+        assert (r["tier"], r["action"], r["prompt"]) == (2, "recreate_at_tip", "continue"), r
+        assert r["branch"] == {"name": "sunfmin/issue-31-continuation", "commits_ahead": 2,
+                               "candidates": ["sunfmin/issue-31-continuation"]}
+
+        # another issue's branch is never mistaken for this one
+        assert w.afk("recovery", "--issue", "3", "--no-worktree", *R, *cfg)["tier"] == 3
+
+        # a worktree still on this machine wins: tier 1, reused in place, never removed
+        git(w.cwd, "checkout", "-q", "sunfmin/issue-31-continuation")
+        r = w.afk("recovery", "--issue", "31", "--worktree", w.cwd, *R, *cfg)
+        assert (r["tier"], r["action"], r["prompt"]) == (1, "reuse_worktree", "continue"), r
+        assert r["worktree"]["present"] is True and r["worktree"]["commits_ahead"] == 2
+
+        # an earlier worktree of the issue left a second, shorter branch behind — a
+        # continuation's branch is a new name, wherever orca put it: the one FURTHEST
+        # ahead is the progress worth continuing, whatever its name sorts as
+        push("aaa/issue-31-continuation-2", "old.txt")
+        w.fleet_branch(31, "aaa/issue-31-continuation-2")
+        r = w.afk(*gone)
+        assert r["branch"]["candidates"] == ["aaa/issue-31-continuation-2",
+                                             "sunfmin/issue-31-continuation"]
+        assert r["branch"]["name"] == "sunfmin/issue-31-continuation"
+        assert r["branch"]["commits_ahead"] == 2 and r["tier"] == 2
+        # a branch named outright is measured as given, with no discovery
+        r = w.afk(*gone, "--branch", "aaa/issue-31-continuation-2")
+        assert (r["branch"]["name"], r["branch"]["commits_ahead"]) == \
+            ("aaa/issue-31-continuation-2", 1)
+        assert r["branch"]["candidates"] == []
+
+        # a branch that was never pushed has nothing ahead — measured as unknown, tier 3
+        r = w.afk(*gone, "--branch", "sunfmin/issue-31-never-pushed")
+        assert (r["branch"]["commits_ahead"], r["tier"]) == (None, 3)
+        # a base branch the remote does not have is a config mistake, said as one
+        assert "no-such-base" in w.error(*gone, "--set", "base_branch=no-such-base")
+        # …and a remote that cannot be READ is not "nothing pushed": tier 3 is the one
+        # tier that tears a worktree down, so "could not look" must never select it
+        os.rename(w.sb.bare, w.sb.bare + ".away")
+        for how in ((), ("--branch", "sunfmin/issue-31-continuation")):
+            assert w.sb.bare in w.error(*gone, *how), how
+
+
 def test_recovery_finds_this_machines_worktree_through_orca():
     with world() as w:
         cfg = ("--config", json.dumps({"base_branch": w.sb.base}))
         w.commit("step1.txt", branch="sunfmin/issue-31-x")
         git(w.cwd, "push", "-q", "origin", "HEAD")
+        w.fleet_branch(31, "sunfmin/issue-31-x")
         with open(os.path.join(w.cwd, "wip.txt"), "w") as f:
             f.write("uncommitted\n")
 
@@ -2550,6 +2628,10 @@ def test_dispatch_continues_from_whatever_progress_survived():
         assert git(r2["worktree"], "rev-parse", "HEAD") == pushed
         assert r2["branch"] == first["branch"] + "-2"
         assert f"`{r2['branch']}`" in _told(w.terminals()[-1])
+        # each worktree cut for the issue left its branch on record there — what makes
+        # both the fleet's (ADR-0043); the worktree reused in between cut none
+        assert afk_decide.recorded_branches([{"body": body} for body in w.comments(7)]) == \
+            [first["branch"], r2["branch"]]
         w.work(r2["worktree"], "step3.txt")
 
         # --start fresh: the tick judged the recovered state unsafe to build on → the
@@ -4786,6 +4868,26 @@ def test_fail_retries_from_a_clean_base_then_escalates_when_exhausted():
         assert w.orca_calls() == []
 
 
+def test_a_retry_discards_the_attempts_own_branch_and_no_other():
+    """A retry throws away what the fleet's attempt made. A person's branches for
+    the same issue — `hotfix/issue-5-…` is shaped exactly like one orca cuts — and
+    the PR they opened from one are theirs: none of it is the fleet's to discard."""
+    theirs, proposed = "hotfix/issue-5-my-manual-fix", "alice/issue-5-another-way"
+    with world(issues=[issue(5, "ready-for-agent")]) as w:
+        first, _ = with_pr(w, 5, 50, conclusion="FAILURE")
+        fix = git(w.cwd, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "a person's fix")
+        for branch in (theirs, proposed):
+            git(w.cwd, "push", "-q", "origin", f"{fix}:refs/heads/{branch}")
+        w.open_pr(49, closes=5, branch=proposed)
+
+        r = w.afk(*_fail(5, "CI red"))["worker"]
+        assert r["discarded"]["closed_prs"] == [50]
+        assert not w.sb.remote_ref(f"refs/heads/{first['branch']}")
+        assert w.sb.remote_ref(f"refs/heads/{theirs}") == fix
+        assert w.sb.remote_ref(f"refs/heads/{proposed}") == fix
+        assert w.pr(49).get("state", "open") == "open"
+
+
 def _refuse_branch_deletes(w, refuse, under="refs/heads"):
     """The remote refuses (or takes again) the deletion of a branch — or of any
     ref `under` another namespace."""
@@ -4820,6 +4922,7 @@ def _a_failure_cut_short(w, cut):
     first, _ = with_pr(w, 5, 50, conclusion="FAILURE")
     left = "tester/issue-5-left-behind"
     git(first["worktree"], "push", "-q", "origin", f"HEAD:refs/heads/{left}")
+    w.fleet_branch(5, left)
     breaks(w)
     assert says in w.error(*_fail(5, "CI red: TestNames fails")), cut
     # the failure is counted, and nothing is settled: the claim is still held
