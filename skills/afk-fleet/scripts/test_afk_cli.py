@@ -4467,6 +4467,26 @@ def test_fail_retries_from_a_clean_base_then_escalates_when_exhausted():
         assert w.orca_calls() == []
 
 
+def test_a_retry_discards_the_attempts_own_branch_and_no_other():
+    """A retry throws away what the fleet's attempt made. A person's branches for
+    the same issue — `hotfix/issue-5-…` is shaped exactly like one orca cuts — and
+    the PR they opened from one are theirs: none of it is the fleet's to discard."""
+    theirs, proposed = "hotfix/issue-5-my-manual-fix", "alice/issue-5-another-way"
+    with world(issues=[issue(5, "ready-for-agent")]) as w:
+        first, _ = with_pr(w, 5, 50, conclusion="FAILURE")
+        fix = git(w.cwd, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "a person's fix")
+        for branch in (theirs, proposed):
+            git(w.cwd, "push", "-q", "origin", f"{fix}:refs/heads/{branch}")
+        w.open_pr(49, closes=5, branch=proposed)
+
+        r = w.afk(*_fail(5, "CI red"))["worker"]
+        assert r["discarded"]["closed_prs"] == [50]
+        assert not w.sb.remote_ref(f"refs/heads/{first['branch']}")
+        assert w.sb.remote_ref(f"refs/heads/{theirs}") == fix
+        assert w.sb.remote_ref(f"refs/heads/{proposed}") == fix
+        assert w.pr(49).get("state", "open") == "open"
+
+
 def _refuse_branch_deletes(w, refuse):
     """The remote refuses (or takes again) the deletion of a branch."""
     hook = os.path.join(w.sb.bare, "hooks", "update")
