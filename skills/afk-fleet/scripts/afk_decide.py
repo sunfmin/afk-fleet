@@ -3157,9 +3157,10 @@ def retry_labels(labels: Iterable[str] | None, to_label: str) -> tuple[list[str]
     """The label edit that counts a failure: `(add, remove)`, made in ONE edit of
     the issue. Adds `to_label` and `ATTEMPT_STARTING` where the issue lacks them
     and removes every other attempt label it carries — so for a failure already
-    counted there is nothing to add or remove, and no edit to make: however a
-    hand-edit spelled the count (`afk-attempt/01`), or whatever it left beside
-    it, the number is the one `to_label` says and the next count tidies it."""
+    counted there is nothing to add or remove, and no edit to make: whatever a
+    hand-edit left beside the count, the number is the one `to_label` says and
+    the next count tidies it. A count spelled as the fleet never writes one
+    (`afk-attempt/01`) is no count (`fleet_number`): it goes out with the rest."""
     labels = list(labels or [])
     if attempt_starting(labels) and current_attempt(labels) == current_attempt([to_label]):
         return [], []
