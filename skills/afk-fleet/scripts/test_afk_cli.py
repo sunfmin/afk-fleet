@@ -3595,7 +3595,7 @@ def test_the_adversarial_verify_is_settled_before_the_turn_and_pinned_to_the_hea
     """A worker never verifies itself: the tick's verifier speaks about a head
     BEFORE the turn is granted, and a landing whose sync moved that head stops
     and waits for it to speak again."""
-    on = (*local_gate("true"), "--set", "gate.adversarial_verify_prompt=re-derive it")
+    on = (*local_gate("true"), "--set", "gate.adversarial_verify_prompt=prove it")   # not `World.verified`'s
     with world(issues=[issue(6, "ready-for-agent")]) as w:
         d, pr_head = with_pr(w, 6, 60)
         wt = d["worktree"]
@@ -3639,7 +3639,7 @@ def test_a_recorded_worker_gate_run_is_not_repeated_by_the_landing():
     with world(issues=[issue(3, "ready-for-agent"), issue(4, "ready-for-agent")]) as w:
         runs = os.path.join(w.sb.root, "gate-runs")
         command = f"echo gate-log; echo run >> {runs}"
-        gate = local_gate(command)
+        gate = turn_gate(command)
 
         def count():
             with open(runs) as f:
@@ -3667,8 +3667,7 @@ def test_a_recorded_worker_gate_run_is_not_repeated_by_the_landing():
         r = _land(w, 3, wt, *gate, now=int(time.time()))
         assert (r["outcome"], r["synced"], r["head"]) == ("merged", False, head), r
         # the outcome says the gate was trusted, not run, and names the head that landed
-        # — the PR stacked on a target that had not moved holds the tree the worker gated
-        assert r["gate"] == {"status": "green", "source": "recorded", "head": r["commit"],
+        assert r["gate"] == {"status": "green", "source": "recorded", "head": head,
                              "command": command, "recorded_at": r["gate"]["recorded_at"]}
         assert count() == 1 and w.pr(30)["merged"]["head"] == head
 
@@ -3796,14 +3795,14 @@ def test_a_landing_accepts_only_a_gate_run_of_the_committed_tree():
     with world(issues=[issue(n, "ready-for-agent") for n in (6, 7)]) as w:
         runs = os.path.join(w.sb.root, "gate-runs")
         clean = f"echo run >> {runs}"
-        d, head = with_pr(w, 6, 60, gate=local_gate(clean))
+        d, head = with_pr(w, 6, 60, gate=turn_gate(clean))
         wt = d["worktree"]
-        w.afk(*_turn(6, *local_gate(clean)))
+        w.afk(*_turn(6, *turn_gate(clean)))
         base0 = _target(w)
 
         def refused(command, *paths, ran):
             before = _gate_runs(w)
-            err = _land_error(w, 6, wt, *local_gate(command))
+            err = _land_error(w, 6, wt, *turn_gate(command))
             assert "not the commit that would land" in err and "Nothing was merged" in err, err
             assert all(path in err for path in paths), err
             assert _gate_runs(w) == before + ran
@@ -3838,21 +3837,21 @@ def test_a_landing_accepts_only_a_gate_run_of_the_committed_tree():
 
         # a clean worktree lands exactly as before
         before = _gate_runs(w)
-        r = _land(w, 6, wt, *local_gate(clean))
+        r = _land(w, 6, wt, *turn_gate(clean))
         assert (r["outcome"], r["gate"]["source"], r["head"]) == ("merged", "run", head), r
         assert _gate_runs(w) == before + 1
 
         # a RECORDED run stands in whatever lies around the commit: it is of the tree
-        d, _ = with_pr(w, 7, 70, gate=local_gate(clean))
+        d, _ = with_pr(w, 7, 70, gate=turn_gate(clean))
         wt = d["worktree"]
         git(wt, "pull", "-q", "--no-edit", "origin", w.sb.base)   # the worker's own sync
         git(wt, "push", "-q", "origin", "HEAD")
         assert _gate(w, wt, clean)["recorded"] is True
         with open(os.path.join(wt, "notes.txt"), "w") as f:
             f.write("left behind\n")
-        w.afk(*_turn(7, *local_gate(clean)))
+        w.afk(*_turn(7, *turn_gate(clean)))
         before = _gate_runs(w)
-        r = _land(w, 7, wt, *local_gate(clean))
+        r = _land(w, 7, wt, *turn_gate(clean))
         assert (r["outcome"], r["gate"]["source"]) == ("merged", "recorded"), r
         assert _gate_runs(w) == before
 
@@ -3862,7 +3861,7 @@ def test_a_gate_run_the_remote_will_not_record_is_still_green_and_the_landing_ga
     the ref leaves the worker's run green and unrecorded, and the landing runs
     the gate itself."""
     with world(issues=[issue(5, "ready-for-agent")]) as w:
-        gate = local_gate("true")
+        gate = turn_gate("true")
         d, head = with_pr(w, 5, 50, gate=gate)
         w.sb.forbid("refs/afk/gate/")
         g = _gate(w, d["worktree"], "true")
@@ -3912,7 +3911,7 @@ def test_a_worker_silent_while_fixing_off_its_turn_is_nudged_restarted_then_esca
     a turn: nudged once, restarted once (`afk turn --restart`, which grants no
     turn here), then escalated with the PR, the branch and the worktree kept.
     No step discards anything or spends an attempt, and `afk fail` is never one."""
-    gate = local_gate("true")
+    gate = turn_gate("true")
     with world(issues=[issue(5, "ready-for-agent"), issue(6, "ready-for-agent")]) as w:
         d, pr_head = with_pr(w, 5, 50, name="shared.txt", text="from the worker")
         with_pr(w, 6, 60)
@@ -3953,10 +3952,8 @@ def test_a_worker_silent_while_fixing_off_its_turn_is_nudged_restarted_then_esca
         # nothing is closed, deleted or counted, and no turn was granted by it
         assert "state" not in w.pr(50) and w.issue(5)["labels"] == ["ready-for-agent"]
         assert w.sb.remote_ref(f"refs/heads/{branch}") == pr_head and w.claimed_by(5) == "me"
-        [marker] = _turns(w, 50)
-        assert marker.startswith(f"<!--afk:turn instance=me at={t0 + 600} stopped=conflict "
-                                 f"head={pr_head} restarted={t0 + 600} given_up={t0} "
-                                 f"released=1-->\n"), marker
+        assert _marked(w, 50) == {"at": t0 + 600, "stopped": "conflict", "head": pr_head,
+                                  "restarted": t0 + 600, "given_up": t0, "released": True}
         assert _mine(w, gate, 5) == ("fixing", "fixing", "conflict") and "being fixed" in w.board(5)
         assert _mine(w, gate, 6)[0] == "landing"
 
@@ -3983,9 +3980,7 @@ def test_a_worker_silent_while_fixing_off_its_turn_is_nudged_restarted_then_esca
         w.advance_base("shared.txt", text="from someone else")
         wt = d["worktree"]
         t0 = int(time.time()) + 5000
-        cfg = {"base_branch": w.sb.base, "concurrency": 3,
-               "gate": {"ci": "local", "local_command": "true",
-                        "adversarial_verify_prompt": ""}}
+        cfg = {"base_branch": w.sb.base, "concurrency": 3, "gate": {"ci": "required"}}
         on = ("--config", json.dumps(cfg))
 
         def cycle(at, state=None):
@@ -4024,7 +4019,7 @@ def test_a_worker_silent_on_its_turn_is_nudged_once_then_restarted_onto_it_once_
     attempt is spent, the human gets the reason and the worker's last screen,
     and the released claim holds no turn, so the next PR gets it. No silence of
     a landing claim ever reaches `afk fail`."""
-    gate = local_gate("true")
+    gate = turn_gate("true")
     with world(issues=[issue(5, "ready-for-agent"), issue(6, "ready-for-agent")]) as w:
         d, pr_head = with_pr(w, 5, 50)
         with_pr(w, 6, 60)
@@ -4059,8 +4054,6 @@ def test_a_worker_silent_on_its_turn_is_nudged_once_then_restarted_onto_it_once_
         assert w.afk(*_turn(6, *gate))["outcome"] == "waiting"
         # only a PR that holds my turn has a worker to restart onto it
         assert "does not hold this fleet's landing turn" in w.error(*_turn(6, *gate, "--restart"))
-        assert "takes --issue" in w.error("turn", "--batch", "--restart", *ME, "--worker-command",
-                                          WORKER, *R, *NOW, *gate)
 
         w.orca_calls()
         r = w.afk(*_turn(5, *gate, "--restart", now=t0 + 600))
@@ -4085,9 +4078,8 @@ def test_a_worker_silent_on_its_turn_is_nudged_once_then_restarted_onto_it_once_
         # the turn stays with the PR, the claim reads `landing` throughout, and the
         # restart is on the PR's ONE turn marker
         assert _mine(w, gate, 5) == ("landing", "landing", None) and "已轮到落地" in w.board(5)
-        [marker] = _turns(w, 50)
-        assert f" at={t0 + 600} restarted={t0 + 600}-->" in marker.split("\n")[0]
-        assert "a new one was started onto it" in marker
+        assert _marked(w, 50) == {"at": t0 + 600, "restarted": t0 + 600}
+        assert "a new one was started onto it" in _turns(w, 50)[0]
         assert w.afk(*_turn(6, *gate))["outcome"] == "waiting"
 
         # the restarted worker is a new worker: one grace period to start, then its
@@ -4145,8 +4137,7 @@ def test_a_worker_silent_on_its_turn_is_nudged_once_then_restarted_onto_it_once_
         d, pr_head = with_pr(w, 8, 80)
         wt = d["worktree"]
         t0 = int(time.time()) + 5000
-        cfg = {"base_branch": w.sb.base, "concurrency": 1,
-               "gate": {"ci": "local", "local_command": "true"}}
+        cfg = {"base_branch": w.sb.base, "concurrency": 1, "gate": {"ci": "required"}}
 
         def cycle(at, state=None):
             return w.afk("cycle", *ME, "--worker-command", WORKER, *R, "--now", str(at), "--wake",
@@ -4191,7 +4182,7 @@ def test_a_turn_with_no_terminal_is_delivered_by_continuation_never_from_base():
     the claim taken over from another machine). The turn then STARTS a worker by
     continuation — in the worktree still here, else one recreated at the PR head —
     briefed only to land the PR. There is no launcher-side merge to fall back on."""
-    gate = local_gate("true")
+    gate = turn_gate("true")
     with world(issues=[issue(6, "ready-for-agent"), issue(7, "ready-for-agent")]) as w:
         d, pr_head = with_pr(w, 6, 60, gate=gate)
         wt, branch = d["worktree"], d["branch"]
@@ -4223,7 +4214,7 @@ def test_a_turn_with_no_terminal_is_delivered_by_continuation_never_from_base():
         assert (r["claim"], r["action"], r["prompt"], r["landing"]) == \
             ("held", "reuse_worktree", "landing", 60)
         assert _told(w.terminals()[-1]) == told and len(w.comments(60)) == 1
-        assert _land(w, 6, wt, *gate)["outcome"] == "merged"
+        assert _land_verified(w, 6, wt, *gate)[1]["outcome"] == "merged"
         w.afk("release", "6", *ME, *R, *gate)
 
         # no worktree on this machine at all (a takeover from another machine): one is
@@ -4239,13 +4230,12 @@ def test_a_turn_with_no_terminal_is_delivered_by_continuation_never_from_base():
         assert wt7 != d7["worktree"] and git(wt7, "rev-parse", "HEAD") == head7
         told = _told(w.terminals()[-1])
         assert f"**Your branch:** `{d7['branch']}-2`" in told and f"`{d7['branch']}`" in told
-        r = _land(w, 7, wt7, *gate)
-        assert (r["outcome"], r["synced"], r["head"]) == ("merged", False, head7), r
-        assert w.pr(70)["merged"] == {"pushed": True, "head": head7}
+        stop, r = _land_verified(w, 7, wt7, *gate)
+        assert (r["outcome"], r["synced"], r["head"]) == ("merged", False, stop["head"]), r
+        assert git(wt7, "log", "-1", "--format=%P").split() == [head7, base_tip]
+        assert w.pr(70)["merged"] == {"delete_branch": True, "head": stop["head"]}
         assert {"feature7.txt", "landed-later.txt"} <= w.remote_files(w.sb.base)
-        git(w.cwd, "fetch", "-q", "origin", w.sb.base)
-        assert git(w.cwd, "log", "-1", "--format=%P", r["commit"]).split() == [base_tip, head7]
-        # the stack was made and gated in this worktree, which is back on ITS branch
+        # the sync was made and gated in this worktree, on ITS branch — pushed to the PR's
         assert git(wt7, "rev-parse", "--abbrev-ref", "HEAD") == f"{d7['branch']}-2"
 
     # a delivery that fails AFTER the record is repaired by the paths that exist: the
@@ -5108,7 +5098,7 @@ def test_a_landing_aims_a_pr_open_against_an_earlier_base_at_the_base_branch():
     one, and GitHub merges a PR into the branch it is open against: the landing
     points it at the run's base branch first (ADR-0042)."""
     with world(issues=[issue(3, "ready-for-agent")]) as w:
-        gate = local_gate("true")
+        gate = turn_gate("true")
         d, _ = with_pr(w, 3, 30, gate=gate)
         w.set(prs=[{**w.pr(30), "baseRefName": "an-earlier-base"}])
         w.afk(*_turn(3, *gate))
