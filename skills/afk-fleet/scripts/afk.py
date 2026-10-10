@@ -135,6 +135,11 @@ _GIT_ENV = {
     "GIT_COMMITTER_NAME": "afk-fleet", "GIT_COMMITTER_EMAIL": "afk@fleet.local",
 }
 
+# The message locale every git here runs under. What git says is read — a ref the
+# remote lacks, a push the server turned down — so it is said in one language
+# whatever the machine's locale is. `LC_ALL=C` also switches `LANGUAGE` off.
+_GIT_LOCALE = {"LC_ALL": "C"}
+
 _SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _WORKER_PROMPT = os.path.join(_SKILL, "references", "worker-prompt.md")
 
@@ -181,10 +186,19 @@ def _agent(a: argparse.Namespace) -> _Agent:
 
 
 def _git(args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
-    p = subprocess.run(["git", *args], capture_output=True, text=True, env=_GIT_ENV)
+    p = subprocess.run(["git", *args], capture_output=True, text=True,
+                       env={**_GIT_ENV, **_GIT_LOCALE})
     if check and p.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {p.stderr.strip()}")
     return p
+
+
+def _git_as_caller(path: str, args: list[str]) -> subprocess.CompletedProcess[str]:
+    """One git in the repo at `path` that may write a commit of the caller's own —
+    a merge, a cherry-pick — so it runs under the caller's identity, not the
+    records'. Never raises: the caller reads the exit code."""
+    return subprocess.run(["git", "-C", path, *args], capture_output=True, text=True,
+                          env={**os.environ, **_GIT_LOCALE})
 
 
 def _gh(args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -247,7 +261,11 @@ def _remote_sha(remote: str, refname: str) -> str:
     return out[0] if out else ""
 
 
-_NO_REMOTE_REF = "couldn't find remote ref"       # git's words for a ref the remote lacks
+def _remote_lacks(p: subprocess.CompletedProcess[str], branch: str) -> bool:
+    """Whether a failed fetch failed because the remote has no `branch` — git's own
+    line for exactly that ref (in `_GIT_LOCALE`), never a part of one: a line for
+    `master` says nothing about `ma`."""
+    return f"fatal: couldn't find remote ref refs/heads/{branch}" in p.stderr.splitlines()
 
 
 def _fetch_tip(rem: str, branch: str, cwd: str | None = None) -> str:
@@ -258,7 +276,7 @@ def _fetch_tip(rem: str, branch: str, cwd: str | None = None) -> str:
     at = ["-C", cwd] if cwd else []
     p = _git([*at, "fetch", "--quiet", rem, f"refs/heads/{branch}"], check=False)
     if p.returncode != 0:
-        if _NO_REMOTE_REF in p.stderr:
+        if _remote_lacks(p, branch):
             raise RuntimeError(f"the remote has no branch {branch!r}")
         raise RuntimeError(f"git fetch {rem} refs/heads/{branch} failed: {p.stderr.strip()}")
     return _git([*at, "rev-parse", "FETCH_HEAD"]).stdout.strip()
@@ -592,7 +610,7 @@ def _branch_ahead(remote: str, branch: str, base: str, slot: int) -> int | None:
     p = _git(["fetch", "--force", remote,
               f"refs/heads/{branch}:{ours}/branch", f"refs/heads/{base}:{ours}/base"], check=False)
     if p.returncode != 0:
-        if f"{_NO_REMOTE_REF} refs/heads/{branch}" in p.stderr:
+        if _remote_lacks(p, branch):
             return None
         raise RuntimeError(f"git fetch {remote} of {branch!r} and {base!r} failed: "
                            f"{p.stderr.strip()}")
@@ -2508,8 +2526,7 @@ def _sync(rem: str, path: str, target: str) -> list[str]:
                            f"what would be gated is not what would land. Commit them (a "
                            f"resolved sync conflict must be committed) or discard them:\n{dirty}")
     sha = _fetch_tip(rem, target, cwd=path)
-    p = subprocess.run(["git", "-C", path, "merge", "--no-edit", sha],
-                       capture_output=True, text=True)
+    p = _git_as_caller(path, ["merge", "--no-edit", sha])
     if p.returncode != 0:
         files = _unmerged(path)
         if not files:
@@ -3201,8 +3218,7 @@ def _stack_pr(rem: str, path: str, pr: PullRequest,
     unchanged, which is what makes GitHub show the PR merged once the stack is
     on the target; the merge commit is the caller's own."""
     head = _fetch_tip(rem, pr["headRefName"], cwd=path)
-    p = subprocess.run(["git", "-C", path, "merge", "--no-ff", "--no-commit", head],
-                       capture_output=True, text=True)
+    p = _git_as_caller(path, ["merge", "--no-ff", "--no-commit", head])
     files = _unmerged(path)
     if p.returncode != 0 or files:
         _git(["-C", path, "merge", "--abort"], check=False)
@@ -3214,9 +3230,8 @@ def _stack_pr(rem: str, path: str, pr: PullRequest,
     if not _git(["-C", path, "status", "--porcelain", "--untracked-files=no"]).stdout.strip():
         _git(["-C", path, "merge", "--abort"], check=False)    # none is open when it was up to date
         return None, "no_changes", []
-    p = subprocess.run(["git", "-C", path, "commit", "-q", "--no-verify",
-                        "-m", afk_decide.stack_message(pr["title"], pr["number"], issue)],
-                       capture_output=True, text=True)
+    p = _git_as_caller(path, ["commit", "-q", "--no-verify",
+                              "-m", afk_decide.stack_message(pr["title"], pr["number"], issue)])
     if p.returncode != 0:
         raise RuntimeError(f"could not commit PR #{pr['number']} onto the stack: "
                            f"{(p.stderr or p.stdout).strip()}")
@@ -3351,7 +3366,7 @@ def _land_batch(run: _Run, batch: str, limits: _GateLimits, merged_timeout: floa
                              "nothing landed — send your wake and stop")
     kept = []
     for sha in fixes:
-        p = subprocess.run(["git", "-C", path, "cherry-pick", sha], capture_output=True, text=True)
+        p = _git_as_caller(path, ["cherry-pick", sha])
         if p.returncode == 0:
             kept.append(sha)
         else:                            # it no longer applies to this stack: the gate will say
