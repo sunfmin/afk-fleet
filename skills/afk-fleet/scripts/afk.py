@@ -3492,7 +3492,7 @@ def _train_worker(run: _Run, worker: _Worker) -> TrainWorkerRow:
         seen = afk_decide.classify_stopped(
             progress, worker.reading["terminal_idle_seconds"], None, {}, worker.now,
             worker.grace, nudged_at=nudged_at,
-            turn=afk_decide.next_turn(None, at=told_at) if told_at else None)
+            turn=afk_decide.next_turn(None, at=told_at, released=True) if told_at else None)
     return {"train": _train_refs(cfg)[0], **seen, "worktree": path, "progress": progress,
             "nudged_at": nudged_at, "turn_at": told_at,
             "worker_state": worker.reading["state"]}
