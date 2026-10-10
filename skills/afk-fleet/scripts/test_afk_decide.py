@@ -2797,7 +2797,8 @@ def test_fingerprint():
 
     # canonical: row order, label order and fields outside the digest never move it
     assert fp == d.fingerprint(list(reversed(issues)), prs, claims)
-    assert fp == d.fingerprint([{**issues[0], "title": "retitled"}, issues[1]], prs, claims)
+    assert fp == d.fingerprint([{**issues[0], "id": 99}, issues[1]], prs, claims)
+    assert fp != d.fingerprint([{**issues[0], "title": "retitled"}, issues[1]], prs, claims)
     two = [{**issues[0], "labels": ["a", "b"]}, issues[1]]
     assert d.fingerprint(two, prs, claims) == \
         d.fingerprint([{**issues[0], "labels": ["b", "a"]}, issues[1]], prs, claims)
@@ -2813,6 +2814,7 @@ def test_fingerprint():
     pushed = [{**prs[0], "headRefOid": "def"}]
     assert fp != d.fingerprint(issues, pushed, claims)                        # worker pushed
     assert fp != d.fingerprint(issues, prs, [{"number": 1, "instance": "peer", "sha": "s2"}])  # reclaimed
+    assert fp != d.fingerprint(issues, prs, [{**claims[0], "instance": "peer"}])   # another owner
     edged = [{**issues[0], "blocked_by": 1}, issues[1]]
     assert fp != d.fingerprint(edged, prs, claims)                            # a blocker recorded
     # a PR becomes an issue's only through what it closes, and GitHub may list
@@ -2839,6 +2841,181 @@ def test_fingerprint():
     assert fp != d.fingerprint(issues, checks(), claims)                      # no checks at all
     # heartbeats are not an input at all — the launcher's own skip-cycle refresh
     # can't move the digest (that is what keeps the gate from defeating itself).
+
+
+# --- the digest and the working set (ADR-0007) ------------------------------ #
+#
+# Generated worlds: a small backlog, its PRs and its claims, drawn so that every
+# branch of the assembly is taken — a claim on a closed issue, two PRs closing one
+# issue, a turn held, a turn of a dead fleet's, a batch.
+
+_LABELS = ["ready-for-agent", "epic", "afk-attempt/1", "afk-attempt/2", d.ATTEMPT_STARTING, "bug"]
+_ROLLUPS = [None, [], [{"conclusion": "SUCCESS"}], [{"conclusion": "FAILURE"}],
+            [{"status": "QUEUED", "conclusion": None}],
+            [{"conclusion": "SUCCESS"}, {"state": "PENDING"}, {"conclusion": "SKIPPED"}]]
+_INSTANCES = ["me", "peerA", "peerB", None]
+
+# One more value of each field of a gathered row, for a world to be changed by:
+# a field with none here is a field these tests do not cover, and they say so.
+_OTHER_VALUE = {
+    "Issue": {"number": lambda rng: rng.randrange(50, 60), "id": lambda rng: rng.randrange(10**6),
+              "title": lambda rng: rng.choice(["a", "b", "c"]),
+              "labels": lambda rng: rng.sample(_LABELS, rng.randrange(len(_LABELS))),
+              "updatedAt": lambda rng: f"T{rng.randrange(9)}",
+              "blocked_by": lambda rng: rng.randrange(3)},
+    "PullRequest": {"number": lambda rng: rng.randrange(60, 70),
+                    "title": lambda rng: rng.choice(["a", "b", "c"]),
+                    "headRefName": lambda rng: rng.choice(["x", "y"]),
+                    "headRefOid": lambda rng: rng.choice(["aaa", "bbb"]),
+                    "baseRefName": lambda rng: rng.choice(["main", "dev"]),
+                    "updatedAt": lambda rng: f"T{rng.randrange(9)}",
+                    "statusCheckRollup": lambda rng: rng.choice(_ROLLUPS),
+                    "closingIssuesReferences": lambda rng: [
+                        {"number": n} for n in rng.sample(range(1, 9), rng.randrange(3))]},
+    "Claim": {"number": lambda rng: rng.randrange(70, 80),
+              "instance": lambda rng: rng.choice(_INSTANCES),
+              "host": lambda rng: rng.choice(["h1", "h2", None]),
+              "ts": lambda rng: rng.randrange(1000),
+              "sha": lambda rng: rng.choice(["s1", "s2", "s3"])},
+}
+
+
+def _row(rng, kind, number):
+    return {"number": number, **{field: value(rng) for field, value in _OTHER_VALUE[kind].items()
+                                 if field != "number"}}
+
+
+def _world(rng):
+    """(issues, prs, claims), and what the working set reads besides them
+    (`OUTSIDE_THE_DIGEST`, as keyword arguments)."""
+    now = 100_000
+    numbers = rng.sample(range(1, 9), rng.randrange(1, 8))
+    issues = [_row(rng, "Issue", n) for n in numbers]
+    prs = [_row(rng, "PullRequest", n) for n in rng.sample(range(20, 26), rng.randrange(5))]
+    claimed = rng.sample(range(1, 11), rng.randrange(6))
+    claims = [_row(rng, "Claim", n) for n in claimed]
+    turns = {}
+    for n in claimed:
+        turn = rng.choice([
+            None, d.single_turn(None, rng.choice(["me", "peerB"]), now),
+            d.next_turn(d.single_turn(None, "me", now), stopped="awaiting_ci", head="aaa"),
+            d.next_turn(None, instance=rng.choice(["me", "peerB"]), at=now + n, batch="b1",
+                        members=[{"issue": n, "pr": 20}], phase=rng.choice(d.BATCH_PHASES))])
+        if turn:
+            turns[n] = d.latest_turn([{"id": n, "body": d.turn_comment(turn)}])
+    outside = {
+        "now": now, "me": "me",
+        "heartbeats": {i: now - rng.choice([10, TTL + 99]) for i in ("me", "peerA", "peerB")
+                       if rng.random() < 0.8},
+        "turns": turns,
+        "closed": [n for n in claimed if n not in numbers and rng.random() < 0.7],
+        "config": d.resolve_config({"epic_labels": ["epic"], "concurrency": rng.randrange(1, 5),
+                                    "gate": {"ci": rng.choice(["required", "local"])}}),
+    }
+    return (issues, prs, claims), outside
+
+
+def _shuffled(rng, rows):
+    """`rows` in another order, every list inside a row in another order too."""
+    rows = [{k: rng.sample(v, len(v)) if isinstance(v, list) else v for k, v in row.items()}
+            for row in rows]
+    return rng.sample(rows, len(rows))
+
+
+def _changed(rng, lists):
+    """`lists` with ONE thing different: a field of one row, a row gone, or a row
+    more → (the new lists, what was changed)."""
+    kinds = ("Issue", "PullRequest", "Claim")
+    at = rng.randrange(3)
+    rows = lists[at]
+    if rows and rng.random() < 0.8:
+        k, field = rng.randrange(len(rows)), rng.choice(sorted(_OTHER_VALUE[kinds[at]]))
+        new = [*rows[:k], {**rows[k], field: _OTHER_VALUE[kinds[at]][field](rng)}, *rows[k + 1:]]
+        what = f"{kinds[at]}.{field}"
+    elif rows and rng.random() < 0.5:
+        k = rng.randrange(len(rows))
+        new, what = rows[:k] + rows[k + 1:], f"{kinds[at]} gone"
+    else:
+        new = [*rows, _row(rng, kinds[at], _OTHER_VALUE[kinds[at]]["number"](rng) + 100)]
+        what = f"{kinds[at]} more"
+    return (*lists[:at], new, *lists[at + 1:]), what
+
+
+def test_the_working_set_does_not_depend_on_the_order_rows_arrive_in():
+    """Any shuffle of every input list — the rows, and the labels, checks and
+    closed issues inside a row — assembles the same working set, digest and
+    dispatch order included."""
+    import random
+    rng = random.Random(120)
+    dispatched = set()
+    for _ in range(400):
+        (issues, prs, claims), outside = _world(rng)
+        ws = d.assemble_working_set(issues, prs, claims, **outside)
+        for _ in range(4):
+            again = {**outside, "closed": rng.sample(outside["closed"], len(outside["closed"])),
+                     "heartbeats": dict(rng.sample(sorted(outside["heartbeats"].items()),
+                                                   len(outside["heartbeats"]))),
+                     "turns": dict(rng.sample(sorted(outside["turns"].items()),
+                                              len(outside["turns"])))}
+            assert d.assemble_working_set(_shuffled(rng, issues), _shuffled(rng, prs),
+                                          _shuffled(rng, claims), **again) == ws
+        order = [i["number"] for i in ws["frontier"]["dispatch"]]
+        assert order == sorted(order)
+        dispatched.add(len(order))
+    assert max(dispatched) >= 2, dispatched     # worlds where the order is a question at all
+
+
+def test_one_digest_means_one_working_set():
+    """Two gathers with one digest assemble one working set, given the same
+    OUTSIDE_THE_DIGEST: whatever a change to a gathered row does to the working
+    set, it does to the digest first."""
+    import random
+    rng = random.Random(7)
+    kept, moved = {}, {}
+    for _ in range(600):
+        lists, outside = _world(rng)
+        ws = d.assemble_working_set(*lists, **outside)
+        for _ in range(12):
+            other, what = _changed(rng, lists)
+            ws2 = d.assemble_working_set(*other, **outside)
+            if ws2["fingerprint"] == ws["fingerprint"]:
+                assert ws2 == ws, what
+                kept[what] = kept.get(what, 0) + 1
+            else:
+                moved[what] = moved.get(what, 0) + 1
+    # the generator covers every field of every gathered row ...
+    fields = {f"{kind.__name__}.{f}" for kind in (d.Issue, d.PullRequest, d.Claim)
+              for f in typing.get_type_hints(kind)}
+    assert fields == {f"{kind}.{f}" for kind, of in _OTHER_VALUE.items() for f in of}
+    assert fields <= set(kept) | set(moved), fields - set(kept) - set(moved)
+    # ... and both sides of the claim are real: fields the working set never reads
+    # leave the digest alone, and the ones it reads are seen to move it
+    assert {"Issue.id", "Claim.host", "PullRequest.headRefName",
+            "PullRequest.statusCheckRollup"} <= set(kept), sorted(kept)
+    assert {"Issue.title", "Issue.labels", "Issue.blocked_by", "Claim.instance",
+            "PullRequest.closingIssuesReferences", "Issue gone", "Claim more"} <= set(moved)
+
+
+def test_what_the_working_set_reads_outside_the_digest_is_named():
+    """Every input of the working set is one the digest holds, or is named in
+    OUTSIDE_THE_DIGEST with why a skipped cycle may go without it — and ADR-0007
+    lists exactly those."""
+    import inspect
+    digested = set(inspect.signature(d.fingerprint).parameters)
+    reads = set(inspect.signature(d.assemble_working_set).parameters)
+    assert digested == {"issues", "prs", "claims"} and digested <= reads
+    assert reads - digested == set(d.OUTSIDE_THE_DIGEST)
+
+    # the glossary and the ADRs live in the source repo only
+    adr = os.path.join(os.path.dirname(__file__), "..", "..", "..", "docs", "adr",
+                       "0007-fingerprint-gated-ticks.md")
+    if os.path.exists(adr):
+        with open(adr) as f:
+            text = f.read()
+        table = text[text.index("## What the working set reads outside the digest"):]
+        table = table[:table.index("\n## ", 3)]
+        listed = set(re.findall(r"^\| `(\w+)`", table, re.M))
+        assert listed == set(d.OUTSIDE_THE_DIGEST), listed ^ set(d.OUTSIDE_THE_DIGEST)
 
 
 def test_unseen_prs_are_the_claims_whose_pr_is_not_the_one_the_tick_worked_from():

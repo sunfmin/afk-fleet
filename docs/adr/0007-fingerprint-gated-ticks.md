@@ -45,6 +45,21 @@ fleet, 2 min 23 s and 4 min 42 s with the landing turn free the whole time. Two 
   next cycle at once; it ticks (`reason: unsettled`) and grants the turn. It costs no read — the
   closing gather is the one the digest is taken from.
 
+**Note (#120) — one digest, one working set.** The gate skips a tick on the ruling that the same
+digest means the same working set, apart from what time alone changes. Two things broke it, and
+neither was a field going stale:
+
+- **The frontier followed the order its rows arrived in**, which the digest — sorted — cannot see:
+  two gathers with one digest filled the free slots with different issues. The frontier is now in
+  issue-number order, lowest first, whatever order the issue list came in.
+- **The working set read more than the digest held.** An issue's title and a claim's owning
+  instance are now in their rows of the digest. What is left outside it is a closed list — the
+  section *What the working set reads outside the digest* below — where it used to be whatever the
+  assembly happened to take.
+
+A test generates fleets and holds both: any shuffle of every input list assembles the same working
+set, and a change to a gathered row that leaves the digest alone leaves the working set alone.
+
 ## Context
 
 ADR-0001/0002 bound the fleet's context growth — tokens *per call* — but every launcher wake-up
@@ -76,6 +91,22 @@ spawns nothing. Two invariants make skipping safe:
 The launcher's inter-cycle state stays tiny and constant: last summary + last fingerprint + skip
 streak. Pacing is unchanged and paces off the previous summary — the gate decides *whether* a tick
 runs, never *when* the next wake-up is.
+
+## What the working set reads outside the digest
+
+The digest holds everything the working set reads of the three gathered lists — open issues, open
+PRs, claim refs. These are its other inputs, by the name `assemble_working_set` takes each under
+(`afk_decide.OUTSIDE_THE_DIGEST`; a test holds this table to it). With these equal, one digest is
+one working set.
+
+| Input | What it is | Why a skipped cycle may go without it |
+|---|---|---|
+| `now` | the clock | Time alone moves it. What it decides — a lease lapsing — is the forced tick's to see. |
+| `heartbeats` | every instance's last beat | See the second invariant above: this instance's own beat on a skipped cycle would move the digest every cycle. A peer's beat going stale is time passing — the forced tick. |
+| `turns` | the landing-turn marker on the PR of each claim of mine | A comment on the PR, read once per claim that has a PR — a read the gate does not make. Writing one moves that PR's `updatedAt`, which the digest holds: the digest sees *that* a marker was written, not what it says. Observed for a new comment; for a marker rewritten in place it rests on GitHub moving `updatedAt` then too, and on the forced tick if it does not. |
+| `closed` | which claims are on a closed issue | Asked only of a claim whose issue is missing from the open list. The issue leaving that list moved the digest; why it left is one read, and a read that failed is asked again by the forced tick. |
+| `me` | this instance's id | The run's own: no cycle changes it. |
+| `config` | the resolved config | The run's own: no cycle changes it. |
 
 ## Considered and rejected
 
