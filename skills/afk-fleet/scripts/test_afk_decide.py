@@ -469,6 +469,23 @@ def test_turns_are_granted_in_one_order_a_held_turn_first_then_pr_number():
     assert d.turn_order([]) == [] and d.turn_order(rows[1:2]) == []
 
 
+def test_an_escalate_label_the_escalation_edit_would_also_remove_is_refused():
+    """An escalation adds `escalate_label` and removes `ready_label` and every
+    attempt label in ONE edit: a label on both sides of it is a config that
+    cannot mean anything."""
+    d.validate_config(d.resolve_config({"ready_label": "go", "escalate_label": "human"}))
+    for bad, says in (({"escalate_label": "ready-for-agent"}, "is ready_label too"),
+                      ({"ready_label": "x", "escalate_label": "x"}, "is ready_label too"),
+                      ({"escalate_label": "afk-attempt/human"}, "attempt labels"),
+                      ({"escalate_label": "afk-attempt/3"}, "attempt labels"),
+                      ({"escalate_label": d.ATTEMPT_STARTING}, "attempt labels")):
+        try:
+            d.validate_config(d.resolve_config(bad))
+            assert False, f"expected ValueError for {bad}"
+        except ValueError as e:
+            assert "escalate_label" in str(e) and says in str(e)
+
+
 def test_validate_config():
     ok = d.resolve_config({})
     assert d.validate_config(ok) is ok                    # returns it, unchanged
@@ -1637,11 +1654,65 @@ def test_attempt_and_escalation_labels():
     add, remove = d.escalation_labels(["go"], {**cfg, "ready_label": "go", "escalate_label": "human"})
     assert (add, remove) == (["human"], ["go"])
 
-    body = d.escalation_comment("  the gate needs a secret CI has and I do not  ", 2, pr=31)
+    body = d.escalation_comment("  the gate needs a secret CI has and I do not  ", 2, "c1", pr=31)
     assert "escalated to a human" in body and "after 2 retries" in body and "#31" in body
     assert body.endswith("the gate needs a secret CI has and I do not")
-    assert "after 1 retry)" in d.escalation_comment("x", 1)
-    assert "without a retry" in d.escalation_comment("x", 0) and "PR" not in d.escalation_comment("x", 0)
+    assert "after 1 retry)" in d.escalation_comment("x", 1, "c1")
+    assert "without a retry" in d.escalation_comment("x", 0, "c1")
+    assert "PR" not in d.escalation_comment("x", 0, "c1")
+
+
+def test_an_escalation_is_recorded_in_its_comment_as_the_claims():
+    """The relabel of an escalation strips the attempt count, so what says "this
+    claim is already being escalated, after n retries" is the comment (ADR-0033)."""
+    def comments(*bodies):
+        return [{"id": 100 + i, "body": b, "url": "u"} for i, b in enumerate(bodies)]
+
+    mine = d.escalation_comment("stuck", 2, "c2", pr=31)
+    assert mine.startswith("<!--afk:escalation claim=c2 attempt=2-->\n**afk-fleet: escalated")
+    assert d.escalation_begun(comments("chat", mine, "more chat"), "c2") == \
+        {"attempt": 2, "comment_id": 101}
+    # an escalation without a retry is one too: its count is 0, not missing
+    assert d.escalation_begun(comments(d.escalation_comment("x", 0, "c2")), "c2") == \
+        {"attempt": 0, "comment_id": 100}
+    # nothing begun: no comment, one a human wrote, one from before the record existed
+    assert d.escalation_begun(None, "c2") is None
+    assert d.escalation_begun(comments("**afk-fleet: escalated to a human** (x)"), "c2") is None
+    # an earlier escalation of the issue was of another claim — it ended in a release
+    earlier = d.escalation_comment("first time", 2, "c1")
+    assert d.escalation_begun(comments(earlier), "c2") is None
+    assert d.escalation_begun(comments(earlier, mine), "c2")["comment_id"] == 101
+    assert d.escalation_begun(comments("<!--afk:escalation claim=c2-->"), "c2") is None
+
+    # a failure being escalated escalates, whatever the labels still say: stripped,
+    # they read as attempt 0 — which would start the whole ladder over
+    begun = d.escalation_begun(comments(mine), "c2")
+    assert d.next_attempt(0, 2, escalation=begun) == {"action": "escalate", "attempt": 2}
+    assert d.next_attempt(1, 2, counted=True, escalation=begun)["action"] == "escalate"
+    assert d.next_attempt(0, 2, escalation=None)["action"] == "retry"
+
+
+def test_a_hand_edited_attempt_label_costs_no_edit_and_no_attempt():
+    """`afk-attempt/<n>` is the fleet's to write, but a human can: a count spelled
+    another way, or a label under the prefix that is no count at all."""
+    starting = d.ATTEMPT_STARTING
+    assert d.current_attempt(["afk-attempt/01"]) == 1
+    assert d.current_attempt(["afk-attempt/²", "afk-attempt/x"]) == 0     # a digit, not a number
+    # counted once more: the odd spelling goes out in the edit that writes the next count
+    step = d.next_attempt(d.current_attempt(["afk-attempt/01", "afk-attempt/x"]), 2)
+    assert step == {"action": "retry", "attempt": 2, "to_label": "afk-attempt/2"}
+    assert d.retry_labels(["afk-attempt/01", "afk-attempt/x"], step["to_label"]) == \
+        (["afk-attempt/2", starting], ["afk-attempt/01", "afk-attempt/x"])
+    # the same failure again: the attempt it already made, and no edit — the count is
+    # the number `to_label` says, however it is spelled and whatever sits beside it
+    for labels in (["afk-attempt/01", starting], ["afk-attempt/1", starting, "afk-attempt/x"]):
+        again = d.next_attempt(d.current_attempt(labels), 2, counted=d.attempt_starting(labels))
+        assert (again["action"], again["attempt"]) == ("retry", 1), labels
+        assert d.retry_labels(labels, again["to_label"]) == ([], []), labels
+    # an escalation strips them all in its one edit
+    cfg = d.resolve_config({})
+    assert d.escalation_labels(["afk-attempt/01", "afk-attempt/x", starting], cfg)[1] == \
+        ["afk-attempt/01", starting, "afk-attempt/x"]
 
 
 def test_render_status_board():

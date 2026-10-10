@@ -136,6 +136,8 @@ def known_labels():
 
 if " ".join(argv[:2]) in st.get("fail", []):
     finish(code=1, err="fake gh: injected failure\n")
+if any(part in " ".join(argv) for part in st.get("fail_saying", [])):
+    finish(code=1, err="fake gh: injected failure\n")      # one write, by what it says
 if any(part in " ".join(argv) for part in st.get("garble", [])):
     finish(out="null")                  # an answer of a shape nothing expects
 
@@ -4467,16 +4469,17 @@ def test_fail_retries_from_a_clean_base_then_escalates_when_exhausted():
         assert w.orca_calls() == []
 
 
-def _refuse_branch_deletes(w, refuse):
-    """The remote refuses (or takes again) the deletion of a branch."""
+def _refuse_branch_deletes(w, refuse, under="refs/heads"):
+    """The remote refuses (or takes again) the deletion of a branch — or of any
+    ref `under` another namespace."""
     hook = os.path.join(w.sb.bare, "hooks", "update")
     if not refuse:
         os.remove(hook)
         return
     os.makedirs(os.path.dirname(hook), exist_ok=True)
     with open(hook, "w") as f:
-        f.write('#!/bin/sh\ncase "$1 $3" in refs/heads/*\\ 0000*) echo "deletion refused" >&2; '
-                'exit 1;; esac\n')
+        f.write('#!/bin/sh\ncase "$1 $3" in %s/*\\ 0000*) echo "deletion refused" >&2; '
+                'exit 1;; esac\n' % under)
     os.chmod(hook, 0o755)
 
 
@@ -4590,9 +4593,16 @@ def test_escalate_relabels_before_it_releases():
         assert "held by 'me'" in w.error(*escalate(8, instance="peer"))
         assert "not claimed at all" in w.error(*escalate(10))
 
+        def writes():
+            return [" ".join(c[:2]) if c[0] != "api" else "comment " + c[c.index("--method") + 1]
+                    for c in w.calls() if c[0] != "api" or "--method" in c]
+
         # the relabel FAILS → the claim must still be held: nothing got back on the frontier
         w.set(fail=["issue edit"])
+        w.calls()
         assert "issue edit" in w.error(*escalate(8))
+        # one order: status board → comment → labels (the release is the last thing)
+        assert writes() == ["pr list", "comment POST", "comment POST", "label create", "issue edit"]
         assert w.claimed_by(8) == "me" and "ready-for-agent" in w.issue(8)["labels"]
         assert w.afk("rebuild", "--instance", "peer", *R, *NOW)["frontier"]["dispatch"] == []
 
@@ -4601,11 +4611,9 @@ def test_escalate_relabels_before_it_releases():
         r = w.afk(*escalate(8))
         assert (r["action"], r["attempt"], r["pr"], r["released"]) == ("escalate", 1, None, True)
         assert w.issue(8)["labels"] == ["ready-for-human"] and w.claimed_by(8) is None
-        # one order: status board → labels → comment (the release is the last thing)
-        writes = [" ".join(c[:2]) if c[0] != "api" else "comment " + c[c.index("--method") + 1]
-                  for c in w.calls() if c[0] != "api" or "--method" in c]
-        assert writes == ["pr list", "label create", "issue edit", "comment POST"], writes
-        assert "已升级给人处理" in w.board(8)                       # written by the failed run
+        # run again it does what is left: the board and the comment are the failed run's
+        assert writes() == ["pr list", "label create", "issue edit"]
+        assert "已升级给人处理" in w.board(8)
         assert w.comments(8)[-1].endswith("blocked by #41, which is still open")
         assert "after 1 retry)" in w.comments(8)[-1]
         # a peer's next rebuild does not see it as dispatchable
@@ -4616,6 +4624,111 @@ def test_escalate_relabels_before_it_releases():
         r = w.afk(*escalate(9, "--set", "escalate_label=needs-human"))
         assert r["comment_id"] and len(w.comments(9)) == 2
         assert w.issue(9)["labels"] == ["needs-human"] and "needs-human" in w.state()["labels"]
+
+
+# Every write of an escalation, in its order, as (what goes wrong, what the
+# transition then says, how it is put right).
+_ESCALATION_CUTS = {
+    "the status board refused": (lambda w: w.set(fail_saying=["已升级给人处理"]), "injected failure",
+                                 lambda w: w.set(fail_saying=[])),
+    "the comment refused": (lambda w: w.set(fail_saying=["escalated to a human"]),
+                            "injected failure", lambda w: w.set(fail_saying=[])),
+    "the relabel refused": (lambda w: w.set(fail=["issue edit"]), "gh issue edit failed",
+                            lambda w: w.set(fail=[])),
+    "the release refused": (lambda w: _refuse_branch_deletes(w, True, "refs/afk/claim"),
+                            "release failed",
+                            lambda w: _refuse_branch_deletes(w, False)),
+}
+
+
+def _escalate(n, reason):
+    return ("escalate", "--issue", str(n), *ME, *R, *NOW, "--reason", reason)
+
+
+def _an_escalation_cut_short(w, cut, command):
+    """Issue 5 on its last retry, with a red PR (#50), and a `command` of it that
+    `cut` stopped → how to put `cut` right. Whatever was written, the claim is
+    still held: nothing is settled."""
+    breaks, says, mends = _ESCALATION_CUTS[cut]
+    with_pr(w, 5, 50, conclusion="FAILURE")
+    w.orca_calls()
+    breaks(w)
+    assert says in w.error(*command), cut
+    assert w.claimed_by(5) == "me", cut
+    return mends
+
+
+def _the_escalation_completed(w, cut, first):
+    """…once: one comment, saying the retries the issue really had; the count
+    gone with the ready label; the claim released — and no retry begun: the PR
+    still open, its worktree kept, no worker started."""
+    assert w.issue(5)["labels"] == ["ready-for-human"] and w.claimed_by(5) is None, cut
+    notes = [c for c in w.comments(5) if "escalated to a human" in c]
+    assert len(notes) == 1 and "after 2 retries" in notes[0] and "#50" in notes[0], (cut, notes)
+    assert "已升级给人处理" in w.board(5), cut
+    assert w.pr(50).get("state", "open") == "open" and os.path.isdir(first), cut
+    assert not [c for c in w.orca_calls() if c[:2] == ["worktree", "create"]], cut
+
+
+def test_an_escalation_cut_short_escalates_when_run_again_and_never_retries():
+    """An escalation's relabel strips the attempt count. Cut short after it, the
+    claim is still held and the count reads 0 — and the same failure, failed
+    again, must finish the escalation, not start the retry ladder over on an
+    issue already labelled for a human. Whichever write is refused, by `afk fail`
+    or by `afk escalate`: one escalation, one comment."""
+    for cut in _ESCALATION_CUTS:
+        for command in (_fail(5, "third time red: needs a human"),
+                        _escalate(5, "the gate needs a secret: needs a human")):
+            with world(issues=[issue(5, "ready-for-agent", "afk-attempt/2")]) as w:
+                mends = _an_escalation_cut_short(w, cut, command)
+                [first] = [wt["path"] for wt in w.worktrees()]
+                w.error(*command)                                   # …and cut short again
+                mends(w)
+                r = w.afk(*command)
+                assert (r["action"], r["attempt"], r["pr"], r["released"]) == \
+                    ("escalate", 2, 50, True), (cut, r)
+                _the_escalation_completed(w, cut, first)
+                assert "needs a human" in w.comments(5)[-1], cut
+                # the claim is released: there is nothing left to run it on
+                assert "not claimed at all" in w.error(*command), cut
+
+
+def test_the_next_tick_finishes_an_escalation_that_was_cut_short():
+    """The same, when it is the next tick that comes back to the failure: the
+    red PR still asks for its reason, and the answer runs the same transition."""
+    for cut in _ESCALATION_CUTS:
+        with world(issues=[issue(5, "ready-for-agent", "afk-attempt/2")]) as w:
+            mends = _an_escalation_cut_short(w, cut, _fail(5, "third time red: needs a human"))
+            [first] = [wt["path"] for wt in w.worktrees()]
+            mends(w)
+            r = cycle(w, None)
+            [j] = r["judgments"]
+            assert (j["kind"], j["issue"]) == ("reason", 5), (cut, j)
+            done = answer(w, j["if_yes"].replace("<the reason>", "still red: needs a human"))
+            assert (done["action"], done["attempt"]) == ("escalate", 2), (cut, done)
+            _the_escalation_completed(w, cut, first)
+            assert cycle(w, r["state"])["judgments"] == [], cut
+
+
+def test_an_issue_escalated_again_under_a_new_claim_gets_its_own_comment():
+    """An escalation's comment is its claim's. Handed back by its human and failed
+    again, the issue is escalated anew — the earlier comment is not this one's."""
+    with world(issues=[issue(6, "ready-for-agent")]) as w:
+        for round_ in (1, 2):
+            w.afk("claim", "6", *ME, "--now", str(T0 + round_), *R)
+            r = w.afk(*_fail(6, f"round {round_}: gave up", "--set", "retry=0"))
+            assert (r["action"], r["attempt"]) == ("escalate", 0), r
+            notes = [c for c in w.comments(6) if "escalated to a human" in c]
+            assert len(notes) == round_ and f"round {round_}" in notes[-1]
+            w.set(issues=[issue(6, "ready-for-agent")])              # the human hands it back
+
+
+def test_a_config_whose_escalation_would_contradict_itself_is_refused_by_every_command():
+    with world(issues=[issue(7, "ready-for-agent")]) as w:
+        w.afk("claim", "7", *ME, *NOW, *R)
+        for bad in ("escalate_label=ready-for-agent", "escalate_label=afk-attempt/human"):
+            assert "config escalate_label" in w.error(*_escalate(7, "x"), "--set", bad)
+        assert w.issue(7)["labels"] == ["ready-for-agent"] and w.claimed_by(7) == "me"
 
 
 def _park(n, *extra, instance="me"):

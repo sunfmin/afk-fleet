@@ -776,6 +776,15 @@ def validate_config(cfg: Config) -> Config:
         raise ValueError("config gate.ci: 'local' requires a non-empty gate.local_command — in "
                          "local mode that command IS the completion gate (ADR-0012), so an empty "
                          "one would merge every PR unverified")
+    escalate, ready = cfg["escalate_label"], cfg["ready_label"]
+    if escalate == ready:
+        raise ValueError(f"config escalate_label: {escalate!r} is ready_label too — an escalation "
+                         f"adds the one and removes the other in one edit, and an issue handed "
+                         f"to a human would still be one the fleet dispatches")
+    if escalate.startswith(_ATTEMPT_PREFIX):
+        raise ValueError(f"config escalate_label: {escalate!r} is under {_ATTEMPT_PREFIX!r}, the "
+                         f"fleet's own attempt labels — an escalation strips every one of those "
+                         f"in the edit that adds it")
     return cfg
 
 
@@ -3041,7 +3050,7 @@ def current_attempt(labels: Iterable[str] | None) -> int:
     for lb in labels or []:
         if isinstance(lb, str) and lb.startswith(_ATTEMPT_PREFIX):
             n = lb[len(_ATTEMPT_PREFIX):]
-            if n.isdigit():
+            if n.isascii() and n.isdigit():
                 attempts.append(int(n))
     return max(attempts)
 
@@ -3068,7 +3077,8 @@ def attempt_starting(labels: Collection[str] | None) -> bool:
     return ATTEMPT_STARTING in (labels or []) and current_attempt(labels) > 0
 
 
-def next_attempt(attempt: int, retry_max: int, counted: bool = False) -> Obj:
+def next_attempt(attempt: int, retry_max: int, counted: bool = False,
+                 escalation: Escalation | None = None) -> Obj:
     """
     Retry-or-escalate for a failed issue on attempt `attempt` (`current_attempt`).
 
@@ -3078,10 +3088,16 @@ def next_attempt(attempt: int, retry_max: int, counted: bool = False) -> Obj:
                                  when `counted` (`attempt_starting`): this failure
                                  is the one that made the attempt n — the retry
                                  is finished, and nothing is added
+      {"action":"escalate","attempt":<the escalation's>}
+                                 when `escalation` (`escalation_begun`): this
+                                 failure is the one being escalated — the labels
+                                 may already be stripped, and say nothing
 
     `afk fail` is the one caller, and the one writer of the label: it applies
     `retry_labels` of `to_label`.
     """
+    if escalation is not None:
+        return {"action": "escalate", "attempt": escalation["attempt"]}
     if counted:
         return {"action": "retry", "attempt": attempt, "to_label": f"{_ATTEMPT_PREFIX}{attempt}"}
     if attempt >= retry_max:
@@ -3094,20 +3110,55 @@ def retry_labels(labels: Iterable[str] | None, to_label: str) -> tuple[list[str]
     """The label edit that counts a failure: `(add, remove)`, made in ONE edit of
     the issue. Adds `to_label` and `ATTEMPT_STARTING` where the issue lacks them
     and removes every other attempt label it carries — so for a failure already
-    counted there is nothing to add or remove, and no edit to make."""
-    present, wanted = set(labels or []), [to_label, ATTEMPT_STARTING]
+    counted there is nothing to add or remove, and no edit to make: however a
+    hand-edit spelled the count (`afk-attempt/01`), or whatever it left beside
+    it, the number is the one `to_label` says and the next count tidies it."""
+    labels = list(labels or [])
+    if attempt_starting(labels) and current_attempt(labels) == current_attempt([to_label]):
+        return [], []
+    present, wanted = set(labels), [to_label, ATTEMPT_STARTING]
     return ([lb for lb in wanted if lb not in present],
             [lb for lb in attempt_labels(labels) if lb not in wanted])
 
 
-def escalation_comment(reason: str | None, attempt: int, pr: int | None = None) -> str:
+# An escalation, as its comment keeps it: of which claim (the sha its ref is
+# at — a claim ref is written once, so each claim of an issue has its own) and
+# after how many retries. The comment is an escalation's first write that the
+# next one cannot tell from its own, and the edit after it strips the count; so
+# this is what says "the escalation of this claim has begun" to a run that
+# finds the claim still held (ADR-0033).
+ESCALATION_RECORD = RecordKind("afk:escalation", {"claim": str, "attempt": int},
+                               ("claim", "attempt"))
+
+
+class Escalation(TypedDict):
+    """The escalation a held claim is already in: what its comment recorded."""
+    attempt: int
+    comment_id: int
+
+
+def escalation_comment(reason: str | None, attempt: int, claim: str,
+                       pr: int | None = None) -> str:
     """The durable hand-off comment an escalation appends to the issue (ADR-0006
-    keeps it apart from the status board, which only points here). The stuck-point
-    wording is the tick's; this frames it."""
+    keeps it apart from the status board, which only points here), under the
+    record of whose it is (`ESCALATION_RECORD`). The stuck-point wording is the
+    tick's; this frames it."""
     tried = f"after {attempt} retr{'y' if attempt == 1 else 'ies'}" if attempt else "without a retry"
     link = f" Last PR: #{pr}." if pr else ""
-    return (f"**afk-fleet: escalated to a human** ({tried}).{link}\n\n"
-            f"{(reason or '').strip()}")
+    return record_comment(ESCALATION_RECORD, {"claim": claim, "attempt": attempt},
+                          f"**afk-fleet: escalated to a human** ({tried}).{link}\n\n"
+                          f"{(reason or '').strip()}")
+
+
+def escalation_begun(comments: Iterable[Comment] | None, claim: str) -> Escalation | None:
+    """The escalation of the claim `claim` (its ref's sha) that an issue's
+    comments already carry — one that was cut short after its comment, with the
+    claim still held — else None. An issue's earlier escalations were of other
+    claims: each ended in a release, and the issue was claimed anew."""
+    record, comment = latest_record(ESCALATION_RECORD, comments)
+    if record is None or comment is None or record["claim"] != claim:
+        return None
+    return {"attempt": record["attempt"], "comment_id": comment["id"]}
 
 
 def escalation_labels(labels: Iterable[str] | None,

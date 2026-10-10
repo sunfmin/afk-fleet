@@ -525,11 +525,15 @@ the call does the rest and reports which way it went:
   the same edit adds `afk-attempt/starting`, which the started worker removes — so if the call
   errors after counting (a PR close refused, orca down), **run it again**: it finishes the retry
   without counting twice, and the next tick does the same by itself.
-- `"action": "escalate"` — the attempts are exhausted. In one fixed order: status board → relabel
-  (add `escalate_label`, remove `ready_label` and the attempt label) → comment the reason
+- `"action": "escalate"` — the attempts are exhausted. In one fixed order: status board → comment
+  the reason → relabel (add `escalate_label`, remove `ready_label` and the attempt label)
   → release the claim. The PR and the worktree are left for the human — except a worktree whose
   branch holds no work (nothing committed, nothing uncommitted), which is removed with its idle
-  worker: there is nothing in it to read.
+  worker: there is nothing in it to read. **An escalation is one escalation however often it
+  runs**: its comment records which claim it is of and after how many retries, so if the call
+  errors with the claim still held (the relabel refused, the release refused), **run it again** —
+  `afk fail` or `afk escalate` — and it finishes: no second comment, and never a retry of an
+  issue whose count the relabel already stripped. The next tick does the same by itself.
 
 An issue that should go to a human **without** consuming a retry takes the same ordered transition
 directly: `afk escalate --issue <n> --instance <id> --reason "<…>"`. Three cases: a `blocked` verdict
