@@ -2880,7 +2880,7 @@ _OTHER_VALUE = {
 }
 
 
-def _row(rng, kind, number):
+def _gathered_row(rng, kind, number):
     return {"number": number, **{field: value(rng) for field, value in _OTHER_VALUE[kind].items()
                                  if field != "number"}}
 
@@ -2890,10 +2890,10 @@ def _world(rng):
     (`OUTSIDE_THE_DIGEST`, as keyword arguments)."""
     now = 100_000
     numbers = rng.sample(range(1, 9), rng.randrange(1, 8))
-    issues = [_row(rng, "Issue", n) for n in numbers]
-    prs = [_row(rng, "PullRequest", n) for n in rng.sample(range(20, 26), rng.randrange(5))]
+    issues = [_gathered_row(rng, "Issue", n) for n in numbers]
+    prs = [_gathered_row(rng, "PullRequest", n) for n in rng.sample(range(20, 26), rng.randrange(5))]
     claimed = rng.sample(range(1, 11), rng.randrange(6))
-    claims = [_row(rng, "Claim", n) for n in claimed]
+    claims = [_gathered_row(rng, "Claim", n) for n in claimed]
     turns = {}
     for n in claimed:
         turn = rng.choice([
@@ -2936,7 +2936,7 @@ def _changed(rng, lists):
         k = rng.randrange(len(rows))
         new, what = rows[:k] + rows[k + 1:], f"{kinds[at]} gone"
     else:
-        new = [*rows, _row(rng, kinds[at], _OTHER_VALUE[kinds[at]]["number"](rng) + 100)]
+        new = [*rows, _gathered_row(rng, kinds[at], _OTHER_VALUE[kinds[at]]["number"](rng) + 100)]
         what = f"{kinds[at]} more"
     return (*lists[:at], new, *lists[at + 1:]), what
 
