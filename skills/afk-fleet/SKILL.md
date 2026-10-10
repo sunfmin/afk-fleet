@@ -196,7 +196,8 @@ the opening working set differs:
    taken claims as `mine` and recovers each by
    [continuation](references/recovery.md) — tier 1 when the
    dead fleet ran on *this* box, since its worktrees are still here — **and** works the frontier up to
-   `concurrency`, until you stop it.
+   `concurrency` (a takeover may leave it holding more: it then takes nothing new until it is back
+   under), until you stop it.
 
 A takeover **is not a retry** (it never reads or increments `afk-attempt/<n>`) and **does not shorten the
 lease** — the unattended safety net stays exactly as wide; this is only the human-gated fast path across
@@ -341,8 +342,8 @@ In this order, each step the same `afk` transition you could type yourself
    merge batch pushed and was cut before closing the issue; delete every dead peer's phantom lock.
 6. **Start workers** (`afk dispatch`): first by [continuation](references/recovery.md) for claims
    already held — an **orphaned claim** (always continued, never released back), one whose blockers
-   have all closed, each **stale** peer claim it reclaims — then the frontier, in order, into the
-   free slots (plus one for every claim this pass settled).
+   have all closed. Then, into the free slots only ([Concurrency](#concurrency)): the **stale** peer
+   claims, lowest number first, each reclaimed and continued, then the frontier; the rest wait.
 7. **Heartbeat** (each claim push beat first), then the **status board** of every claim nothing above touched.
 
 A worker still coding, a PR whose checks are running, a finished PR waiting behind the one that
@@ -567,7 +568,13 @@ one with nothing on its branch closes the issue once you confirm the empty diff.
 
 ## Concurrency
 
-`concurrency` (default 3) bounds parallel workers. Semantic ordering is the backlog's dependency DAG
+`concurrency` (default 3) bounds the claims a fleet instance holds, and so its parallel workers: a
+claim holds its slot from the moment it is taken until it is released, whatever its worker is doing.
+The **free slots** are what is left under the bound, and a pass takes a claim it does not hold — a
+**stale** peer claim first, then a frontier issue — only into one; a claim the pass settled frees
+its slot in the same pass. Continuing a claim already held takes none. A fleet holding more claims
+than `concurrency` (after a [`--takeover`](#takeover-mode---takeover), or once the key is lowered)
+takes nothing until it is back under. Semantic ordering is the backlog's dependency DAG
 (your responsibility when decomposing); textual conflicts between parallel PRs are caught by the
 one-at-a-time landing turn and resolved there by the worker that wrote the branch. Early machinery issues that all
 touch shared root config are naturally throttled by the DAG — chain them with `blocked_by`.

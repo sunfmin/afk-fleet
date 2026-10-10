@@ -50,6 +50,8 @@ import sys
 import time
 from contextlib import contextmanager
 
+import pytest
+
 import afk
 import afk_decide
 from test_afk_refs import (ENV, NO_CONFIG, T0, TTL, afk as run, afk_error, git, last_beat,
@@ -1092,6 +1094,7 @@ def test_the_cycle_state_carries_the_instance_and_the_worker_launch_command():
         assert first["progress"] == "dispatched #1; 1 in flight, 1 left on the frontier"
         state = first["state"]
         assert (state["instance"], state["worker_command"]) == ("fl-9", WORKER)
+        w.worker(output=T0 - 1, state="working", since=T0 - 60)
 
         # only the state: #2 is claimed by fl-9 and its worker started with WORKER
         # (a slot opened by the config, which no digest sees: the cycle is woken)
@@ -1173,6 +1176,7 @@ def test_the_drain_releases_claims_with_no_pr_and_keeps_those_with_one():
     with world(issues=issues) as w:
         with_pr(w, 1, 10, conclusion="PENDING")                      # finished, checks running
         w.afk(*dispatch(2))                                          # still coding
+        w.worker(output=T0 - 1, state="working", since=T0 - 60)
         w.afk("claim", "4", "--instance", "peer-live", *NOW, *R)
         last_beat(w.cwd, "peer-live", T0 - 60)
         r = cycle(w, None, "--set", "concurrency=2")
@@ -1734,6 +1738,7 @@ def test_what_changed_while_a_tick_ran_still_gets_a_tick():
         first = cycle(w, None, *forced)
         assert first["progress"].startswith("dispatched #1; 1 in flight")
         assert w.issue(2)["state"] == "open" and w.claimed_by(2) is None
+        w.worker(output=T0 - 1, state="working", since=T0 - 60)
         # no wake said so, and the digest already holds it: the next cycle skips…
         quiet = cycle(w, first["state"], *forced)
         assert (quiet["action"], quiet["reason"]) == ("skip", "unchanged")
@@ -1741,6 +1746,7 @@ def test_what_changed_while_a_tick_ran_still_gets_a_tick():
         caught = cycle(w, {**quiet["state"], "skips": 5}, *forced)
         assert (caught["action"], caught["reason"]) == ("tick", "forced")
         assert caught["progress"].startswith("dispatched #2; 2 in flight")
+        w.worker(output=T0 - 1, state="working", since=T0 - 60)
 
         # #4 is filed while the tick that dispatches #3 runs, and this time a wake
         # arrived: the next cycle ticks at once, whatever the digest says
@@ -1748,11 +1754,13 @@ def test_what_changed_while_a_tick_ran_still_gets_a_tick():
               arrives_mid_tick=[issue(4, "ready-for-agent")])
         again = cycle(w, caught["state"], *forced)
         assert again["progress"].startswith("dispatched #3; 3 in flight")
+        w.worker(output=T0 - 1, state="working", since=T0 - 60)
         assert w.claimed_by(4) is None
         assert cycle(w, again["state"], *forced)["action"] == "skip"
         woke = cycle(w, again["state"], *forced, "--wake")
         assert (woke["action"], woke["reason"]) == ("tick", "wake")
         assert woke["progress"].startswith("dispatched #4; 4 in flight")
+        w.worker(output=T0 - 1, state="working", since=T0 - 60)
         # a wake with nothing behind it costs one tick that finds nothing, no more
         idle = cycle(w, woke["state"], *forced, "--wake")
         assert (idle["reason"], idle["progress"]) == \
@@ -1779,6 +1787,7 @@ def test_a_pr_that_opens_while_a_tick_runs_gets_its_turn_from_the_next_cycle_at_
                                     "2 in flight, 0 left on the frontier")
         assert (busy["sleep_seconds"], busy["state"]["unsettled"]) == (0, True)
         assert _mine(w, (), 1)[0] == "awaiting_turn"
+        w.worker(output=T0 - 1, state="working", since=T0 - 60)
 
         nxt = cycle(w, busy["state"], "--set", "concurrency=5")
         assert (nxt["action"], nxt["reason"]) == ("tick", "unsettled")
@@ -2421,6 +2430,78 @@ def test_config_file_loads_validates_and_round_trips():
         assert "No such file" in w.error("config", "--file", "/no/such/file.md")
 
 
+def _as_yaml(partial, indent=""):
+    """A partial config, as JSON carries it → the same content as the file says it."""
+    lines = []
+    for key, value in partial.items():
+        if isinstance(value, dict):
+            lines += [f"{indent}{key}:", _as_yaml(value, indent + "  ")]
+        elif isinstance(value, list):
+            lines.append(f"{indent}{key}: [{', '.join(map(str, value))}]")
+        else:
+            lines.append(f"{indent}{key}: {json.dumps(value) if isinstance(value, bool) else value}")
+    return "\n".join(lines)
+
+
+# Configs no route takes, each with what its error names. One table, read by both
+# routes: as the file's yaml by `afk config --file`, as JSON by `--config`.
+BAD_CONFIGS = (
+    ({"retyr": 4}, "unknown key 'retyr'"),                                  # unknown
+    ({"gate": {"cii": "local"}}, "unknown key gate.cii"),
+    ({"worker_command": "ckimi"}, "per-run"),
+    ({"instance": "me"}, "unknown key 'instance'"),
+    ({"merge": {"target": "main"}}, "'merge.target' was removed"),          # renamed / removed
+    ({"merge": {"strategy": "squash"}}, "'merge.strategy' was removed"),
+    ({"merge": {"delete_branch": False}}, "'merge.delete_branch' was removed"),
+    ({"merge": {"nope": 1}}, "unknown key merge.nope"),
+    ({"gate": {"trust_recorded_run": False}}, "'gate.trust_recorded_run' was removed"),
+    ({"gate": {"adversarial_verify": True}}, "adversarial_verify_prompt"),
+    ({"fingerprint_gate": False}, "'fingerprint_gate' was removed"),
+    ({"claim_lease_ttl_seconds": 60}, "'claim_lease_ttl_seconds' was removed"),
+    ({"worker": "orca"}, "'worker' was removed"),
+    ({"retry": "soon"}, "'retry': expected an integer"),                    # wrong-typed
+    ({"retry": True}, "'retry': expected an integer"),
+    ({"concurrency": 1.5}, "'concurrency': expected an integer"),
+    ({"concurrency": [3]}, "'concurrency': expected an integer"),
+    ({"epic_labels": "epic"}, "'epic_labels': expected [a, b, ...]"),
+    ({"gate": "on"}, "'gate' is a section"),
+    ({"gate": {"ci": "local"}}, "local_command"),                           # refused as a whole
+    ({"gate": {"ci": "optional"}}, "config gate.ci"),
+    ({"escalate_label": "ready-for-agent"}, "config escalate_label"),
+    ({"ready_label": "x", "escalate_label": "afk-attempt/human"}, "config escalate_label"),
+)
+
+
+def test_the_config_route_refuses_whatever_the_file_route_refuses():
+    """One schema, two routes (#113): a config the file route refuses is refused
+    as JSON handed to `--config` — the one JSON error, exit 3, naming the key —
+    so a launcher that mangles the config it re-types on every call hears of it
+    at once. And what `afk config` prints is JSON `--config` always takes."""
+    with world() as w:
+        path = os.path.join(w.sb.root, "afk-fleet.md")
+        for bad, why in BAD_CONFIGS:
+            with open(path, "w") as f:
+                f.write("# config\n\n```yaml\n" + _as_yaml(bad) + "\n```\n")
+            by_file = w.error("config", "--file", path)
+            by_json = w.error("rebuild", *ME, *R, *NOW, "--config", json.dumps(bad))
+            assert why in by_file and why in by_json, (bad, by_file, by_json)
+
+        # the settled fields are the one difference: no file sets them, and the
+        # canonical config carries them — typed, as every other key is
+        assert "'base_branch': expected a string" in w.error(
+            "rebuild", *ME, *R, *NOW, "--config", json.dumps({"base_branch": 7}))
+
+        # the canonical output of `afk config` is accepted, and comes back unchanged
+        with open(path, "w") as f:
+            f.write("```yaml\nretry: 4\nepic_labels: [epic]\ngate:\n  ci: local\n"
+                    "  local_command: make test\n```\n")
+        cfg = w.afk("config", "--file", path)
+        again = w.afk("probe", "--config", json.dumps(cfg), "--now", str(T0))["config"]
+        assert again == cfg == afk_decide.resolve_config(cfg)
+        assert w.afk("probe", "--config", json.dumps(w.afk("config", "--defaults")),
+                     "--now", str(T0))["config"] == afk_decide.resolve_config({})
+
+
 # --------------------------------------------------------------------------- #
 # recovery via orca                                                            #
 # --------------------------------------------------------------------------- #
@@ -2491,6 +2572,57 @@ def test_recovery_reads_pushed_progress_from_the_remote_alone():
         os.rename(w.sb.bare, w.sb.bare + ".away")
         for how in ((), ("--branch", "sunfmin/issue-31-continuation")):
             assert w.sb.bare in w.error(*gone, *how), how
+
+
+def _translating_locale():
+    """The environment of an installed locale git answers in a language other than
+    English under, or None when this machine has none (git built without its
+    translations)."""
+    for name in ("zh_CN.UTF-8", "de_DE.UTF-8", "fr_FR.UTF-8", "es_ES.UTF-8"):
+        env = {"LC_ALL": name, "LANGUAGE": name.split(".")[0]}
+        p = subprocess.run(["git", "fetch", os.devnull], capture_output=True, text=True,
+                           env={**ENV, **env}, cwd=os.path.dirname(os.path.abspath(__file__)))
+        if p.returncode != 0 and "fatal: " not in p.stderr:
+            return env
+    return None
+
+
+def test_gits_answers_are_read_the_same_in_every_locale():
+    """What git says is read under one fixed message locale, so a machine set to
+    Chinese or German tells "the branch is absent" from "could not look" exactly as
+    an English one does."""
+    foreign = _translating_locale()
+    if foreign is None:
+        pytest.skip("no installed locale makes this git answer in another language")
+    with world() as w:
+        cfg = ("--config", json.dumps({"base_branch": w.sb.base}))
+        gone = ("recovery", "--issue", "31", "--no-worktree", *R, *cfg)
+        git(w.cwd, "push", "-q", "origin", f"{w.sb.base}:refs/heads/sunfmin/issue-31-pushed")
+        for env in ({}, foreign):
+            # absent: a branch never pushed has nothing ahead, in any language
+            r = w.afk(*gone, "--branch", "sunfmin/issue-31-never-pushed", env=env)
+            assert (r["branch"]["commits_ahead"], r["tier"]) == (None, 3), r
+            # could not look: a base the remote lacks is an error, in the words read
+            err = w.error(*gone, "--branch", "sunfmin/issue-31-pushed",
+                          "--set", "base_branch=no-such-base", env=env)
+            assert "couldn't find remote ref refs/heads/no-such-base" in err, err
+        # …and so is a remote that cannot be read at all
+        os.rename(w.sb.bare, w.sb.bare + ".away")
+        for env in ({}, foreign):
+            err = w.error(*gone, "--branch", "sunfmin/issue-31-never-pushed", env=env)
+            assert w.sb.bare in err, err
+
+
+def test_a_present_branch_is_not_read_as_absent_for_prefixing_a_missing_base():
+    """Absent-versus-error is decided on the exact ref asked for: git naming the
+    missing base `main-gone` says nothing about the branch `main-g`, which is there."""
+    with world() as w:
+        cfg = ("--config", json.dumps({"base_branch": w.sb.base}))
+        recover = ("recovery", "--issue", "31", "--no-worktree", *R, *cfg, "--branch", "main-g")
+        w.commit("work.txt", branch="main-g")
+        git(w.cwd, "push", "-q", "origin", "HEAD")
+        assert w.afk(*recover)["branch"]["commits_ahead"] == 1
+        assert "main-gone" in w.error(*recover, "--set", "base_branch=main-gone")
 
 
 def test_recovery_finds_this_machines_worktree_through_orca():
@@ -2773,7 +2905,7 @@ def _brief(wt):
 
 def _gate(w, wt, command, *extra):
     """`afk gate` as a worker runs it: in its own worktree, on a given command."""
-    return w.afk("gate", "--set", f"gate.local_command={command}", *extra, cwd=wt)
+    return w.afk("gate", "--set", f"gate.local_command={command}", *NOW, *extra, cwd=wt)
 
 
 def _template():
@@ -3384,7 +3516,8 @@ def test_a_recorded_worker_gate_run_is_not_repeated_by_the_landing():
                                                             command)}
 
         w.afk(*_turn(3, *gate))
-        r = _land(w, 3, wt, *gate)
+        # the brief's line carries no `--now`: its record is stamped by the wall clock
+        r = _land(w, 3, wt, *gate, now=int(time.time()))
         assert (r["outcome"], r["synced"], r["head"]) == ("merged", False, head), r
         # the outcome says the gate was trusted, not run, and names the head that landed
         assert r["gate"] == {"status": "green", "source": "recorded", "head": head,
@@ -3501,6 +3634,76 @@ def test_a_recorded_gate_run_is_void_unless_it_is_of_the_tree_that_lands():
         r = _land(w, 7, wt, *on)
         assert (r["outcome"], r["gate"]["source"], r["gate"]["head"]) == ("merged", "recorded", g["head"])
         assert count() == before and w.pr(70)["merged"]["head"] == g["head"]
+
+
+def test_a_landing_accepts_only_a_gate_run_of_the_committed_tree():
+    """#109. A green run counts — for a record and for a landing alike — only
+    when the worktree was exactly its commit before the run and is exactly its
+    commit after it. `afk land` refuses anything else: nothing merged, nothing
+    recorded, and the refusal names the paths. A record needs neither: it is of
+    the tree, whatever lies around it."""
+    with world(issues=[issue(n, "ready-for-agent") for n in (6, 7)]) as w:
+        runs = os.path.join(w.sb.root, "gate-runs")
+        clean = f"echo run >> {runs}"
+        d, head = with_pr(w, 6, 60, gate=local_gate(clean))
+        wt = d["worktree"]
+        w.afk(*_turn(6, *local_gate(clean)))
+        base0 = _target(w)
+
+        def refused(command, *paths, ran):
+            before = _gate_runs(w)
+            err = _land_error(w, 6, wt, *local_gate(command))
+            assert "not the commit that would land" in err and "Nothing was merged" in err, err
+            assert all(path in err for path in paths), err
+            assert _gate_runs(w) == before + ran
+            assert _target(w) == base0 and "merged" not in w.pr(60) and _gate_refs(w) == set()
+            assert w.issue(6)["state"] == "open"
+            return err
+
+        # an untracked file: the gate would pass on a tree no commit holds — it
+        # is not even run
+        stray = os.path.join(wt, "not-added.txt")
+        with open(stray, "w") as f:
+            f.write("the test only passes with this\n")
+        assert "untracked" in refused(clean, "?? not-added.txt", ran=0)
+        os.remove(stray)
+
+        # a gate that rewrites a tracked file is green on what it wrote, not on
+        # what is committed: neither recorded…
+        fixing = f"{clean}; echo fixed >> feature6.txt"
+        g = _gate(w, wt, fixing)
+        assert (g["status"], g["recorded"], g["uncommitted"]) == ("green", False, [" M feature6.txt"]), g
+        assert "left the worktree" in g["detail"] and _gate_refs(w) == set()
+        git(wt, "checkout", "-q", "--", "feature6.txt")
+        # …nor accepted
+        assert "left the worktree" in refused(fixing, "M feature6.txt", ran=1)
+        git(wt, "checkout", "-q", "--", "feature6.txt")
+        # …and so is one that commits what it wrote, or litters
+        committing = f"{fixing}; git commit -qam fixed-by-the-gate"
+        assert "HEAD moved" in refused(committing, ran=1)
+        git(wt, "reset", "-q", "--hard", head)
+        refused(f"{clean}; touch litter.txt", "?? litter.txt", ran=1)
+        os.remove(os.path.join(wt, "litter.txt"))
+
+        # a clean worktree lands exactly as before
+        before = _gate_runs(w)
+        r = _land(w, 6, wt, *local_gate(clean))
+        assert (r["outcome"], r["gate"]["source"], r["head"]) == ("merged", "run", head), r
+        assert _gate_runs(w) == before + 1
+
+        # a RECORDED run stands in whatever lies around the commit: it is of the tree
+        d, _ = with_pr(w, 7, 70, gate=local_gate(clean))
+        wt = d["worktree"]
+        git(wt, "pull", "-q", "--no-edit", "origin", w.sb.base)   # the worker's own sync
+        git(wt, "push", "-q", "origin", "HEAD")
+        assert _gate(w, wt, clean)["recorded"] is True
+        with open(os.path.join(wt, "notes.txt"), "w") as f:
+            f.write("left behind\n")
+        w.afk(*_turn(7, *local_gate(clean)))
+        before = _gate_runs(w)
+        r = _land(w, 7, wt, *local_gate(clean))
+        assert (r["outcome"], r["gate"]["source"]) == ("merged", "recorded"), r
+        assert _gate_runs(w) == before
 
 
 def test_a_gate_run_the_remote_will_not_record_is_still_green_and_the_landing_gates():
@@ -4239,6 +4442,43 @@ def test_a_red_batch_lands_nothing_and_is_repaired_with_a_fix_commit_on_top():
         assert not [x for x in w.sb.all_refs() if "afk-batch" in x]
 
 
+def test_a_batch_lands_only_on_a_gate_run_of_the_committed_stack():
+    """#109. A merge batch's landing holds to the same rule as a single one: the
+    stack is gated only as a commit, before the run and after it."""
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
+        gate = _counted(w)
+        for n in (1, 2):
+            with_pr(w, n, n * 10, gate=gate)
+        base0 = _target(w)
+        b = w.afk(*_turn_batch(*gate))
+        bwt = b["worktree"]
+
+        def refused(gate, path, ran):
+            before = _gate_runs(w)
+            err = w.error("land", "--batch", b["batch"], *R, *NOW, *gate, cwd=bwt)
+            assert "not the commit that would land" in err and path in err, err
+            assert _gate_runs(w) == before + ran
+            assert _target(w) == base0 and _gate_refs(w) == set()
+            assert [w.pr(p).get("state", "open") for p in (10, 20)] == ["open", "open"]
+            return err
+
+        # an untracked file in the batch's worktree: the gate is not run
+        stray = os.path.join(bwt, "not-added.txt")
+        with open(stray, "w") as f:
+            f.write("the stack only passes with this\n")
+        assert "untracked" in refused(gate, "?? not-added.txt", ran=0)
+        os.remove(stray)
+        # a gate that rewrites a tracked file of the stack
+        assert "left the worktree" in refused(_counted(w, "echo fixed >> feature1.txt"),
+                                              "M feature1.txt", ran=1)
+        git(bwt, "checkout", "-q", "--", "feature1.txt")       # the worker discards it
+
+        # clean, it lands as before — the stack is rebuilt from the target's tip
+        r = _land_batch(w, b, *gate, now=T0 + 10)
+        assert (r["outcome"], r["issues"]) == ("landed", [1, 2]), r
+        assert _target(w) == r["head"]
+
+
 def test_a_target_that_moves_while_the_batch_gates_refuses_the_push():
     """The fast-forward push IS the lock. Somebody lands on the target while the
     batch's gate runs: the push is refused, nothing lands, and the same command
@@ -4530,6 +4770,7 @@ def test_a_batch_cut_after_its_push_is_settled_by_the_next_cycle_from_the_target
         assert rows == {1: ("landed", None, None), 2: ("landed", None, None),
                         3: ("no_pr", None, None)}
 
+        w.worker(output=T0 + 9_999, state="working", since=T0, n=2)    # #3's, still at it
         c = tick(w, None, *gate, now=T0 + 10_000)                     # long past every grace
         assert c["progress"].startswith("cleared #1, #2; ") and "errors" not in c, c
         assert c["judgments"] == []

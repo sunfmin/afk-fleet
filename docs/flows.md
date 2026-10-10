@@ -25,7 +25,8 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 2. The **frontier** is selected: an issue is dispatchable only if it is open, carries the ready
    label, is not an epic, is unclaimed, has no open linked PR and has zero open blockers.
    `skills/afk-fleet/scripts/afk_decide.py:select_frontier`
-3. For each free slot under `concurrency`, the tick **dispatches** an issue, and the dispatch begins
+3. For each slot still free under `concurrency` — the bound on the claims a fleet holds — once the
+   **stale claims** have taken theirs, the tick **dispatches** an issue, and the dispatch begins
    by **claiming** it: refreshing the fleet's **heartbeat** if it is due, and only then creating the
    claim ref, which the server accepts for exactly one **fleet instance**; a loser starts nothing.
    `skills/afk-fleet/scripts/afk.py:cmd_dispatch`
@@ -294,7 +295,10 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   `test_in_required_mode_the_turn_waits_for_checks_on_the_head_that_lands`) The local gate is not run
   twice on one tree, and only on a record `afk` itself made of that tree, wherever it was made.
   (ADR-0030; `test_a_recorded_worker_gate_run_is_not_repeated_by_the_landing`,
-  `test_a_recorded_gate_run_is_void_unless_it_is_of_the_tree_that_lands`)
+  `test_a_recorded_gate_run_is_void_unless_it_is_of_the_tree_that_lands`) A run counts — for a
+  record and for a landing alike — only when the worktree is exactly its commit before the run and
+  after it. (ADR-0030; `test_a_landing_accepts_only_a_gate_run_of_the_committed_tree`,
+  `test_a_batch_lands_only_on_a_gate_run_of_the_committed_stack`)
 - A worker starts from the commit the remote has, never a stale local branch, and is told the branch
   orca actually created. (ADR-0017;
   `test_dispatch_starts_a_worker_on_the_remote_base_tip_and_submits_its_prompt`)
@@ -400,11 +404,13 @@ What the tick then does, each row a different mainline:
 - **#3** is the first mainline from step 11: it is alone in `merge_order`, so `afk turn` gives PR #30
   the landing turn, and its worker's `afk land` syncs, re-confirms the gate, merges it and
   sets the board to "merged"; the next tick releases the claim.
-- **#1** is the first mainline from step 3: `afk dispatch` claims it, has orca create the worktree,
-  and delivers the worker its prompt. The row also says `free_slots: 1` — one slot is all
-  `concurrency: 3` leaves beside the two claims held.
 - **#6** is the dead-fleet mainline from step 3: `peerB` last beat 5499 s ago, past the 4500 s
-  lease, so reclaim with `--expect-sha s6`, then `afk dispatch` recovers it by continuation.
+  lease, so reclaim with `--expect-sha s6`, then `afk dispatch` recovers it by continuation. It
+  takes the one free slot: the working set says `free_slots: 1`, all `concurrency: 3` leaves beside
+  the two claims held, and a stale claim comes before the frontier.
+- **#1** is the first mainline from step 3, one tick later: with no slot left it stays on the
+  frontier, and once a claim is released `afk dispatch` claims it, has orca create the worktree, and
+  delivers the worker its prompt.
 - **#4** has no PR, so the tick asks `afk no-pr` why — a worker orca reports busy is left at once; it is already on
   attempt 1, so if the answer is a failure, `afk fail` has one more retry left before it escalates
   (`retry`, default 2).

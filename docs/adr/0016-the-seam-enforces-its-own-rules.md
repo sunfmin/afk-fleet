@@ -13,7 +13,9 @@ structure:
 
 1. **`--config` is required.** Every subcommand that reads config refuses to run without it (exit 3).
    Only `afk config` and `afk worker-command`, which run before a config exists, take none. Keys the
-   JSON omits still default; the flag itself cannot be omitted.
+   JSON omits still default; the flag itself cannot be omitted. A key the JSON *does* carry is held
+   to the schema the config file is held to — unknown, renamed, removed or wrong-typed, it is an
+   error naming the key (exit 3), never dropped (#113).
 2. **One override, by the config's own key names.** `--set <key>=<value>` (repeatable, dotted for
    `gate.` / `merge.`) replaces the eleven per-key flags (`--ns`, `--ttl`, `--retry`, `--base`,
    `--grace`, `--ci`, `--command`, `--target`, `--force-after`, `--ready-label`, `--epic-labels`) and

@@ -34,6 +34,8 @@ worker, a whole stack of PRs behind one gate run (`land --batch`, ADR-0029).
 Every subcommand that reads config REQUIRES the same `--config` (the canonical
 JSON from `afk config`, then `afk probe`) and resolves it one way, in `_cfg`:
 `--set key=value` → `--config` → CONFIG_DEFAULTS for the keys it omits (ADR-0009).
+The JSON is held to the schema the config file is held to: a key the schema does
+not have, or a value of the wrong type, is an error, never dropped or defaulted.
 
 Invoked as:  <skill>/scripts/afk.py <subcommand> [flags]
 """
@@ -71,8 +73,9 @@ _T = TypeVar("_T")
 
 def _cfg(a: argparse.Namespace) -> Config:
     """The effective config for a subcommand: the `--config` JSON (canonical or
-    partial) resolved through CONFIG_DEFAULTS, any `--set key=value` laid on top,
-    then validated — no subcommand runs on a config `afk config` would refuse."""
+    partial) held to the file's schema and resolved through CONFIG_DEFAULTS
+    (`resolve_config`), any `--set key=value` laid on top, then validated — no
+    subcommand runs on a config `afk config` would refuse."""
     cfg = afk_decide.resolve_config(json.loads(a.config))
     return afk_decide.validate_config(afk_decide.override_config(cfg, a.set))
 
@@ -132,6 +135,11 @@ _GIT_ENV = {
     "GIT_COMMITTER_NAME": "afk-fleet", "GIT_COMMITTER_EMAIL": "afk@fleet.local",
 }
 
+# The message locale every git here runs under. What git says is read — a ref the
+# remote lacks, a push the server turned down — so it is said in one language
+# whatever the machine's locale is. `LC_ALL=C` also switches `LANGUAGE` off.
+_GIT_LOCALE = {"LC_ALL": "C"}
+
 _SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _WORKER_PROMPT = os.path.join(_SKILL, "references", "worker-prompt.md")
 
@@ -178,10 +186,19 @@ def _agent(a: argparse.Namespace) -> _Agent:
 
 
 def _git(args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
-    p = subprocess.run(["git", *args], capture_output=True, text=True, env=_GIT_ENV)
+    p = subprocess.run(["git", *args], capture_output=True, text=True,
+                       env={**_GIT_ENV, **_GIT_LOCALE})
     if check and p.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {p.stderr.strip()}")
     return p
+
+
+def _git_as_caller(path: str, args: list[str]) -> subprocess.CompletedProcess[str]:
+    """One git in the repo at `path` that may write a commit of the caller's own —
+    a merge, a cherry-pick — so it runs under the caller's identity, not the
+    records'. Never raises: the caller reads the exit code."""
+    return subprocess.run(["git", "-C", path, *args], capture_output=True, text=True,
+                          env={**os.environ, **_GIT_LOCALE})
 
 
 def _gh(args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -244,7 +261,11 @@ def _remote_sha(remote: str, refname: str) -> str:
     return out[0] if out else ""
 
 
-_NO_REMOTE_REF = "couldn't find remote ref"       # git's words for a ref the remote lacks
+def _remote_lacks(p: subprocess.CompletedProcess[str], branch: str) -> bool:
+    """Whether a failed fetch failed because the remote has no `branch` — git's own
+    line for exactly that ref (in `_GIT_LOCALE`), never a part of one: a line for
+    `master` says nothing about `ma`."""
+    return f"fatal: couldn't find remote ref refs/heads/{branch}" in p.stderr.splitlines()
 
 
 def _fetch_tip(rem: str, branch: str, cwd: str | None = None) -> str:
@@ -255,7 +276,7 @@ def _fetch_tip(rem: str, branch: str, cwd: str | None = None) -> str:
     at = ["-C", cwd] if cwd else []
     p = _git([*at, "fetch", "--quiet", rem, f"refs/heads/{branch}"], check=False)
     if p.returncode != 0:
-        if _NO_REMOTE_REF in p.stderr:
+        if _remote_lacks(p, branch):
             raise RuntimeError(f"the remote has no branch {branch!r}")
         raise RuntimeError(f"git fetch {rem} refs/heads/{branch} failed: {p.stderr.strip()}")
     return _git([*at, "rev-parse", "FETCH_HEAD"]).stdout.strip()
@@ -589,7 +610,7 @@ def _branch_ahead(remote: str, branch: str, base: str, slot: int) -> int | None:
     p = _git(["fetch", "--force", remote,
               f"refs/heads/{branch}:{ours}/branch", f"refs/heads/{base}:{ours}/base"], check=False)
     if p.returncode != 0:
-        if f"{_NO_REMOTE_REF} refs/heads/{branch}" in p.stderr:
+        if _remote_lacks(p, branch):
             return None
         raise RuntimeError(f"git fetch {remote} of {branch!r} and {base!r} failed: "
                            f"{p.stderr.strip()}")
@@ -2341,27 +2362,69 @@ def _drop_gate_record(rem: str, path: str, tree: str, command: str) -> None:
           afk_decide.gate_record_ref(tree, command)], check=False)
 
 
-def _run_and_record_gate(run: _Run, path: str, limits: _GateLimits,
-                         live: bool = False) -> tuple[Obj, str, list[str], str | None]:
+def _off_commit(path: str, head: str | None = None) -> list[str]:
+    """What keeps a worktree from being exactly a commit: its uncommitted and
+    untracked paths, as `git status --porcelain` lists them, and — given the
+    commit it was at — a HEAD that is no longer `head`. [] when it is the commit
+    and nothing else. Ignored files are not listed: a gate's own artifacts
+    belong in `.gitignore`. A worktree that is gone is not its commit either."""
+    status = _git(["-C", path, "status", "--porcelain"], check=False)
+    if status.returncode != 0:
+        return [f"the worktree {path} is gone"]
+    now = _git(["-C", path, "rev-parse", "HEAD"], check=False).stdout.strip()
+    moved = [f"HEAD moved from {head} to {now}"] if head and now != head else []
+    return moved + status.stdout.splitlines()
+
+
+# Why a run of the local gate was not a run of the committed tree — the two
+# halves of one rule, each said to whoever ran it (`afk gate`'s `detail`, a
+# landing's refusal).
+_DIRTY_BEFORE = ("the worktree had uncommitted or untracked files when the run started, so it "
+                 "tested a tree no commit holds")
+_DIRTY_AFTER = ("the run left the worktree other than the commit it started on, so the commit "
+                "may be red where the tree the run left is green")
+
+
+def _run_and_record_gate(run: _Run, path: str, limits: _GateLimits, live: bool = False
+                         ) -> tuple[Obj, str, tuple[str, list[str]] | None, str | None]:
     """One run of the local gate in a worktree, put on record when green →
-    (`_run_gate_command`'s verdict, the head it ran on, the uncommitted paths,
-    why the run is NOT on record — None when it is). Only a green run on a committed tree
-    is recorded: over uncommitted or untracked files it tested a tree no commit
-    holds. A red or timed-out run on a committed tree takes that tree's record
-    away — the latest run of a tree is the one believed. The record is `afk`'s,
-    made from an exit code it saw (ADR-0030)."""
+    (`_run_gate_command`'s verdict, the head it ran on, why it was NOT a run of
+    the committed tree — (`_DIRTY_BEFORE` | `_DIRTY_AFTER`, the paths) — or None,
+    why the run is NOT on record — None when it is).
+
+    A run is of the committed tree only when the worktree was exactly `head`
+    before it — nothing uncommitted, nothing untracked — and is exactly `head`
+    after it: a command that rewrites a tracked file passes on what it wrote,
+    not on what is committed. Only such a run, green, is recorded, and only such
+    a run is one a landing may merge on (`_gated`). A red or timed-out run that
+    started on a committed tree takes that tree's record away — the latest run
+    of a tree is the one believed. The record is `afk`'s, made from an exit
+    code it saw (ADR-0030)."""
     rem = run.rem
     head = _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip()
     tree = _git(["-C", path, "rev-parse", "HEAD^{tree}"]).stdout.strip()
-    dirty = _git(["-C", path, "status", "--porcelain"]).stdout.splitlines()
+    before = _off_commit(path)
+    off = (_DIRTY_BEFORE, before) if before else None
     gate = _run_gate_command(run.cfg, path, limits, live=live)
     if gate["status"] != "green":
-        if not dirty:
+        if not off:
             _drop_gate_record(rem, path, tree, gate["command"])
-        return gate, head, dirty, "the gate is red"
-    if dirty or _git(["-C", path, "rev-parse", "HEAD"], check=False).stdout.strip() != head:
-        return gate, head, dirty, "the run was not on a committed tree"
-    return gate, head, dirty, _write_gate_record(rem, path, tree, gate["command"], run.now())
+        return gate, head, off, "the gate is red"
+    after = [] if off else _off_commit(path, head)
+    if after:
+        off = (_DIRTY_AFTER, after)
+    if off:
+        return gate, head, off, "the run was not on a committed tree"
+    return gate, head, None, _write_gate_record(rem, path, tree, gate["command"], run.now())
+
+
+def _not_gated(path: str, why: str, paths: list[str]) -> RuntimeError:
+    """A landing's refusal of a gate run that was not of the committed tree."""
+    return RuntimeError(f"the worktree {path} is not the commit that would land — {why}. "
+                        f"Nothing was merged and nothing is on record. Commit what belongs to "
+                        f"the change, have the gate's own artifacts ignored (`.gitignore`), "
+                        f"discard the rest (`git status`), and run this again:\n"
+                        + "\n".join(paths[:20]))
 
 
 def _gated(run: _Run, path: str, limits: _GateLimits) -> Obj:
@@ -2376,7 +2439,14 @@ def _gated(run: _Run, path: str, limits: _GateLimits) -> Obj:
       {**`_run_gate_command`'s red verdict, "source": "run", "head", "not_trusted"}
 
     `head` is the commit that was asked about; `not_trusted` is why no record
-    stood in for the run."""
+    stood in for the run.
+
+    A run made now answers the question only when it was a run of the committed
+    tree — the rule a record is written by. Otherwise this raises, and nothing
+    lands: before the run, on a worktree with uncommitted or untracked files
+    (the gate is not run at all); after a green one that left the worktree other
+    than `head`. A record needs neither: it is of the tree, whatever lies around
+    it in the worktree."""
     command = run.cfg["gate"]["local_command"]
     head, tree = _git(["-C", path, "rev-parse", "HEAD", "HEAD^{tree}"]).stdout.split()
     record = _read_gate_record(run.rem, path, tree, command)
@@ -2384,9 +2454,16 @@ def _gated(run: _Run, path: str, limits: _GateLimits) -> Obj:
     if record and void is None:
         return {"status": "green", "source": "recorded", "head": head, "command": command,
                 "recorded_at": record["at"]}
-    gate, *_ = _run_and_record_gate(run, path, limits)
+    strays = _off_commit(path)
+    if strays:
+        raise _not_gated(path, "it has uncommitted or untracked files, and a run of the gate "
+                               "over them would test a tree no commit holds", strays)
+    gate, _, off, _ = _run_and_record_gate(run, path, limits)
     if gate["status"] != "green":
         return {**gate, "source": "run", "head": head, "not_trusted": void}
+    # a worktree removed under the run (a batch abandoned) is the caller's to report
+    if off and os.path.isdir(path):
+        raise _not_gated(path, *off)
     return {"status": "green", "source": "run", "head": head, "command": command,
             "not_trusted": void}
 
@@ -2407,17 +2484,18 @@ def cmd_gate(a: argparse.Namespace) -> Obj:
     if not cfg["gate"]["local_command"].strip():
         raise ValueError("gate.local_command is empty — there is no local gate to run")
     path = _git(["rev-parse", "--show-toplevel"]).stdout.strip()
-    gate, head, dirty, unrecorded = _run_and_record_gate(
+    gate, head, off, unrecorded = _run_and_record_gate(
         run, path, _GateLimits(a.gate_timeout, excerpt_lines=0), live=True)
     out = {k: gate[k] for k in ("status", "exit_code", "timed_out", "command")}
     if gate["status"] != "green":
         return {**out, "head": head, "recorded": False,
                 "detail": "the gate is red — nothing is on record; fix it and run this again"}
-    if dirty:
-        return {**out, "head": head, "recorded": False, "uncommitted": dirty[:20],
-                "detail": "green, but not on a committed tree — the worktree had uncommitted or "
-                          "untracked files, so this run proves nothing about a commit. Commit "
-                          "them (or ignore the gate's own artifacts) and run this again"}
+    if off:
+        why, paths = off
+        return {**out, "head": head, "recorded": False, "uncommitted": paths[:20],
+                "detail": f"green, but not on a committed tree — {why}. This run proves nothing "
+                          f"about a commit, and a landing refuses one like it. Commit them (or "
+                          f"ignore the gate's own artifacts) and run this again"}
     if unrecorded:
         return {**out, "head": head, "recorded": False, "not_recorded": unrecorded,
                 "detail": f"green on {head}, but the record could not be written — push it and "
@@ -2448,8 +2526,7 @@ def _sync(rem: str, path: str, target: str) -> list[str]:
                            f"what would be gated is not what would land. Commit them (a "
                            f"resolved sync conflict must be committed) or discard them:\n{dirty}")
     sha = _fetch_tip(rem, target, cwd=path)
-    p = subprocess.run(["git", "-C", path, "merge", "--no-edit", sha],
-                       capture_output=True, text=True)
+    p = _git_as_caller(path, ["merge", "--no-edit", sha])
     if p.returncode != 0:
         files = _unmerged(path)
         if not files:
@@ -3141,8 +3218,7 @@ def _stack_pr(rem: str, path: str, pr: PullRequest,
     unchanged, which is what makes GitHub show the PR merged once the stack is
     on the target; the merge commit is the caller's own."""
     head = _fetch_tip(rem, pr["headRefName"], cwd=path)
-    p = subprocess.run(["git", "-C", path, "merge", "--no-ff", "--no-commit", head],
-                       capture_output=True, text=True)
+    p = _git_as_caller(path, ["merge", "--no-ff", "--no-commit", head])
     files = _unmerged(path)
     if p.returncode != 0 or files:
         _git(["-C", path, "merge", "--abort"], check=False)
@@ -3154,9 +3230,8 @@ def _stack_pr(rem: str, path: str, pr: PullRequest,
     if not _git(["-C", path, "status", "--porcelain", "--untracked-files=no"]).stdout.strip():
         _git(["-C", path, "merge", "--abort"], check=False)    # none is open when it was up to date
         return None, "no_changes", []
-    p = subprocess.run(["git", "-C", path, "commit", "-q", "--no-verify",
-                        "-m", afk_decide.stack_message(pr["title"], pr["number"], issue)],
-                       capture_output=True, text=True)
+    p = _git_as_caller(path, ["commit", "-q", "--no-verify",
+                              "-m", afk_decide.stack_message(pr["title"], pr["number"], issue)])
     if p.returncode != 0:
         raise RuntimeError(f"could not commit PR #{pr['number']} onto the stack: "
                            f"{(p.stderr or p.stdout).strip()}")
@@ -3291,7 +3366,7 @@ def _land_batch(run: _Run, batch: str, limits: _GateLimits, merged_timeout: floa
                              "nothing landed — send your wake and stop")
     kept = []
     for sha in fixes:
-        p = subprocess.run(["git", "-C", path, "cherry-pick", sha], capture_output=True, text=True)
+        p = _git_as_caller(path, ["cherry-pick", sha])
         if p.returncode == 0:
             kept.append(sha)
         else:                            # it no longer applies to this stack: the gate will say
@@ -3647,7 +3722,8 @@ def build_parser() -> _Parser:
         if needs_config:
             p.add_argument("--config", required=True,
                            help="the run's config JSON, from `afk config` / `afk probe` (keys "
-                                "it omits fall back to the defaults table — ADR-0009)")
+                                "it omits fall back to the defaults table — ADR-0009; an "
+                                "unknown key or a wrong-typed value is an error)")
             p.add_argument("--set", action="append", metavar="KEY=VALUE",
                            help="override one config key for this call, e.g. "
                                 "concurrency=1 or gate.ci=local (repeatable; "
