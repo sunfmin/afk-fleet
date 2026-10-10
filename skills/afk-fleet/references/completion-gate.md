@@ -23,10 +23,14 @@ A PR may land only when **all** configured gates are green. Which **machine gate
   pre-PR sync, and **the landing runs it again** in the same worktree, on the head that lands — because
   the pre-PR pass tested pre-sync code, and two PRs can each be locally green yet conflict semantically. The
   invariant both runs serve: *what lands on the target branch was tested in the form it lands.* The
-  landing's run happens inside `afk land`, after its sync and before `gh pr merge`. A target that
-  moved while it ran would make the merge commit a tree no run saw, so the landing reads the
-  target's tip again before merging and stops with `target_moved` instead — its next run syncs and
-  gates again. A red run is the
+  landing's run happens inside `afk land`. Where merge batches form (no adversarial verify) it is
+  a run of the commit that lands: the PR's head merged onto the target's tip, pushed afterwards as
+  a fast-forward that a moved target refuses (`target_moved`; the next run stacks and gates again)
+  — the branch is not synced for it, and gains a merge of the target only when the PR conflicts
+  with the tip or that run was red (ADR-0046). With the verify on, the run is after the landing's
+  sync and before `gh pr merge`: a target that moved while it ran would make the merge commit a
+  tree no run saw, so the landing reads the target's tip again before merging and stops with
+  `target_moved` instead — its next run syncs and gates again. A red run is the
   worker's own `outcome: gate_red` with `gate: {status, exit_code, excerpt, omitted_lines, timed_out}`,
   and it fixes the code and lands again — you are not involved, and no attempt is spent. A run
   that outlives `--gate-timeout` is red, never green by default. The `excerpt` is also
@@ -37,7 +41,7 @@ A PR may land only when **all** configured gates are green. Which **machine gate
   worker branches; bootstrap **hard-errors** when `base_branch` requires status checks (see
   [Bootstrap](../SKILL.md#bootstrap-once-with-the-human-present) step 2).
 - **A recorded gate run — a tree is gated once**
-  ([ADR-0030](../../../docs/adr/0030-a-gate-run-is-recorded-on-the-remote-under-the-tree-it-tested.md); `local` only). When the landing's sync is a no-op, the
+  ([ADR-0030](../../../docs/adr/0030-a-gate-run-is-recorded-on-the-remote-under-the-tree-it-tested.md); `local` only). When the target has not moved since the worker's pre-PR sync, the
   landing's run would test the very content the worker's pre-PR run did. The worker runs the gate
   **through `afk gate`** — its prompt hands it that line — which runs `gate.local_command` in the
   worker's worktree and, on green on a committed tree, puts the run on record **on the remote**: one
@@ -46,7 +50,7 @@ A PR may land only when **all** configured gates are green. Which **machine gate
   run when — and only when — a record stands for **the tree that would land** and the command
   configured now, no more than a day old. It is found from anywhere that content is about to land:
   a worktree recreated from the pushed branch, another machine, another commit holding the same
-  files. Anything else and the landing runs the gate exactly as above: the sync moved the head, the
+  files. Anything else and the landing runs the gate exactly as above: the target moved, the
   worker committed afterwards, the command changed, the worker typed the bare command (no record),
   the run was over uncommitted or untracked files or left a tracked file changed (no record), the
   same tree was run red or timed out since (that deletes the record), the remote refused the ref.

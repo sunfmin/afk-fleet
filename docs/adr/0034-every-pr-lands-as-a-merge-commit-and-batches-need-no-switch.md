@@ -8,6 +8,10 @@ only lock, and everything about leaving, dissolving and abandoning a batch are u
 [ADR-0027](0027-a-worker-lands-its-own-pr-on-a-landing-turn.md) is unchanged but for the flag
 `afk land` passes to `gh pr merge`.
 
+**Amended by [ADR-0046](0046-a-single-landing-stacks-on-the-target-like-a-batch-of-one.md) (#154):** where batches
+form, a PR landing alone is stacked like a batch member, not merged with `gh pr merge`; "Alone:"
+below holds where no batch forms.
+
 ## Context
 
 Two things were options that did not need to be.

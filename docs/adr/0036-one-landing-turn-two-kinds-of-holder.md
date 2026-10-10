@@ -6,6 +6,10 @@ so that later reviews do not raise it again:
 [ADR-0029](0029-a-merge-batch-lands-n-prs-behind-one-gate-run.md) both stand as they are. One
 validator that accepted both vocabularies is split in two.
 
+**Amended by [ADR-0046](0046-a-single-landing-stacks-on-the-target-like-a-batch-of-one.md) (#154):** where batches
+form, *how* a single PR lands is now the batch's way — a stack of one, pushed as a fast-forward.
+*Who* lands it, in which worktree, what the tick judges first and how a silence ends are still two.
+
 ## Context
 
 A **landing turn** is held by one PR or by one **merge batch**. The batch came in as a fork in four

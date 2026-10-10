@@ -855,7 +855,7 @@ def _release_claim(run: _Run, instance: str, number: int,
     operations behind one subcommand: only the first asks whose the claim is,
     and only it settles what a landing left behind (`_settle_landed`) — before
     the claim is deleted, so that a settling that raised is still this fleet's
-    to finish. An OPEN issue a merge batch landed (`_cut_landing`) is closed
+    to finish. An OPEN issue a stacked landing landed (`_cut_landing`) is closed
     first, and so settled the same way."""
     if expect_sha:
         return _release(run, number, expect_sha)
@@ -896,7 +896,7 @@ def _mine_or_gone(run: _Run, number: int, instance: str) -> Claim | None:
 def _settle_landed(run: _Run, number: int) -> Obj:
     """What only the tick can do for a claim whose issue is closed — `afk land`
     runs inside the worktree and holds no instance id → {"closed_pr"?,
-    "cleanup"?}: close the PR a merge batch landed that GitHub still shows open
+    "cleanup"?}: close the PR a stacked landing landed that GitHub still shows open
     (`_close_landed_pr`), remove the worktree, and
     bring the landing into the fleet's own checkout (`_sync_checkout`). An open
     issue's worktree is never touched: it may hold work."""
@@ -2752,28 +2752,44 @@ def cmd_land(a: argparse.Namespace) -> Obj:
     a PR lands (ADR-0027). Refused (exit 3, nothing changed) unless the PR holds
     the landing turn of the fleet instance that holds the issue's claim: the check
     guards against a worker that strays, not a malicious one — worker and launcher
-    share one `gh` credential. Then, in order: sync by merging the target in
-    (never a rebase) → push → the machine gate on that exact head (in `required`
-    mode, the PR's checks on it, waited for) → the verify check → the turn and
-    the target's tip, read again → `gh pr merge` pinned to the gated head →
-    status board. It stops with an `outcome`:
+    share one `gh` credential. Then one of two landings, by config:
+
+      stacked    where merge batches form (`afk_decide.batches_form`: local
+                 mode, no adversarial verify) the PR lands as a batch of one
+                 (`_land_stacked`, ADR-0046): its head merged onto the target's
+                 tip with ONE merge commit → the machine gate on that commit →
+                 the turn, read again → the commit pushed to the target as a
+                 fast-forward → status board. The branch is not synced, so the
+                 landing leaves no sync merge on it; `commit` in the result is
+                 what was gated and pushed, `head` the PR's own.
+      in-branch  everywhere else — checks and verifies are of the PR's head —
+                 and for a PR that cannot be stacked: sync by merging the
+                 target in (never a rebase) → push → the machine gate on that
+                 exact head (in `required` mode, the PR's checks on it, waited
+                 for) → the verify check → the turn and the target's tip, read
+                 again → `gh pr merge` pinned to the gated head → status board.
+
+    It stops with an `outcome`:
 
       merged        landed. The worker sends its wake and stops.
-      conflict      the sync conflicted; the merge is left in progress with
-                    `files` unmerged. The worker resolves them, COMMITS, and
-                    runs this again.
-      gate_red      local mode: the gate was red on the synced head (`gate.excerpt`,
-                    also a PR comment). required mode: the PR's checks are red.
-                    The worker fixes the code, commits, and runs this again.
-      awaiting_turn the PR gave its turn up, and is ready again: this run synced
-                    it and found the gate green off the turn, and merged
-                    nothing. The worker sends its wake and stops; it is told
-                    when the PR's next turn comes.
+      conflict      the PR conflicts with the target's tip: the target was
+                    merged into the branch and that merge is left in progress
+                    with `files` unmerged. The worker resolves them, COMMITS,
+                    and runs this again.
+      gate_red      local mode: the gate was red on what would land
+                    (`gate.excerpt`, also a PR comment) — a red stack's target
+                    is merged into the branch first, so the worker has the red
+                    tree. required mode: the PR's checks are red. The worker
+                    fixes the code, commits, and runs this again.
+      awaiting_turn the PR gave its turn up, and is ready again: this run
+                    found the gate green off the turn, on what would land now,
+                    and merged nothing. The worker sends its wake and stops;
+                    it is told when the PR's next turn comes.
       target_moved  the target moved while the gate ran (or the checks were
-                    waited for): the head that was gated no longer holds its
-                    tip, so merging it would land a tree no gate saw. Nothing
-                    was merged. The worker runs this again, which syncs with
-                    the new tip and gates that.
+                    waited for): what was gated is not what would land — the
+                    fast-forward was refused, or the gated head no longer
+                    holds the target's tip. Nothing was merged. The worker
+                    runs this again, which gates on the new tip.
       awaiting_ci   required mode: the checks on the head that would land were
                     still running when `--checks-timeout` ran out. Up to then
                     this waits for them itself — after a sync that pushed a
@@ -2793,7 +2809,7 @@ def cmd_land(a: argparse.Namespace) -> Obj:
     landing stops with `conflict` or `gate_red` it GIVES THE TURN UP (`turn`:
     "given_up" in the result, `afk_decide.gives_turn_up`): the next PR lands
     while the worker fixes this one in place, exactly as before. Run off the
-    turn, this still syncs and gates, stops with `conflict` / `gate_red` as
+    turn, this still gates what would land, stops with `conflict` / `gate_red` as
     often as it takes, and merges nothing: green there is `awaiting_turn`. On
     the PR's next turn those two outcomes keep the turn (ADR-0045). A turn that is no longer this landing's once the gate
     has run — the claim was released or taken over, the turn granted afresh — is
@@ -2802,7 +2818,9 @@ def cmd_land(a: argparse.Namespace) -> Obj:
     id: the next cycle sees a claim whose issue is closed and settles both.
 
     The invariant every path keeps: what lands on the target was gated in the form
-    it lands (ADR-0012). The merge is pinned to the PR's head and to nothing on
+    it lands (ADR-0012). A stacked landing keeps it by construction: the commit
+    pushed is the commit gated, and a target that moved refuses the push.
+    `gh pr merge` is pinned to the PR's head and to nothing on
     the target, so the target's tip is read again right before it; what is left
     is the instant between that read and GitHub making the merge commit, in
     which only someone outside this fleet instance's turns can move the target
@@ -3313,7 +3331,8 @@ def _own_line(path: str, revs: str, *limits: str) -> list[tuple[str, str, str]]:
 
 
 def _landed_pr(path: str, tip: str, issue: int) -> int | None:
-    """The PR a merge batch landed `issue` with, read from the target's own line
+    """The PR that was stacked to land `issue` — in a merge batch or alone —
+    read from the target's own line
     (`tip`, already fetched into `path`): the newest commit stacked with a PR
     (`afk_decide.stacked_pr`) whose message says `Closes #<issue>`, as
     `afk_decide.stack_message` writes it — or None. A later commit that only
@@ -3341,13 +3360,14 @@ def _target_tip(run: _Run) -> str:
 
 
 def _cut_landing(run: _Run, claim: Claim) -> int | None:
-    """The PR a merge batch landed `claim`'s still-open issue with, when the
-    batch's finishing was cut short after its push — the one cut `afk land
+    """The PR a stacked landing — a merge batch's, or one PR's own (ADR-0046) —
+    landed `claim`'s still-open issue with, when its
+    finishing was cut short after its push — the one cut `afk land
     --batch` cannot finish itself: GitHub shows the PR merged, so no open PR
     carries the batch's turn marker and nothing lists the batch any more
     (ADR-0029) → that PR's number, else None. The target itself is asked: the
-    merge commit on its own line that closes the issue, by a PR that was in a
-    batch under this claim (`afk_decide.landed_under`). None too for an issue
+    merge commit on its own line that closes the issue, by a PR that held a
+    turn under this claim (`afk_decide.landed_under`). None too for an issue
     that is closed, or that an open PR closes: those are settled, or still
     landing, by the paths that already exist."""
     number = claim["number"]
@@ -3370,9 +3390,9 @@ def _finish_member(run: _Run, instance: str | None, member: BatchMember) -> None
 
 
 def _close_landed_pr(run: _Run, number: int) -> int | None:
-    """Close the open PR of a CLOSED issue when a merge batch landed it and
-    GitHub does not show it merged → the PR number, None when there is nothing
-    of the kind. The target itself is asked: a PR whose merge commit is not on
+    """Close the open PR of a CLOSED issue when it landed stacked — in a merge
+    batch or alone — and GitHub does not show it merged → the PR number, None
+    when there is nothing of the kind. The target itself is asked: a PR whose merge commit is not on
     it is left alone."""
     pr = afk_decide.closing_pr(_open_prs(run.repo), number)
     turn = _turn(run.repo, pr["number"]) if pr else None
@@ -3999,8 +4019,9 @@ def build_parser() -> _Parser:
                    metavar="k", help="how many trailing log lines a red gate's excerpt keeps "
                                      "(default %(default)s; 0: none)")
     p.add_argument("--merged-timeout", type=int, default=60, metavar="s",
-                   help="--batch: seconds to wait for GitHub to show the landed PRs merged "
-                        "before leaving their branches in place (default %(default)s)")
+                   help="a stacked landing — --batch, or one PR where batches form: seconds "
+                        "to wait for GitHub to show the landed PRs merged before leaving "
+                        "their branches in place (default %(default)s)")
     p.add_argument("--checks-timeout", type=int, default=1800, metavar="s",
                    help="gate.ci required: seconds to wait for the checks on the head that "
                         "would land before stopping with awaiting_ci (default %(default)s)")

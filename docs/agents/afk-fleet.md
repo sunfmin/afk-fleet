@@ -25,7 +25,7 @@ gate:
 - **The local gate is the gate.** This repo has no GitHub Actions and requires no status check on
   its merge target, so `gate.ci: local` (ADR-0012): `gate.local_command` is run by the worker before its PR
   and by its landing on the head that lands — no `no_checks` judgment per PR, and nothing lands
-  ungated. A landing whose sync moved nothing does not run the gate a second time: the worker's
+  ungated. A landing onto a base that has not moved does not run the gate a second time: the worker's
   green run is on record for that tree (ADR-0030).
 - **Types first.** Before the tests, `gate.local_command` holds the production scripts to their
   types (ADR-0039): `ruff` that every function states them, `ty` that they agree. Seconds, against
@@ -36,8 +36,10 @@ gate:
   rule, in parallel: 71 s against 488 s serial, measured on 2026-10-05 on a 14-core Apple M4 Pro
   (Mac16,8). That is a snapshot, not a promise — the suite grows. It is a real gate for the code-touching issues and a no-op pass for
   prompt/docs-only issues.
-- **Sync, not rebase.** A landing merges `base_branch` into the branch before its re-gate
-  (ADR-0012, ADR-0027) — always: there is no key for it (ADR-0038).
+- **Sync, not rebase.** A worker merges `base_branch` into its branch before its pre-PR gate
+  (ADR-0012) — always: there is no key for it (ADR-0038). A landing here stacks the PR on the base
+  instead, one merge commit per PR, and merges the base into the branch only for a PR that
+  conflicts with it or whose landing's gate was red (ADR-0046).
 - **Reserved surfaces.** The fleet manages the `afk-attempt/<n>` labels, the `refs/afk/*` ref
   namespace (`refs/afk/claim/*`, `refs/afk/heartbeat/*`, `refs/afk/base`), the single `<!--afk:status-->` status-board
   comment, the `<!--afk:escalation …-->` marker leading an escalation's comment, and the

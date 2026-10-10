@@ -16,7 +16,7 @@ authorization, ADR-0023):
 
 A key is here because repos really differ in it. What every fleet does alike is **not** a key, and a
 file that still sets one is refused with a note saying so (ADR-0038): the pacing and the claim lease,
-the worktree name, that a landing syncs with `base_branch` before it gates, that a landed branch and
+the worktree name, that a landing gates a PR together with `base_branch`'s tip, that a landed branch and
 worktree are removed, that every claimed issue carries a status board and every escalation a comment,
 and where claim refs live (`afk probe` settles that at every bootstrap).
 
@@ -91,12 +91,12 @@ escalate_label: ready-for-human        # applied (with ready_label removed, clai
   every completed step (progress preservation), so on `required` every one of those pushes fires the
   repo's `on: push` / `on: pull_request` workflows while the fleet reads only the last run — and then
   the landing waits for yet another full run. In `local` mode the local command is the
-  whole gate, run twice: by the worker after its pre-PR **sync**, and by its landing after
-  the landing's sync — or once, when nothing moved in between (next note). Three obligations come with it:
+  whole gate, run twice: by the worker after its pre-PR **sync**, and by its landing on the
+  PR stacked on `base_branch`'s tip — or once, when nothing moved in between (next note). Three obligations come with it:
   - **Scope remote CI away from worker branches** (e.g. trigger `on: push` for the target branch only,
     and drop `on: pull_request`). The fleet cannot edit your workflows — if you leave them broad you
     keep paying the congestion, you just stop reading it.
-  - **Do not require status checks on `base_branch`.** `gh pr merge` would be rejected however green
+  - **Do not require status checks on `base_branch`.** A landing would be rejected however green
     the local gate is, and the only bypass (`--admin`) also overrides human review, so the fleet
     refuses to use it. Bootstrap probes the protection and **hard-errors** on this combination.
   - **Own the environment parity.** `ci: local` is a claim that `local_command` is CI-equivalent. If
@@ -106,7 +106,7 @@ escalate_label: ready-for-human        # applied (with ready_label removed, clai
   `afk gate` or `afk land` on a committed tree is put on record on the remote
   (`refs/afk/gate/<tree>-<hash of the command>`), and a landing skips its own run whenever a record of the
   command configured now stands for the tree that would land — in this worktree, a recreated one,
-  or on another machine. A sync that moved the head, a later commit, a changed command, a red run
+  or on another machine. A target that moved, a later commit, a changed command, a red run
   of the same tree since, or a record more than a day old, and the landing runs the gate itself.
   There is no switch: what this gives up is a second, independent sample of a flaky or
   machine-dependent gate on unchanged content. A gate that leaves untracked, un-ignored files

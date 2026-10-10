@@ -1292,8 +1292,9 @@ def claim_status(has_pr: bool, checks_state: ChecksState | None, ci_mode: GateCi
                     by hand
       landing:      the PR holds this fleet instance's landing turn (`held_turn`)
       landed:       no open PR closes the issue, the issue is still open, and the
-                    target holds the commit a merge batch landed it with: the
-                    batch's finishing was cut short after its push (ADR-0029)
+                    target holds the commit it was stacked with — by a merge
+                    batch, or alone: that landing's finishing was cut short
+                    after its push (ADR-0029, ADR-0046)
       fixing:       the PR gave this fleet instance's landing turn up and its
                     worker has not said it is ready again (`fixing_off_turn`)
 
