@@ -4,6 +4,10 @@
 batch is no longer opt-in (`merge.batch` is removed), its stack is one **merge** commit per PR, and
 a batched PR reads *merged* on GitHub, not *closed*. Read "squash commit", "with the option on"
 and "closed with a comment" below as they were decided then.
+**Amended by [ADR-0045](0045-a-landing-that-stops-on-a-conflict-or-a-red-gate-gives-its-turn-up.md) (#151):** a
+PR that gave its turn up and is still being fixed holds no turn and is not in the merge queue, so a
+batch forms beside it; one that is ready again takes a single turn first, like a PR that left a
+batch, and is not batched.
 **Status:** accepted — opt-in (`merge.batch`, default off, `gate.ci: local` only). Relaxes, per
 batch, the reading of [ADR-0012](0012-local-completion-gate.md)'s invariant that the gate proves
 *a PR*: with the option on it proves *a stack*. Extends
@@ -63,7 +67,8 @@ skill prose re-derives it. A batch is formed only when
   else is granted;
 - `gate.adversarial_verify` is off — with it every PR owes a verify of its own head, so none is
   eligible;
-- no PR that already left a batch is waiting (those go first, on single turns);
+- no PR that already left a batch is waiting (those go first, on single turns) — nor, since
+  ADR-0045, one that gave its turn up and is ready again;
 - and at least two of my claims' ready PRs remain after dropping the ones whose own worker is still
   working (its PR may yet move). A peer fleet's PR is never mine to batch.
 

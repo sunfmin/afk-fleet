@@ -181,12 +181,23 @@ def test_claim_status():
 
     # CLAIM_STATUSES is exactly what it can return: no status the docs were never
     # held to, and none listed that cannot happen
-    seen = {d.claim_status(has_pr, checks, ci, closed=closed, landing=landing, landed=landed)
+    seen = {d.claim_status(has_pr, checks, ci, closed=closed, landing=landing, landed=landed,
+                           fixing=fixing)
             for ci in d.GATE_CI_MODES for has_pr in (True, False)
             for checks in ("green", "red", "pending", None)
             for closed in (True, False) for landing in (True, False)
-            for landed in (True, False)}
+            for landed in (True, False) for fixing in (True, False)}
     assert seen == set(d.CLAIM_STATUSES)
+
+    # a PR that gave its turn up and is being fixed off it (ADR-0045): `fixing`
+    # whatever its checks say — the red run is what its worker is fixing, never a
+    # route into `afk fail` — and only while there is a PR on an open issue
+    for ci in d.GATE_CI_MODES:
+        for checks in ("green", "red", "pending", None):
+            assert d.claim_status(True, checks, ci, fixing=True) == "fixing", (ci, checks)
+        assert d.claim_status(True, "red", ci, closed=True, fixing=True) == "closed"
+        assert d.claim_status(False, None, ci, fixing=True) == "no_pr"
+    assert d.BOARD_PHASE_OF["fixing"] == "fixing"
 
     # no open PR, the issue open, and its landing on the target: a merge batch
     # pushed it and was cut before it closed the issue. Never `no_pr` — nobody is
@@ -222,8 +233,8 @@ def test_turn_record_round_trips_and_is_held_only_by_the_claims_owner():
     assert body.startswith("<!--afk:turn instance=fl-1 at=1234-->\n")
     assert "holds the landing turn" in body and "`fl-1`" in body and "`afk land`" in body
     rec = d.latest_turn([{"id": 7, "body": "a human note"}, {"id": 8, "body": body}])
-    single = {"restarted": None, "batch": None, "members": [], "phase": None, "unbatched": None,
-              "of": None, "released": False}
+    single = {"restarted": None, "given_up": None, "batch": None, "members": [], "phase": None,
+              "unbatched": None, "of": None, "released": False}
     assert rec == {"instance": "fl-1", "at": 1234, "verified": None, "allow_no_checks": False,
                    "stopped": None, "head": None, "comment_id": 8, **single}
     assert d.latest_turn([]) is None and d.latest_turn([{"id": 1, "body": "x"}]) is None
@@ -513,6 +524,13 @@ def test_the_cycle_forms_a_batch_only_from_two_or_more_eligible_prs():
     left = [*waiting, (4, "awaiting_turn", {"unbatched": "left_out"})]
     assert picked(left) == [] and d.turn_order(rows(*left)[0])[0] == 4
     assert d.turn_due(*rows(*left)) == 4
+    # so does a PR that gave its turn up and is ready again (ADR-0045) — while one
+    # still being fixed off that turn holds nothing back: the batch forms beside it
+    again = [*waiting, (4, "awaiting_turn", {"given_up": True})]
+    assert picked(again) == [] and d.turn_due(*rows(*again)) == 4
+    fixing = [*waiting, (4, "fixing", {"given_up": True, "stopped": "conflict"})]
+    assert picked(fixing) == [1, 2, 3]
+    assert d.turn_due(*rows(waiting[0], fixing[-1])) == 3         # …and so does a single turn
     # every PR owes its own adversarial verify before its turn: none is eligible
     verify = d.resolve_config({"gate": {"ci": "local", "local_command": "x",
                                         "adversarial_verify_prompt": "re-derive it"}})
@@ -589,6 +607,13 @@ def test_turns_are_granted_in_one_order_a_held_turn_first_then_pr_number():
     assert {tuple(d.turn_order(list(p))) for p in itertools.permutations(shared)} == \
         {(4, 6, 2, 5, 3, 8, 9, 1)}
     assert d.turn_order([]) == [] and d.turn_order(rows[1:2]) == []
+    # a PR that gave its turn up (ADR-0045): out of the queue while it is being
+    # fixed, and ready again it goes behind a held turn only — ahead of a PR that
+    # left a batch and of every PR that never held a turn
+    queue = [row(1, "awaiting_turn", 10), _mine(2, "awaiting_turn", pr=20, unbatched="left_out"),
+             _mine(3, "awaiting_turn", pr=90, given_up=True), row(4, "landing", 40),
+             _mine(5, "fixing", pr=5, given_up=True, stopped="gate_red")]
+    assert {tuple(d.turn_order(list(p))) for p in itertools.permutations(queue)} == {(4, 3, 2, 1)}
 
 
 def test_an_escalate_label_the_escalation_edit_would_also_remove_is_refused():
@@ -870,8 +895,8 @@ def test_each_record_in_a_comment_round_trips_through_its_own_reader():
         "comment_url": "u"}
 
     no_turn = {"verified": None, "allow_no_checks": False, "stopped": None, "head": None,
-               "restarted": None, "batch": None, "members": [], "phase": None, "unbatched": None,
-               "of": None, "released": False, "comment_id": 5}
+               "restarted": None, "given_up": None, "batch": None, "members": [], "phase": None,
+               "unbatched": None, "of": None, "released": False, "comment_id": 5}
     literals = {
         "<!--afk:turn instance=fl-7fbd5e at=1759676212-->\n**afk-fleet: this PR holds the landing turn**":
             {"instance": "fl-7fbd5e", "at": 1759676212},
@@ -889,6 +914,10 @@ def test_each_record_in_a_comment_round_trips_through_its_own_reader():
              "of": "fl-7fbd5e-1759676400", "released": True},
         "<!--afk:turn instance=fl-7fbd5e at=1759676600 restarted=1759676600-->\n…":
             {"instance": "fl-7fbd5e", "at": 1759676600, "restarted": 1759676600},
+        "<!--afk:turn instance=fl-7fbd5e at=1759676700 stopped=conflict head=abc "
+        "given_up=1759676700 released=1-->\n…":
+            {"instance": "fl-7fbd5e", "at": 1759676700, "stopped": "conflict", "head": "abc",
+             "given_up": 1759676700, "released": True},
     }
     for body, said in literals.items():
         assert d.latest_turn([{"id": 5, "body": body}]) == {**no_turn, **said}, body
@@ -1091,6 +1120,130 @@ def test_a_batch_shows_on_the_board_in_the_brief_and_in_the_working_set():
     assert {m["number"]: (m["status"], m["batch"]) for m in ws["mine"]} == \
         {n: ("awaiting_turn", None) for n in (1, 2, 3)}
     assert [(b["id"], b["instance"]) for b in ws["batches"]] == [("old-90", "old")]
+
+
+def test_a_landing_that_stops_on_a_fix_gives_its_turn_up_once():
+    """ADR-0045, as the turn record says it: a held turn whose landing stops on a
+    conflict or a red gate becomes a marker that holds no turn; granted again,
+    the PR keeps that second turn through the same stop."""
+    held = d.single_turn(None, "me", 100, verified="v1", restarted=90)
+    for outcome in d.LAND_OUTCOMES:
+        assert d.gives_turn_up(held, outcome) == (outcome in ("conflict", "gate_red")), outcome
+    assert set(d.LAND_FIXES) == {"conflict", "gate_red"} and not set(d.LAND_FIXES) & set(d.LAND_WAITS)
+
+    gone = d.given_up_turn(held, 200.7, "conflict", "abc123")
+    assert (gone["released"], gone["given_up"], gone["stopped"], gone["head"], gone["at"]) == \
+        (True, 200, "conflict", "abc123", 200)
+    # the worker that got as far as `afk land` is not the one a restart replaced
+    assert gone["restarted"] is None and gone["verified"] == "v1"
+    body = d.turn_comment(gone)
+    assert body.startswith("<!--afk:turn instance=me at=200 verified=v1 stopped=conflict "
+                           "head=abc123 given_up=200 released=1-->\n")
+    assert "gave its landing turn up" in body and "fixing that in place, off the turn" in body
+    read = d.latest_turn([{"id": 3, "body": body}])
+    assert read == {**gone, "comment_id": 3}
+
+    # it holds no turn — the next PR is granted one — but the PR's own worker still
+    # lands under it, off the turn; and its silence climbs the landing ladder
+    assert d.held_turn(read, "me") is None and d.own_landing(read, "me") is read
+    assert d.own_landing(read, "other") is None and d.own_landing(read, None) is None
+    assert d.turn_given_up(read) and d.fixing_off_turn(read) and d.worker_at_landing(read)
+    assert not d.single_turn_held(read) and d.restartable_turn(read)
+    assert not d.restartable_turn(d.next_turn(read, restarted=250))
+
+    # fixed: `afk land`, off the turn, says the PR is ready again
+    ready = d.next_turn(read, at=300, stopped="awaiting_turn", head="def456")
+    assert d.turn_given_up(ready) and not d.fixing_off_turn(ready)
+    assert not d.worker_at_landing(ready) and d.own_landing(ready, "me") is ready
+    assert "ready again" in d.turn_comment(ready) and "ahead of PRs that never held one" in \
+        d.turn_comment(ready)
+
+    # its next turn is an ordinary held one that remembers — whoever grants it —
+    # and on it the same stop keeps the turn
+    for instance in ("me", "heir"):
+        second = d.single_turn(ready, instance, 400)
+        assert (second["released"], second["stopped"], second["given_up"]) == (False, None, 200)
+        assert d.held_turn(second, instance) is second and d.own_landing(second, instance) is second
+        assert not any(d.gives_turn_up(second, outcome) for outcome in d.LAND_OUTCOMES)
+        assert "gave a turn up once already" in d.turn_comment(second)
+        try:
+            d.given_up_turn(second, 500, "conflict", "abc")
+        except ValueError as e:
+            assert "gave one up already" in str(e)
+        else:
+            raise AssertionError("a PR gave its turn up twice")
+    # a stop that is the fleet's to move on never gives a turn up
+    for outcome in (*d.LAND_WAITS, "target_moved", "merged"):
+        try:
+            d.given_up_turn(held, 200, outcome, "abc")
+        except ValueError as e:
+            assert "keeps its turn" in str(e)
+        else:
+            raise AssertionError(f"{outcome} gave the turn up")
+    # a merge batch's turn is its batch worker's, and a PR that only left a batch
+    # gave nothing up
+    members = [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}]
+    assert d.own_landing(d.batch_turn(None, "me", 10, "me-10", members, "gating"), "me") is None
+    left = d.unbatched_turn(None, "me", 10, "me-10", "left_out")
+    assert d.own_landing(left, "me") is None and not d.turn_given_up(left)
+    # …and one that left a batch, took a single turn and gave THAT up says so
+    both = d.given_up_turn(d.single_turn(left, "me", 20), 30, "gate_red", "abc")
+    assert "gave its landing turn up" in d.turn_comment(both) and both["unbatched"] == "left_out"
+
+
+def test_the_working_set_keeps_a_pr_being_fixed_off_its_turn_out_of_the_queue():
+    """ADR-0045, as `afk rebuild` reports it: `fixing` while the worker fixes —
+    no turn out, not in the merge queue — then `awaiting_turn` at its head."""
+    cfg = d.resolve_config({"gate": {"ci": "local", "local_command": "make test"}})
+    issues = [{"number": n, "title": f"i{n}", "labels": ["ready-for-agent"], "updatedAt": "t"}
+              for n in (1, 2, 3)]
+    prs = [{"number": n * 10, "headRefOid": f"h{n}", "statusCheckRollup": [],
+            "closingIssuesReferences": [{"number": n}]} for n in (1, 2, 3)]
+    claims = [{"number": n, "instance": "me", "sha": f"s{n}"} for n in (1, 2, 3)]
+    beats = [{"instance": "me", "ts": 1000}]
+    issues, prs, claims = _gathered(issues, prs, claims)
+
+    def rows(turn, config=cfg):
+        ws = d.assemble_working_set(issues, prs, claims, beats, "me", 1000, config, turns={3: turn})
+        return ws, {m["number"]: (m["status"], m["board_phase"], m["stopped"], m["given_up"])
+                    for m in ws["mine"]}
+
+    given_up = d.given_up_turn(d.single_turn(None, "me", 900), 950, "conflict", "h3")
+    ws, said = rows(given_up)
+    assert said[3] == ("fixing", "fixing", "conflict", True)
+    assert said[1] == ("awaiting_turn", "awaiting_turn", None, False)
+    assert ws["merge_order"] == [1, 2] and d.asks_after(ws["mine"]) == [3]
+    assert d.turn_holder(ws, "me") == (None, None)                 # no turn is out
+    assert d.batch_candidates(ws["mine"], ws["merge_order"], cfg) == [1, 2]
+    # in `required` its red checks are what it is fixing, never a `failure`
+    required = d.resolve_config({})
+    red = [{**p, "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "FAILURE"}]}
+           for p in prs]
+    ws_red = d.assemble_working_set(issues, red, claims, beats, "me", 1000, required,
+                                    turns={3: given_up})
+    assert {m["number"]: m["status"] for m in ws_red["mine"]} == \
+        {1: "failure", 2: "failure", 3: "fixing"}
+
+    # ready again: at the head of the queue, on a single turn, its board saying so
+    ws, said = rows(d.next_turn(given_up, at=980, stopped="awaiting_turn"))
+    assert said[3] == ("awaiting_turn", "ready_again", None, True)
+    assert ws["merge_order"] == [3, 1, 2] and d.turn_due(ws["mine"], ws["merge_order"]) == 3
+    assert d.asks_after(ws["mine"]) == [] and d.batch_candidates(ws["mine"], ws["merge_order"], cfg) == []
+    # on its second turn it is an ordinary landing row that remembers
+    ws, said = rows(d.next_turn(d.single_turn(given_up, "me", 990), stopped="conflict", head="h3"))
+    assert said[3] == ("landing", "landing", "conflict", True) and ws["merge_order"] == [3, 1, 2]
+    assert d.turn_due(ws["mine"], ws["merge_order"]) is None        # fixed with the turn held
+    # a turn a DEAD fleet gave up is nobody's: the PR waits for a turn of mine, on
+    # which — `given_up` staying on the marker — a conflict keeps the turn
+    ws, said = rows(d.given_up_turn(d.single_turn(None, "old", 900), 950, "conflict", "h3"))
+    assert said[3] == ("awaiting_turn", "awaiting_turn", None, True)
+    assert ws["merge_order"] == [3, 1, 2]
+
+    for phase, words in (("fixing", ("turn given up", "being fixed")),
+                         ("ready_again", ("ready again", "awaiting its turn"))):
+        board = d.render_status_board(phase, "local", 2, instance="me", pr=30)
+        assert all(w in board for w in words) and "- [x] PR 已开 (#30)" in board, board
+        assert "- [ ] 轮到落地" in board
 
 
 def test_protection_verdict():
@@ -1416,6 +1569,25 @@ def test_classification_nudges_a_silent_worker_once_before_failing_it():
         assert (r["cause"], r["action"]) == ("silent_after_nudge", "next_attempt"), held
         r = _classify(ZERO, "idle", 9000, can_nudge=False, turn=held)
         assert (r["cause"], r["action"]) == ("silent_unnudgeable", "next_attempt"), held
+    # a PR being fixed OFF the turn it gave up is on those same rungs (ADR-0045):
+    # grace from its last `afk land`, a nudge, one restart, then the escalation —
+    # and once it said it is ready again its worker has nothing left to do
+    off = {"released": True, "given_up": NOW - 9 * GRACE}
+    assert turn(9000, NOW - 10, stopped="conflict", **{}) == ("coding", "leave", 10)
+    for stopped in d.LAND_FIXES:
+        fixing = {**off, "stopped": stopped}
+        r = lambda **more: (lambda c: (c["cause"], c["action"]))(
+            _classify({**ZERO, "commits_ahead": 3}, "idle", 9000, **more))
+        assert r(turn={**fixing, "at": NOW - 10}) == ("within_grace", "leave")
+        assert r(turn={**fixing, "at": NOW - GRACE}) == ("silent", "nudge")
+        assert r(turn={**fixing, "at": NOW - 2 * GRACE}, nudged_at=NOW - GRACE) == \
+            ("silent_on_turn", "restart")
+        assert r(turn={**fixing, "at": NOW - 2 * GRACE, "restarted": NOW - 2 * GRACE},
+                 nudged_at=NOW - GRACE) == ("silent_past_restart", "escalate")
+        assert r(turn={**fixing, "at": NOW - GRACE}, can_nudge=False) == ("silent_on_turn", "restart")
+    assert _classify(ZERO, "idle", 9000, nudged_at=NOW - GRACE,
+                     turn={**off, "at": NOW - 2 * GRACE, "stopped": "awaiting_turn"})["cause"] == \
+        "silent_after_nudge"
     a = lambda **said: d.next_turn(None, **said)
     assert d.restartable_turn(a(at=1)) and not d.restartable_turn(a(at=1, restarted=2))
     assert d.single_turn_held(a(at=1, restarted=2)) and not d.single_turn_held(a(at=1, batch="b"))
@@ -2324,7 +2496,7 @@ def _mine(n, status="no_pr", **more):
     """A whole `mine` row (`afk_decide.MineRow`), saying nothing but what is named."""
     return {"number": n, "title": None, "status": status, "board_phase": None, "pr": None,
             "checks": None, "attempt": 0, "starting": False, "stopped": None, "batch": None,
-            "unbatched": None, **more}
+            "unbatched": None, "given_up": False, **more}
 
 
 def test_a_tick_asks_after_waiting_workers_and_grants_one_turn():
@@ -2334,6 +2506,11 @@ def test_a_tick_asks_after_waiting_workers_and_grants_one_turn():
             _mine(8, "landing", pr=19, stopped="gate_red")]
     # `afk no-pr` is asked about a PR-less claim, and a landing one that did not stop for the tick
     assert d.asks_after(mine) == [1, 3, 8]
+    # …and about one being fixed off the turn its PR gave up (ADR-0045) — which is
+    # no turn out: the head of the queue is granted its own beside it
+    fixing = _mine(9, "fixing", pr=18, stopped="conflict", given_up=True)
+    assert d.asks_after([*mine, fixing]) == [1, 3, 8, 9]
+    assert d.turn_due([fixing, mine[1]], d.turn_order([fixing, mine[1]])) == 2
 
     # the turn goes to the head of the merge queue, and only when its worker is not at it
     assert d.turn_due(mine, []) is None
@@ -2352,9 +2529,14 @@ def test_turn_step_routes_every_outcome_or_returns_the_judgment():
                            config)
 
     assert step("granted") == ("granted", None)
-    for outcome in ("waiting", "landing", "awaiting_ci"):
+    for outcome in ("waiting", "landing", "fixing", "awaiting_ci"):
         assert step(outcome) == ("leave", None), outcome
-    routed = {"granted", "waiting", "landing", "awaiting_ci", "gate_red", "no_checks", "needs_verify"}
+    # `afk turn --restart` on a PR that gave its turn up grants none: the worker
+    # it started is what is counted (ADR-0045)
+    assert d.turn_step(CALL, {"issue": 4, "pr": 30, "head": "abc123", "outcome": "fixing",
+                              "restarted": NOW}, cfg, restart=True) == ("granted", None)
+    routed = {"granted", "waiting", "landing", "fixing", "awaiting_ci", "gate_red", "no_checks",
+              "needs_verify"}
     assert routed == set(d.TURN_OUTCOMES)             # a new outcome needs a route here
 
     do, j = step("no_checks")
@@ -2434,6 +2616,20 @@ def test_worker_step_routes_every_cause_or_returns_the_judgment():
     # restarted once (#91); a landing row's silence has NO failure route at all
     do, reason = step("silent_past_restart", _mine(4, "landing", pr=30, stopped="conflict"))
     assert (do, reason) == ("escalate", _KEPT.format(pr=30, stopped="conflict"))
+    # a worker fixing OFF the turn its PR gave up climbs the same two rungs, and
+    # its silence has no failure route either (ADR-0045)
+    fixing = _mine(4, "fixing", pr=30, stopped="gate_red", given_up=True)
+    assert step("silent_on_turn", fixing) == ("restart", None)
+    do, reason = step("silent_past_restart", fixing)
+    assert do == "escalate" and "gave it up" in reason and "`gate_red`" in reason
+    assert "kept as they are" in reason
+    for cause in ("silent_after_nudge", "silent_unnudgeable"):
+        try:
+            step(cause, fixing)
+        except ValueError as e:
+            assert "never a failure" in str(e)
+        else:
+            raise AssertionError("a fixing claim's silence reached `afk fail`")
     for cause in ("silent_after_nudge", "silent_unnudgeable"):
         try:
             step(cause, _mine(4, "landing", pr=30))
@@ -3085,6 +3281,46 @@ def test_a_landing_worker_silent_after_its_nudge_is_restarted_onto_its_turn():
         assert "never a failure" in str(e)
     else:
         raise AssertionError("a landing claim's silence reached `afk fail`")
+
+
+def test_a_tick_grants_the_turn_elsewhere_while_a_pr_is_fixed_off_the_one_it_gave_up():
+    """ADR-0045: a `fixing` claim holds no turn — the head of the queue gets one,
+    or a batch forms — while its worker is watched on the landing's own ladder."""
+    fixing = _row(5, "fixing", pr=50, stopped="conflict", given_up=True, board_phase="fixing")
+    waiting = [_row(n, "awaiting_turn", pr=n * 10, board_phase="awaiting_turn") for n in (6, 7)]
+    granted = {"issue": 6, "pr": 60, "head": "abc", "outcome": "granted", "delivery": "terminal"}
+    # one PR waits: it is granted its single turn although #5 is still being fixed
+    steps, done = _play(_working_set(mine=[fixing, waiting[0]]), {("turn", 6): granted},
+                        causes={5: "working"})
+    assert _brief(steps) == [("no-pr", [5]), ("turn", 6), ("heartbeat",), ("status", 5)]
+    assert done["did"] == _nothing_done(granted=[6], in_flight=2)
+    # two wait: they form a merge batch beside it
+    local = d.resolve_config({"gate": {"ci": "local", "local_command": "make test"}})
+    formed = {"outcome": "granted", "batch": "fl-1-9", "issues": [6, 7], "prs": [60, 70]}
+    steps, done = _play(_working_set(mine=[fixing, *waiting]), {"batch-turn": formed},
+                        causes={5: "working"}, config=local)
+    assert _brief(steps)[:2] == [("no-pr", [5]), ("batch-turn",)]
+    assert done["did"]["granted"] == [6, 7]
+    # its worker went silent after its nudge: restarted to keep fixing — no turn
+    # is granted by that, and the queue's head still gets its own in the same tick
+    kept = {"issue": 5, "pr": 50, "head": "abc", "outcome": "fixing", "restarted": NOW,
+            "delivery": "continuation"}
+    steps, done = _play(_working_set(mine=[fixing, waiting[0]]),
+                        {("turn", 6): granted, ("restart", 5): kept}, causes={5: "silent_on_turn"})
+    assert _brief(steps) == [("no-pr", [5]), ("turn", 6), ("restart", 5), ("heartbeat",)]
+    assert done["did"] == _nothing_done(granted=[6], restarted=[5], in_flight=2)
+    # …and silent again past that restart it is escalated with everything kept
+    steps, done = _play(_working_set(mine=[fixing, waiting[0]]), {("turn", 6): granted},
+                        causes={5: "silent_past_restart"})
+    assert _brief(steps) == [("no-pr", [5]), ("turn", 6), ("escalate", 5), ("heartbeat",)]
+    assert done["did"] == _nothing_done(granted=[6], escalated=[5], in_flight=1)
+    assert "gave it up" in steps[2]["reason"] and "kept as they are" in steps[2]["reason"]
+    try:
+        _play(_working_set(mine=[fixing]), causes={5: "silent_after_nudge"})
+    except ValueError as e:
+        assert "never a failure" in str(e)
+    else:
+        raise AssertionError("a fixing claim's silence reached `afk fail`")
 
 
 def test_a_plan_names_only_steps_the_table_lists_and_refuses_an_unknown_cause():

@@ -327,16 +327,16 @@ In this order, each step the same `afk` transition you could type yourself
 
 1. **Rebuild** the working set (`afk rebuild`): the frontier, each claim of mine with its `status`,
    the merge queue, live and stale peer claims, the free slots.
-2. **Ask after the workers it is waiting on** (`afk no-pr`): every claim with no PR, and every
-   landing one whose worker has not stopped for the tick. A worker's state is what its runtime
+2. **Ask after the workers it is waiting on** (`afk no-pr`): every claim with no PR or being fixed
+   off a turn its PR gave up, and every landing one whose worker has not stopped for the tick. A worker's state is what its runtime
    reported to orca, never its screen (ADR-0021).
 3. **The landing turn** (`afk turn`) — at most one a cycle: to the head of the merge queue, or,
    when two or more may land together, to a merge batch of them. See
    [Landing](#landing--the-worker-lands-its-own-pr-on-its-turn).
 4. **Settle what a stopped worker left** where the reason is on record: a worker idle with no
-   outcome is nudged once (`afk nudge`, ADR-0018), and one on a landing turn that stays silent is
-   then restarted onto the turn once (`afk turn --restart`) and, silent again past that, escalated
-   with its PR kept (`afk escalate`, ADR-0035); a `giving-up` verdict, a refuted
+   outcome is nudged once (`afk nudge`, ADR-0018), and one on a landing turn — or fixing off one
+   its PR gave up — that stays silent is then restarted once (`afk turn --restart`) and, silent
+   again past that, escalated with its PR kept (`afk escalate`, ADR-0035, ADR-0045); a `giving-up` verdict, a refuted
    `already-satisfied`, a PR-less silence that outlasted its nudge is failed (`afk fail`); a
    `blocked` verdict is parked while the backlog will resolve its blockers (`afk park`, ADR-0022)
    and escalated when nothing will — as a `needs-decision` one is at once (`afk escalate`, ADR-0041).
@@ -432,11 +432,15 @@ synced and gated on the new tip).
 A sync conflict or a red gate at landing is fixed where the context is: by that worker, in place,
 with no round trip through the launcher
 ([ADR-0027](../../docs/adr/0027-a-worker-lands-its-own-pr-on-a-landing-turn.md)). What the fleet
-gives is the **landing turn**: `afk land` refuses to run until its PR has the turn, and turns go out
-**one at a time**, so no PR is synced against a tip that is about to move.
+gives is the **landing turn**: `afk land` merges nothing until its PR has the turn, and turns go out
+**one at a time**, so no PR is merged against a tip that is about to move. A turn covers the
+bounded part of a landing — sync, gate, merge: a PR whose landing stops on a conflict or a red gate
+**gives its turn up**, once, and is fixed off it
+([ADR-0045](../../docs/adr/0045-a-landing-that-stops-on-a-conflict-or-a-red-gate-gives-its-turn-up.md)).
 
 **The pass grants it** — `afk turn`, at most once a cycle, to the head of the merge queue: among
-this fleet's ready PRs, the one that already holds a turn first, then the lower PR number. The grant
+this fleet's ready PRs, the one that already holds a turn first, then one that gave a turn up and is
+ready again, then the lower PR number. The grant
 records the turn as a marker comment on the PR, tells the worker — one submitted line pointing at a
 landing brief — and updates the status board. If the worker's terminal is gone (it finished and
 closed, the machine restarted, the claim came from another machine) a new worker is started by
@@ -454,8 +458,16 @@ and a released claim holds no turn) or been **failed** on a tick judgment (`afk 
 **While a PR holds the turn, its worker does everything**, and says where its last `afk land`
 stopped on the PR:
 
-- a `conflict` or a `gate_red` is the worker's own, fixed in place. The pass watches it like a
-  PR-less worker: nudged once when it goes silent, and replaced by continuation onto the turn when
+- a `conflict` or a `gate_red` is the worker's own, fixed in place — and, the first time, **off
+  the turn**: the landing writes on the turn marker that the PR gave its turn up (`given_up`), the
+  claim is `fixing`, and the next cycle grants the turn to the next PR of the merge queue, or to a
+  merge batch. The worker is told nothing new: it fixes, commits and runs `afk land` again, which
+  off the turn still syncs and gates and merges nothing; green there is `awaiting_turn` — the
+  worker wakes the launcher and stops, the PR is ready again, and it is granted its next turn
+  ahead of every PR that never held one. A PR gives its turn up **once**: on that next turn a
+  `conflict` or a `gate_red` is fixed with the turn held, so the landings that pass a PR cannot
+  starve it. Fixing, on the turn or off it, the pass watches the worker like a
+  PR-less one: nudged once when it goes silent, and replaced by continuation onto the landing when
   its terminal is gone. Silent a grace period after its nudge it is **restarted onto the turn**
   (`afk turn --restart`), not failed: the PR was judged ready, and what did not happen is the
   landing — so the idle session is closed and a worker is started by continuation in the same
@@ -466,7 +478,7 @@ stopped on the PR:
   escalate`, with the PR open, the branch and the worktree kept, no attempt spent, the reason and
   the worker's last screen on the issue, and the claim released, which frees the turn. That ladder
   — told → grace → nudge → grace → restart → grace → nudge → grace → escalate — is what bounds a
-  turn, and nothing is discarded at any step of it.
+  turn, and equally a fix off a turn given up; nothing is discarded at any step of it.
 - checks that must run on the head its sync pushed are waited for by `afk land` itself, in the
   same run: green and it merges, red and it is `gate_red`. No cycle is involved.
 - `awaiting_ci`, `needs_verify` or `no_checks` means the next move is the fleet's — the checks were
@@ -508,9 +520,10 @@ human-gated step — never done here.
 A claim **fails** on any of: red checks on its PR; an adversarial refute; a `giving-up` verdict; an
 `already-satisfied` refuted by work on the branch; a PR-less worker still idle with **no verdict at
 all** a grace period after its one nudge. A **sync conflict, a red gate at landing, or a silence on
-the landing turn is not on this list** — the worker fixes the first two in place on its
-[landing turn](#landing--the-worker-lands-its-own-pr-on-its-turn), and its silence there costs a
-restart, then an escalation that keeps the PR (ADR-0035) — never an attempt. `afk fail` reaches a
+the landing turn is not on this list** — the worker fixes the first two in place, at its
+[landing](#landing--the-worker-lands-its-own-pr-on-its-turn), on the turn or off one its PR gave
+up, and its silence there costs a restart, then an escalation that keeps the PR (ADR-0035,
+ADR-0045) — never an attempt. `afk fail` reaches a
 landing claim only by your own judgments: red checks in `required` mode, a refuted verify.
 
 ```bash
@@ -547,7 +560,7 @@ An issue that should go to a human **without** consuming a retry takes the same 
 directly: `afk escalate --issue <n> --instance <id> --reason "<…>"`. Three cases: a `blocked` verdict
 naming a dependency nothing will resolve — it does not exist, was closed as not planned, is an
 epic, is open with no fleet to work it, or waiting on it would close a dependency cycle; a
-**landing turn nobody could get a worker to perform**: silent again after its one restart, the PR
+**landing nobody could get a worker to perform** — on its turn, or fixing off one the PR gave up: silent again after its one restart, the PR
 the pass judged ready goes to the human as it is, open, with its branch and worktree, the reason
 and the worker's last screen (ADR-0035); and a **`needs-decision` verdict**: the issue as written
 needs a decision from its owner — a premise that does not hold, criteria that contradict each
@@ -562,8 +575,9 @@ frontier contract does the waiting — no label changes, no human, no attempt sp
 park` re-reads the blockers and refuses (exit 3, nothing changed) a claim that is not parkable now.
 
 Not everything a stopped worker leaves is a failure: one idle with no outcome is **nudged** first,
-which costs no attempt, and one that holds the landing turn is then **restarted onto it** once and
-**escalated** after that, neither of which costs one — a landing turn never spends an attempt; a
+which costs no attempt, and one that holds the landing turn (or is fixing off one its PR gave up)
+is then **restarted onto it** once and **escalated** after that, neither of which costs one — a
+landing never spends an attempt; a
 `blocked` verdict skips retry accounting entirely — re-dispatched when its
 blockers have closed, parked while the open ones are workable backlog; and an `already-satisfied`
 one with nothing on its branch closes the issue once you confirm the empty diff.

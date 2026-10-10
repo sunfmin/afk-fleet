@@ -24,6 +24,12 @@ has run out.
 worker still silent after its nudge on the turn is restarted onto the turn once, not failed, and
 silent again past that restart it is escalated with the PR kept — see
 [What bounds a turn](#what-bounds-a-turn).
+**Amended by [ADR-0045](0045-a-landing-that-stops-on-a-conflict-or-a-red-gate-gives-its-turn-up.md) (#151):** a
+turn covers only sync, gate and merge. The first time a PR's landing stops with `conflict` or
+`gate_red` it **gives its turn up** and is fixed off the turn; the turn goes to the next PR. Where
+the text below says such a stop keeps the turn, that no outcome gives the turn up, or that each PR
+of a conflicting group is resolved exactly once, read ADR-0045: that holds only from a PR's second
+turn on.
 **Amended (#126):** a landing reads its turn and the target's tip again right before it merges — see
 [the amendment](#amendment-126--a-landing-reads-its-turn-and-the-target-again-before-it-merges) at
 the end, which also states the window that remains.
@@ -104,7 +110,9 @@ It stops with an `outcome`:
 Every stop short of `merged` is written onto the turn marker (`stopped`, `head`), which is what
 `afk rebuild` reports on the `landing` row. On the last three the tick re-runs `afk turn` — after CI
 has spoken, with `--verified <new head>`, with `--allow-no-checks` — and that tells the worker to
-land again. No outcome spends an attempt, closes the PR, or gives the turn up.
+land again. No outcome spends an attempt, closes the PR, or gives the turn up. *(As first
+written. Since ADR-0045 the first `conflict` or `gate_red` of a PR gives the turn up; the worker
+fixes off the turn, and `afk land` there ends with `awaiting_turn`.)*
 
 The invariant of ADR-0012 is unchanged — **what lands on the target was gated in the form it
 lands** — and so is merge-never-rebase. What moved is who runs the gate at landing: the worker's
@@ -158,7 +166,8 @@ The tick's summary counts `granted` where it counted
 ## Consequences
 
 - A conflict or a red gate at landing costs the worker minutes and the fleet nothing: no cycle, no
-  second sync, no attempt. The file-overlap queue, the hand-back record, the busy-worktree guard and
+  second sync, no attempt. *(Minutes it held the turn for, with every ready PR behind it — which is
+  what ADR-0045 ends.)* The file-overlap queue, the hand-back record, the busy-worktree guard and
   the freed-claims list are gone, with the code and tests that held them up.
 - The tick is short again: it runs no gate and no merge.
 - A landing needs a live worker. A finished worker's session is kept (or one is started by
