@@ -1,4 +1,4 @@
-# ADR-0043 — `concurrency` bounds the claims a fleet holds, stale reclaims included
+# ADR-0044 — `concurrency` bounds the claims a fleet holds, stale reclaims included
 
 **Status:** accepted — settles what `concurrency` counts, which
 [ADR-0009](0009-one-home-for-config.md) gave a home but no rule; narrows the unattended reclaim of
