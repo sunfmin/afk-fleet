@@ -481,10 +481,17 @@ BRANCH_NAMESPACE = "refs/heads"
 #   - of the comments on one issue or PR, the latest that carries a record is
 #     the record (`latest_record`).
 #
-# A value is percent-encoded only where it would break a word (whitespace, `%`,
-# anything outside ASCII), so an instance id or a hostname is written as itself.
-# The one value written raw is a kind's `tail`: the field a person fills in with
-# a phrase, which runs from its name to the end of the record.
+# Writing a record and reading it back is the identity, for every value, every
+# kind and both carriers (a generated test holds it). A value is percent-encoded
+# only where it would break that: whitespace, `%`, anything outside ASCII, and
+# the `>` of a `-->`, which would end a marker. So an instance id or a hostname
+# is written as itself. A kind's `tail` is the field a person fills in with a
+# phrase, running from its name to the end of the record: it keeps its spaces
+# and its own script, and is encoded only where it would not read back
+# (`_TAIL_BREAKS`).
+#
+# A list is the one value a hand may spread over several words: a word with no
+# `=` after a list's field is one more item of it (`blocked_by=3, 4`).
 
 class RecordKind(NamedTuple):
     word: str           # the record's first word: what kind of record this is
@@ -499,6 +506,7 @@ class FieldType(NamedTuple):
     write: Callable[[Any], str]     # value → its text; "" when there is nothing to write
     read: Callable[[str], Any]      # text (never empty) → value; None when it is no such value
     empty: object = None            # what a record that does not state the field reads as
+    many: bool = False              # a list: a word with no `=` after it is one more item
 
 
 def _digits(raw: str) -> int | None:
@@ -512,10 +520,12 @@ _FIELD_TYPES = {str: FieldType(str, lambda raw: raw),
 FLAG = FieldType(lambda value: "1" if value else "", lambda raw: True if raw == "1" else None,
                  empty=False)
 
-# Whole numbers, comma-separated; anything else in the list is dropped.
+# Whole numbers, comma-separated. A hand may write each as an issue is named
+# (`#3`); anything else in the list is dropped.
 INTS = FieldType(lambda values: ",".join(str(int(v)) for v in values),
-                 lambda raw: [int(x) for x in re.split(r"[,\s]+", raw) if _digits(x) is not None]
-                 or None, empty=())
+                 lambda raw: [n for x in raw.split(",")
+                              if (n := _digits(x.removeprefix("#"))) is not None] or None,
+                 empty=(), many=True)
 
 
 def one_of(vocabulary: tuple[str, ...]) -> FieldType:
@@ -556,6 +566,10 @@ def blank_record(kind: RecordKind) -> Obj:
 
 
 _RECORD_SAFE = "!\"#$&'()*+,/:;<=>?@[\\]^`{|}~"
+# What a tail may not hold as itself: a `%` that would read as an encoding, a
+# line break or any other control or odd whitespace, a space at either end
+# (reading trims them), and the `>` that would close a marker.
+_TAIL_BREAKS = re.compile(r"%(?=[0-9A-Fa-f]{2})|[^\S ]|[\x00-\x1f\x7f]|\A | \Z|(?<=--)>")
 
 
 def _field_words(kind: RecordKind, record: Obj, spell: Callable[[str, Any], str]) -> list[str]:
@@ -583,24 +597,32 @@ def record_message(kind: RecordKind, record: Obj) -> str:
     raises."""
     def spell(name: str, value: Any) -> str:
         text = _field_type(kind, name).write(value)
-        return text if name == kind.tail else urllib.parse.quote(text, safe=_RECORD_SAFE)
+        if name == kind.tail:
+            return _TAIL_BREAKS.sub(lambda m: urllib.parse.quote(m[0], safe=""), text)
+        return urllib.parse.quote(text, safe=_RECORD_SAFE).replace("-->", "--%3E")
     return " ".join([kind.word, *_field_words(kind, record, spell)])
 
 
 def _read_fields(kind: RecordKind, text: str) -> Obj | None:
     """What follows a kind's word → the record, or None when a required field is
-    missing. A comma may be followed by whitespace: a list is still one value."""
-    record: Obj = {}
-    tail = re.search(rf"\b{kind.tail}=(.*)$", text, re.DOTALL) if kind.tail else None
+    missing. A list may run over several words; no other value does."""
+    stated: dict[str, str] = {}
+    tail = re.search(rf"(?<!\S){kind.tail}=(.*)$", text, re.DOTALL) if kind.tail else None
     if kind.tail and tail:
         text = text[:tail.start()]
-        if tail.group(1).strip():
-            record[kind.tail] = tail.group(1).strip()
-    for word in re.sub(r",\s+", ",", text).split():
-        name, _, raw = word.partition("=")
-        if name not in kind.fields or not raw:
-            continue
-        value = _field_type(kind, name).read(urllib.parse.unquote(raw))
+        stated[kind.tail] = tail.group(1).strip()
+    listing = None      # the list field whose items the words with no `=` are
+    for word in text.split():
+        name, named, raw = word.partition("=")
+        if named:
+            listing = name if name in kind.fields and _field_type(kind, name).many else None
+            if name in kind.fields:
+                stated[name] = raw
+        elif listing:
+            stated[listing] += f",{word}"
+    record: Obj = {}
+    for name, raw in stated.items():
+        value = _field_type(kind, name).read(urllib.parse.unquote(raw)) if raw else None
         if value is not None:
             record[name] = value
     return record if all(name in record for name in kind.required) else None
@@ -1970,7 +1992,7 @@ def _batch_members(raw: str | None) -> list[dict[str, int]]:
 
 # The PRs a merge batch holds, in stack order, each with the issue it closes.
 _MEMBERS = FieldType(lambda members: ",".join(f"{m['issue']}:{m['pr']}" for m in members),
-                     lambda raw: _batch_members(raw) or None, empty=())
+                     lambda raw: _batch_members(raw) or None, empty=(), many=True)
 
 # The landing turn, as the marker of one comment on a PR. A marker that names no
 # instance is not a record — nobody could hold it.
