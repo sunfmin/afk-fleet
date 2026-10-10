@@ -366,13 +366,16 @@ def _open_prs(repo: str, fresh: bool = False) -> list[PullRequest]:
     return _once(("prs", repo), read)
 
 
-def _issue_comments(repo: str, number: int) -> list[Comment]:
+def _issue_comments(repo: str, number: int, fresh: bool = False) -> list[Comment]:
     """An issue's comments, oldest first, as [{"id", "body", "url"}...] — a PR's
-    too: its landing turn is one of them."""
+    too: its landing turn is one of them. `fresh`: read now, whatever this
+    process read before."""
     def read() -> list[Comment]:
         p = _gh(["api", "--paginate", f"repos/{repo}/issues/{number}/comments",
                  "--jq", ".[] | {id, body, url: .html_url}"])
         return [json.loads(ln) for ln in p.stdout.splitlines() if ln.strip()]
+    if fresh:
+        _forget(("comments", repo, number))
     return _once(("comments", repo, number), read)
 
 
@@ -509,7 +512,8 @@ def _single_turn(run: _Run, number: int, pr_number: int,
     claims and the PR's comments are read now, whatever this process read
     before — what a landing asks again once its gate has run."""
     if fresh:
-        _forget(_scan_key(run), ("comments", run.repo, pr_number))
+        _scan(run, fresh=True)
+        _issue_comments(run.repo, pr_number, fresh=True)
     owner = _claim_owner(run, number)
     turn = afk_decide.held_turn(_turn(run.repo, pr_number), owner)
     return owner, None if turn is None or turn["batch"] else turn
@@ -636,10 +640,11 @@ def _scan_key(run: _Run) -> tuple[str, str, str]:
     return ("scan", run.rem, run.cfg["claim_namespace"])
 
 
-def _scan(run: _Run) -> tuple[list[Claim], dict[str, int]]:
+def _scan(run: _Run, fresh: bool = False) -> tuple[list[Claim], dict[str, int]]:
     """Mirror the remote claim+heartbeat refs into a disposable local namespace and
     read every record. Returns (claims, heartbeats). Raises when the remote cannot
-    be read: a fleet whose claims are unreadable must not look like one holding none."""
+    be read: a fleet whose claims are unreadable must not look like one holding none.
+    `fresh`: read now, whatever this process read before."""
     def read() -> tuple[list[Claim], dict[str, int]]:
         claim_ns, hb_ns, _ = afk_decide.CLAIM_NAMESPACES[run.cfg["claim_namespace"]]
         _git(["fetch", "--prune", run.rem,
@@ -652,6 +657,8 @@ def _scan(run: _Run) -> tuple[list[Claim], dict[str, int]]:
                       in _mirrored_records(afk_decide.HEARTBEAT_RECORD, f"{_LOCAL_SCAN}/heartbeat")
                       if record}
         return claims, heartbeats
+    if fresh:
+        _forget(_scan_key(run))
     return _once(_scan_key(run), read)
 
 

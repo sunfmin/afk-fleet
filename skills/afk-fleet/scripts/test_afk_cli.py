@@ -1406,7 +1406,7 @@ def test_a_turn_marker_write_is_in_the_turn_read_after_it():
 # them: the only code that may know a read cache exists.
 _KNOWS_THE_READS = {
     "_once", "_forget",
-    "_open_issues", "_open_prs", "_gather", "_comment", "_claim_written",
+    "_open_issues", "_open_prs", "_issue_comments", "_scan", "_gather", "_comment", "_claim_written",
     "_issue_written", "_pr_comment", "_close_pr", "_aim_pr", "_merge_pr", "_push_branch",
     "_delete_branch", "_claim", "_force_take",
 }
