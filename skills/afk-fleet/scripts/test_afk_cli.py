@@ -3583,6 +3583,76 @@ def test_a_recorded_gate_run_is_void_unless_it_is_of_the_tree_that_lands():
         assert count() == before and w.pr(70)["merged"]["head"] == g["head"]
 
 
+def test_a_landing_accepts_only_a_gate_run_of_the_committed_tree():
+    """#109. A green run counts — for a record and for a landing alike — only
+    when the worktree was exactly its commit before the run and is exactly its
+    commit after it. `afk land` refuses anything else: nothing merged, nothing
+    recorded, and the refusal names the paths. A record needs neither: it is of
+    the tree, whatever lies around it."""
+    with world(issues=[issue(n, "ready-for-agent") for n in (6, 7)]) as w:
+        runs = os.path.join(w.sb.root, "gate-runs")
+        clean = f"echo run >> {runs}"
+        d, head = with_pr(w, 6, 60, gate=local_gate(clean))
+        wt = d["worktree"]
+        w.afk(*_turn(6, *local_gate(clean)))
+        base0 = _target(w)
+
+        def refused(command, *paths, ran):
+            before = _gate_runs(w)
+            err = _land_error(w, 6, wt, *local_gate(command))
+            assert "not the commit that would land" in err and "Nothing was merged" in err, err
+            assert all(path in err for path in paths), err
+            assert _gate_runs(w) == before + ran
+            assert _target(w) == base0 and "merged" not in w.pr(60) and _gate_refs(w) == set()
+            assert w.issue(6)["state"] == "open"
+            return err
+
+        # an untracked file: the gate would pass on a tree no commit holds — it
+        # is not even run
+        stray = os.path.join(wt, "not-added.txt")
+        with open(stray, "w") as f:
+            f.write("the test only passes with this\n")
+        assert "untracked" in refused(clean, "?? not-added.txt", ran=0)
+        os.remove(stray)
+
+        # a gate that rewrites a tracked file is green on what it wrote, not on
+        # what is committed: neither recorded…
+        fixing = f"{clean}; echo fixed >> feature6.txt"
+        g = _gate(w, wt, fixing)
+        assert (g["status"], g["recorded"], g["uncommitted"]) == ("green", False, [" M feature6.txt"]), g
+        assert "left the worktree" in g["detail"] and _gate_refs(w) == set()
+        git(wt, "checkout", "-q", "--", "feature6.txt")
+        # …nor accepted
+        assert "left the worktree" in refused(fixing, "M feature6.txt", ran=1)
+        git(wt, "checkout", "-q", "--", "feature6.txt")
+        # …and so is one that commits what it wrote, or litters
+        committing = f"{fixing}; git commit -qam fixed-by-the-gate"
+        assert "HEAD moved" in refused(committing, ran=1)
+        git(wt, "reset", "-q", "--hard", head)
+        refused(f"{clean}; touch litter.txt", "?? litter.txt", ran=1)
+        os.remove(os.path.join(wt, "litter.txt"))
+
+        # a clean worktree lands exactly as before
+        before = _gate_runs(w)
+        r = _land(w, 6, wt, *local_gate(clean))
+        assert (r["outcome"], r["gate"]["source"], r["head"]) == ("merged", "run", head), r
+        assert _gate_runs(w) == before + 1
+
+        # a RECORDED run stands in whatever lies around the commit: it is of the tree
+        d, _ = with_pr(w, 7, 70, gate=local_gate(clean))
+        wt = d["worktree"]
+        git(wt, "pull", "-q", "--no-edit", "origin", w.sb.base)   # the worker's own sync
+        git(wt, "push", "-q", "origin", "HEAD")
+        assert _gate(w, wt, clean)["recorded"] is True
+        with open(os.path.join(wt, "notes.txt"), "w") as f:
+            f.write("left behind\n")
+        w.afk(*_turn(7, *local_gate(clean)))
+        before = _gate_runs(w)
+        r = _land(w, 7, wt, *local_gate(clean))
+        assert (r["outcome"], r["gate"]["source"]) == ("merged", "recorded"), r
+        assert _gate_runs(w) == before
+
+
 def test_a_gate_run_the_remote_will_not_record_is_still_green_and_the_landing_gates():
     """A record is an optimisation, never a precondition: a remote that refuses
     the ref leaves the worker's run green and unrecorded, and the landing runs
@@ -4317,6 +4387,43 @@ def test_a_red_batch_lands_nothing_and_is_repaired_with_a_fix_commit_on_top():
         assert _gate_runs(w) == 2 and "fix.txt" in w.remote_files(w.sb.base)
         assert [w.pr(p)["state"] for p in (10, 20)] == ["merged", "merged"]
         assert not [x for x in w.sb.all_refs() if "afk-batch" in x]
+
+
+def test_a_batch_lands_only_on_a_gate_run_of_the_committed_stack():
+    """#109. A merge batch's landing holds to the same rule as a single one: the
+    stack is gated only as a commit, before the run and after it."""
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
+        gate = _counted(w)
+        for n in (1, 2):
+            with_pr(w, n, n * 10, gate=gate)
+        base0 = _target(w)
+        b = w.afk(*_turn_batch(*gate))
+        bwt = b["worktree"]
+
+        def refused(gate, path, ran):
+            before = _gate_runs(w)
+            err = w.error("land", "--batch", b["batch"], *R, *NOW, *gate, cwd=bwt)
+            assert "not the commit that would land" in err and path in err, err
+            assert _gate_runs(w) == before + ran
+            assert _target(w) == base0 and _gate_refs(w) == set()
+            assert [w.pr(p).get("state", "open") for p in (10, 20)] == ["open", "open"]
+            return err
+
+        # an untracked file in the batch's worktree: the gate is not run
+        stray = os.path.join(bwt, "not-added.txt")
+        with open(stray, "w") as f:
+            f.write("the stack only passes with this\n")
+        assert "untracked" in refused(gate, "?? not-added.txt", ran=0)
+        os.remove(stray)
+        # a gate that rewrites a tracked file of the stack
+        assert "left the worktree" in refused(_counted(w, "echo fixed >> feature1.txt"),
+                                              "M feature1.txt", ran=1)
+        git(bwt, "checkout", "-q", "--", "feature1.txt")       # the worker discards it
+
+        # clean, it lands as before — the stack is rebuilt from the target's tip
+        r = _land_batch(w, b, *gate, now=T0 + 10)
+        assert (r["outcome"], r["issues"]) == ("landed", [1, 2]), r
+        assert _target(w) == r["head"]
 
 
 def test_a_target_that_moves_while_the_batch_gates_refuses_the_push():
