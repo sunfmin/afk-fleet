@@ -4172,17 +4172,41 @@ def pr_checks_state(rollup: Iterable[Obj] | None) -> ChecksState | None:
     return state
 
 
-_CLOSING_KEYWORD = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+#(\d+)\b", re.I)
+# What GitHub does not format, and so reads no reference in: a fenced code block
+# (an unclosed one runs to the end of the body), an HTML comment, and an inline
+# code span. One pattern, so whichever opens first owns its text — a `<!--`
+# inside a fence is code, a backtick inside a comment is comment.
+_UNFORMATTED = re.compile(
+    r"^[ \t>]*(?P<backticks>`{3,})[^`\n]*\n.*?(?:^[ \t>]*(?P=backticks)`*[ \t]*$|\Z)"
+    r"|^[ \t>]*(?P<tildes>~{3,})[^\n]*\n.*?(?:^[ \t>]*(?P=tildes)~*[ \t]*$|\Z)"
+    r"|<!--.*?-->"
+    r"|(?<!`)(?P<span>`+)(?!`)(?:(?!\n[ \t]*\n).)+?(?<!`)(?P=span)(?!`)",
+    re.M | re.S)
+
+# A closing keyword and the ONE reference after it — `Closes #1, #2` closes #1
+# alone — in each form GitHub autolinks: `#7`, `GH-7`, `owner/repo#7`, the URL.
+_REPO_NAME = r"[\w.-]+/[\w.-]+"
+_CLOSING_REFERENCE = re.compile(
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+"
+    rf"(?:(?P<short>{_REPO_NAME})?#|GH-|https?://github\.com/(?P<url>{_REPO_NAME})/(?:issues|pull)/)"
+    r"(?P<number>\d+)\b", re.I)
 
 
-def issues_closed_by(body: str | None, linked: Iterable[IssueRef] | None) -> list[IssueRef]:
-    """The issues a PR closes: the ones GitHub links to it, and the ones its body
-    names with a closing keyword (`Closes #7`). GitHub reads the keyword only on
-    a PR against the repo's default branch — against any other base it links
-    nothing and closes nothing — so the body is read here, and the answer is the
-    same whatever branch the fleet lands on."""
+def issues_closed_by(body: str | None, linked: Iterable[IssueRef] | None,
+                     repo: str) -> list[IssueRef]:
+    """The issues of `repo` (`owner/name`) a PR closes: the ones GitHub links to
+    it, and the ones its body names with a closing keyword (`Closes #7`). GitHub
+    reads the keyword only on a PR against the repo's default branch — against
+    any other base it links nothing and closes nothing — so the body is read
+    here, as GitHub documents reading it, and the answer is the same whatever
+    branch the fleet lands on. A reference to another repository's issue is not
+    one of them, and neither is one in text GitHub does not format
+    (`_UNFORMATTED`); one in a quote or after a "does not" is, as on GitHub."""
     numbers = {ref["number"] for ref in linked or []}
-    numbers.update(int(n) for n in _CLOSING_KEYWORD.findall(body or ""))
+    for m in _CLOSING_REFERENCE.finditer(_UNFORMATTED.sub(" ", body or "")):
+        named = m["short"] or m["url"]
+        if named is None or named.lower() == repo.lower():
+            numbers.add(int(m["number"]))
     return [{"number": n} for n in sorted(numbers)]
 
 
