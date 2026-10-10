@@ -34,6 +34,8 @@ worker, a whole stack of PRs behind one gate run (`land --batch`, ADR-0029).
 Every subcommand that reads config REQUIRES the same `--config` (the canonical
 JSON from `afk config`, then `afk probe`) and resolves it one way, in `_cfg`:
 `--set key=value` → `--config` → CONFIG_DEFAULTS for the keys it omits (ADR-0009).
+The JSON is held to the schema the config file is held to: a key the schema does
+not have, or a value of the wrong type, is an error, never dropped or defaulted.
 
 Invoked as:  <skill>/scripts/afk.py <subcommand> [flags]
 """
@@ -71,8 +73,9 @@ _T = TypeVar("_T")
 
 def _cfg(a: argparse.Namespace) -> Config:
     """The effective config for a subcommand: the `--config` JSON (canonical or
-    partial) resolved through CONFIG_DEFAULTS, any `--set key=value` laid on top,
-    then validated — no subcommand runs on a config `afk config` would refuse."""
+    partial) held to the file's schema and resolved through CONFIG_DEFAULTS
+    (`resolve_config`), any `--set key=value` laid on top, then validated — no
+    subcommand runs on a config `afk config` would refuse."""
     cfg = afk_decide.resolve_config(json.loads(a.config))
     return afk_decide.validate_config(afk_decide.override_config(cfg, a.set))
 
@@ -3601,7 +3604,8 @@ def build_parser() -> _Parser:
         if needs_config:
             p.add_argument("--config", required=True,
                            help="the run's config JSON, from `afk config` / `afk probe` (keys "
-                                "it omits fall back to the defaults table — ADR-0009)")
+                                "it omits fall back to the defaults table — ADR-0009; an "
+                                "unknown key or a wrong-typed value is an error)")
             p.add_argument("--set", action="append", metavar="KEY=VALUE",
                            help="override one config key for this call, e.g. "
                                 "concurrency=1 or gate.ci=local (repeatable; "
