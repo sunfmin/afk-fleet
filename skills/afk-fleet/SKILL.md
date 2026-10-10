@@ -337,9 +337,8 @@ In this order, each step the same `afk` transition you could type yourself
    `already-satisfied`, a PR-less silence that outlasted its nudge is failed (`afk fail`); a
    `blocked` verdict is parked while the backlog will resolve its blockers (`afk park`, ADR-0022)
    and escalated when nothing will — as a `needs-decision` one is at once (`afk escalate`, ADR-0041).
-5. **Release** every claim that outlived its issue — a PR its worker landed — or its landing — a
-   merge batch pushed it and was cut before closing the issue, which the release closes — and delete every dead
-   peer's phantom lock, under the sha it was read at.
+5. **Release** every claim that outlived its issue — a PR its worker landed — or whose landing a
+   merge batch pushed and was cut before closing the issue; delete every dead peer's phantom lock.
 6. **Start workers** (`afk dispatch`): first by [continuation](references/recovery.md) for claims
    already held — an **orphaned claim** (always continued, never released back), one whose blockers
    have all closed, each **stale** peer claim it reclaims — then the frontier, in order, into the
