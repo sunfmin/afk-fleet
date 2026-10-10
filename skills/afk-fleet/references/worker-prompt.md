@@ -43,8 +43,11 @@ none (ADR-0020) — `{gate_command}` — the line the worker runs the **local ga
 carrying `gate.local_command`, so a green run is on record for the landing (ADR-0030), or a no-op when
 no local gate is configured — `{land_command}` — the line the worker **lands** its PR with: `afk land`
 carrying the run's whole config — and `{verdict_marker}`, the `<!--afk:verdict …-->` line a worker that opens no PR
-must post, written by the same code that parses it back. A field or slot the code cannot fill is an error: no
-worker is ever started on a prompt with a literal placeholder in it. A test renders every variant.
+must post, written by the same code that parses it back. A field or slot the code cannot fill is an error — and so is a placeholder no field answers to: no
+worker is ever started on a prompt with a literal placeholder in it. Every field of a brief is
+filled in one pass, so a value is never itself read for placeholders: a title naming `{branch}`, or
+a gate command using the shell's `${branch}`, reaches the worker as it was given. A test renders
+every variant.
 
 <!--afk:block prompt-->
 {opening}
@@ -75,7 +78,9 @@ git add -A && git commit -m "<what this step did>" && git push origin HEAD
    ```
    Run the last line exactly as written; it ends with one JSON object. On `"status": "red"`, fix,
    commit, and run it again. Finish on a run that says `"recorded": true`, then
-   `git push origin HEAD`. Any commit after that run needs another run.
+   `git push origin HEAD`. Any commit after that run needs another run. A run is recorded only on
+   a worktree that is exactly its commit, before and after: commit or remove what `git status`
+   lists (`"uncommitted"` names it) — the landing refuses a run like that too.
 4. **Open the PR:** `gh pr create --base {base_branch} --head {branch} --title "..." --body "Closes #{n}
    ..."`. Body: what you changed, how you verified, any follow-ups.
 5. **Wake the coordinator** — once, exactly as written; if it fails, ignore it:
@@ -173,7 +178,11 @@ exact head — or waits for the PR's checks on it, which can take as long as CI 
 once it has read again that the turn is still yours and the target has not moved, merges the PR
 pinned to the head it gated. It ends with one JSON object. An
 `"error"` saying the PR does **not hold the landing turn** means it is not your turn: nothing was
-changed — stop and wait to be told; do not land it any other way. Otherwise act on its `outcome`:
+changed — stop and wait to be told; do not land it any other way. An `"error"` saying the worktree
+is **not the commit that would land** means the gate could not prove that commit: there were
+uncommitted or untracked files here, or the gate's run changed the worktree. Nothing was merged —
+commit what belongs to the change, discard the rest (`git status` shows nothing when you are done),
+and run the command again. Otherwise act on its `outcome`:
 
 | `outcome` | what happened | what you do |
 |---|---|---|
@@ -229,8 +238,11 @@ batch has landed.
 It rebuilds the stack on the tip of `{target}` (your own commits are kept on top), pushes it to your
 branch, runs the gate once on the stack, and pushes the stack to `{target}` as a fast-forward. It
 ends with one JSON object. An `"error"` saying a PR does **not hold the landing turn** means the
-batch is no longer yours: nothing was changed — wake the coordinator and stop. Otherwise act on its
-`outcome`:
+batch is no longer yours: nothing was changed — wake the coordinator and stop. An `"error"` saying
+the worktree is **not the commit that would land** means the gate could not prove the stack: there
+were uncommitted or untracked files here, or the gate's run changed the worktree. Nothing landed —
+commit what belongs to the fix, discard the rest (`git status` shows nothing when you are done), and
+run the command again. Otherwise act on its `outcome`:
 
 | `outcome` | what happened | what you do |
 |---|---|---|

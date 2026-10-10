@@ -738,6 +738,33 @@ def test_malformed_refs_in_the_namespace_are_ignored_not_fatal():
         assert part["mine"] == [5] and part["stale"] == [6, 7] and part["peer_live"] == []
 
 
+def test_a_claim_ref_not_named_as_the_fleet_names_one_is_no_claim():
+    """An issue has ONE claim ref, `<n>` as the fleet writes it. Another spelling
+    of the number — or a digit run no issue has — is not that issue's claim, and
+    a record whose time is no number is one that states no time."""
+    with sandbox() as sb:
+        w = sb.clones[0]
+        won = afk(w, "claim", "7", "--instance", "me", "--now", str(T0))
+        empty = git(w, "hash-object", "-t", "tree", os.devnull)
+        theirs = git(w, "commit-tree", empty, "-m", f"afk-claim instance=peer host=mac ts={T0}")
+        names = ["007", "07", "٧", "７", "²", "9" * 19, "1" + "0" * 200]
+        git(w, "push", "-q", "origin", *(f"{theirs}:refs/afk/claim/{name}" for name in names))
+        for i, ts in enumerate(("9" * 19, "7" * 4301, "٧", "²", "007")):
+            odd = git(w, "commit-tree", empty, "-m", f"afk-claim instance=peer host=mac ts={ts}")
+            beat = git(w, "commit-tree", empty, "-m", f"afk-heartbeat instance=p{i} ts={ts}")
+            git(w, "push", "-q", "origin", f"{odd}:refs/afk/claim/{20 + i}",
+                f"{beat}:refs/afk/heartbeat/p{i}")
+
+        scan = afk(w, "scan")
+        by = {c["number"]: c for c in scan["claims"]}
+        assert sorted(by) == [7, 20, 21, 22, 23, 24]
+        assert by[7] == {"number": 7, "instance": "me", "host": by[7]["host"], "ts": T0,
+                         "sha": won["sha"]}
+        assert all((by[n]["instance"], by[n]["ts"]) == ("peer", None) for n in range(20, 25))
+        assert scan["heartbeats"] == {"me": T0}
+        assert afk(w, "classify-claims", "--instance", "me", "--now", str(T0))["mine"] == [7]
+
+
 def test_every_ref_op_round_trips_under_the_refs_heads_fallback():
     """When an org ruleset forbids non-branch refs, every op must work unchanged
     under `refs/heads/afk-*` — the fallback is only worth having if it is complete."""
