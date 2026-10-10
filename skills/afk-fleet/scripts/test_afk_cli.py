@@ -1437,7 +1437,7 @@ _WRITES = {
     ("gh", "label"): {"_ensure_label"},
     ("gh", "--method"): {"_comment", "_add_blocker"},
     ("git", "push"): {"_push_branch", "_delete_branch", "_claim", "_force_take", "_release",
-                      "_clear", "_beat", "_usable_namespace", "_settle_base", "_probe_gate_records",
+                      "_clear", "_beat", "_push_probe", "_drop_probes", "_settle_base", "_probe_gate_records",
                       "_write_gate_record", "_drop_gate_record"},
 }
 
