@@ -3058,15 +3058,16 @@ def test_a_red_gate_on_the_turn_is_the_workers_to_fix_and_spends_nothing():
         # the failure is durable where a later tick — and a human — can re-read it
         [note] = w.state()["pr_comments"]["40"]
         assert "FAIL TestNames" in note and "exit 1" in note
-        # no attempt spent, the PR open, the turn kept — and the stop is on the marker
+        # no attempt spent, the PR open — and the stop is on the marker, with the
+        # turn it gave up: a red gate is fixed OFF the turn, the first time (ADR-0045)
         assert w.issue(4)["labels"] == ["ready-for-agent"] and w.claimed_by(4) == "me"
-        assert w.pr(40).get("state", "open") == "open"
+        assert w.pr(40).get("state", "open") == "open" and r["turn"] == "given_up"
         [mark] = _turns(w, 40)
         assert mark.startswith(f"<!--afk:turn instance=me at={T0 + 10} stopped=gate_red "
-                               f"head={r['head']}-->\n")
-        assert _mine(w, red, 4) == ("landing", "landing", "gate_red")
+                               f"head={r['head']} given_up={T0 + 10} released=1-->\n")
+        assert _mine(w, red, 4) == ("fixing", "fixing", "gate_red")
         # the tick has nothing to add: the worker is fixing it
-        assert w.afk(*_turn(4, *red, now=T0 + 90))["outcome"] == "landing"
+        assert w.afk(*_turn(4, *red, now=T0 + 90))["outcome"] == "fixing"
 
         # a hung gate is RED, never green-by-default; the excerpt is a bounded tail
         r = _land(w, 4, wt, *local_gate("sleep 30"), "--gate-timeout", "1")
@@ -3081,33 +3082,68 @@ def test_a_red_gate_on_the_turn_is_the_workers_to_fix_and_spends_nothing():
         assert "--excerpt-lines" in _land_error(w, 4, wt, *red, "--excerpt-lines", "-1")
         assert len(w.state()["pr_comments"]["40"]) == 4 and len(_turns(w, 40)) == 1
 
-        # the worker fixes the code, commits, and lands again — its commit is pushed
+        # the worker fixes the code, commits, and lands again — its commit is pushed,
+        # gated green off the turn, and nothing is merged until the PR's next turn
         fixed = w.work(wt, "fixed.txt", push=False)
         r = _land(w, 4, wt, *red)
-        assert (r["outcome"], r["synced"], r["head"]) == ("merged", True, fixed), r
+        assert (r["outcome"], r["synced"], r["head"], r["gate"]["source"]) == \
+            ("awaiting_turn", True, fixed, "run"), r
+        assert "merged" not in w.pr(40) and _mine(w, red, 4) == ("awaiting_turn", "ready_again", None)
+        # on that turn the run made off the turn stands for the tree: a merge, no second run
+        assert w.afk(*_turn(4, *red))["outcome"] == "granted"
+        r = _land(w, 4, wt, *red)
+        assert (r["outcome"], r["synced"], r["head"], r["gate"]["source"]) == \
+            ("merged", False, fixed, "recorded"), r
         assert w.pr(40)["merged"] == {"head": fixed, "delete_branch": True}
 
 
 def test_a_sync_conflict_on_the_turn_is_resolved_in_place_by_the_worker():
-    with world(issues=[issue(2, "ready-for-agent"), issue(8, "ready-for-agent")]) as w:
+    """…and, the first time, OFF the turn (ADR-0045): the landing gives the turn
+    up, the next PR lands while the worker resolves, `afk land` there syncs and
+    gates and merges nothing, and the PR's next turn comes ahead of a PR that
+    never held one — on which a second conflict keeps the turn."""
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2, 3, 8)]) as w:
+        d1, _ = with_pr(w, 1, 10)                                # never holds a turn below
         d, pr_head = with_pr(w, 2, 20, name="shared.txt", text="from the worker")
+        d3, _ = with_pr(w, 3, 30)
         base_tip = w.advance_base("shared.txt", text="from someone else")
         gate = local_gate("true")
         wt = d["worktree"]
         w.afk(*_turn(2, *gate))
+        assert w.afk(*_turn(3, *gate))["outcome"] == "waiting"
+        told = [len(t["sent"]) for t in w.terminals()]
 
-        r = _land(w, 2, wt, *gate)
-        assert (r["outcome"], r["files"]) == ("conflict", ["shared.txt"]), r
-        assert os.path.samefile(r["worktree"], wt)
+        r = _land(w, 2, wt, *gate, now=T0 + 10)
+        assert (r["outcome"], r["files"], r["turn"]) == ("conflict", ["shared.txt"], "given_up"), r
+        assert os.path.samefile(r["worktree"], wt) and "GAVE ITS LANDING TURN UP" in r["detail"]
         assert "head" not in r and "gate" not in r               # nothing was gated or pushed
         assert w.sb.remote_ref(f"refs/heads/{d['branch']}") == pr_head
         assert w.sb.remote_ref(f"refs/heads/{w.sb.base}") == base_tip
         # the merge is left IN PROGRESS, for the worker whose worktree this is
         assert _merging(wt) and git(wt, "rev-parse", "MERGE_HEAD") == base_tip
-        assert _mine(w, gate, 2) == ("landing", "landing", "conflict")
-        assert w.issue(2)["labels"] == ["ready-for-agent"]       # a conflict is not a failure
-        # re-entrant: a re-run reports the same conflict rather than piling on a merge
-        assert _land(w, 2, wt, *gate)["files"] == ["shared.txt"]
+        # the PR is left without the turn, recorded on its ONE turn marker…
+        [mark] = _turns(w, 20)
+        assert mark.startswith(f"<!--afk:turn instance=me at={T0 + 10} stopped=conflict "
+                               f"head={pr_head} given_up={T0 + 10} released=1-->\n"), mark
+        assert "gave its landing turn up" in mark
+        assert _mine(w, gate, 2) == ("fixing", "fixing", "conflict")
+        assert "turn given up" in w.board(2) and "being fixed" in w.board(2)
+        # …with no attempt spent, the PR, branch and claim kept, and no word from the launcher
+        assert w.issue(2)["labels"] == ["ready-for-agent"] and w.claimed_by(2) == "me"
+        assert w.pr(20).get("state", "open") == "open"
+        assert [len(t["sent"]) for t in w.terminals()] == told
+        # the queue no longer waits behind it: the turn is granted elsewhere while it is fixed
+        ws = w.afk("rebuild", *ME, *R, *NOW, *gate)
+        assert ws["merge_order"] == [1, 3]
+        assert w.afk(*_turn(2, *gate))["outcome"] == "fixing" and len(_turns(w, 20)) == 1
+        assert w.afk(*_turn(3, *gate))["outcome"] == "granted"
+        # re-entrant, off the turn: a re-run reports the same conflict rather than piling on a merge
+        r = _land(w, 2, wt, *gate, now=T0 + 20)
+        assert (r["outcome"], r["files"], r["turn"]) == ("conflict", ["shared.txt"], "given_up")
+        assert "GAVE ITS" not in r["detail"]                     # said once, when it happened
+        landed = _land(w, 3, d3["worktree"], *gate)
+        assert (landed["outcome"], landed["turn"]) == ("merged", "held")
+        tip = w.sb.remote_ref(f"refs/heads/{w.sb.base}")
 
         # resolved but not committed: what would be gated is not what would land
         with open(os.path.join(wt, "shared.txt"), "w") as f:
@@ -3116,11 +3152,42 @@ def test_a_sync_conflict_on_the_turn_is_resolved_in_place_by_the_worker():
         assert "uncommitted" in _land_error(w, 2, wt, *gate)
         git(wt, "commit", "-qm", "merge main: keep both")
 
-        r = _land(w, 2, wt, *gate)
-        assert (r["outcome"], r["synced"]) == ("merged", True), r
+        # fixed: off the turn the landing syncs — with what landed meanwhile too —
+        # and gates, and merges NOTHING; the PR is ready again
+        r = _land(w, 2, wt, *gate, now=T0 + 30)
+        assert (r["outcome"], r["turn"], r["synced"], r["gate"]["status"]) == \
+            ("awaiting_turn", "given_up", True, "green"), r
+        assert w.sb.remote_ref(f"refs/heads/{w.sb.base}") == tip and "merged" not in w.pr(20)
+        assert w.sb.remote_ref(f"refs/heads/{d['branch']}") == r["head"]
+        assert os.path.exists(os.path.join(wt, "feature3.txt"))
+        [mark] = _turns(w, 20)
+        assert mark.startswith(f"<!--afk:turn instance=me at={T0 + 30} stopped=awaiting_turn "
+                               f"head={r['head']} given_up={T0 + 10} released=1-->\n"), mark
+        assert _mine(w, gate, 2) == ("awaiting_turn", "ready_again", None)
+        assert "ready again" in w.board(2) and "awaiting its turn" in w.board(2)
+        # …and goes ahead of the PR that never held a turn, lower PR number or not
+        w.afk("release", "3", *ME, *R, *gate)
+        assert w.afk("rebuild", *ME, *R, *NOW, *gate)["merge_order"] == [2, 1]
+
+        # its second turn: the gate run made off the turn stands for the tree, and a
+        # conflict now KEEPS the turn — a PR gives its turn up once
+        w.advance_base("shared.txt", text="someone else, again")
+        assert w.afk(*_turn(2, *gate, now=T0 + 40))["outcome"] == "granted"
+        r = _land(w, 2, wt, *gate, now=T0 + 50)
+        assert (r["outcome"], r["files"], r["turn"]) == ("conflict", ["shared.txt"], "held"), r
+        [mark] = _turns(w, 20)
+        assert mark.startswith(f"<!--afk:turn instance=me at={T0 + 50} stopped=conflict "
+                               f"head={git(wt, 'rev-parse', 'HEAD')} "
+                               f"given_up={T0 + 10}-->\n"), mark
+        assert "gave a turn up once already" in mark
+        assert _mine(w, gate, 2) == ("landing", "landing", "conflict")
+        assert w.afk(*_turn(1, *gate))["outcome"] == "waiting"
+        _resolve(w, wt, "shared.txt", "resolved: all three")
+        r = _land(w, 2, wt, *gate, now=T0 + 60)
+        assert (r["outcome"], r["synced"], r["turn"]) == ("merged", True, "held"), r
         p = subprocess.run(["git", "--git-dir", w.sb.bare, "show", f"{w.sb.base}:shared.txt"],
                            capture_output=True, text=True, env=ENV)
-        assert p.stdout == "resolved: both\n"
+        assert p.stdout == "resolved: all three\n"
 
         # a claim with no PR has nothing to land, for the tick or for the worker
         w.afk("claim", "8", *ME, *NOW, *R)
@@ -3130,9 +3197,10 @@ def test_a_sync_conflict_on_the_turn_is_resolved_in_place_by_the_worker():
 
 def test_turns_are_granted_one_at_a_time_in_merge_order():
     """Three ready PRs: exactly one holds the turn at a time, granted in
-    `merge_order`; the next is granted the cycle after the first lands or is
-    failed. Mutually conflicting PRs therefore resolve once each — none is synced
-    against a tip that is about to move."""
+    `merge_order`; the next is granted the cycle after the first lands, is
+    failed, or gives its turn up (ADR-0045). Mutually conflicting PRs therefore
+    resolve against a target that holds what landed before their turn — none is
+    merged against a tip that is about to move."""
     gate = local_gate("true")
     with world(issues=[issue(n, "ready-for-agent") for n in (1, 2, 3, 4)]) as w:
         d = {}
@@ -3173,12 +3241,15 @@ def test_turns_are_granted_one_at_a_time_in_merge_order():
         state, order = rows()
         assert (state, order) == ({1: "closed", 2: "awaiting_turn", 3: "awaiting_turn"}, [2, 3])
         assert w.afk(*_turn(2, *gate))["outcome"] == "granted"
-        assert _land(w, 2, d[2]["worktree"], *gate)["outcome"] == "conflict"
         assert w.afk(*_turn(3, *gate))["outcome"] == "waiting"
+        # its conflict gives the turn up: #2 is fixed off it, and out of the queue
+        assert _land(w, 2, d[2]["worktree"], *gate)["outcome"] == "conflict"
+        state, order = rows()
+        assert (state[2], state[3], order) == ("fixing", "awaiting_turn", [3])
 
-        # #2 is FAILED instead, on the tick's own judgment (a landing turn's silence
-        # never is one — ADR-0035): its PR closes, and that frees the turn — #3 spent
-        # no attempt of its own waiting
+        # #2 is FAILED meanwhile, on the tick's own judgment (a landing's silence
+        # never is one — ADR-0035): its PR closes — #3 spent no attempt of its own
+        # waiting
         assert w.afk(*_fail(2, "the adversarial verify refuted head of PR #20", *gate))["action"] == "retry"
         assert w.pr(20)["state"] == "closed"
         state, order = rows()
@@ -3256,21 +3327,39 @@ def test_in_required_mode_the_turn_waits_for_checks_on_the_head_that_lands():
         r = land(5, *wait)
         assert (r["outcome"], r["checks"], r["synced"]) == ("gate_red", "red", True), r
         assert r["head"] == branch_tip(5) != heads[5]
-        row = next(m for m in w.afk("rebuild", *ME, *R, *NOW)["mine"] if m["number"] == 5)
-        assert (row["status"], row["stopped"]) == ("landing", "gate_red")
+        def row5():
+            row = next(m for m in w.afk("rebuild", *ME, *R, *NOW)["mine"] if m["number"] == 5)
+            return row["status"], row["stopped"]
+        # …off the turn: a first red gives the turn up (ADR-0045), and the claim is
+        # `fixing` whatever those red checks say — never a `failure` for `afk fail`
+        assert r["turn"] == "given_up" and row5() == ("fixing", "gate_red")
 
-        # the worker's fix is pushed by its next landing, whose checks are still
-        # running when the bound runs out: THEN it stops with `awaiting_ci`…
+        # the worker's fix is pushed by its next `afk land`, off the turn, which
+        # waits for the new head's checks like any landing. Still running when the
+        # bound runs out, they are the tick's to wait for before the next grant: the
+        # PR is ready again as far as its worker goes, and nothing was merged
         w.work(d[5]["worktree"], "fix5.txt", push=False)
         checks_run(5, "FAILURE", *["PENDING"] * 50)
         r = land(5, *wait, "--checks-timeout", "0")
+        assert (r["outcome"], r["turn"], r["synced"]) == ("awaiting_turn", "given_up", True), r
+        assert "merged" not in w.pr(50) and row5() == ("awaiting_ci", None)
+        assert w.afk(*_turn(5))["outcome"] == "awaiting_ci"
+        # once CI is green the PR is granted its next turn — a new one, on the same marker
+        checks_run(5, "SUCCESS")
+        r = w.afk(*_turn(5, now=T0 + 80))
+        assert (r["outcome"], r["again"], r["delivery"]) == ("granted", False, "terminal"), r
+
+        # a landing ON the turn whose checks are still running when the bound runs
+        # out: THEN it stops with `awaiting_ci`…
+        w.work(d[5]["worktree"], "more5.txt", push=False)
+        checks_run(5, "SUCCESS", *["PENDING"] * 50)
+        r = land(5, *wait, "--checks-timeout", "0")
         assert (r["outcome"], r["checks"], r["synced"]) == ("awaiting_ci", "pending", True), r
-        assert "0s" in r["detail"]
+        assert "0s" in r["detail"] and r["turn"] == "held"
         # …the turn is KEPT while CI runs, and the worker — stopped for the tick —
         # is not silent: it is not nudged or failed
         assert w.claimed_by(5) == "me" and w.pr(50).get("state", "open") == "open"
-        row = next(m for m in w.afk("rebuild", *ME, *R, *NOW)["mine"] if m["number"] == 5)
-        assert (row["status"], row["stopped"]) == ("landing", "awaiting_ci")
+        assert row5() == ("landing", "awaiting_ci")
         np = w.no_pr("--issue", "5", *R, "--now", str(int(time.time()) + 5000))
         assert (np["outcome"], np["action"]) == ("coding", "leave"), np
         # …and the path that was there before takes over: once CI is green the tick
@@ -3281,11 +3370,13 @@ def test_in_required_mode_the_turn_waits_for_checks_on_the_head_that_lands():
         assert (r["outcome"], r["again"], r["delivery"]) == ("granted", True, "terminal"), r
         assert w.orca_calls() == ["terminal list", "terminal send"]
         [mark] = _turns(w, 50)
-        assert mark.startswith(f"<!--afk:turn instance=me at={T0 + 90}-->")
-        # a head whose checks are running when the landing starts is waited for too
+        assert mark.startswith(f"<!--afk:turn instance=me at={T0 + 90} given_up={T0}-->")
+        # a head whose checks are running when the landing starts is waited for too —
+        # and red on this SECOND turn, the PR keeps it: a turn is given up once
         checks_run(5, "PENDING", "PENDING", "FAILURE")
         r = land(5, *wait)
         assert (r["outcome"], r["checks"], r["synced"]) == ("gate_red", "red", False), r
+        assert r["turn"] == "held" and row5() == ("landing", "gate_red")
 
 
 def _during_gate(w, name, *lines):
@@ -3495,7 +3586,8 @@ def test_a_recorded_gate_run_is_void_unless_it_is_of_the_tree_that_lands():
     command, a later commit, a sync that moved the head. (The turn here was
     granted on a verify of some older head, so `needs_verify` holds the PR open
     between probes: the verify check still comes after the machine gate, pinned
-    to the head.)"""
+    to the head. And the PR gave a turn up before this one, so the red probe
+    keeps the turn — ADR-0045.)"""
     with world(issues=[issue(7, "ready-for-agent")]) as w:
         runs = os.path.join(w.sb.root, "gate-runs")
         flaky = os.path.join(w.sb.root, "flaky")
@@ -3504,7 +3596,9 @@ def test_a_recorded_gate_run_is_void_unless_it_is_of_the_tree_that_lands():
         d, head = with_pr(w, 7, 70)
         wt = d["worktree"]
         w.set(comments={"70": [{"id": 2001, "html_url": "u", "body":
-                                afk_decide.turn_comment(afk_decide.single_turn(None, "me", T0, verified="0" * 40))}]})
+                                afk_decide.turn_comment(afk_decide.next_turn(
+                                    afk_decide.single_turn(None, "me", T0, verified="0" * 40),
+                                    given_up=T0 - 1))}]})
 
         def count():
             if not os.path.exists(runs):
@@ -3701,6 +3795,111 @@ def test_a_ref_afk_did_not_write_is_not_a_recorded_gate_run():
 # --------------------------------------------------------------------------- #
 # a turn nobody lands, and a turn whose worker is gone                         #
 # --------------------------------------------------------------------------- #
+
+def test_a_worker_silent_while_fixing_off_its_turn_is_nudged_restarted_then_escalated():
+    """ADR-0045. A PR that gave its turn up holds nobody back, so its worker's
+    silence parks nothing — and is still bounded, by the ladder of a silence ON
+    a turn: nudged once, restarted once (`afk turn --restart`, which grants no
+    turn here), then escalated with the PR, the branch and the worktree kept.
+    No step discards anything or spends an attempt, and `afk fail` is never one."""
+    gate = local_gate("true")
+    with world(issues=[issue(5, "ready-for-agent"), issue(6, "ready-for-agent")]) as w:
+        d, pr_head = with_pr(w, 5, 50, name="shared.txt", text="from the worker")
+        with_pr(w, 6, 60)
+        w.advance_base("shared.txt", text="from someone else")
+        wt, branch = d["worktree"], d["branch"]
+        t0 = int(time.time()) + 5000
+        cfg = ("--config", json.dumps({"base_branch": w.sb.base}))
+        nudge = ("nudge", "--issue", "5", *ME, *R, *cfg)
+
+        def no_pr(at):
+            r = w.no_pr("--issue", "5", *R, *cfg, "--now", str(at))
+            return r["outcome"], r["action"], r["turn_at"]
+
+        assert w.afk(*_turn(5, *gate, now=t0 - 50))["outcome"] == "granted"
+        assert _land(w, 5, wt, *gate, now=t0)["turn"] == "given_up"
+        # the next PR has the turn while #5 is fixed — and #5's worker is watched:
+        # its last `afk land` is a sign of life, then one grace period, then a nudge
+        assert w.afk(*_turn(6, *gate, now=t0))["outcome"] == "granted"
+        assert no_pr(t0 + 299) == ("coding", "leave", t0)
+        assert no_pr(t0 + 300) == ("idle_stalled", "nudge", t0)
+        w.afk(*nudge, "--now", str(t0 + 300))
+        assert no_pr(t0 + 599)[:2] == ("coding", "leave")
+        # silent after its nudge: a restart, never `next_attempt`
+        assert no_pr(t0 + 600) == ("idle_stalled", "restart", t0)
+
+        w.orca_calls()
+        r = w.afk(*_turn(5, *gate, "--restart", now=t0 + 600))
+        assert (r["outcome"], r["delivery"], r["restarted"], r["worktree"]) == \
+            ("fixing", "continuation", t0 + 600, wt), r
+        assert w.orca_calls() == ["terminal close", "terminal create", "terminal wait",
+                                  "terminal send"]
+        # the new worker is in the SAME worktree, the merge still in progress there,
+        # on the landing brief — whose command, off the turn, merges nothing
+        new = w.terminals()[-1]
+        assert (new["open"], new["worktreePath"]) == (True, wt) and _merging(wt)
+        told = _told(new)
+        assert told == _landing_brief(w, 5, d, 50, branch, *gate) and "`awaiting_turn`" in told
+        # nothing is closed, deleted or counted, and no turn was granted by it
+        assert "state" not in w.pr(50) and w.issue(5)["labels"] == ["ready-for-agent"]
+        assert w.sb.remote_ref(f"refs/heads/{branch}") == pr_head and w.claimed_by(5) == "me"
+        [marker] = _turns(w, 50)
+        assert marker.startswith(f"<!--afk:turn instance=me at={t0 + 600} stopped=conflict "
+                                 f"head={pr_head} restarted={t0 + 600} given_up={t0} "
+                                 f"released=1-->\n"), marker
+        assert _mine(w, gate, 5) == ("fixing", "fixing", "conflict") and "being fixed" in w.board(5)
+        assert _mine(w, gate, 6)[0] == "landing"
+
+        # the restarted worker gets its own grace and its own nudge; silent after
+        # THAT the claim is escalated — never restarted again, never failed
+        assert no_pr(t0 + 899) == ("coding", "leave", t0 + 600)
+        assert no_pr(t0 + 900) == ("idle_stalled", "nudge", t0 + 600)
+        assert "already restarted" in w.error(*_turn(5, *gate, "--restart", now=t0 + 900))
+        w.afk(*nudge, "--now", str(t0 + 900))
+        assert no_pr(t0 + 1200) == ("idle_stalled", "escalate", t0 + 600)
+        r = w.afk("escalate", "--issue", "5", *ME, *R, "--now", str(t0 + 1200),
+                  "--reason", "PR #50 gave its landing turn up and was not fixed", *cfg)
+        assert (r["action"], r["attempt"], r["pr"], r["released"]) == ("escalate", 0, 50, True)
+        assert "state" not in w.pr(50) and w.issue(5)["labels"] == ["ready-for-human"]
+        assert w.sb.remote_ref(f"refs/heads/{branch}") == pr_head and len(w.worktrees()) == 2
+        assert _merging(wt) and w.claimed_by(5) is None
+        # the worker left on it can no longer run its landing, on the turn or off it
+        assert "does not hold the landing turn" in _land_error(w, 5, wt, *gate)
+
+    # the pass does it by itself — and keeps granting turns beside it meanwhile
+    with world(issues=[issue(n, "ready-for-agent") for n in (7, 8, 9)]) as w:
+        d, _ = with_pr(w, 8, 80, name="shared.txt", text="from the worker")
+        d7, _ = with_pr(w, 7, 70)
+        w.advance_base("shared.txt", text="from someone else")
+        wt = d["worktree"]
+        t0 = int(time.time()) + 5000
+        cfg = {"base_branch": w.sb.base, "concurrency": 3,
+               "gate": {"ci": "local", "local_command": "true",
+                        "adversarial_verify_prompt": ""}}
+        on = ("--config", json.dumps(cfg))
+
+        def cycle(at, state=None):
+            return w.afk("cycle", *ME, "--worker-command", WORKER, *R, "--now", str(at), "--wake",
+                         *on, *(("--state", json.dumps(state)) if state else ()))
+
+        assert w.afk(*_turn(8, *on, now=t0))["outcome"] == "granted"
+        assert _land(w, 8, wt, *on, now=t0)["turn"] == "given_up"
+        c = cycle(t0)
+        assert c["progress"].startswith("landing turn to #7; dispatched #9"), c
+        assert _land(w, 7, d7["worktree"], *on, now=t0)["outcome"] == "merged"
+        c = cycle(t0 + 300, c["state"])
+        assert "nudged #8" in c["progress"] and "errors" not in c, c
+        c = cycle(t0 + 600, c["state"])
+        assert "restarted #8" in c["progress"] and "errors" not in c, c
+        assert [t["open"] for t in w.terminals() if t["worktreePath"] == wt] == [False, True]
+        c = cycle(t0 + 900, c["state"])
+        assert "nudged #8" in c["progress"], c
+        c = cycle(t0 + 1200, c["state"])
+        assert "escalated #8" in c["progress"] and "errors" not in c and c["judgments"] == [], c
+        assert "state" not in w.pr(80) and w.issue(8)["labels"] == ["ready-for-human"]
+        assert "gave it up when its landing stopped with `conflict`" in w.comments(8)[-1]
+        assert _merging(wt) and w.claimed_by(8) is None
+
 
 def test_a_worker_silent_on_its_turn_is_nudged_once_then_restarted_onto_it_once_then_escalated():
     """A turn can never park the queue: a worker that goes silent on it — idle past
@@ -4259,10 +4458,11 @@ def _resolve(w, wt, name, text):
 def test_a_pr_that_conflicts_with_the_stack_is_left_out_and_never_batched_again():
     """Five ready PRs, three of which rewrite one file. Driven by `afk cycle`
     alone: the batch lands the three that stack — behind ONE gate run — and leaves
-    the two that conflict out. Those take single landing turns, one after the
-    other, each resolving once against a target that already holds what it
-    conflicts with; neither is ever put in a batch again, not even beside a
-    fresh PR that could be."""
+    the two that conflict out. Those take single landing turns, and neither
+    holds its turn while it resolves (ADR-0045): each gives it up on its
+    conflict, is fixed off the turn, and lands on its next one — the second of
+    them resolving once more, against what the first landed meanwhile. Neither
+    is ever put in a batch again, not even beside a fresh PR that could be."""
     with world(issues=[issue(n, "ready-for-agent") for n in range(1, 6)]) as w:
         gate = (*_counted(w), "--set", "concurrency=6")
         d = {}
@@ -4305,22 +4505,44 @@ def test_a_pr_that_conflicts_with_the_stack_is_left_out_and_never_batched_again(
                                f"of={b['batch']}-->\n"), note
         assert "released=1" in _turns(w, 30)[0]
         assert not os.path.isdir(b["worktree"])                       # the batch's worktree is gone
-        # …and its own worker lands it: the first of the two conflict resolutions
-        wt = d[2]["worktree"]
-        assert _land(w, 2, wt, *gate)["files"] == ["shared.txt"]
-        _resolve(w, wt, "shared.txt", "from #1 and #2")
-        assert _land(w, 2, wt, *gate)["outcome"] == "merged"
+        # …and its own worker meets the conflict — which gives the turn up: the next
+        # cycle (the worker's wake) hands it to #3 while #2 is being resolved
+        wt2, wt3 = d[2]["worktree"], d[3]["worktree"]
+        r = _land(w, 2, wt2, *gate)
+        assert (r["files"], r["turn"]) == (["shared.txt"], "given_up"), r
+        c = tick(w, c["state"], *gate)
+        assert c["progress"].startswith("landing turn to #3; "), c["progress"]
+        assert _land(w, 3, wt3, *gate)["turn"] == "given_up"
+        # both are being fixed off the turn: no turn is out, and nobody waits in the queue
+        c = tick(w, c["state"], *gate)
+        rows, order, _ = _batch_rows(w, gate)
+        assert (rows[2][0], rows[3][0], order) == ("fixing", "fixing", [])
+        assert "errors" not in c and c["judgments"] == [], c
 
-        # a fresh PR turns up beside the other left-out one: still no batch
+        # #2 is resolved first: gated off the turn, then landed on its next one —
+        # which is the merge alone, the run made off the turn standing for the tree
+        _resolve(w, wt2, "shared.txt", "from #1 and #2")
+        assert _land(w, 2, wt2, *gate)["outcome"] == "awaiting_turn" and _gate_runs(w) == 2
+        c = tick(w, c["state"], *gate)
+        assert c["progress"].startswith("landing turn to #2; "), c["progress"]
+        r = _land(w, 2, wt2, *gate)
+        assert (r["outcome"], r["gate"]["source"], _gate_runs(w)) == ("merged", "recorded", 2), r
+
+        # #3 was resolved against a target that did not hold #2 yet. Off the turn its
+        # landing syncs again and meets #2: the one more resolution giving a turn up
+        # may cost — made without holding anybody back
+        _resolve(w, wt3, "shared.txt", "from #1 and #3")
+        r = _land(w, 3, wt3, *gate)
+        assert (r["outcome"], r["files"], r["turn"]) == ("conflict", ["shared.txt"], "given_up"), r
+        _resolve(w, wt3, "shared.txt", "from #1, #2 and #3")
+        # a fresh PR turns up beside it: still no batch — ready again, #3 goes first
         w.set(issues=w.state()["issues"] + [issue(6, "ready-for-agent")])
         with_pr(w, 6, 60, gate=gate)
-        c = cycle(w, c["state"], *gate)
+        assert _land(w, 3, wt3, *gate)["outcome"] == "awaiting_turn"
+        c = tick(w, c["state"], *gate)
         assert c["progress"].startswith("landing turn to #3; cleared #2; "), c["progress"]
         assert _turns(w, 60) == [] and _batch_rows(w, gate)[2] == []
-        wt = d[3]["worktree"]
-        assert _land(w, 3, wt, *gate)["outcome"] == "conflict"
-        _resolve(w, wt, "shared.txt", "from #1, #2 and #3")
-        assert _land(w, 3, wt, *gate)["outcome"] == "merged"
+        assert _land(w, 3, wt3, *gate)["outcome"] == "merged"
         c = cycle(w, c["state"], *gate)
         assert c["progress"].startswith("landing turn to #6; cleared #3; "), c["progress"]
         # five PRs landed behind three gate runs, where single turns take five

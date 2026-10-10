@@ -202,7 +202,8 @@ that other finished PRs land while you fix this one. Nothing else changes for yo
 coordinator once, right away and without waiting for an answer, then do exactly what the table says —
 fix it here, commit, run the command again. Off the turn the command still syncs and gates, and
 stops with `conflict` or `gate_red` as often as it takes; it merges nothing, and ends with
-`awaiting_turn` once your fix holds. A PR gives its turn up **once**: on its next turn a `conflict` or
+`awaiting_turn` once your fix holds. (Just started here, and the first result already says
+`given_up`? The PR gave its turn up before you came: the same applies.) A PR gives its turn up **once**: on its next turn a `conflict` or
 a `gate_red` keeps the turn, and every other finished PR waits behind it — do not sit on it.
 
 No outcome costs an attempt or closes the PR. Only **silence** ends it: a worker that goes quiet is

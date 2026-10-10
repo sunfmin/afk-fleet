@@ -325,9 +325,8 @@ In this order, each step the same `afk` transition you could type yourself
 
 1. **Rebuild** the working set (`afk rebuild`): the frontier, each claim of mine with its `status`,
    the merge queue, live and stale peer claims, the free slots.
-2. **Ask after the workers it is waiting on** (`afk no-pr`): every claim with no PR, every
-   landing one whose worker has not stopped for the tick, and every one being fixed off a turn its
-   PR gave up. A worker's state is what its runtime
+2. **Ask after the workers it is waiting on** (`afk no-pr`): every claim with no PR or being fixed
+   off a turn its PR gave up, and every landing one whose worker has not stopped for the tick. A worker's state is what its runtime
    reported to orca, never its screen (ADR-0021).
 3. **The landing turn** (`afk turn`) — at most one a cycle: to the head of the merge queue, or,
    when two or more may land together, to a merge batch of them. See
