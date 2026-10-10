@@ -3858,6 +3858,78 @@ def test_a_batched_pr_github_does_not_show_merged_keeps_its_branch_and_is_closed
             assert not w.sb.remote_ref(f"refs/heads/{d[n][0]['branch']}")
 
 
+def _line_repo(root):
+    """A throwaway repo whose `main` is a target's own line → (path, commit,
+    stack): `commit(subject, body)` puts one plain commit on it, and
+    `stack(title, pr, issue)` one PR the way a batch stacks it — a merge commit
+    with `afk_decide.stack_message`. Each returns the commit it made."""
+    path, n = str(root), iter(range(10 ** 6))
+    git(path, "init", "-q", "--initial-branch=main")
+
+    def commit(subject, body=""):
+        git(path, "commit", "-q", "--allow-empty", "-m", subject, *(["-m", body] if body else []))
+        return git(path, "rev-parse", "HEAD")
+
+    def stack(title, pr, issue):
+        git(path, "checkout", "-q", "-b", f"pr-{pr}-{next(n)}")
+        commit(f"work for {pr}", f"Closes #{issue}")
+        git(path, "checkout", "-q", "main")
+        git(path, "merge", "-q", "--no-ff", "-m", afk_decide.stack_message(title, pr, issue), "-")
+        return git(path, "rev-parse", "HEAD")
+
+    commit("init")
+    return path, commit, stack
+
+
+def test_a_landed_commit_is_found_by_its_subject_whatever_came_after(tmp_path):
+    """What a batch landed is read from the target's own line: the merge commit
+    a PR was stacked with is the one whose SUBJECT ends ` (#<pr>)`. Nothing that
+    landed later hides it — not a revert that quotes the subject, not a fix
+    titled after the PR, not a message that mentions the PR or says it closes
+    the issue."""
+    path, commit, stack = _line_repo(tmp_path)
+    assert afk._landed_commit(path, "main", 10) is None and afk._landed_pr(path, "main", 1) is None
+    # a mention before the landing is not the landing
+    commit("get ready for feature (#10)", "Closes #1")
+    assert afk._landed_commit(path, "main", 10) is None and afk._landed_pr(path, "main", 1) is None
+    ten, twenty = stack("feature (#9)", 10, 1), stack("other", 20, 2)
+    found = (ten, twenty, 10, 20)
+
+    def read():
+        return (afk._landed_commit(path, "main", 10), afk._landed_commit(path, "main", 20),
+                afk._landed_pr(path, "main", 1), afk._landed_pr(path, "main", 2))
+
+    assert read() == found
+    for subject, body in [
+            ('Revert "feature (#9) (#10)"', "This reverts the commit.\n\nCloses #1"),
+            ("unrelated", "see feature (#10)\n\n (#10)\nCloses #1\nCloses #2"),
+            ("a fix on top of feature (#10)", "Closes #1"),
+            ("another (#20)", ""),
+            ("docs", "the stack's commit was `feature (#9) (#10)`")]:
+        commit(subject, body)
+        assert read() == found, subject
+    # a PR the batch did not stack is not found by the subject another one quotes
+    assert afk._landed_commit(path, "main", 9) is None
+    # the issue landed again, by a later batch: its newest landing is the one named
+    again = stack("feature, again", 30, 1)
+    assert read() == found[:2] + (30, 20) and afk._landed_commit(path, "main", 30) == again
+
+
+def test_a_fix_commit_titled_after_a_member_is_read_as_a_fix(tmp_path):
+    """A batch worktree's own line is read back as members and fixes: only a
+    merge commit is a member's. A fix whose subject ends in a member's
+    ` (#<pr>)` is carried as a fix — also when that member is not on the stack."""
+    path, commit, stack = _line_repo(tmp_path)
+    tip = git(path, "rev-parse", "HEAD")
+    ten, thirty = stack("feature 1", 10, 1), stack("feature 3", 30, 3)
+    fixes = [commit("make feature 1 pass with feature 3 (#10)"),
+             commit("what feature 2 needed (#20)", "Closes #2"),      # 20 was left out
+             commit("make the stack green")]
+    line = afk._own_line(path, f"{tip}..HEAD")
+    assert [sha for sha, _, _ in line] == [ten, thirty, *fixes]
+    assert afk_decide.read_stack(line, {10, 20, 30}) == ({10: ten, 30: thirty}, fixes)
+
+
 def _fleet_files(wt):
     """What the fleet keeps about the worker of a worktree, in its git dir."""
     return sorted(f for f in os.listdir(git(wt, "rev-parse", "--absolute-git-dir"))
