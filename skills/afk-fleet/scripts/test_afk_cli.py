@@ -1058,6 +1058,7 @@ def test_the_cycle_state_carries_the_instance_and_the_worker_launch_command():
         assert first["progress"] == "dispatched #1; 1 in flight, 1 left on the frontier"
         state = first["state"]
         assert (state["instance"], state["worker_command"]) == ("fl-9", WORKER)
+        w.worker(output=T0 - 1, state="working", since=T0 - 60)
 
         # only the state: #2 is claimed by fl-9 and its worker started with WORKER
         # (a slot opened by the config, which no digest sees: the cycle is woken)
@@ -1139,6 +1140,7 @@ def test_the_drain_releases_claims_with_no_pr_and_keeps_those_with_one():
     with world(issues=issues) as w:
         with_pr(w, 1, 10, conclusion="PENDING")                      # finished, checks running
         w.afk(*dispatch(2))                                          # still coding
+        w.worker(output=T0 - 1, state="working", since=T0 - 60)
         w.afk("claim", "4", "--instance", "peer-live", *NOW, *R)
         w.afk("heartbeat", "--instance", "peer-live", "--now", str(T0 - 60), *R)
         r = cycle(w, None, "--set", "concurrency=2")
@@ -1634,6 +1636,7 @@ def test_what_changed_while_a_tick_ran_still_gets_a_tick():
         first = cycle(w, None, *forced)
         assert first["progress"].startswith("dispatched #1; 1 in flight")
         assert w.issue(2)["state"] == "open" and w.claimed_by(2) is None
+        w.worker(output=T0 - 1, state="working", since=T0 - 60)
         # no wake said so, and the digest already holds it: the next cycle skips…
         quiet = cycle(w, first["state"], *forced)
         assert (quiet["action"], quiet["reason"]) == ("skip", "unchanged")
@@ -1641,6 +1644,7 @@ def test_what_changed_while_a_tick_ran_still_gets_a_tick():
         caught = cycle(w, {**quiet["state"], "skips": 5}, *forced)
         assert (caught["action"], caught["reason"]) == ("tick", "forced")
         assert caught["progress"].startswith("dispatched #2; 2 in flight")
+        w.worker(output=T0 - 1, state="working", since=T0 - 60)
 
         # #4 is filed while the tick that dispatches #3 runs, and this time a wake
         # arrived: the next cycle ticks at once, whatever the digest says
@@ -1648,11 +1652,13 @@ def test_what_changed_while_a_tick_ran_still_gets_a_tick():
               arrives_mid_tick=[issue(4, "ready-for-agent")])
         again = cycle(w, caught["state"], *forced)
         assert again["progress"].startswith("dispatched #3; 3 in flight")
+        w.worker(output=T0 - 1, state="working", since=T0 - 60)
         assert w.claimed_by(4) is None
         assert cycle(w, again["state"], *forced)["action"] == "skip"
         woke = cycle(w, again["state"], *forced, "--wake")
         assert (woke["action"], woke["reason"]) == ("tick", "wake")
         assert woke["progress"].startswith("dispatched #4; 4 in flight")
+        w.worker(output=T0 - 1, state="working", since=T0 - 60)
         # a wake with nothing behind it costs one tick that finds nothing, no more
         idle = cycle(w, woke["state"], *forced, "--wake")
         assert (idle["reason"], idle["progress"]) == \
@@ -1679,6 +1685,7 @@ def test_a_pr_that_opens_while_a_tick_runs_gets_its_turn_from_the_next_cycle_at_
                                     "2 in flight, 0 left on the frontier")
         assert (busy["sleep_seconds"], busy["state"]["unsettled"]) == (0, True)
         assert _mine(w, (), 1)[0] == "awaiting_turn"
+        w.worker(output=T0 - 1, state="working", since=T0 - 60)
 
         nxt = cycle(w, busy["state"], "--set", "concurrency=5")
         assert (nxt["action"], nxt["reason"]) == ("tick", "unsettled")
@@ -2600,7 +2607,7 @@ def _brief(wt):
 
 def _gate(w, wt, command, *extra):
     """`afk gate` as a worker runs it: in its own worktree, on a given command."""
-    return w.afk("gate", "--set", f"gate.local_command={command}", *extra, cwd=wt)
+    return w.afk("gate", "--set", f"gate.local_command={command}", *NOW, *extra, cwd=wt)
 
 
 def _template():
@@ -3103,7 +3110,8 @@ def test_a_recorded_worker_gate_run_is_not_repeated_by_the_landing():
                                                             command)}
 
         w.afk(*_turn(3, *gate))
-        r = _land(w, 3, wt, *gate)
+        # the brief's line carries no `--now`: its record is stamped by the wall clock
+        r = _land(w, 3, wt, *gate, now=int(time.time()))
         assert (r["outcome"], r["synced"], r["head"]) == ("merged", False, head), r
         # the outcome says the gate was trusted, not run, and names the head that landed
         assert r["gate"] == {"status": "green", "source": "recorded", "head": head,

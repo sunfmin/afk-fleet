@@ -83,6 +83,36 @@ def test_is_stale_and_due():
     assert d.heartbeat_due(1000, 1000 + TTL // 3 + 2, TTL) is True
 
 
+def test_a_stamp_from_the_future_is_not_evidence():
+    """Age is `now − written`, and the stamp is the writing host's clock: beyond
+    the one tolerance allowed for skew, a stamp ahead of the reader is read as
+    missing — wherever an age is acted on."""
+    now, skew = 1_000_000, d.CLOCK_SKEW_TOLERANCE_SECONDS
+    # the one reading: within the tolerance "just now", past it nothing at all
+    assert d.stamp_age(now - 40, now) == 40
+    assert d.stamp_age(now + skew, now) == 0
+    assert d.stamp_age(now + skew + 1, now) is None
+    assert d.stamp_age(None, now) is None
+
+    # a heartbeat a day ahead does not keep a dead fleet's claims live for a day
+    # past the lease — and its own fleet beats again rather than wait for it
+    assert d.is_stale(now + skew, now, TTL) is False
+    assert d.is_stale(now + skew + 1, now, TTL) is True
+    assert d.is_stale(now + 86400, now, TTL) is True
+    assert d.heartbeat_due(now + skew, now, TTL) is False
+    assert d.heartbeat_due(now + 86400, now, TTL) is True
+    part = d.classify_claims([{"number": 7, "instance": "peer"}], {"peer": now + 86400},
+                             "me", now, TTL)
+    assert part == {"mine": [], "peer_live": [], "stale": [7]}
+    assert d.group_instances([], {"peer": now + 86400}, "me", now, TTL)[0]["fresh"] is False
+
+    # a recorded gate run dated ten days ahead is void now, not trusted for eleven
+    ahead = lambda s: d.gate_record("abc123", "make test", now + s)   # noqa: E731
+    assert d.gate_record_void(ahead(skew), now) is None
+    assert "ahead of this clock" in d.gate_record_void(ahead(skew + 1), now)
+    assert "ahead of this clock" in d.gate_record_void(ahead(10 * 86400), now)
+
+
 def test_classify_claims():
     now = 100_000
     claims = [
@@ -1085,6 +1115,17 @@ def test_classification_idle_seconds_is_the_most_recent_sign_of_life():
     assert r["idle_seconds"] is None and r["outcome"] == "idle_stalled"
     # a clock skewed into the future reads as "just now", never a negative age
     assert idle({**ZERO, "worktree_mtime_ts": NOW + 30}, None)["idle_seconds"] == 0
+    skew = d.CLOCK_SKEW_TOLERANCE_SECONDS
+    assert idle({**ZERO, "worktree_mtime_ts": NOW + skew}, None)["idle_seconds"] == 0
+    # …but only that far: a file dated next week is no sign of life, so it neither
+    # keeps a stopped worker within grace nor hides the signs that are real
+    r = idle({**ZERO, "worktree_mtime_ts": NOW + skew + 1}, None)
+    assert r["idle_seconds"] is None and r["outcome"] == "idle_stalled"
+    r = idle({**ZERO, "last_commit_ts": NOW - 5000, "worktree_mtime_ts": NOW + 7 * 86400}, 3000)
+    assert r["idle_seconds"] == 3000 and r["outcome"] == "idle_stalled"
+    # the same for the clocks orca reports: output dated ahead is not output now
+    assert _reading(_ps("working", 900, -30)) == ("busy", 0, "working")
+    assert _reading(_ps("working", 900, -skew - 1)) == ("idle", None, "working")
 
 
 def test_classification_routes_idle_workers_on_their_verdict():

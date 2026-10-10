@@ -140,7 +140,8 @@ one committed tree. It is made by the tool that saw the exit code — never by a
 and kept on GitHub under the tree it tested, so it stands wherever that same content is about to
 land: the worker's worktree, one recreated from the pushed branch, another machine, another commit
 holding the same files, a **merge batch**'s stack. It is always trusted while it stands, and it
-stops standing when the same tree is later run red, or after a day. A **sync** that brought the
+stops standing when the same tree is later run red, or after a day. One stamped from the future
+never stood (see **heartbeat**). A **sync** that brought the
 target in or a later commit makes a different tree, which has its own record or none — and with
 none, the landing runs the gate (ADR-0030).
 _Avoid_: gate cache (it is evidence, not an optimisation that may be wrong), cached result, CI
@@ -236,6 +237,11 @@ The liveness signal a **fleet instance** publishes for itself — one ref `refs/
 a timestamp, refreshed while it holds any claim (per instance, not per claim; roughly once per
 a third of the claim lease, not once per tick). A claim is leased-live while its owner's heartbeat is within
 the claim lease (`CLAIM_LEASE_TTL_SECONDS`, the same in every repo); its freshness is the only thing that lets a peer tell a live owner from a dead one.
+The timestamp is the writing host's clock, so freshness has a floor as well as a ceiling: a stamp
+ahead of the reader by more than the skew tolerance (`CLOCK_SKEW_TOLERANCE_SECONDS`, the one place
+skew is allowed for) is not evidence — a heartbeat from the future is stale, a **recorded gate run**
+from the future does not stand, and a worker's sign of life from the future is no sign. Within the
+tolerance a stamp ahead reads as "just now".
 _Avoid_: ping, keepalive, liveness probe, **worker state** (that is per worker, read from orca — a
 different thing, at a different granularity)
 

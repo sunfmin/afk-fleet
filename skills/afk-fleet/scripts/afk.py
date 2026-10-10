@@ -1096,7 +1096,8 @@ def _settle_base(run: _Run, answer: str | None) -> Obj:
         return {"status": "ask", **found}
     now = run.now()
     claims, heartbeats = _scan(run)
-    live = [i for i, ts in heartbeats.items() if now - ts < afk_decide.CLAIM_LEASE_TTL_SECONDS]
+    live = [i for i, ts in heartbeats.items()
+            if not afk_decide.is_stale(ts, now, afk_decide.CLAIM_LEASE_TTL_SECONDS)]
     refusal = afk_decide.base_refusal(answer, recorded, _remote_heads(rem), len(claims), live)
     if refusal:
         raise ValueError(refusal)

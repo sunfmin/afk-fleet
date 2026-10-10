@@ -438,6 +438,26 @@ IDLE_INTERVAL_SECONDS = 1500                # ... and once the fleet has gone qu
 IDLE_TICKS_BEFORE_SLEEP = 3                 # empty cycles in a row before it counts as quiet
 CLAIM_LEASE_TTL_SECONDS = 4500              # a claim is live while its heartbeat is this fresh
 FORCE_TICK_AFTER_SKIPS = 6                  # a full tick at least every N skipped cycles (ADR-0007)
+CLOCK_SKEW_TOLERANCE_SECONDS = 300          # how far ahead of the reader a stamp may be and still count
+
+
+def stamp_age(stamp: float | None, now: float) -> int | None:
+    """
+    How old a stamp another clock wrote is, in seconds — a heartbeat, a recorded
+    gate run, a commit, a file's mtime, orca's report — or None when it is no
+    evidence of anything: missing, or further ahead of `now` than
+    `CLOCK_SKEW_TOLERANCE_SECONDS`. A stamp ahead by no more than that is
+    ordinary skew between two hosts and reads as "just now" (0), never as a
+    negative age.
+
+    Every age the fleet acts on is read here, so this is the only place skew is
+    allowed for. Without the bound, age has no floor: a stamp from the future
+    stays fresh until the reader's clock catches up with it, however far that is.
+    """
+    if stamp is None:
+        return None
+    age = int(now) - int(stamp)
+    return None if age < -CLOCK_SKEW_TOLERANCE_SECONDS else max(0, age)
 
 
 # The two places claim + heartbeat refs can live, as namespace → (claim ref prefix,
@@ -1007,19 +1027,20 @@ def select_frontier(issues: list[EligibleIssue], ready_label: str, epic_labels: 
 # --------------------------------------------------------------------------- #
 
 def is_stale(last_ts: float | None, now: float, ttl: float) -> bool:
-    """A claim's owner is presumed dead when its heartbeat is missing or older
-    than `ttl`. Missing (None) counts as stale — an owner that never beat."""
-    if last_ts is None:
-        return True
-    return (now - int(last_ts)) > ttl
+    """A claim's owner is presumed dead when its heartbeat is missing, older than
+    `ttl`, or stamped from the future (`stamp_age`). Missing (None) counts as
+    stale — an owner that never beat; so does a future stamp, which would
+    otherwise keep a dead fleet's claims live past the lease."""
+    age = stamp_age(last_ts, now)
+    return age is None or age > ttl
 
 
 def heartbeat_due(last_ts: float | None, now: float, ttl: float) -> bool:
-    """Refresh my own heartbeat once it is older than ttl/3 (or never beat). Beating
+    """Refresh my own heartbeat once it is older than ttl/3 (or never beat, or is
+    stamped from the future — `stamp_age` — which peers read as stale). Beating
     at ttl/3 keeps a comfortable 3x margin under the lease while staying cheap."""
-    if last_ts is None:
-        return True
-    return (now - int(last_ts)) > ttl / 3.0
+    age = stamp_age(last_ts, now)
+    return age is None or age > ttl / 3.0
 
 
 def classify_claims(claims: list[Claim], heartbeats: Mapping[str, float], me: str | None,
@@ -1204,11 +1225,16 @@ def gate_record_void(record: Obj | None, now: float) -> str | None:
     which command it is of are not questions left to ask here. A sync that
     brought the target in, a later commit or another command is another name,
     with its own record or none; a record older than `GATE_RECORD_TTL` is no
-    longer believed. Void is the safe side: the landing runs the gate.
+    longer believed, and neither is one stamped from the future (`stamp_age`),
+    whose day would never run out. Void is the safe side: the landing runs the
+    gate.
     """
     if record is None:
         return "no green run of the gate is on record for the tree that would land"
-    age = int(now) - record["at"]
+    age = stamp_age(record["at"], now)
+    if age is None:
+        return (f"the recorded run is stamped {record['at'] - int(now)}s ahead of this clock — "
+                f"past the {CLOCK_SKEW_TOLERANCE_SECONDS}s allowed for skew")
     if age > GATE_RECORD_TTL:
         return (f"the recorded run is {age}s old — a record is trusted for "
                 f"{GATE_RECORD_TTL}s")
@@ -1660,7 +1686,8 @@ def read_worker_state(row: Obj | None, now: float, grace_seconds: float,
             stop report is timed from the terminal's last output; a runtime that
             reports no state is not timed at all (None) — its idle screen redraws
             on a timer, so its output says nothing — and the worktree's own
-            clocks decide.
+            clocks decide. A clock stamped from the future (`stamp_age`) is
+            not read: output "then" is not output within grace.
     `state` is the report it was read from: the top-level agent that changed
     state last (an older pane's report, a subagent's, do not speak for it).
     """
@@ -1668,7 +1695,7 @@ def read_worker_state(row: Obj | None, now: float, grace_seconds: float,
         return {"terminal": "none", "terminal_idle_seconds": None, "state": None}
 
     def ago(ms: float | None) -> int | None:
-        return max(0, int(now) - int(ms) // 1000) if ms else None
+        return stamp_age(int(ms) // 1000, now) if ms else None
 
     output_idle = ago(row.get("lastOutputAt"))
     agents = [x for x in row.get("agents") or [] if x.get("state") and not x.get("parentPaneKey")]
@@ -1700,11 +1727,12 @@ def _idle_seconds(now: float, terminal_idle_seconds: float | None,
                   *signs: float | None) -> int | None:
     """Seconds since the MOST RECENT sign of life: the terminal's own clock, and
     each epoch-second `signs` that is known. None when none is known — which is
-    never "within grace"."""
-    seen = [int(t) for t in signs if t is not None]
+    never "within grace". A sign stamped from the future (`stamp_age`) is not
+    known: a file dated next week does not keep a stopped worker active."""
+    ages = [age for age in (stamp_age(t, now) for t in signs) if age is not None]
     if terminal_idle_seconds is not None:
-        seen.append(int(now) - int(terminal_idle_seconds))
-    return max(0, int(now) - max(seen)) if seen else None
+        ages.append(max(0, int(terminal_idle_seconds)))
+    return min(ages) if ages else None
 
 
 def settled_by_worker_state(reading: WorkerReading, now: float, grace_seconds: float,
@@ -1785,7 +1813,8 @@ def classify_stopped(progress: Progress | None, terminal_idle_seconds: float | N
 
     `idle_seconds` is the time since the MOST RECENT sign of life (last commit,
     newest file mtime, terminal activity, the nudge, the landing turn); None
-    when none is known, which is never "within grace". Commits ahead / a dirty
+    when none is known — or every one is stamped from the future (`stamp_age`)
+    — which is never "within grace". Commits ahead / a dirty
     tree are standing facts — true until the branch merges — never signs of life
     (ADR-0013). `pending_blockers` is `blocked_route`'s: the blocked_by not yet
     done, [] for any other verdict.
