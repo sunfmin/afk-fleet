@@ -234,8 +234,8 @@ _Avoid_: assignee (dropped as a claim signal), assignment, lock (too generic)
 
 **Heartbeat** (and its lease):
 The liveness signal a **fleet instance** publishes for itself — one ref `refs/afk/heartbeat/<id>` carrying
-a timestamp, refreshed while it holds any claim (per instance, not per claim; roughly once per
-a third of the claim lease, not once per tick). A claim is leased-live while its owner's heartbeat is within
+a timestamp, refreshed before it takes a claim and while it holds any (per instance, not per claim; roughly once per
+a third of the claim lease, not once per tick) — so a claim is never on the remote ahead of its owner's heartbeat. A claim is leased-live while its owner's heartbeat is within
 the claim lease (`CLAIM_LEASE_TTL_SECONDS`, the same in every repo); its freshness is the only thing that lets a peer tell a live owner from a dead one.
 _Avoid_: ping, keepalive, liveness probe, **worker state** (that is per worker, read from orca — a
 different thing, at a different granularity)

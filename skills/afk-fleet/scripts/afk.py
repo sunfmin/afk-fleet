@@ -691,6 +691,7 @@ def _claim(run: _Run, number: int, instance: str, host: str) -> Obj:
     rem, ref = run.rem, _claim_ref(run.cfg, number)
     record = {"instance": instance, "host": host, "ts": int(run.now())}
     sha = _record_commit(afk_decide.CLAIM_RECORD, record)
+    _beat(run, instance)        # first: a claim a peer can see is one whose owner has beaten
     # Create-only: the server rejects a ref that already exists → that is the CAS.
     p = _git(["push", rem, f"{sha}:{ref}"], check=False)
     if p.returncode == 0:
@@ -719,6 +720,7 @@ def _force_take(run: _Run, number: int, expect_sha: str, instance: str, host: st
     rem, ref = run.rem, _claim_ref(run.cfg, number)
     record = {"instance": instance, "host": host, "ts": int(run.now())}
     sha = _record_commit(afk_decide.CLAIM_RECORD, record)
+    _beat(run, instance)        # first, as in `_claim`: the taker is alive before it owns
     p = _git(["push", rem, f"--force-with-lease={ref}:{expect_sha}", f"{sha}:{ref}"], check=False)
     if p.returncode == 0:
         _claim_written(run, number, {"number": number, **record, "sha": sha})
@@ -947,7 +949,11 @@ def _require_mine(run: _Run, number: int, instance: str) -> None:
 
 def _beat(run: _Run, instance: str) -> Obj:
     """Refresh my heartbeat ref if it is due (stateless: the old ts is read from
-    the refs, in the scan)."""
+    the refs, in the scan). Every push that puts a claim in `instance`'s name
+    (`_claim`, `_force_take`) runs this BEFORE it, so no claim is ever on the
+    remote ahead of its owner's heartbeat: a peer scanning the instant the claim
+    lands would otherwise read it as stale and take it from a live fleet. A
+    fleet that holds nothing and claims nothing is never brought here."""
     rem, cfg, now = run.rem, run.cfg, run.now()
     ref = _heartbeat_ref(cfg, instance)
     heartbeats = _scan(run)[1]
