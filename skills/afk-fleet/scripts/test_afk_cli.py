@@ -161,7 +161,7 @@ def close_issues_of(row):
 
 # GitHub marks a PR merged by itself once a push puts its head on the base: the
 # PR's own commits reached it, whoever pushed them. (`pushes_never_merge` holds
-# that back — GitHub can be slow, or the head moved after it was stacked.)
+# that back — GitHub can be slow, or the head moved after it joined.)
 if not st.get("pushes_never_merge"):
     for row in st["prs"]:
         ref = "refs/heads/" + row["headRefName"]
@@ -3149,14 +3149,13 @@ def test_a_red_gate_on_the_turn_is_the_workers_to_fix_and_spends_nothing():
                          "echo 'FAIL TestNames' >&2 && test -f fixed.txt")
         assert w.afk(*_turn(4, *red))["outcome"] == "granted"
 
-        # it runs IN the worktree, on the PR stacked on the target; stderr is part of the log
+        # it runs IN the worktree, on the PR synced with the target; stderr is part of the log
         r = _land(w, 4, wt, *red, now=T0 + 10)
         assert (r["outcome"], r["synced"], r["pr"]) == ("gate_red", True, 40), r
         assert (r["gate"]["status"], r["gate"]["exit_code"], r["gate"]["excerpt"]) == \
             ("red", 1, "FAIL TestNames")
-        # a red stack is the one case a clean PR's branch is synced: the target is
-        # merged into it and pushed, so the worker fixes the tree that was red
-        # (ADR-0046); the target was not touched
+        # the target was merged into the branch and pushed before the gate ran, so
+        # the worker fixes the tree that was red; the target was not touched
         assert r["head"] == w.sb.remote_ref(f"refs/heads/{branch}") != pr_head
         assert r["head"] == git(wt, "rev-parse", "HEAD") and git(wt, "status", "--porcelain") == ""
         assert git(wt, "log", "-1", "--format=%P").split() == [pr_head, base_tip]
