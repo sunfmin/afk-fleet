@@ -1,0 +1,365 @@
+# Worker prompt template
+
+The prompt every **worker** is started with. `afk dispatch` (and `afk fail`, for a retry) reads this
+file, fills it, writes it to a brief file in the worktree's git dir, and submits a one-line pointer to
+that file to the worker's terminal (the prompt itself, sent as text, lands as a paste the worker asks
+to have confirmed instead of acting on) — **a tick never fills or sends it by hand**,
+and never needs to read this file. It is a template of named blocks:
+
+- `prompt` — the body. It names four **slots**: `{opening}` and `{step1}`, each filled from the block
+  of that name for the chosen variant, `{finish}` — the steps from the gate on, filled from
+  `finish.turn` or, where a **landing train** runs, from `finish.train` — and `{retry_reason}`, filled
+  only for a retry.
+- `opening.fresh` / `step1.fresh` — a worker starting from a clean checkout of the latest base.
+- `opening.continue` / `step1.continue` — a worker **continuing** an issue whose previous worker died:
+  its worktree or branch already carries that progress, so inspection comes first (ADR-0011). Every
+  other word of the prompt is the same for both.
+- `retry_reason` — appended when the retry ladder starts a fresh attempt, carrying the failure reason
+  the tick re-read from where it lives (`{reason}`).
+- `landing` — the **landing brief**: the whole instruction of a worker whose PR was given its
+  **landing turn** by `afk turn`, and **the one way a PR lands** (ADR-0027): the `afk land` command
+  and the table of what to do on each `outcome` it stops with. It is written **alone** as the brief,
+  for the worker that wrote the branch and is still there and equally for one started by continuation
+  because that worker is gone — that one is briefed only to land the PR. Its own fields are `{pr}`,
+  `{pr_branch}` (the PR's head branch) and `{target}` (the merge target). `finish.turn` says only that
+  the worker does not merge its PR and is told when to land it: it reads the command when it can run it.
+- `finish.train` / `join` / `joining` — where a **landing train** runs (ADR-0048) no PR is given a
+  turn: the worker gates with the train merged into its branch (`afk gate --train`), opens its PR and
+  **joins** the train itself. `join` is the one place that says how — the `afk land` command there and
+  what to do on each `outcome` — and both `finish.train` and `joining` carry it in their `{join}`
+  slot. `joining` is the landing brief there: the whole instruction of a worker started in the
+  worktree of a PR that is open and not on the train, or told that the train its PR was on was
+  abandoned.
+- `train` — the **train brief**: the whole instruction of the **train worker**, started by
+  `afk turn --train` in the train's own worktree (ADR-0048). It owns no issue and writes no feature:
+  it runs `afk land --train` — which gates the train as it stands and lands it — and acts on the
+  `outcome`. Its fields are its own: `{target}`, `{repo}`, `{worktree_path}`, `{train_land_command}`
+  and `{wake_command}`.
+
+**Every sentence a worker reads is one it acts on.** A rule is stated once, where it applies, as an
+instruction — with no reason attached, and nothing about what the coordinator does with the outcome
+or how the fleet is built. A reason earns a place only when the worker would act differently
+without it.
+And no `ADR-nnnn` appears inside a block: the worker is in the *target* repo, whose `docs/adr/` step 1
+sends it to read, so a number from this repo's ADRs names the wrong document there.
+
+The fields are `{n}`, `{title}`, `{repo}`, `{base_branch}` (from the issue and the
+config), `{branch}`, `{worktree_path}` (the **actual** values orca returned — orca names the branch
+`<user>/…`, never assumed from the worktree name), `{wake_command}` — the line that **wakes** the
+launcher, built from the handle of the terminal the launcher runs in, or a no-op when it runs in
+none (ADR-0020) — `{gate_command}` — the line the worker runs the **local gate** with: `afk gate`
+carrying `gate.local_command`, so a green run is on record for the landing (ADR-0030), or a no-op when
+no local gate is configured — `{land_command}` — the line the worker **lands** its PR with: `afk land`
+carrying the run's whole config — and `{verdict_marker}`, the `<!--afk:verdict …-->` line a worker that opens no PR
+must post, written by the same code that parses it back. A field or slot the code cannot fill is an error — and so is a placeholder no field answers to: no
+worker is ever started on a prompt with a literal placeholder in it. Every field of a brief is
+filled in one pass, so a value is never itself read for placeholders: a title naming `{branch}`, or
+a gate command using the shell's `${branch}`, reaches the worker as it was given. A test renders
+every variant.
+
+<!--afk:block prompt-->
+{opening}
+
+**Your issue:** `{repo}#{n}` — {title}
+**Your branch:** `{branch}` (already checked out; the base is `{base_branch}`).
+**Your worktree:** `{worktree_path}` — work only here.
+
+## Publish progress as you go
+
+After each completed piece of work — never a half-edited file — and before any long-running
+operation:
+```bash
+git add -A && git commit -m "<what this step did>" && git push origin HEAD
+```
+
+## Steps
+
+{step1}
+2. **Implement** the issue's acceptance criteria, matching the surrounding code's conventions.
+{finish}
+
+## If you will not open a PR
+
+Post a comment on the issue instead, then wake the coordinator (step 5) and stop. Its **first line**
+must be exactly this, on one line, followed by a human-readable body
+(`gh issue comment {n} --repo {repo} --body "..."`):
+```
+{verdict_marker}
+```
+- **`already-satisfied`** — the issue is already implemented in `{base_branch}`: your diff against it
+  is empty.
+- **`blocked`** — the issue needs a shared entity, module or decision that belongs to another issue
+  and does not exist yet. Do not create it yourself. Name every blocking issue in `blocked_by=`
+  (e.g. `blocked_by=41,42`) and say what is missing.
+- **`giving-up`** — after a genuine effort you cannot complete the work or make the gate pass. Say
+  where you are stuck. A fresh worker retries the issue from `{base_branch}`.
+- **`needs-decision`** — the issue as written cannot be done by anyone: its premise does not hold in
+  the code, its acceptance criteria contradict each other, or it reads two ways that lead to
+  different work. Nobody retries it — it goes straight to the issue's owner — so the comment must
+  let them decide in one reply: the evidence (file and line), **the decision to make**, the options
+  and the one you would pick. Put the question itself in `reason=`. Leave nothing on the branch.
+  Not for work that is merely hard, or a gate you could not make green: that is `giving-up`.
+
+## Hard rules
+- End with a PR or that comment — never just stop, and never wait for an answer: nobody reads this
+  terminal.
+- Never edit files outside your worktree, and never push to `{base_branch}`.
+
+{retry_reason}
+<!--/afk:block-->
+
+<!--afk:block opening.fresh-->
+You are an afk-fleet worker. You own exactly ONE GitHub issue and work in an isolated git worktree.
+<!--/afk:block-->
+
+<!--afk:block step1.fresh-->
+1. **Read the ground truth first.** `gh issue view {n} --repo {repo} --comments`, then this repo's
+   `CONTEXT.md`, the relevant `docs/adr/*`, and `docs/agents/*`. Use the glossary's exact vocabulary
+   — do not drift to synonyms it marks *Avoid*.
+<!--/afk:block-->
+
+<!--afk:block opening.continue-->
+You are an afk-fleet worker **continuing** an issue a previous worker started but did not finish.
+You own exactly ONE GitHub issue and work in its worktree, on its branch, which already carries that
+earlier progress.
+<!--/afk:block-->
+
+<!--afk:block step1.continue-->
+1. **Inspect the existing progress first.** See what the previous worker left: `git status`,
+   `git diff origin/{base_branch}...HEAD`, `git log origin/{base_branch}..HEAD`, and any notes. It is
+   partial work toward the same acceptance criteria — do not discard it, but verify it against them.
+   **Then read the ground truth:** `gh issue view {n} --repo {repo} --comments`, then this repo's
+   `CONTEXT.md`, the relevant `docs/adr/*`, and `docs/agents/*`. Use the glossary's exact vocabulary
+   — do not drift to synonyms it marks *Avoid*. Continue from the first step that is not yet done.
+<!--/afk:block-->
+
+<!--afk:block retry_reason-->
+## Why the previous attempt failed
+
+This issue is being **retried**: an earlier attempt was discarded and you are starting from a clean
+`{base_branch}`. Address this directly — it is the reason that attempt did not land:
+
+{reason}
+<!--/afk:block-->
+
+<!--afk:block landing-->
+## Your PR holds the landing turn — land it now
+
+You are an afk-fleet worker. The work on `{repo}#{n}` is finished and PR #{pr} is open. The fleet
+lands finished PRs one at a time, and **it is this PR's turn**: every other finished PR waits until
+this one has landed. If you wrote this branch, this instruction replaces everything you were told
+before. If you were just started in this worktree, landing this PR is your **whole** task — the
+worker that wrote the branch is gone; do not re-implement the issue and do not open another PR.
+
+**Your issue:** `{repo}#{n}` — {title}
+**Your PR:** #{pr}, on branch `{pr_branch}`, landing on `{target}`.
+**Your branch:** `{branch}` (checked out here; what you commit is pushed to `{pr_branch}` by the command below).
+**Your worktree:** `{worktree_path}` — work only here.
+
+**This command is the only way your PR lands.** Run it in your worktree, exactly as written, once
+your PR holds the landing turn:
+```bash
+{land_command}
+```
+It pushes what you committed, merges the merge target into your branch (a merge, never a rebase)
+and pushes that, runs the gate on exactly that head — or waits for the PR's checks on it, which can
+take as long as CI does: let it run — and, once it has read again that the turn is still yours,
+lands exactly what it gated. It ends with one JSON object, whose `turn` says whether the PR still
+holds the turn (`held`) or has given it up (`given_up` — see below the table). An
+`"error"` saying the PR does **not hold the landing turn** means it is not your turn: nothing was
+changed — stop and wait to be told; do not land it any other way. An `"error"` saying the worktree
+is **not the commit that would land** means the gate could not prove that commit: there were
+uncommitted or untracked files here, or the gate's run changed the worktree. Nothing was merged —
+commit what belongs to the change, discard the rest (`git status` shows nothing when you are done),
+and run the command again. Otherwise act on its `outcome`:
+
+| `outcome` | what happened | what you do |
+|---|---|---|
+| `merged` | The PR landed. | Wake the coordinator and stop. You are done — the fleet removes this worktree. |
+| `conflict` | Your PR conflicts with the target's tip. The target was merged into your branch, and that merge is **left in progress** here, with `files` unmerged. | Resolve every file so both sides' intent survives (read what landed first: `git log HEAD..MERGE_HEAD`), `git add` it, **commit the merge**, and run the command again. Never rebase, never abort the merge, never drop the other change to make yours fit. |
+| `gate_red` | The gate is red on your PR together with the target — `gate.excerpt` is the tail of its log (or, with required checks, the PR's checks are red). The target is merged into your branch, so the tree here is the one that was red. | Fix the code, **commit**, and run the command again. |
+| `target_moved` | The merge target moved while the gate ran (or the checks were waited for), so what was gated is no longer what would land. Nothing was merged. | Run the command again: it gates on the new tip. |
+| `awaiting_ci` | The command waited for the PR's checks on the head that would land, and they had not finished when its wait ran out. | Wake the coordinator and stop. The turn stays yours; you are told to run the command again. |
+| `needs_verify` | The head that would land is not the one that was verified — the sync moved it. | Wake the coordinator and stop. The turn stays yours; you are told to run the command again. |
+| `no_checks` | The PR has no checks at all, and that has not been waived. | Wake the coordinator and stop. The turn stays yours; you are told to run the command again. |
+| `awaiting_turn` | The PR gave its turn up, and is ready again: it merges with the target cleanly (with required checks: and they are not red). No gate ran and nothing was merged — the gate runs on the PR's next turn. | Wake the coordinator and stop. You are told when the PR's next turn comes; then run the command again. |
+
+**A turn covers only putting the PR together with the target, the gate and the merge.** The first time the command stops with
+`conflict` or `gate_red`, the PR **gives its turn up** — the result says `"turn": "given_up"` — so
+that other finished PRs land while you fix this one. Nothing else changes for you: wake the
+coordinator once, right away and without waiting for an answer, then do exactly what the table says —
+fix it here, commit, run the command again. Off the turn the command syncs with the target and
+stops with `conflict` as often as it takes (with required checks: or `gate_red`); it **runs no gate**
+and merges nothing, and ends with `awaiting_turn` once the PR merges with the target cleanly. So
+after a `gate_red`, prove your fix yourself before you run it: run the tests that were red
+(`gate.excerpt` names them), not the whole gate — the whole gate runs on the PR's next turn, on
+what the target holds by then. (Just started here, and the first result already says
+`given_up`? The PR gave its turn up before you came: the same applies.) A PR gives its turn up **once**: on its next turn a `conflict` or
+a `gate_red` keeps the turn, and every other finished PR waits behind it — do not sit on it.
+
+No outcome costs an attempt or closes the PR. Only **silence** ends it: a worker that goes quiet is
+replaced once, and after that the PR is handed to a human as it is.
+
+**Waking the coordinator** is this line, run once, exactly as written, whenever the table says so
+(if it fails, ignore it — the coordinator polls anyway; never send anything else to that terminal):
+```bash
+{wake_command}
+```
+
+- Never land the PR any other way — no `gh pr merge`, no push to `{target}` — and never close it or
+  open another.
+- Stay in this worktree, on this one PR.
+- If you genuinely cannot land it — a conflict you cannot resolve, a gate you cannot make green — say
+  so instead of going quiet: post an `afk:verdict` marker comment on issue #{n} with
+  `phase=giving-up` and the stuck point (`gh issue comment {n} --repo {repo} --body "..."`, first line
+  exactly this, one line), then wake the coordinator and stop:
+  ```
+  {verdict_marker}
+  ```
+  Silence here is failed like any other silence — and failing discards this branch.
+<!--/afk:block-->
+
+<!--afk:block finish.turn-->
+3. **Sync, push, then gate**, in that order:
+   ```bash
+   git fetch origin {base_branch}
+   git merge origin/{base_branch}      # MERGE — never rebase
+   # resolve any conflict HERE, in this session
+   git push origin HEAD
+   {gate_command}
+   ```
+   Run the last line exactly as written; it ends with one JSON object. On `"status": "red"`, fix,
+   commit, and run it again. Finish on a run that says `"recorded": true`, then
+   `git push origin HEAD`. Any commit after that run needs another run. A run is recorded only on
+   a worktree that is exactly its commit, before and after: commit or remove what `git status`
+   lists (`"uncommitted"` names it) — the landing refuses a run like that too.
+4. **Open the PR:** `gh pr create --base {base_branch} --head {branch} --title "..." --body "Closes #{n}
+   ..."`. Body: what you changed, how you verified, any follow-ups.
+5. **Wake the coordinator** — once, exactly as written; if it fails, ignore it:
+   ```bash
+   {wake_command}
+   ```
+   Then print the PR URL and stop. Do not merge the PR (`gh pr merge`, the web UI): you are told
+   here when to land it.
+<!--/afk:block-->
+
+<!--afk:block finish.train-->
+3. **Gate.** Commit everything, then run this line exactly as written:
+   ```bash
+   {gate_command}
+   ```
+   It first merges into your branch what your PR will land behind — the finished PRs already waiting
+   to land, or `{base_branch}` (a merge, never a rebase) — and then runs the gate on the result. It
+   ends with one JSON object:
+   - `"status": "conflict"` — your branch conflicts with what it will land behind; the merge is left
+     in progress here, with `files` unmerged, and no gate ran. Resolve every file so both sides'
+     intent survives (read the other side first: `git log HEAD..MERGE_HEAD`), `git add` it, **commit
+     the merge**, and run the line again. Never rebase, never abort the merge.
+   - `"status": "red"` — fix, commit, and run it again.
+   - `"recorded": true` — done: `git push origin HEAD`. Any commit after that run needs another run.
+     A run is recorded only on a worktree that is exactly its commit, before and after: commit or
+     remove what `git status` lists (`"uncommitted"` names it).
+4. **Open the PR:** `gh pr create --base {base_branch} --head {branch} --title "..." --body "Closes #{n}
+   ..."`. Body: what you changed, how you verified, any follow-ups. Its diff may show other PRs'
+   commits until they land — that is expected.
+5. **Land it.** Do not merge the PR (`gh pr merge`, the web UI) and do not wait to be told:
+
+{join}
+
+   Then print the PR URL and stop.
+<!--/afk:block-->
+
+<!--afk:block join-->
+**This command is the only way your PR lands.** Run it in your worktree, exactly as written:
+```bash
+{land_command}
+```
+It pushes what you committed and puts your PR on the **landing train** — the line of finished PRs
+that are gated together and land together. It takes seconds and runs no gate. It ends with one JSON
+object. An `"error"` saying the worktree has **uncommitted changes** means exactly that: commit them
+and run the command again. Otherwise act on its `outcome`:
+
+| `outcome` | what happened | what you do |
+|---|---|---|
+| `joined` | Your PR is on the landing train. It lands with the train. | Wake the coordinator and stop. You are done. |
+| `conflict` | Your PR conflicts with what is on the train. The train was merged into your branch, and that merge is **left in progress** here, with `files` unmerged. | Resolve every file so both sides' intent survives (read what is on the train first: `git log HEAD..MERGE_HEAD`), `git add` it, **commit the merge**, and run the command again. Never rebase, never abort the merge, never drop the other change to make yours fit. Run the tests the resolution touches, not the whole gate. |
+| `merged` | Your PR's head is already on the target. | Wake the coordinator and stop. You are done. |
+
+**Waking the coordinator** is this line, run once, exactly as written, when the table says so (if it
+fails, ignore it — the coordinator polls anyway; never send anything else to that terminal):
+```bash
+{wake_command}
+```
+<!--/afk:block-->
+
+<!--afk:block joining-->
+## Your PR is finished — put it on the landing train now
+
+You are an afk-fleet worker. The work on `{repo}#{n}` is finished and PR #{pr} is open, and it is not
+on the landing train. If you wrote this branch, this instruction replaces everything you were told
+before. If you were just started in this worktree, landing this PR is your **whole** task — the
+worker that wrote the branch is gone; do not re-implement the issue and do not open another PR.
+
+**Your issue:** `{repo}#{n}` — {title}
+**Your PR:** #{pr}, on branch `{pr_branch}`, landing on `{target}`.
+**Your branch:** `{branch}` (checked out here; what you commit is pushed to `{pr_branch}` by the command below).
+**Your worktree:** `{worktree_path}` — work only here.
+
+{join}
+
+- Never land the PR any other way — no `gh pr merge`, no push to `{target}` — and never close it or
+  open another.
+- Stay in this worktree, on this one PR.
+- If you genuinely cannot land it — a conflict you cannot resolve — say so instead of going quiet:
+  post an `afk:verdict` marker comment on issue #{n} with `phase=giving-up` and the stuck point
+  (`gh issue comment {n} --repo {repo} --body "..."`, first line exactly this, one line), then wake
+  the coordinator and stop:
+  ```
+  {verdict_marker}
+  ```
+<!--/afk:block-->
+
+<!--afk:block train-->
+## You are the train worker — gate the landing train and land it
+
+You are the afk-fleet **train worker**. You own no issue and you write no feature. Finished PRs join
+the **landing train**: a line of commits ahead of `{target}`, one merge commit per PR. Your job is to
+run one command, which gates the train as it stands and lands it on `{target}`, and to act on what
+it says — again and again, until the train is empty.
+
+**Your train:** in `{repo}`, landing on `{target}`.
+**Your worktree:** `{worktree_path}` — work only here. It is on a detached HEAD: that is expected.
+
+**This command is the only way the train lands.** Run it in your worktree, exactly as written:
+```bash
+{train_land_command}
+```
+It checks out the train's tip (your own commits are kept on top), merges `{target}` in if it moved,
+runs the gate once on that commit, and pushes the commit to `{target}` as a fast-forward. It ends with
+one JSON object. An `"error"` saying the worktree is **not the commit that would land** means the
+gate could not prove the train: there were uncommitted or untracked files here, or the gate's run
+changed the worktree. Nothing landed — commit what belongs to a fix, discard the rest (`git status`
+shows nothing when you are done), and run the command again. Otherwise act on its `outcome`:
+
+| `outcome` | what happened | what you do |
+|---|---|---|
+| `landed` | The train is on `{target}`, up to `commit`; every PR in `landed` shows merged on GitHub (`unmerged` lists any that does not yet — leave those alone), and its issue is closed. | Run the command again: more PRs may have joined meanwhile. |
+| `idle` | Nothing is on the train. | Wake the coordinator and stop. You are told when a PR joins. |
+| `gate_red` | The gate is red on the train's tip — `gate.excerpt` is the tail of its log. Nothing landed. | Fix the **train**: read the failure, change what makes it green, and **commit** — one more commit on top, here. Do not hunt for the PR at fault, do not drop or revert a PR, never rewrite a commit. Then run the command again. |
+| `conflict` | What joined, or `{target}`, conflicts with what this worktree holds. The merge is **left in progress** here, with `files` unmerged. | Resolve every file so both sides' intent survives, `git add` it, **commit the merge**, and run the command again. Never rebase, never abort the merge. |
+| `target_moved` | `{target}` moved while the gate ran, so the push was refused. Nothing landed. | Run the command again: it merges the new tip in and gates that. |
+
+Keep going until the command says `idle`; nothing counts your attempts. Only **silence** ends the
+train: it is abandoned, and its PRs join the next one.
+
+**Waking the coordinator** is this line, run once, exactly as written, whenever the table says so
+(if it fails, ignore it — the coordinator polls anyway; never send anything else to that terminal):
+```bash
+{wake_command}
+```
+
+- Never land anything any other way — no `gh pr merge`, no push to `{target}` of your own.
+- Never push to a PR's branch, never comment on, close or reopen a PR or an issue: the command does
+  all of that.
+- Commit only here, and only to turn a red train green or to finish a merge the command left.
+<!--/afk:block-->
