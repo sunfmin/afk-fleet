@@ -4218,16 +4218,31 @@ def test_a_turn_with_no_terminal_is_delivered_by_continuation_never_from_base():
 
 
 # --------------------------------------------------------------------------- #
-# act: the merge batch (ADR-0029)                                              #
+# act: the landing train (ADR-0048)                                            #
 # --------------------------------------------------------------------------- #
-
-BATCH = ()        # nothing to set: batches form wherever the gate is local
-
 
 def _counted(w, command="true"):
     """A local gate that counts its own runs — in a file outside every worktree —
-    in the gate mode merge batches form in."""
-    return (*local_gate(f"echo run >> {w.sb.root}/gate-runs && {command}"), *BATCH)
+    in the gate mode a landing train runs in. On each run it first carries out,
+    once, whatever `_during_the_gate` queued: what others did while it ran."""
+    script = os.path.join(w.sb.root, "during-the-gate.py")
+    queue = os.path.join(w.sb.root, "during-the-gate.json")
+    with open(script, "w") as f:
+        f.write("\n".join([
+            "import json, os, subprocess",
+            f"if os.path.exists({queue!r}):",
+            f"    todo = json.load(open({queue!r}))",
+            f"    os.remove({queue!r})",
+            "    for cwd, argv in todo:",
+            "        subprocess.run(argv, cwd=cwd, check=True, stdout=subprocess.DEVNULL)"]) + "\n")
+    return local_gate(f"echo run >> {w.sb.root}/gate-runs && "
+                      f"{shlex.quote(sys.executable)} {shlex.quote(script)} && {command}")
+
+
+def _during_the_gate(w, *commands):
+    """Queue (cwd, argv) commands for the next gate run to carry out while it runs."""
+    with open(os.path.join(w.sb.root, "during-the-gate.json"), "w") as f:
+        json.dump([[cwd, list(argv)] for cwd, argv in commands], f)
 
 
 def _gate_runs(w):
@@ -4238,24 +4253,45 @@ def _gate_runs(w):
         return 0
 
 
-def _turn_batch(*extra, now=T0, instance="me"):
-    """The argv of one `afk turn --batch` — the tick forming (or continuing) a batch."""
-    return ("turn", "--batch", "--instance", instance, "--worker-command", WORKER, *R,
+def _join_argv(n, *gate, now=T0):
+    """`afk land --issue <n>` as a process started by something else runs it."""
+    return [sys.executable, AFK, "land", "--issue", str(n), *R, "--now", str(now), *gate,
+            "--config", settled("{}")]
+
+
+def _turn_train(*extra, now=T0, instance="me"):
+    """The argv of one `afk turn --train` — the tick keeping the train worker on the train."""
+    return ("turn", "--train", "--instance", instance, "--worker-command", WORKER, *R,
             "--now", str(now), *extra)
 
 
-def _abandon(batch, *extra, now=T0, instance="me"):
-    return ("turn", "--abandon", batch, "--instance", instance, "--worker-command", WORKER, *R,
+def _abandon(*extra, now=T0, instance="me"):
+    return ("turn", "--abandon", "--instance", instance, "--worker-command", WORKER, *R,
             "--now", str(now), *extra)
 
 
-def _land_batch(w, b, *extra, now=T0):
-    """`afk land --batch` as the batch worker runs it: in the batch's worktree."""
-    return w.afk("land", "--batch", b["batch"], *R, "--now", str(now), *extra, cwd=b["worktree"])
+def _land_train(w, twt, *extra, now=T0):
+    """`afk land --train` as the train worker runs it: in the train's worktree."""
+    return w.afk("land", "--train", *R, "--now", str(now), *extra, cwd=twt)
+
+
+def _gate_train(w, wt, *gate, now=T0):
+    """`afk gate --train` as a worker runs it where a train runs: its own gate
+    run, with what its PR will land behind merged in first."""
+    return w.afk("gate", "--train", *R, "--now", str(now), *gate, cwd=wt)
 
 
 def _target(w):
     return w.sb.remote_ref(f"refs/heads/{w.sb.base}")
+
+
+def _line(w):
+    """The landing train's tip on the remote ("" when no train ever ran)."""
+    return w.sb.remote_ref(afk_decide.train_refs("refs/afk", w.sb.base)[0])
+
+
+def _red(w):
+    return w.sb.remote_ref(afk_decide.train_refs("refs/afk", w.sb.base)[1])
 
 
 def _history(w, since):
@@ -4268,310 +4304,15 @@ def _history(w, since):
     return [tuple(x.strip() for x in row.split("\t")) for row in p.stdout.split("\0") if row.strip()]
 
 
-def _batch_rows(w, gate, instance="me"):
-    ws = w.afk("rebuild", "--instance", instance, *R, *NOW, *gate)
-    return ({m["number"]: (m["status"], (m["batch"] or {}).get("phase"), m["unbatched"])
-             for m in ws["mine"]}, ws["merge_order"], ws["batches"])
+def _statuses(w, gate, instance="me", now=T0):
+    ws = w.afk("rebuild", "--instance", instance, *R, "--now", str(now), *gate)
+    assert ws["merge_order"] == []            # where a train runs nobody waits for a turn
+    return {m["number"]: m["status"] for m in ws["mine"]}
 
 
-def test_a_merge_batch_lands_three_prs_behind_one_gate_run():
-    """The whole of a batch: three finished PRs that do not conflict take ONE
-    landing turn together. A batch worker — in a worktree of the batch's own —
-    stacks them on the target with one merge commit each, runs the gate once on
-    the stack, and pushes the stack to the target as a fast-forward. Each PR's
-    own head is then on the target, so GitHub shows it merged; the next cycle settles
-    the claims and removes every worktree, the batch's included."""
-    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2, 3, 4)]) as w:
-        # green ONLY on the three together: what is gated is the stack, not a PR
-        gate = _counted(w, "test -f feature1.txt && test -f feature2.txt && test -f feature3.txt")
-        d = {n: with_pr(w, n, n * 10, gate=gate) for n in (3, 1, 2)}
-        with_pr(w, 4, 40, instance="peer", gate=gate)                  # a peer's: never mine to batch
-        w.afk("heartbeat", "--instance", "peer", *NOW, *R)
-        base0 = _target(w)
-        assert _batch_rows(w, gate) == (
-            {n: ("awaiting_turn", None, None) for n in (1, 2, 3)}, [1, 2, 3], [])
-        told = [len(t["sent"]) for t in w.terminals()]
-        w.orca_calls()
-
-        b = w.afk(*_turn_batch(*gate))
-        batch, bwt = b["batch"], b["worktree"]
-        assert b == {"outcome": "granted", "batch": batch, "issues": [1, 2, 3],
-                     "prs": [10, 20, 30], "again": False, "delivery": "fresh",
-                     "terminal": b["terminal"], "worktree": bwt}, b
-        # a worktree of the batch's own, at the target's tip, linked to no issue —
-        # and a worker of its own, started with the run's launch command
-        [row] = [x for x in w.worktrees() if x["path"] == bwt]
-        assert row["linkedIssue"] is None and git(bwt, "rev-parse", "HEAD") == base0
-        assert w.terminals()[-1]["command"] == WORKER and w.terminals()[-1]["handle"] == b["terminal"]
-        # no member's worker was told anything; no member's branch was touched
-        assert [len(t["sent"]) for t in w.terminals()[:-1]] == told
-        for n in (1, 2, 3):
-            assert w.sb.remote_ref(f"refs/heads/{d[n][0]['branch']}") == d[n][1]
-        # the turn is ONE marker on every member PR, naming the batch and its members
-        for p in (10, 20, 30):
-            [note] = _turns(w, p)
-            assert note.startswith(f"<!--afk:turn instance=me at={T0} batch={batch} "
-                                   f"members=1:10,2:20,3:30 phase=stacking-->\n"), note
-        assert _turns(w, 40) == []
-        # each member's status board names the batch's PRs and what it is doing
-        for n in (1, 2, 3):
-            assert "#10、#20、#30" in w.board(n) and "stacking" in w.board(n), w.board(n)
-        rows, order, batches = _batch_rows(w, gate)
-        assert rows == {n: ("landing", "stacking", None) for n in (1, 2, 3)}
-        assert order == [1, 2, 3]
-        assert batches == [{"id": batch, "instance": "me", "phase": "stacking", "at": T0,
-                            "members": [{"issue": n, "pr": n * 10} for n in (1, 2, 3)]}]
-
-        # while a batch holds the turn nothing else is granted — not to a member,
-        # not to another batch; and a member's own worker cannot land its PR
-        r = w.afk(*_turn(2, *gate))
-        assert (r["outcome"], r["holder"]) == ("waiting", 1), r
-        assert w.afk(*_turn_batch(*gate, now=T0 + 5))["outcome"] == "landing"
-        assert "does not hold the landing turn" in _land_error(w, 2, d[2][0]["worktree"], *gate)
-        assert len(_turns(w, 20)) == 1 and _gate_runs(w) == 0
-
-        # the batch brief names ONE command, carrying the run's config — and that
-        # line, as written, stacks, gates and lands the batch
-        brief = _brief(bwt)
-        assert not re.search(r"\{[a-z_]+\}", brief.split("--config")[0])
-        for p in (10, 20, 30):
-            assert f"#{p}" in brief
-        [line] = [ln.strip() for ln in brief.splitlines() if " land --batch " in ln]
-        assert line.startswith(f"{AFK} land --batch {batch} --repo {REPO} --config ")
-        p = subprocess.run(line, shell=True, cwd=bwt, capture_output=True, text=True, env=w.env)
-        assert p.returncode == 0, p.stdout + p.stderr
-        r = json.loads(p.stdout)
-        tip = _target(w)
-        landed = _history(w, base0)
-        # the target's history: one merge commit per PR, in merge order, each
-        # naming its PR and closing its issue — and bringing the PR's own head
-        assert [(s, body) for _, s, body in landed] == [
-            (f"feature {n} (#{n * 10})", f"Closes #{n}") for n in (1, 2, 3)]
-        assert landed[-1][0] == tip == r["head"]
-        assert git(w.cwd, "fetch", "-q", "origin", w.sb.base) == "" and \
-            [git(w.cwd, "rev-parse", f"{sha}^2") for sha, _, _ in landed] == \
-            [d[n][1] for n in (1, 2, 3)]
-        assert {"feature1.txt", "feature2.txt", "feature3.txt"} <= w.remote_files(w.sb.base)
-        # ONE gate run for three PRs, and the outcome says exactly what happened
-        assert _gate_runs(w) == 1
-        assert r == {"outcome": "landed", "batch": batch, "issues": [1, 2, 3],
-                     "prs": [10, 20, 30], "left_out": [], "fix_commits": 0,
-                     "head": tip, "target": w.sb.base, "detail": r["detail"], "unmerged": [],
-                     "landed": [{"issue": n, "pr": n * 10, "commit": landed[i][0]}
-                                for i, n in enumerate((1, 2, 3))]}, r
-        # every PR reads MERGED — by GitHub itself, since its head is on the target:
-        # nobody closed it and nobody commented; every issue is closed; its branch is gone
-        for n in (1, 2, 3):
-            assert w.pr(n * 10)["state"] == "merged"
-            assert w.pr(n * 10)["merged"] == {"pushed": True, "head": d[n][1]}
-            assert str(n * 10) not in w.state().get("pr_comments", {})
-            assert w.issue(n)["state"] == "closed"
-            assert not w.sb.remote_ref(f"refs/heads/{d[n][0]['branch']}")
-            assert "已合并,完成" in w.board(n)
-        assert w.pr(40).get("state", "open") == "open" and w.issue(4)["state"] == "open"
-        # run again (the worker was cut off before it read the result): nothing moves
-        again = _land_batch(w, b, *gate)
-        assert (again["outcome"], again["landed"]) == ("landed", r["landed"])
-        assert _target(w) == tip and _gate_runs(w) == 1
-
-        # `afk rebuild` after a batch: none of its PRs open, failed or abandoned
-        ws = w.afk("rebuild", *ME, *R, *NOW, *gate)
-        assert [(m["number"], m["status"], m["pr"]) for m in ws["mine"]] == \
-            [(n, "closed", None) for n in (1, 2, 3)]
-        assert (ws["batches"], ws["merge_order"]) == ([], [])
-        # the next cycle releases the claims and removes the members' worktrees
-        # and the batch's — and the batch's pushed branch is gone
-        c = cycle(w, None, *gate)
-        assert c["judgments"] == [] and "errors" not in c, c
-        assert c["progress"] == "cleared #1, #2, #3; 0 in flight, 0 left on the frontier"
-        assert [w.claimed_by(n) for n in (1, 2, 3)] == [None] * 3
-        assert [x["linkedIssue"] for x in w.worktrees()] == [4] and not os.path.isdir(bwt)
-        assert not [ref for ref in w.sb.all_refs() if "afk-batch" in ref]
-        assert w.afk("rebuild", *ME, *R, *NOW, *gate)["mine"] == []
-
-
-def test_prs_landed_one_after_another_leave_one_merge_commit_each_and_no_sync_merge():
-    """ADR-0046. Where merge batches form, a PR that lands alone lands like a
-    batch of one: stacked on the target's tip, gated there, pushed as a
-    fast-forward. Three clean PRs landed one after another — the target moving
-    under the second and the third — put three merge commits on the target's own
-    line and not one sync merge on a branch."""
-    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2, 3)]) as w:
-        # green only on everything landed so far: each run is of a stack, not a branch
-        gate = _counted(w, "test -f feature1.txt")
-        d = {n: with_pr(w, n, n * 10, gate=gate) for n in (1, 2, 3)}
-        base0 = _target(w)
-        # a landing killed mid-gate left #3's worktree on its stack: the next one
-        # starts from the branch all the same
-        git(d[3][0]["worktree"], "checkout", "-q", "--detach", base0)
-        for n in (1, 2, 3):
-            (started, head), tip = d[n], _target(w)
-            assert w.afk(*_turn(n, *gate))["outcome"] == "granted"
-            r = _land(w, n, started["worktree"], *gate)
-            assert (r["outcome"], r["synced"], r["head"], r["commit"]) == \
-                ("merged", False, head, _target(w)), r
-            # the PR's head was never moved, and is the merge's second parent: GitHub
-            # shows the PR merged, its issue is closed and its branch deleted
-            assert w.pr(n * 10)["merged"] == {"pushed": True, "head": head}
-            assert w.issue(n)["state"] == "closed"
-            assert not w.sb.remote_ref(f"refs/heads/{started['branch']}")
-            git(w.cwd, "fetch", "-q", "origin", w.sb.base)
-            assert git(w.cwd, "log", "-1", "--format=%P", r["commit"]).split() == [tip, head]
-            assert git(started["worktree"], "rev-parse", "--abbrev-ref", "HEAD") == started["branch"]
-            # …and the next pass releases the claim, as for a batch member
-            assert _mine(w, gate, n)[0] == "closed"
-            assert w.afk("release", str(n), *ME, *R, *gate)["released"] is True
-            assert w.claimed_by(n) is None
-        assert _gate_runs(w) == 3
-        # the target's own line: three merge commits, one per PR…
-        assert [(s, b) for _, s, b in _history(w, base0)] == \
-            [(f"feature {n} (#{n * 10})", f"Closes #{n}") for n in (1, 2, 3)]
-        # …and everything they brought is the PRs' own work: no `Merge commit '<sha>'
-        # into <branch>`, no merge at all but those three
-        everything = git(w.cwd, "log", "--format=%s", f"{base0}..{_target(w)}").splitlines()
-        assert sorted(everything) == sorted(
-            [f"feature {n} (#{n * 10})" for n in (1, 2, 3)] +
-            [f"work: feature{n}.txt" for n in (1, 2, 3)]), everything
-        assert len(git(w.cwd, "rev-list", "--merges", f"{base0}..{_target(w)}").split()) == 3
-
-
-def test_a_pr_stacked_alone_whose_finishing_was_cut_is_settled_by_the_next_pass():
-    """A PR stacked alone lands by a push, like a batch member, so what follows
-    the push can be cut the same two ways — and is settled the same way, from the
-    commit on the target (ADR-0046)."""
-    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
-        gate = _counted(w)
-        d = {n: with_pr(w, n, n * 10, gate=gate) for n in (1, 2)}
-
-        # GitHub never shows the PR merged: its branch is left, and the release
-        # closes the PR with the commit that landed it
-        w.afk(*_turn(1, *gate))
-        w.set(pushes_never_merge=True)
-        r = _land(w, 1, d[1][0]["worktree"], *gate, "--merged-timeout", "0")
-        assert r["outcome"] == "merged" and r["commit"] == _target(w), r
-        assert w.issue(1)["state"] == "closed" and w.pr(10).get("state", "open") == "open"
-        assert w.sb.remote_ref(f"refs/heads/{d[1][0]['branch']}") == d[1][1]
-        assert w.afk("release", "1", *ME, *R, *gate)["closed_pr"] == 10
-        [said] = w.state()["pr_comments"]["10"]
-        assert r["commit"] in said and "stacked on it as one merge commit" in said
-        assert w.pr(10)["state"] == "closed"
-        assert not w.sb.remote_ref(f"refs/heads/{d[1][0]['branch']}")
-        w.set(pushes_never_merge=False)
-
-        # cut after the push, before the issue was closed — on a target GitHub
-        # closes no issue for: the claim reads `landed`, never a worker to ask after
-        w.afk(*_turn(2, *gate))
-        w.set(default_branch="some-other-branch", fail=["issue close"])
-        assert "issue close" in _land_error(w, 2, d[2][0]["worktree"], *gate)
-        w.set(fail=[])
-        assert w.pr(20)["state"] == "merged" and w.issue(2)["state"] == "open"
-        assert _mine(w, gate, 2)[0] == "landed"
-        assert w.afk("release", "2", *ME, *R, *gate)["released"] is True
-        assert w.issue(2)["state"] == "closed" and w.claimed_by(2) is None
-
-
-def test_a_batched_pr_github_does_not_show_merged_keeps_its_branch_and_is_closed_by_the_next_cycle():
-    """GitHub marks a batched PR merged a moment after the push, by itself. The
-    landing waits for that before it deletes the PR's branch — deleted first, the
-    PR would read closed. One GitHub still shows open when the wait runs out is
-    left as it is, and the next cycle's release closes it, naming its commit."""
-    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
-        gate = _counted(w)
-        d = {n: with_pr(w, n, n * 10, gate=gate) for n in (1, 2)}
-        base0 = _target(w)
-        b = w.afk(*_turn_batch(*gate))
-        w.set(pushes_never_merge=True)
-        r = _land_batch(w, b, *gate, "--merged-timeout", "0")
-        assert (r["outcome"], r["prs"], r["unmerged"]) == ("landed", [10, 20], [10, 20]), r
-        landed = _history(w, base0)
-        assert [s for _, s, _ in landed] == ["feature 1 (#10)", "feature 2 (#20)"]
-        # the stack is on the target and the issues are closed — the PRs and their
-        # branches are untouched
-        for n in (1, 2):
-            assert w.issue(n)["state"] == "closed"
-            assert w.pr(n * 10).get("state", "open") == "open"
-            assert w.sb.remote_ref(f"refs/heads/{d[n][0]['branch']}") == d[n][1]
-        # still open a cycle later: the release closes each, with its commit
-        c = cycle(w, None, *gate)
-        assert c["progress"] == "cleared #1, #2; 0 in flight, 0 left on the frontier" and \
-            "errors" not in c, c
-        for i, n in enumerate((1, 2)):
-            assert w.pr(n * 10)["state"] == "closed"
-            [said] = w.state()["pr_comments"][str(n * 10)]
-            assert landed[i][0] in said and f"`{b['batch']}`" in said and "#10, #20" in said
-            assert not w.sb.remote_ref(f"refs/heads/{d[n][0]['branch']}")
-
-
-def _line_repo(root):
-    """A throwaway repo whose `main` is a target's own line → (path, commit,
-    stack): `commit(subject, body)` puts one plain commit on it, and
-    `stack(title, pr, issue)` one PR the way a batch stacks it — a merge commit
-    with `afk_decide.stack_message`. Each returns the commit it made."""
-    path, n = str(root), iter(range(10 ** 6))
-    git(path, "init", "-q", "--initial-branch=main")
-
-    def commit(subject, body=""):
-        git(path, "commit", "-q", "--allow-empty", "-m", subject, *(["-m", body] if body else []))
-        return git(path, "rev-parse", "HEAD")
-
-    def stack(title, pr, issue):
-        git(path, "checkout", "-q", "-b", f"pr-{pr}-{next(n)}")
-        commit(f"work for {pr}", f"Closes #{issue}")
-        git(path, "checkout", "-q", "main")
-        git(path, "merge", "-q", "--no-ff", "-m", afk_decide.stack_message(title, pr, issue), "-")
-        return git(path, "rev-parse", "HEAD")
-
-    commit("init")
-    return path, commit, stack
-
-
-def test_a_landed_commit_is_found_by_its_subject_whatever_came_after(tmp_path):
-    """What a batch landed is read from the target's own line: the merge commit
-    a PR was stacked with is the one whose SUBJECT ends ` (#<pr>)`. Nothing that
-    landed later hides it — not a revert that quotes the subject, not a fix
-    titled after the PR, not a message that mentions the PR or says it closes
-    the issue."""
-    path, commit, stack = _line_repo(tmp_path)
-    assert afk._landed_commit(path, "main", 10) is None and afk._landed_pr(path, "main", 1) is None
-    # a mention before the landing is not the landing
-    commit("get ready for feature (#10)", "Closes #1")
-    assert afk._landed_commit(path, "main", 10) is None and afk._landed_pr(path, "main", 1) is None
-    ten, twenty = stack("feature (#9)", 10, 1), stack("other", 20, 2)
-    found = (ten, twenty, 10, 20)
-
-    def read():
-        return (afk._landed_commit(path, "main", 10), afk._landed_commit(path, "main", 20),
-                afk._landed_pr(path, "main", 1), afk._landed_pr(path, "main", 2))
-
-    assert read() == found
-    for subject, body in [
-            ('Revert "feature (#9) (#10)"', "This reverts the commit.\n\nCloses #1"),
-            ("unrelated", "see feature (#10)\n\n (#10)\nCloses #1\nCloses #2"),
-            ("a fix on top of feature (#10)", "Closes #1"),
-            ("another (#20)", ""),
-            ("docs", "the stack's commit was `feature (#9) (#10)`")]:
-        commit(subject, body)
-        assert read() == found, subject
-    # a PR the batch did not stack is not found by the subject another one quotes
-    assert afk._landed_commit(path, "main", 9) is None
-    # the issue landed again, by a later batch: its newest landing is the one named
-    again = stack("feature, again", 30, 1)
-    assert read() == found[:2] + (30, 20) and afk._landed_commit(path, "main", 30) == again
-
-
-def test_a_fix_commit_titled_after_a_member_is_read_as_a_fix(tmp_path):
-    """A batch worktree's own line is read back as members and fixes: only a
-    merge commit is a member's. A fix whose subject ends in a member's
-    ` (#<pr>)` is carried as a fix — also when that member is not on the stack."""
-    path, commit, stack = _line_repo(tmp_path)
-    tip = git(path, "rev-parse", "HEAD")
-    ten, thirty = stack("feature 1", 10, 1), stack("feature 3", 30, 3)
-    fixes = [commit("make feature 1 pass with feature 3 (#10)"),
-             commit("what feature 2 needed (#20)", "Closes #2"),      # 20 was left out
-             commit("make the stack green")]
-    line = afk._own_line(path, f"{tip}..HEAD")
-    assert [sha for sha, _, _ in line] == [ten, thirty, *fixes]
-    assert afk_decide.read_stack(line, {10, 20, 30}) == ({10: ten, 30: thirty}, fixes)
+def _train_worktree(w):
+    [path] = [x["path"] for x in w.worktrees() if x["linkedIssue"] is None]
+    return path
 
 
 def _fleet_files(wt):
@@ -4580,511 +4321,350 @@ def _fleet_files(wt):
                   if f.startswith("afk-"))
 
 
-def _github_reads(calls):
-    """The gh calls that only read GitHub, each as the thing it read → sorted."""
-    return sorted(c[1] if c[0] == "pr" else c[-3].split("/issues/")[1] if "--paginate" in c
-                  else "issue " + c[1].split("/issues/")[1]
-                  for c in calls if c[:2] == ["pr", "list"] or (c[0] == "api" and "--method" not in c))
-
-
-def _the_batch(w, gate):
-    """The batch that holds my turn, as its worker knows it → {"batch", "worktree"}."""
-    [batch] = w.afk("rebuild", *ME, *R, *NOW, *gate)["batches"]
-    [path] = [x["path"] for x in w.worktrees() if x["linkedIssue"] is None]
-    return {"batch": batch["id"], "worktree": path}
-
-
 def _resolve(w, wt, name, text):
-    """A worker resolving the sync conflict its landing stopped on, and committing it."""
+    """A worker resolving the conflict its landing stopped on, and committing it."""
     with open(os.path.join(wt, name), "w") as f:
         f.write(text + "\n")
     git(wt, "add", name)
     git(wt, "commit", "-qm", f"merge: resolve {name}")
 
 
-def test_a_pr_that_conflicts_with_the_stack_is_left_out_and_never_batched_again():
-    """Five ready PRs, three of which rewrite one file. Driven by `afk cycle`
-    alone: the batch lands the three that stack — behind ONE gate run — and leaves
-    the two that conflict out. Those take single landing turns, and neither
-    holds its turn while it resolves (ADR-0045): each gives it up on its
-    conflict, is fixed off the turn, and lands on its next one — the second of
-    them resolving once more, against what the first landed meanwhile. Neither
-    is ever put in a batch again, not even beside a fresh PR that could be."""
-    with world(issues=[issue(n, "ready-for-agent") for n in range(1, 6)]) as w:
-        gate = (*_counted(w), "--set", "concurrency=6")
-        d = {}
-        for n in (1, 2, 3):
-            d[n] = with_pr(w, n, n * 10, name="shared.txt", text=f"from #{n}", gate=gate)[0]
-        for n in (4, 5):
-            d[n] = with_pr(w, n, n * 10, gate=gate)[0]
+def test_three_prs_that_join_during_one_gate_run_land_behind_the_next():
+    """The whole of the train. A finished PR joins without a turn: its head is
+    merged onto the train's tip as one merge commit and pushed — seconds, and no
+    gate. The train's own worker gates the train as it stands and lands it; the
+    three PRs that joined WHILE that run was going land behind the very next
+    one. Four PRs, two gate runs."""
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2, 3, 4)]) as w:
+        gate = _counted(w)
+        d = {n: with_pr(w, n, n * 10, gate=gate) for n in (1, 2, 3, 4)}
+        wt = {n: d[n][0]["worktree"] for n in d}
         base0 = _target(w)
+        # no PR waits for a turn, and none is given one: joining is the worker's own step
+        assert _statuses(w, gate) == {n: "joining" for n in d}
+        err = w.error(*_turn(1, *gate))
+        assert "no PR is given a landing turn" in err and _turns(w, 10) == []
+        assert w.afk(*_turn_train(*gate))["outcome"] == "idle" and len(w.worktrees()) == 4
 
+        r = _land(w, 1, wt[1], *gate)
+        tip1 = _line(w)
+        assert r == {"issue": 1, "pr": 10, "head": d[1][1], "outcome": "joined", "commit": tip1,
+                     "again": False, "detail": r["detail"]}, r
+        # the join is ONE merge commit on the target's tip: the PR's head its second
+        # parent, its message naming the PR and closing the issue. Nothing else moved:
+        # no marker, no gate run, the branch and the target where they were
+        git(w.cwd, "fetch", "-q", "origin", f"{afk_decide.train_refs('refs/afk', w.sb.base)[0]}:refs/t")
+        assert git(w.cwd, "log", "-1", "--format=%P|%s|%b", tip1).strip() == \
+            f"{base0} {d[1][1]}|feature 1 (#10)|Closes #1"
+        assert _turns(w, 10) == [] and _gate_runs(w) == 0 and _target(w) == base0
+        assert w.sb.remote_ref(f"refs/heads/{d[1][0]['branch']}") == d[1][1]
+        assert "已并入落地列车" in w.board(1), w.board(1)
+        assert _statuses(w, gate) == {1: "joined", 2: "joining", 3: "joining", 4: "joining"}
+        # run again (the worker was cut off before it read the result): the same joining
+        again = _land(w, 1, wt[1], *gate)
+        assert (again["outcome"], again["commit"], again["again"]) == ("joined", tip1, True)
+        assert _line(w) == tip1
+
+        # the tick puts the train's worker on it: a worktree of the train's own,
+        # linked to no issue, and a worker started with the run's launch command
+        t = w.afk(*_turn_train(*gate))
+        twt = t["worktree"]
+        assert t == {"train": "refs/afk/train/line/main", "tip": tip1, "outcome": "granted",
+                     "delivery": "worker", "terminal": t["terminal"], "worktree": twt}, t
+        assert twt == _train_worktree(w) and os.path.basename(twt) == afk_decide.TRAIN_WORKTREE
+        assert w.terminals()[-1]["command"] == WORKER and w.terminals()[-1]["handle"] == t["terminal"]
+        assert _fleet_files(twt) == ["afk-train-told.json", "afk-worker-prompt.md"]
+        # the train brief names ONE command, carrying the run's config
+        brief = _brief(twt)
+        assert not re.search(r"\{[a-z_]+\}", brief.split("--config")[0])
+        [line] = [ln.strip() for ln in brief.splitlines() if " land --train " in ln]
+        assert line.startswith(f"{AFK} land --train --repo {REPO} --config ")
+        # told about this tip already: while its terminal is busy it is at work…
+        w.worker(output=T0, state="working", since=T0)
+        assert w.afk(*_turn_train(*gate))["outcome"] == "landing"
+
+        # #2, #3 and #4 join WHILE the train's gate runs on #1
+        _during_the_gate(w, *((wt[n], _join_argv(n, *gate)) for n in (2, 3, 4)))
+        p = subprocess.run(line, shell=True, cwd=twt, capture_output=True, text=True, env=w.env)
+        assert p.returncode == 0, p.stdout + p.stderr
+        r = json.loads(p.stdout)
+        assert (r["outcome"], r["commit"], r["prs"], r["gate"]["source"], r["more"]) == \
+            ("landed", tip1, [10], "run", True), r
+        assert r["landed"] == [{"issue": 1, "pr": 10, "commit": tip1}] and r["unmerged"] == []
+        assert _gate_runs(w) == 1 and _target(w) == tip1
+        assert w.pr(10)["merged"] == {"pushed": True, "head": d[1][1]}
+        assert w.issue(1)["state"] == "closed" and "已合并,完成" in w.board(1)
+        assert not w.sb.remote_ref(f"refs/heads/{d[1][0]['branch']}")
+        # the three are on the train, in the order they joined, behind what just landed
+        assert _statuses(w, gate) == {1: "closed", 2: "joined", 3: "joined", 4: "joined"}
+        for n in (2, 3, 4):
+            assert w.pr(n * 10).get("state", "open") == "open"
+
+        # …and they land behind the NEXT run: one more, for all three
+        r = _land_train(w, twt, *gate)
+        tip = _target(w)
+        assert (r["outcome"], r["commit"], r["prs"], r["more"]) == ("landed", tip, [20, 30, 40], False)
+        assert _gate_runs(w) == 2
+        landed = _history(w, base0)
+        assert [(s, body) for _, s, body in landed] == [
+            (f"feature {n} (#{n * 10})", f"Closes #{n}") for n in (1, 2, 3, 4)]
+        assert r["landed"] == [{"issue": n, "pr": n * 10, "commit": landed[n - 1][0]}
+                               for n in (2, 3, 4)]
+        git(w.cwd, "fetch", "-q", "origin", w.sb.base)
+        assert [git(w.cwd, "rev-parse", f"{sha}^2") for sha, _, _ in landed] == \
+            [d[n][1] for n in (1, 2, 3, 4)]
+        for n in (2, 3, 4):
+            assert w.pr(n * 10)["merged"] == {"pushed": True, "head": d[n][1]}
+            assert str(n * 10) not in w.state().get("pr_comments", {})
+            assert w.issue(n)["state"] == "closed"
+            assert not w.sb.remote_ref(f"refs/heads/{d[n][0]['branch']}")
+        # nothing is left on the train: the worker is told so, and stops
+        r = _land_train(w, twt, *gate)
+        assert (r["outcome"], _gate_runs(w), _target(w)) == ("idle", 2, tip)
+        assert w.afk(*_turn_train(*gate))["outcome"] == "idle"
+
+        # the next cycle releases the claims and removes the PRs' worktrees. The
+        # train's worktree is the repo's: it is kept, with whatever its runs built
         c = cycle(w, None, *gate)
         assert c["judgments"] == [] and "errors" not in c, c
-        assert c["progress"].startswith("landing turn to #1, #2, #3, #4, #5; "), c["progress"]
-        b = _the_batch(w, gate)
-        r = _land_batch(w, b, *gate)
-        assert (r["outcome"], r["issues"], r["prs"]) == ("landed", [1, 4, 5], [10, 40, 50]), r
-        assert r["left_out"] == [{"issue": n, "pr": n * 10, "reason": "conflict",
-                                  "files": ["shared.txt"]} for n in (2, 3)]
-        assert [s for _, s, _ in _history(w, base0)] == [f"feature {n} (#{n * 10})" for n in (1, 4, 5)]
-        assert _gate_runs(w) == 1
-        # a PR left out is untouched — open, its branch where it was — and its
-        # marker says it left: it holds no turn and waits for one of its own
-        for n in (2, 3):
-            assert w.pr(n * 10).get("state", "open") == "open" and w.issue(n)["state"] == "open"
-            [note] = _turns(w, n * 10)
-            assert note.startswith(f"<!--afk:turn instance=me at={T0} unbatched=left_out "
-                                   f"of={b['batch']} released=1-->\n"), note
-            assert "排队等落地轮次" in w.board(n)
-        rows, order, batches = _batch_rows(w, gate)
-        assert rows == {1: ("closed", None, None), 4: ("closed", None, None),
-                        5: ("closed", None, None), 2: ("awaiting_turn", None, "left_out"),
-                        3: ("awaiting_turn", None, "left_out")}
-        assert (order, batches) == ([2, 3], [])
+        assert c["progress"] == "cleared #1, #2, #3, #4; 0 in flight, 0 left on the frontier"
+        assert [w.claimed_by(n) for n in d] == [None] * 4
+        assert [x["path"] for x in w.worktrees()] == [twt] and os.path.isdir(twt)
+        assert w.afk("rebuild", *ME, *R, *NOW, *gate)["mine"] == []
 
-        # two PRs wait and the option is on — but both left a batch: ONE gets the turn
-        assert w.afk(*_turn_batch(*gate))["outcome"] == "too_few"
-        c = cycle(w, c["state"], *gate)
-        assert c["progress"].startswith("landing turn to #2; cleared #1, #4, #5; "), c["progress"]
-        [note] = _turns(w, 20)
-        assert note.startswith(f"<!--afk:turn instance=me at={T0} unbatched=left_out "
-                               f"of={b['batch']}-->\n"), note
-        assert "released=1" in _turns(w, 30)[0]
-        assert not os.path.isdir(b["worktree"])                       # the batch's worktree is gone
-        # …and its own worker meets the conflict — which gives the turn up: the next
-        # cycle (the worker's wake) hands it to #3 while #2 is being resolved
-        wt2, wt3 = d[2]["worktree"], d[3]["worktree"]
-        r = _land(w, 2, wt2, *gate)
-        assert (r["files"], r["turn"]) == (["shared.txt"], "given_up"), r
-        c = tick(w, c["state"], *gate)
-        assert c["progress"].startswith("landing turn to #3; "), c["progress"]
-        assert _land(w, 3, wt3, *gate)["turn"] == "given_up"
-        # both are being fixed off the turn: no turn is out, and nobody waits in the queue
-        c = tick(w, c["state"], *gate)
-        rows, order, _ = _batch_rows(w, gate)
-        assert (rows[2][0], rows[3][0], order) == ("fixing", "fixing", [])
+
+def test_a_train_of_one_lands_on_its_workers_own_gate_run():
+    """One PR, nothing else in flight. Its worker's own gate run is of the tree
+    it joins the train with, so the train needs no run of its own: one run in
+    all, and the PR lands as one merge commit on the target."""
+    with world(issues=[issue(1, "ready-for-agent")]) as w:
+        gate = _counted(w, "test -f feature1.txt")
+        d, head = with_pr(w, 1, 10, gate=gate)
+        base0 = _target(w)
+        # the worker's brief has it gate with the train merged in, and join by itself
+        brief = _brief(d["worktree"])
+        assert " gate --train --repo acme/widgets --config " in brief
+        assert f" land --issue 1 --repo {REPO} --config " in brief and "| `joined` |" in brief
+        g = _gate_train(w, d["worktree"], *gate)
+        assert (g["status"], g["recorded"], g["merged"], g["head"]) == ("green", True, base0, head)
+        assert _land(w, 1, d["worktree"], *gate)["outcome"] == "joined"
+
+        # a cycle starts the train worker, and leaves the PR's own worker alone
+        told = [len(t["sent"]) for t in w.terminals()]
+        c = cycle(w, None, *gate)
         assert "errors" not in c and c["judgments"] == [], c
-
-        # #2 is resolved first: ready again off the turn, where no gate runs
-        # (ADR-0047), then gated and landed on its next one
-        _resolve(w, wt2, "shared.txt", "from #1 and #2")
-        assert _land(w, 2, wt2, *gate)["outcome"] == "awaiting_turn" and _gate_runs(w) == 1
-        c = tick(w, c["state"], *gate)
-        assert c["progress"].startswith("landing turn to #2; "), c["progress"]
-        r = _land(w, 2, wt2, *gate)
-        assert (r["outcome"], r["gate"]["source"], _gate_runs(w)) == ("merged", "run", 2), r
-
-        # #3 was resolved against a target that did not hold #2 yet. Off the turn its
-        # landing syncs again and meets #2: the one more resolution giving a turn up
-        # may cost — made without holding anybody back
-        _resolve(w, wt3, "shared.txt", "from #1 and #3")
-        r = _land(w, 3, wt3, *gate)
-        assert (r["outcome"], r["files"], r["turn"]) == ("conflict", ["shared.txt"], "given_up"), r
-        _resolve(w, wt3, "shared.txt", "from #1, #2 and #3")
-        # a fresh PR turns up beside it: still no batch — ready again, #3 goes first
-        w.set(issues=w.state()["issues"] + [issue(6, "ready-for-agent")])
-        with_pr(w, 6, 60, gate=gate)
-        assert _land(w, 3, wt3, *gate)["outcome"] == "awaiting_turn"
-        c = tick(w, c["state"], *gate)
-        assert c["progress"].startswith("landing turn to #3; cleared #2; "), c["progress"]
-        assert _turns(w, 60) == [] and _batch_rows(w, gate)[2] == []
-        assert _land(w, 3, wt3, *gate)["outcome"] == "merged"
-        c = cycle(w, c["state"], *gate)
-        assert c["progress"].startswith("landing turn to #6; cleared #3; "), c["progress"]
-        # five PRs landed behind three gate runs, where single turns take five
-        assert _gate_runs(w) == 3
-
-
-def test_a_red_batch_lands_nothing_and_is_repaired_with_a_fix_commit_on_top():
-    """The gate is red on the stack: nothing lands, and nobody hunts for the PR at
-    fault — the batch worker fixes the stack with one more commit, the gate runs
-    again on stack + fix, and the batch lands WITH the fix commit. The target is
-    never at a commit the gate did not pass on."""
-    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
-        during = os.path.join(w.sb.root, "during.json")
-        gate = _counted(w, f'cp "$AFK_FAKE_GH" {during} && test -f fix.txt')
-        for n in (1, 2):
-            with_pr(w, n, n * 10, gate=gate)
-        base0 = _target(w)
-        b = w.afk(*_turn_batch(*gate))
-        batch, bwt = b["batch"], b["worktree"]
-
-        r = _land_batch(w, b, *gate, now=T0 + 10)
-        assert (r["outcome"], r["issues"], r["fix_commits"]) == ("gate_red", [1, 2], 0), r
-        assert (r["gate"]["status"], r["gate"]["exit_code"]) == ("red", 1)
-        # nothing landed: the target is where it was, every PR and issue open
-        assert _target(w) == base0
-        assert [w.pr(p).get("state", "open") for p in (10, 20)] == ["open", "open"]
-        assert [w.issue(n)["state"] for n in (1, 2)] == ["open", "open"]
-        # the stack is durable on the batch's own branch: one merge commit per PR
-        [ref] = [x for x in w.sb.all_refs() if "afk-batch" in x]
-        assert w.sb.remote_ref(ref) == r["head"] == git(bwt, "rev-parse", "HEAD")
-        assert git(bwt, "log", "--first-parent", "--format=%s", f"{base0}..HEAD").splitlines() == \
-            ["feature 2 (#20)", "feature 1 (#10)"]
-        # WHILE the gate ran, each PR's marker and each issue's board said so
-        with open(during) as f:
-            seen = json.load(f)["comments"]
-        assert f"batch={batch} members=1:10,2:20 phase=gating-->" in seen["10"][0]["body"]
-        assert all("gating" in c["body"] for c in seen["2"] if afk_decide.STATUS_MARKER in c["body"])
-        # …and now they say it is being fixed — no attempt spent, no PR failed
-        for p in (10, 20):
-            [note] = _turns(w, p)
-            assert note.startswith(f"<!--afk:turn instance=me at={T0 + 10} batch={batch} "
-                                   f"members=1:10,2:20 phase=fixing-->\n"), note
-        assert "being fixed" in w.board(1) and "#10、#20" in w.board(2)
-        assert _batch_rows(w, gate)[0] == {1: ("landing", "fixing", None),
-                                           2: ("landing", "fixing", None)}
-        assert w.issue(1)["labels"] == ["ready-for-agent"]
-
-        # a fix that is not committed is not what would land
-        with open(os.path.join(bwt, "feature1.txt"), "a") as f:
-            f.write("half a fix\n")
-        assert "uncommitted" in w.error("land", "--batch", batch, *R, *NOW, *gate, cwd=bwt)
-        git(bwt, "checkout", "-q", "--", "feature1.txt")
-        assert _target(w) == base0 and _gate_runs(w) == 1
-
-        # the fix: ONE more commit on top of the stack — then the same command
-        fix = w.work(bwt, "fix.txt", push=False)
-        r = _land_batch(w, b, *gate, now=T0 + 20)
-        assert (r["outcome"], r["issues"], r["fix_commits"], r["left_out"]) == \
-            ("landed", [1, 2], 1, []), r
-        landed = _history(w, base0)
-        assert [s for _, s, _ in landed] == ["feature 1 (#10)", "feature 2 (#20)", "work: fix.txt"]
-        assert landed[-1][0] == _target(w) == r["head"] and fix != r["head"]
-        assert [m["commit"] for m in r["landed"]] == [landed[0][0], landed[1][0]]
-        assert _gate_runs(w) == 2 and "fix.txt" in w.remote_files(w.sb.base)
-        assert [w.pr(p)["state"] for p in (10, 20)] == ["merged", "merged"]
-        assert not [x for x in w.sb.all_refs() if "afk-batch" in x]
-
-
-def test_a_batch_lands_only_on_a_gate_run_of_the_committed_stack():
-    """#109. A merge batch's landing holds to the same rule as a single one: the
-    stack is gated only as a commit, before the run and after it."""
-    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
-        gate = _counted(w)
-        for n in (1, 2):
-            with_pr(w, n, n * 10, gate=gate)
-        base0 = _target(w)
-        b = w.afk(*_turn_batch(*gate))
-        bwt = b["worktree"]
-
-        def refused(gate, path, ran):
-            before = _gate_runs(w)
-            err = w.error("land", "--batch", b["batch"], *R, *NOW, *gate, cwd=bwt)
-            assert "not the commit that would land" in err and path in err, err
-            assert _gate_runs(w) == before + ran
-            assert _target(w) == base0 and _gate_refs(w) == set()
-            assert [w.pr(p).get("state", "open") for p in (10, 20)] == ["open", "open"]
-            return err
-
-        # an untracked file in the batch's worktree: the gate is not run
-        stray = os.path.join(bwt, "not-added.txt")
-        with open(stray, "w") as f:
-            f.write("the stack only passes with this\n")
-        assert "untracked" in refused(gate, "?? not-added.txt", ran=0)
-        os.remove(stray)
-        # a gate that rewrites a tracked file of the stack
-        assert "left the worktree" in refused(_counted(w, "echo fixed >> feature1.txt"),
-                                              "M feature1.txt", ran=1)
-        git(bwt, "checkout", "-q", "--", "feature1.txt")       # the worker discards it
-
-        # clean, it lands as before — the stack is rebuilt from the target's tip
-        r = _land_batch(w, b, *gate, now=T0 + 10)
-        assert (r["outcome"], r["issues"]) == ("landed", [1, 2]), r
-        assert _target(w) == r["head"]
-
-
-def test_a_target_that_moves_while_the_batch_gates_refuses_the_push():
-    """The fast-forward push IS the lock. Somebody lands on the target while the
-    batch's gate runs: the push is refused, nothing lands, and the same command
-    stacks the batch on the new tip and gates it again."""
-    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
-        seed, moved = os.path.join(w.sb.root, "seed"), os.path.join(w.sb.root, "moved")
-        gate = _counted(w, f"test -f {moved} || (touch {moved} && git -C {seed} push -q origin "
-                           f"HEAD:refs/heads/{w.sb.base})")
-        for n in (1, 2):
-            with_pr(w, n, n * 10, gate=gate)
-        base0 = _target(w)
-        git(seed, "pull", "-q", "origin", w.sb.base)                 # a commit someone else
-        with open(os.path.join(seed, "theirs.txt"), "w") as f:       # is about to land
-            f.write("theirs\n")
-        git(seed, "add", "-A")
-        git(seed, "commit", "-qm", "base: theirs.txt")
-        theirs = git(seed, "rev-parse", "HEAD")
-        b = w.afk(*_turn_batch(*gate))
-
-        r = _land_batch(w, b, *gate, now=T0 + 10)
-        assert (r["outcome"], r["issues"]) == ("target_moved", [1, 2]), r
+        twt = _train_worktree(w)
+        assert [len(t["sent"]) for t in w.terminals()[:len(told)]] == told
+        r = _land_train(w, twt, *gate)
+        assert (r["outcome"], r["prs"], r["gate"]["source"], r["more"]) == \
+            ("landed", [10], "recorded", False), r
         assert _gate_runs(w) == 1
-        # the target holds THEIR commit and nothing of the batch
-        assert _target(w) == theirs and "feature1.txt" not in w.remote_files(w.sb.base)
-        assert [w.pr(p).get("state", "open") for p in (10, 20)] == ["open", "open"]
-        assert [w.issue(n)["state"] for n in (1, 2)] == ["open", "open"]
-        assert _batch_rows(w, gate)[0] == {1: ("landing", "stacking", None),
-                                           2: ("landing", "stacking", None)}
+        [(sha, subject, body)] = _history(w, base0)
+        assert (subject, body, sha) == ("feature 1 (#10)", "Closes #1", _target(w))
+        assert w.pr(10)["state"] == "merged" and w.issue(1)["state"] == "closed"
+        c = cycle(w, c["state"], *gate, now=T0 + 90)
+        assert c["progress"].startswith("cleared #1; "), c
+        assert [x["path"] for x in w.worktrees()] == [twt]
 
-        # run again: re-stacked on the new tip, gated again, landed
-        r = _land_batch(w, b, *gate, now=T0 + 20)
-        assert (r["outcome"], r["fix_commits"]) == ("landed", 0), r
-        assert [s for _, s, _ in _history(w, base0)] == \
-            ["base: theirs.txt", "feature 1 (#10)", "feature 2 (#20)"]
-        assert _gate_runs(w) == 2
-        assert {"theirs.txt", "feature1.txt", "feature2.txt"} <= w.remote_files(w.sb.base)
+    # with an adversarial verify every PR owes one of its own head: no train
+    # runs there, and a PR lands alone, on a turn (ADR-0027)
+    with world(issues=[issue(1, "ready-for-agent")]) as w:
+        on = (*_counted(w), "--set", "gate.adversarial_verify_prompt=re-derive it")
+        d, head = with_pr(w, 1, 10, gate=on)
+        assert "does not hold the landing turn" in _land_error(w, 1, d["worktree"], *on)
+        for refused in (_turn_train(*on), _abandon(*on)):
+            assert "no landing train runs under this config" in w.error(*refused)
+        assert "no landing train runs" in w.error("gate", "--train", *R, *NOW, *on,
+                                                  cwd=d["worktree"])
+        assert w.afk(*_turn(1, *on, "--verified", head))["outcome"] == "granted"
+        assert _land(w, 1, d["worktree"], *on)["outcome"] == "merged" and not _line(w)
 
 
-def test_land_batch_without_the_batchs_turn_changes_nothing():
-    """`afk land --batch` is refused — exit 3, nothing stacked, pushed or gated —
-    unless every member PR carries the batch's marker for the fleet instance
-    that holds its claim. And a batch abandoned WHILE its gate runs lands nothing."""
+def test_a_join_conflict_is_resolved_against_the_train_and_lands_without_a_second():
+    """A PR that conflicts with what is on the train has the train merged into
+    its branch, and its worker resolves that — against commits that are never
+    rewritten, so once. It then joins, and lands with the train: the train's
+    worker meets no conflict."""
     with world(issues=[issue(n, "ready-for-agent") for n in (1, 2, 3)]) as w:
         gate = _counted(w)
-        d = {n: with_pr(w, n, n * 10, gate=gate)[0] for n in (1, 2, 3)}
+        d1, h1 = with_pr(w, 1, 10, gate=gate, name="shared.txt", text="one")
+        d2, h2 = with_pr(w, 2, 20, gate=gate, name="shared.txt", text="two")
+        d3, h3 = with_pr(w, 3, 30, gate=gate, name="shared.txt", text="three")
         base0 = _target(w)
-        b = w.afk(*_turn_batch(*gate))
-        batch, bwt = b["batch"], b["worktree"]
-        marked = w.state()["comments"]
+        assert _land(w, 1, d1["worktree"], *gate)["outcome"] == "joined"
+        tip1 = _line(w)
 
-        def refused(*extra, cwd=bwt, name=batch):
-            err = w.error("land", "--batch", name, *R, *NOW, *gate, *extra, cwd=cwd)
-            assert _target(w) == base0 and _gate_runs(w) == 0
-            assert not [x for x in w.sb.all_refs() if "refs/heads/tester/afk-batch" in x
-                        and w.sb.remote_ref(x) != base0]
-            assert git(bwt, "rev-parse", "HEAD") == base0
-            return err
+        # found when it joins: the train's tip is merged in, left for the worker
+        r = _land(w, 2, d2["worktree"], *gate)
+        assert (r["outcome"], r["files"]) == ("conflict", ["shared.txt"])
+        assert os.path.samefile(r["worktree"], d2["worktree"])
+        assert _merging(d2["worktree"]) and git(d2["worktree"], "rev-parse", "MERGE_HEAD") == tip1
+        assert _line(w) == tip1 and _turns(w, 20) == []
+        assert _statuses(w, gate) == {1: "joined", 2: "joining", 3: "joining"}
+        # run again before resolving: the same merge, as it stands
+        assert _land(w, 2, d2["worktree"], *gate)["outcome"] == "conflict"
+        _resolve(w, d2["worktree"], "shared.txt", "one and two")
+        r = _land(w, 2, d2["worktree"], *gate)
+        resolved = git(d2["worktree"], "rev-parse", "HEAD")
+        assert (r["outcome"], r["head"]) == ("joined", resolved)
+        assert w.sb.remote_ref(f"refs/heads/{d2['branch']}") == resolved     # the resolution is pushed
+        tip2 = _line(w)
 
-        # not in the batch's worktree; not this batch
-        assert "is not merge batch" in refused(cwd=d[1]["worktree"])
-        assert "is not merge batch" in refused(name="me-t1")
-        # a member whose marker is gone, or names another fleet instance
-        w.set(comments={**marked, "20": []})
-        assert "does not hold the landing turn of merge batch" in refused()
-        w.set(comments={**marked, "20": [{"id": 5001, "html_url": "u", "body":
-              afk_decide.turn_comment(afk_decide.batch_turn(
-                  None, "peer", T0, batch, b_members(b), "stacking"))}]})
-        assert "does not hold the landing turn of merge batch" in refused()
-        # a member's single turn is not the batch's
-        w.set(comments={**marked, "20": [{"id": 5001, "html_url": "u", "body":
-              afk_decide.turn_comment(afk_decide.single_turn(None, "me", T0))}]})
-        assert "does not hold the landing turn of merge batch" in refused()
-        w.set(comments=marked)
-        # a member PR closed by hand
-        open_prs = w.state()["prs"]
-        w.set(prs=[{**p, "state": "closed"} if p["number"] == 20 else p for p in open_prs])
-        assert "PR(s) [20] of merge batch" in refused()
-        w.set(prs=open_prs)
+        # …or before its own gate run, which takes the train in first
+        g = _gate_train(w, d3["worktree"], *gate)
+        assert (g["status"], g["files"], g["recorded"]) == ("conflict", ["shared.txt"], False)
+        assert _merging(d3["worktree"]) and _gate_runs(w) == 0
+        assert _gate_train(w, d3["worktree"], *gate)["status"] == "conflict"
+        _resolve(w, d3["worktree"], "shared.txt", "one, two and three")
+        g = _gate_train(w, d3["worktree"], *gate)
+        assert (g["status"], g["recorded"], g["merged"]) == ("green", True, tip2) and _gate_runs(w) == 1
+        assert _land(w, 3, d3["worktree"], *gate)["outcome"] == "joined"
 
-        # abandoned while its gate runs: the gate goes green, and still nothing lands
-        cfg = json.dumps({"base_branch": w.sb.base,
-                          "gate": {"ci": "local", "local_command": "true"}})
-        abandon = (f"cd {w.cwd} && {sys.executable} {AFK} turn --abandon {batch} --instance me "
-                   f"--worker-command '{WORKER}' --repo {REPO} --now {T0} --config '{cfg}' "
-                   f"| tee {w.sb.root}/abandoned.json")
-        err = w.error("land", "--batch", batch, *R, *NOW, *BATCH, *local_gate(abandon), cwd=bwt)
-        assert "no longer holds the landing turn" in err, err
-        with open(os.path.join(w.sb.root, "abandoned.json")) as f:
-            gone = json.load(f)
-        assert (gone.get("outcome"), gone.get("issues")) == ("abandoned", [1, 2, 3]), gone
-        assert _target(w) == base0
-        assert [w.pr(p).get("state", "open") for p in (10, 20, 30)] == ["open"] * 3
-        assert not [x for x in w.sb.all_refs() if "afk-batch" in x]
-        assert _batch_rows(w, gate) == ({n: ("awaiting_turn", None, "abandoned") for n in (1, 2, 3)},
-                                        [1, 2, 3], [])
-        # a batch nobody holds cannot be abandoned twice, and holds nothing to land
-        assert "nothing was changed" in w.error(*_abandon(batch, *gate))
-
-
-def b_members(b):
-    return [{"issue": i, "pr": p} for i, p in zip(b["issues"], b["prs"])]
-
-
-def test_a_silent_batch_worker_is_nudged_once_then_the_batch_is_abandoned():
-    """A batch can never park the queue. Its worker silent past grace is nudged
-    once; silent again, the batch is abandoned with nothing landed — its PRs go
-    back to waiting, land on single turns, and are not batched again."""
-    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2, 3)]) as w:
-        t0 = int(time.time()) + 5000
-        gate = _counted(w)
-        d = {n: with_pr(w, n, n * 10, gate=gate)[0] for n in (1, 2, 3)}
-        base0 = _target(w)
-
-        c = tick(w, None, *gate, now=t0)
-        assert c["progress"].startswith("landing turn to #1, #2, #3; "), c
-        b = _the_batch(w, gate)
-        batch, bwt = b["batch"], b["worktree"]
-        w.worker(output=t0, state="done", since=t0)                  # it stopped, and said nothing
-
-        def no_pr(at):
-            r = w.no_pr("--batch", batch, *R, *gate, "--now", str(at))
-            return r["outcome"], r["action"], r["turn_at"]
-
-        # the turn is a sign of life: one grace period to start on it
-        assert no_pr(t0 + 299)[:2] == ("coding", "leave")
-        assert no_pr(t0 + 300) == ("idle_stalled", "nudge", t0)
-        c = tick(w, c["state"], *gate, now=t0 + 299)
-        assert "nudged" not in c["progress"] and "abandoned" not in c["progress"]
-        told = len(w.terminals()[-1]["sent"])
-        c = tick(w, c["state"], *gate, now=t0 + 300)
-        assert c["progress"].startswith("nudged #1, #2, #3; ") and "errors" not in c, c
-        assert len(w.terminals()[-1]["sent"]) == told + 1
-        # the nudge points at the batch brief
-        said = w.terminals()[-1]["sent"][-1]["text"]
-        with open(re.search(r"\((\S+)\)", said).group(1)) as f:
-            assert f" land --batch {batch} " in f.read()
-        # nudged once: a grace period more, then the batch is given up
-        c = tick(w, c["state"], *gate, now=t0 + 599)
-        assert "abandoned" not in c["progress"] and _batch_rows(w, gate)[2] != []
-        c = tick(w, c["state"], *gate, now=t0 + 600)
-        assert c["progress"].startswith("abandoned the batch of #1, #2, #3; "), c
-        assert c["judgments"] == [] and "errors" not in c
-        # nothing landed, nothing failed: no attempt spent, every PR open and waiting
-        assert _target(w) == base0 and _gate_runs(w) == 0
+        # the train's worker gates nothing again — #3's run was of this very tree —
+        # and resolves nothing
+        twt = w.afk(*_turn_train(*gate))["worktree"]
+        r = _land_train(w, twt, *gate)
+        assert (r["outcome"], r["prs"], r["gate"]["source"]) == ("landed", [10, 20, 30], "recorded"), r
+        assert _gate_runs(w) == 1 and not _merging(twt)
+        assert [s for _, s, _ in _history(w, base0)] == [f"feature {n} (#{n * 10})" for n in (1, 2, 3)]
+        git(w.cwd, "fetch", "-q", "origin", w.sb.base)
+        assert git(w.cwd, "show", f"origin/{w.sb.base}:shared.txt").strip() == "one, two and three"
         for n in (1, 2, 3):
-            [note] = _turns(w, n * 10)
-            assert note.startswith(f"<!--afk:turn instance=me at={t0 + 600} unbatched=abandoned "
-                                   f"of={batch} released=1-->\n"), note
-            assert w.issue(n) == {"state": "open", "labels": ["ready-for-agent"]}
-            assert w.pr(n * 10).get("state", "open") == "open"
-            assert "排队等落地轮次" in w.board(n)
-        assert not os.path.isdir(bwt) and len(w.worktrees()) == 3
-        # the batch's own worker, were it to wake up now, lands nothing
-        assert _batch_rows(w, gate) == ({n: ("awaiting_turn", None, "abandoned") for n in (1, 2, 3)},
-                                        [1, 2, 3], [])
-
-        # its PRs land on single turns, in order — three wait, and no batch forms
-        assert w.afk(*_turn_batch(*gate, now=t0 + 690))["outcome"] == "too_few"
-        c = tick(w, c["state"], *gate, now=t0 + 690)
-        assert c["progress"].startswith("landing turn to #1; "), c["progress"]
-        assert _land(w, 1, d[1]["worktree"], *gate, now=t0 + 700)["outcome"] == "merged"
-        c = tick(w, c["state"], *gate, now=t0 + 780)
-        assert c["progress"].startswith("landing turn to #2; cleared #1; "), c["progress"]
-        assert "unbatched=abandoned" in _turns(w, 20)[0] and "released" not in _turns(w, 20)[0]
+            assert w.pr(n * 10)["state"] == "merged" and w.issue(n)["state"] == "closed"
 
 
-def test_a_batch_whose_worker_is_gone_is_continued_from_its_worktree_else_its_branch():
-    """The batch worker's terminal is gone — closed, the machine restarted, the
-    run resumed elsewhere. The batch is continued, never restarted from nothing:
-    in its worktree when that is here (fix commits and all), else in a new one
-    cut from the batch's pushed branch."""
-    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
-        gate = _counted(w, "test -f fix.txt")
-        for n in (1, 2):
-            with_pr(w, n, n * 10, gate=gate)
+def test_a_red_train_lands_nothing_and_is_repaired_with_a_fix_commit_on_top():
+    """Two PRs each green alone and red together. The red is the TRAIN's: nobody
+    hunts for the PR at fault and nothing is dropped — its worker puts one fix
+    commit on top and lands the lot. While it is red, a worker about to gate
+    takes in the train's last green commit instead of a tip that would turn its
+    own run red."""
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2, 3, 4)]) as w:
+        gate = _counted(w, "{ ! test -f feature1.txt || ! test -f feature2.txt || "
+                           "test -f fixed.txt || { echo 'FAIL TestBoth' >&2; false; }; }")
+        d = {n: with_pr(w, n, n * 10, gate=gate) for n in (1, 2, 3, 4)}
+        wt = {n: d[n][0]["worktree"] for n in d}
         base0 = _target(w)
-        c = tick(w, None, *gate)
-        b = _the_batch(w, gate)
-        batch, bwt = b["batch"], b["worktree"]
-        assert _land_batch(w, b, *gate)["outcome"] == "gate_red"
-        stack = git(bwt, "rev-parse", "HEAD")
-        [ref] = [x for x in w.sb.all_refs() if "afk-batch" in x]
+        assert _gate_train(w, wt[1], *gate)["recorded"] is True       # #1's own run: green
+        for n in (1, 2):
+            assert _land(w, n, wt[n], *gate)["outcome"] == "joined"
+        git(w.cwd, "fetch", "-q", "origin", "+refs/afk/train/line/*:refs/t/*")
+        tip = _line(w)
+        on1 = git(w.cwd, "rev-parse", f"{tip}^")
+        twt = w.afk(*_turn_train(*gate))["worktree"]
 
-        # its worker is there: a cycle leaves it alone
-        terms = len(w.terminals())
-        c = tick(w, c["state"], *gate)
-        assert "landing turn" not in c["progress"] and len(w.terminals()) == terms
-        # its terminal is gone, its worktree is here: a new worker, in the SAME worktree
-        _close_terminals(w)
-        assert w.no_pr("--batch", batch, *R, *gate, *NOW)["action"] == "orphan"
-        c = tick(w, c["state"], *gate)
-        assert c["progress"].startswith("landing turn to #1, #2; ") and "errors" not in c, c
-        new = w.terminals()[-1]
-        assert (new["worktreePath"], new["command"], new["open"]) == (bwt, WORKER, True)
-        assert len(w.terminals()) == terms + 1 and git(bwt, "rev-parse", "HEAD") == stack
-        assert f" land --batch {batch} " in _brief(bwt)
-        assert _batch_rows(w, gate)[0] == {1: ("landing", "fixing", None),
-                                           2: ("landing", "fixing", None)}
+        r = _land_train(w, twt, *gate)
+        assert (r["outcome"], r["commit"], r["prs"], r["gate"]["status"]) == \
+            ("gate_red", tip, [10, 20], "red"), r
+        assert "FAIL TestBoth" in r["gate"]["excerpt"]
+        assert _target(w) == base0 and _red(w) == tip and _gate_runs(w) == 2
+        for p in (10, 20):
+            assert "FAIL TestBoth" in w.state()["pr_comments"][str(p)][-1], p
+            assert w.pr(p).get("state", "open") == "open"
+        assert _statuses(w, gate) == {1: "joined", 2: "joined", 3: "joining", 4: "joining"}
 
-        # the worktree is gone too (another machine): cut from the batch's pushed branch
-        subprocess.run(["orca", "worktree", "rm", "--worktree", f"path:{bwt}", "--force", "--json"],
-                       env=w.env, capture_output=True, check=True)
-        assert not os.path.isdir(bwt)
-        r = w.afk(*_turn_batch(*gate, now=T0 + 90))
-        assert (r["outcome"], r["batch"], r["issues"], r["again"], r["delivery"]) == \
-            ("granted", batch, [1, 2], True, "branch"), r
-        bwt2 = r["worktree"]
-        assert bwt2 != bwt and git(bwt2, "rev-parse", "HEAD") == stack == w.sb.remote_ref(ref)
-        # nothing of the batch was copied into it: its members are on the PRs' markers
-        assert _fleet_files(bwt2) == ["afk-worker-prompt.md"]
-        # the continued worker fixes the stack and lands it, with the one command
-        w.work(bwt2, "fix.txt", push=False)
-        r = _land_batch(w, {"batch": batch, "worktree": bwt2}, *gate)
-        assert (r["outcome"], r["issues"], r["fix_commits"]) == ("landed", [1, 2], 1), r
-        assert [s for _, s, _ in _history(w, base0)] == \
-            ["feature 1 (#10)", "feature 2 (#20)", "work: fix.txt"]
-        assert not [x for x in w.sb.all_refs() if "afk-batch" in x]
-        # the next cycle sweeps the continued batch's worktree with the claims
-        c = tick(w, c["state"], *gate)
-        assert c["progress"].startswith("cleared #1, #2; ") and w.worktrees() == []
+        # a worker gating now does not inherit the red: it takes in the last
+        # green commit of the train — #1's joining, which #1's own run proved
+        g = _gate_train(w, wt[3], *gate)
+        assert (g["status"], g["recorded"], g["merged"]) == ("green", True, on1), g
+        # …and one that joins meanwhile joins the train as it is, red or not
+        assert _land(w, 4, wt[4], *gate)["outcome"] == "joined"
+        tip4 = _line(w)
+
+        # the fix: ONE commit on top, in the train's worktree. The joining that
+        # came meanwhile is merged with it, and the whole train lands
+        w.work(twt, "fixed.txt", push=False)
+        r = _land_train(w, twt, *gate)
+        assert (r["outcome"], r["prs"], r["gate"]["source"]) == ("landed", [10, 20, 40], "run"), r
+        landed = _history(w, base0)
+        assert [s for _, s, _ in landed[:2]] == ["feature 1 (#10)", "feature 2 (#20)"]
+        assert "fixed.txt" in w.remote_files(w.sb.base) and _target(w) == r["commit"] == _line(w)
+        git(w.cwd, "fetch", "-q", "origin", w.sb.base)
+        assert git(w.cwd, "merge-base", "--is-ancestor", tip4, r["commit"]) == ""
+        for n in (1, 2, 4):
+            assert w.pr(n * 10)["state"] == "merged" and w.issue(n)["state"] == "closed"
+        # the red commit landed with its fix: nothing is being repaired any more
+        assert _gate_train(w, wt[3], *gate)["merged"] == _target(w)
+        assert _land(w, 3, wt[3], *gate)["outcome"] == "joined"
+        assert _land_train(w, twt, *gate)["outcome"] == "landed" and w.issue(3)["state"] == "closed"
 
 
-def test_a_dead_fleets_batch_is_abandoned_by_the_fleet_that_takes_its_claims():
-    """A fleet died holding a batch. The fleet that reclaims its claims cannot
-    land that batch and does not wait on it: it abandons it, and the PRs land on
-    single turns of the new owner."""
+def test_a_target_moved_from_outside_is_merged_into_the_train_never_rebased_onto():
+    """The target moved from outside the train. Before a run, it is merged into
+    the train — a merge commit on top; no joining is rewritten — and the run is
+    of that. During a run, the fast-forward is refused, nothing lands, and the
+    next run takes the new tip in."""
     with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
-        # (the fake GitHub does not move a PR's updatedAt when a comment on it is
-        # rewritten, as the real one does — so the digest gate is off here)
         gate = _counted(w)
-        for n in (1, 2):
-            with_pr(w, n, n * 10, instance="old", gate=gate)
+        d = {n: with_pr(w, n, n * 10, gate=gate) for n in (1, 2)}
         base0 = _target(w)
-        b = w.afk(*_turn_batch(*gate, instance="old"))
-        last_beat(w.cwd, "old", T0 - TTL - 60)
+        for n in (1, 2):
+            assert _land(w, n, d[n][0]["worktree"], *gate)["outcome"] == "joined"
+        tip = _line(w)
+        twt = w.afk(*_turn_train(*gate))["worktree"]
 
-        c = tick(w, None, *gate)
-        assert c["progress"].startswith("reclaimed #1, #2; "), c
-        ws = w.afk("rebuild", *ME, *R, *NOW, *gate)
-        assert [(x["id"], x["instance"]) for x in ws["batches"]] == [(b["batch"], "old")]
-        assert [m["status"] for m in ws["mine"]] == ["awaiting_turn"] * 2
-        # the dead fleet's batch worker, still running, lands nothing on my claims
-        err = w.error("land", "--batch", b["batch"], *R, *NOW, *gate, cwd=b["worktree"])
-        assert "does not hold the landing turn of merge batch" in err and _target(w) == base0
-        # and I form no batch of my own over it
-        r = w.afk(*_turn_batch(*gate))
-        assert (r["outcome"], r["batch"]) == ("waiting", b["batch"]), r
-        assert all(f"instance=old at={T0} batch=" in _turns(w, p)[0] for p in (10, 20))
+        moved = w.advance_base("landed-outside.txt")
+        seed = os.path.join(w.sb.root, "seed")
+        with open(os.path.join(seed, "during.txt"), "w") as f:
+            f.write("during\n")
+        git(seed, "add", "-A")
+        git(seed, "commit", "-qm", "base: landed during the gate")
+        _during_the_gate(w, (seed, ["git", "push", "-q", "origin", f"HEAD:refs/heads/{w.sb.base}"]))
+        r = _land_train(w, twt, *gate)
+        assert (r["outcome"], r["prs"], r["gate"]["status"]) == ("target_moved", [10, 20], "green"), r
+        # nothing landed; the train took the first move in as a merge on top
+        during = _target(w)
+        assert during != moved and "feature1.txt" not in w.remote_files(w.sb.base)
+        git(w.cwd, "fetch", "-q", "origin", "+refs/afk/train/line/*:refs/t/*", w.sb.base)
+        assert git(w.cwd, "log", "-1", "--format=%P", r["commit"]).split() == [tip, moved]
+        assert _line(w) == r["commit"] and _gate_runs(w) == 1
+        for p in (10, 20):
+            assert w.pr(p).get("state", "open") == "open"
 
-        c = tick(w, c["state"], *gate)
-        assert c["progress"].startswith("abandoned the batch of #1, #2; "), c
-        assert all(f"instance=me at={T0} unbatched=abandoned of={b['batch']} released=1" in
-                   _turns(w, p)[0] for p in (10, 20))
-        assert not os.path.isdir(b["worktree"])
-        c = tick(w, c["state"], *gate)
-        assert c["progress"].startswith("landing turn to #1; "), c
+        r = _land_train(w, twt, *gate)
+        assert (r["outcome"], r["prs"], r["gate"]["source"]) == ("landed", [10, 20], "run"), r
+        assert _gate_runs(w) == 2 and _target(w) == r["commit"]
+        git(w.cwd, "fetch", "-q", "origin", w.sb.base)
+        # both joinings are on the target as they were made — never rewritten
+        assert git(w.cwd, "merge-base", "--is-ancestor", tip, r["commit"]) == ""
+        assert {"feature1.txt", "feature2.txt", "landed-outside.txt", "during.txt"} <= \
+            w.remote_files(w.sb.base)
+        for n in (1, 2):
+            assert w.pr(n * 10)["merged"] == {"pushed": True, "head": d[n][1]}
+            assert w.issue(n)["state"] == "closed"
+        assert base0 != _target(w)
 
 
-def _cut_after_the_push(w, b, gate):
-    """`afk land --batch` cut after its push to a target that is not the default
+def _cut_after_the_push(w, twt, gate):
+    """`afk land --train` cut after its push to a target that is not the default
     branch — where GitHub closes no issue itself — and before it closed one."""
     w.set(default_branch="some-other-branch", fail=["issue close"])
-    assert "issue close" in w.error("land", "--batch", b["batch"], *R, *NOW, *gate,
-                                    cwd=b["worktree"])
+    assert "issue close" in w.error("land", "--train", *R, *NOW, *gate, cwd=twt)
     w.set(fail=[])
 
 
-def test_a_batch_cut_after_its_push_is_settled_by_the_next_cycle_from_the_target():
-    """The batch's stack is on the target and its worker was cut before it closed
-    an issue. GitHub shows the PRs merged, so no open PR carries the batch's
-    marker and nothing lists the batch — yet the work landed. The next cycle
-    reads that off the target: each member's issue is closed, its claim released
-    and its worktree removed; no worker is asked after, nudged or failed."""
+def test_a_train_worker_cut_after_the_push_is_finished_by_the_next_cycle_from_the_target():
+    """The train is on the target and its worker was cut before it closed an
+    issue. GitHub shows the PRs merged, so nothing lists them — yet the work
+    landed. The next cycle reads that off the target itself: each issue is
+    closed, its claim released and its worktree removed; no worker is asked
+    after, nudged or failed."""
     with world(issues=[issue(n, "ready-for-agent") for n in (1, 2, 3)]) as w:
         gate = _counted(w)
         d = {n: with_pr(w, n, n * 10, gate=gate)[0] for n in (1, 2)}
         w.afk(*dispatch(3, *gate))                                    # still coding: never landed
         base0 = _target(w)
-        b = w.afk(*_turn_batch(*gate))
-        _cut_after_the_push(w, b, gate)
+        for n in (1, 2):
+            assert _land(w, n, d[n]["worktree"], *gate)["outcome"] == "joined"
+        twt = w.afk(*_turn_train(*gate))["worktree"]
+        _cut_after_the_push(w, twt, gate)
         assert [s for _, s, _ in _history(w, base0)] == ["feature 1 (#10)", "feature 2 (#20)"]
         told = [len(t["sent"]) for t in w.terminals()]
 
         # GitHub shows both PRs merged; both issues are open, both claims held
-        rows, order, batches = _batch_rows(w, gate)
         assert [w.pr(p)["state"] for p in (10, 20)] == ["merged"] * 2
         assert [w.issue(n)["state"] for n in (1, 2)] == ["open"] * 2
-        assert (order, batches) == ([], [])
-        assert rows == {1: ("landed", None, None), 2: ("landed", None, None),
-                        3: ("no_pr", None, None)}
+        assert _statuses(w, gate) == {1: "landed", 2: "landed", 3: "no_pr"}
 
         w.worker(output=T0 + 9_999, state="working", since=T0, n=2)    # #3's, still at it
         c = tick(w, None, *gate, now=T0 + 10_000)                     # long past every grace
@@ -5094,122 +4674,201 @@ def test_a_batch_cut_after_its_push_is_settled_by_the_next_cycle_from_the_target
             assert w.issue(n) == {"state": "closed", "labels": ["ready-for-agent"]}   # no attempt
             assert w.claimed_by(n) is None and "已合并,完成" in w.board(n)
             assert not os.path.isdir(d[n]["worktree"])
-        # nobody was nudged, and the batch's worktree and branch went with it
+        # nobody was nudged; the train's worktree is still the repo's
         assert [len(t["sent"]) for t in w.terminals()][:len(told)] == told
-        assert [x["linkedIssue"] for x in w.worktrees()] == [3]
-        assert not os.path.isdir(b["worktree"])
-        assert not [ref for ref in w.sb.all_refs() if "afk-batch" in ref]
+        assert sorted(x["linkedIssue"] or 0 for x in w.worktrees()) == [0, 3] and os.path.isdir(twt)
         assert [m["number"] for m in w.afk("rebuild", *ME, *R, *NOW, *gate)["mine"]] == [3]
+        # the worker, run again after the cut, finds nothing left to land
+        assert _land_train(w, twt, *gate)["outcome"] == "idle"
+
+    # a PR GitHub does not show merged — its head moved after it joined — is
+    # closed by that cycle too, saying which commit landed it
+    with world(issues=[issue(1, "ready-for-agent")], pushes_never_merge=True) as w:
+        gate = _counted(w)
+        d, _ = with_pr(w, 1, 10, gate=gate)
+        assert _land(w, 1, d["worktree"], *gate)["outcome"] == "joined"
+        twt = w.afk(*_turn_train(*gate))["worktree"]
+        w.set(default_branch="some-other-branch", fail=["issue close"])
+        assert "issue close" in w.error("land", "--train", *R, *NOW, *gate, "--merged-timeout", "0",
+                                        cwd=twt)
+        w.set(fail=[])
+        landed = _target(w)
+        assert w.pr(10).get("state", "open") == "open" and _statuses(w, gate) == {1: "landed"}
+        c = tick(w, None, *gate)
+        assert c["progress"].startswith("cleared #1; ") and "errors" not in c, c
+        assert w.pr(10)["state"] == "closed" and w.issue(1)["state"] == "closed"
+        assert f"landed on `{w.sb.base}` as {landed}" in w.state()["pr_comments"]["10"][-1]
 
     # an issue reopened after its landing, and claimed again, did not land again
-    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
+    with world(issues=[issue(1, "ready-for-agent")]) as w:
         gate = _counted(w)
-        for n in (1, 2):
-            with_pr(w, n, n * 10, gate=gate)
-        b = w.afk(*_turn_batch(*gate))
+        d, _ = with_pr(w, 1, 10, gate=gate)
+        assert _land(w, 1, d["worktree"], *gate)["outcome"] == "joined"
+        twt = w.afk(*_turn_train(*gate))["worktree"]
         w.set(default_branch="some-other-branch")
-        assert _land_batch(w, b, *gate)["outcome"] == "landed"
+        assert _land_train(w, twt, *gate)["outcome"] == "landed"
         tick(w, None, *gate)
         w.set(issues=[{**i, "state": "open"} for i in w.state()["issues"]])
         w.afk(*dispatch(1, *gate, "--now", str(T0 + 50)))
-        assert _batch_rows(w, gate)[0] == {1: ("no_pr", None, None)}
+        assert _statuses(w, gate) == {1: "no_pr"}
 
 
-def test_an_abandon_after_the_batchs_push_abandons_nothing_that_landed():
-    """The batch's worker was cut after its push and GitHub does not show the PRs
-    merged, so the batch is still listed — and an abandon reaches it. What landed
-    is not handed back to single landing: its issue is closed instead, and the
-    next cycle settles it. A batch that landed nothing is abandoned whole."""
+def test_five_prs_two_of_them_conflicting_land_behind_six_gate_runs_not_nine():
+    """The count the train is for. Five PRs: three finish together, two more
+    while those wait, and two of the five rewrite one file. Every worker gates
+    its own branch once, with the train merged in; the train's worker gates
+    once more, because the last two joined side by side. Six runs.
+
+    On a landing turn each (ADR-0027) the same five cost nine: each worker's own
+    run, and one more on the turn of every PR after the first — the target
+    having moved under it, the run on record is of a tree that no longer lands."""
+    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2, 3, 4, 5)]) as w:
+        gate = _counted(w)
+        d = {n: with_pr(w, n, n * 10, gate=gate, **({"name": "shared.txt", "text": f"by {n}"}
+                                                    if n in (2, 5) else {}))
+             for n in (1, 2, 3, 4, 5)}
+        wt = {n: d[n][0]["worktree"] for n in d}
+        base0 = _target(w)
+
+        # #1, #2 and #3 finish together: each gates on the target, and they join
+        for n in (1, 2, 3):
+            assert _gate_train(w, wt[n], *gate)["merged"] == base0
+        for n in (1, 2, 3):
+            assert _land(w, n, wt[n], *gate)["outcome"] == "joined"
+        train3 = _line(w)
+        # #4 and #5 finish while those wait: each gates with the train merged in —
+        # where #5 meets its conflict with #2, before its run and before it joins
+        assert _gate_train(w, wt[4], *gate)["merged"] == train3
+        assert _gate_train(w, wt[5], *gate)["status"] == "conflict"
+        _resolve(w, wt[5], "shared.txt", "by 2 and 5")
+        assert _gate_train(w, wt[5], *gate)["recorded"] is True
+        assert _gate_runs(w) == 5
+        for n in (4, 5):
+            r = _land(w, n, wt[n], *gate)
+            assert (r["outcome"], _gate_runs(w)) == ("joined", 5), r         # a join runs no gate
+
+        twt = w.afk(*_turn_train(*gate))["worktree"]
+        r = _land_train(w, twt, *gate)
+        assert (r["outcome"], r["prs"], r["gate"]["source"]) == \
+            ("landed", [10, 20, 30, 40, 50], "run"), r
+        assert _gate_runs(w) == 6                                            # …not nine
+        assert [s for _, s, _ in _history(w, base0)] == [
+            f"feature {n} (#{n * 10})" for n in (1, 2, 3, 4, 5)]
+        for n in d:
+            assert w.pr(n * 10)["state"] == "merged" and w.issue(n)["state"] == "closed"
+        assert _land_train(w, twt, *gate)["outcome"] == "idle" and _gate_runs(w) == 6
+
+
+def test_a_silent_train_worker_is_nudged_once_then_the_train_is_abandoned():
+    """The train can never park the fleet. Its worker silent past grace is
+    nudged once; silent again, the train is abandoned with nothing landed: its
+    refs are deleted, its worktree is cleared and KEPT, and its PRs' workers are
+    told to join the next train. A PR taken off a train for the second time is
+    handed to a human instead, with everything kept."""
     with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
+        t0 = int(time.time()) + 5000
         gate = _counted(w)
         d = {n: with_pr(w, n, n * 10, gate=gate)[0] for n in (1, 2)}
         base0 = _target(w)
-        b = w.afk(*_turn_batch(*gate))
-        w.set(pushes_never_merge=True)
-        _cut_after_the_push(w, b, gate)
-        landed = _history(w, base0)
-        assert [s for _, s, _ in landed] == ["feature 1 (#10)", "feature 2 (#20)"]
-        assert _batch_rows(w, gate)[0] == {n: ("landing", "gating", None) for n in (1, 2)}
-        marked = [_turns(w, p) for p in (10, 20)]
-
-        r = w.afk(*_abandon(b["batch"], *gate, now=T0 + 600))
-        assert (r["outcome"], r["issues"], r["prs"], r["landed"]) == ("abandoned", [], [], [1, 2]), r
-        assert [_turns(w, p) for p in (10, 20)] == marked             # no marker says abandoned
         for n in (1, 2):
-            assert w.issue(n)["state"] == "closed" and "已合并,完成" in w.board(n)
-        assert not os.path.isdir(b["worktree"])
-        c = tick(w, None, *gate, now=T0 + 700)
-        assert c["progress"].startswith("cleared #1, #2; ") and "errors" not in c, c
-        for i, n in enumerate((1, 2)):
-            assert w.pr(n * 10)["state"] == "closed" and w.claimed_by(n) is None
-            assert landed[i][0] in w.state()["pr_comments"][str(n * 10)][0]
-            assert not os.path.isdir(d[n]["worktree"])
+            assert _land(w, n, d[n]["worktree"], *gate, now=t0)["outcome"] == "joined"
+        for n in (0, 1):                                              # the PRs' workers: done, quiet
+            w.worker(output=t0, state="done", since=t0, n=n)
+        c = tick(w, None, *gate, now=t0)
+        twt = _train_worktree(w)
+        w.worker(output=t0, state="done", since=t0)                   # the train's: stopped, said nothing
 
-    # nothing landed: every member goes back to single landing, as before
+        def no_pr(at):
+            r = w.no_pr("--train", *R, *gate, "--now", str(at))
+            return r["outcome"], r["action"], r["turn_at"]
+
+        # being told is a sign of life: one grace period to start on it
+        assert no_pr(t0 + 299)[:2] == ("coding", "leave")
+        assert no_pr(t0 + 300) == ("idle_stalled", "nudge", t0)
+        c = tick(w, c["state"], *gate, now=t0 + 299)
+        assert "nudged" not in c["progress"] and "abandoned" not in c["progress"]
+        told = len(w.terminals()[-1]["sent"])
+        c = tick(w, c["state"], *gate, now=t0 + 300)
+        assert c["progress"].startswith("nudged #1, #2; ") and "errors" not in c, c
+        assert len(w.terminals()[-1]["sent"]) == told + 1
+        # the nudge points at the train brief
+        said = w.terminals()[-1]["sent"][-1]["text"]
+        with open(re.search(r"\((\S+)\)", said).group(1)) as f:
+            assert " land --train " in f.read()
+        # nudged once: a grace period more, then the train is given up
+        c = tick(w, c["state"], *gate, now=t0 + 599)
+        assert "abandoned" not in c["progress"] and _line(w)
+        git(twt, "commit", "-q", "--allow-empty", "-m", "half a fix")
+        with open(os.path.join(twt, "scratch.txt"), "w") as f:
+            f.write("left behind\n")
+        c = tick(w, c["state"], *gate, now=t0 + 600)
+        assert c["progress"].startswith("abandoned the train of #1, #2; "), c
+        assert c["judgments"] == [] and "errors" not in c
+        # nothing landed, nothing failed: no attempt spent, every PR open
+        assert _target(w) == base0 and _gate_runs(w) == 0
+        assert not _line(w) and not _red(w)
+        for n in (1, 2):
+            [note] = _turns(w, n * 10)
+            assert note.startswith(f"<!--afk:turn instance=me at={t0 + 600} "
+                                   f"abandoned={t0 + 600} released=1-->\n"), note
+            assert w.issue(n) == {"state": "open", "labels": ["ready-for-agent"]}
+            assert w.pr(n * 10).get("state", "open") == "open"
+            # its own worker is told to join the next train, on the join brief
+            said = w.terminals()[n - 1]["sent"][-1]["text"]
+            assert "was abandoned: join the next one now" in said
+            assert f" land --issue {n} " in _brief(d[n]["worktree"])
+        assert _statuses(w, gate, now=t0 + 600) == {1: "joining", 2: "joining"}
+        # the train's worktree is kept — cleared: its worker closed, what it held
+        # gone, on the target's tip — for the next train
+        assert twt == _train_worktree(w) and os.path.isdir(twt)
+        assert git(twt, "rev-parse", "HEAD") == base0 and git(twt, "status", "--porcelain") == ""
+        assert not w.terminals()[-1]["open"]
+
+        # #1 joins the next train, which starts at the target; its worker goes
+        # silent too: #1 was taken off a train once already, and is escalated
+        assert _land(w, 1, d[1]["worktree"], *gate, now=t0 + 700)["outcome"] == "joined"
+        r = w.afk(*_turn_train(*gate, now=t0 + 700))
+        assert (r["outcome"], r["delivery"], r["worktree"]) == ("granted", "worker", twt)
+        r = w.afk(*_abandon(*gate, now=t0 + 1400))
+        assert (r["outcome"], r["issues"], r["escalated"]) == ("abandoned", [], [1]), r
+        assert "ready-for-human" in w.issue(1)["labels"] and w.claimed_by(1) is None
+        assert w.pr(10).get("state", "open") == "open" and os.path.isdir(d[1]["worktree"])
+        assert "on a landing train twice" in "\n".join(w.comments(1))
+        assert _statuses(w, gate, now=t0 + 1400) == {2: "joining"}
+
+
+def test_a_train_is_the_repos_and_the_next_fleet_instance_tends_it():
+    """One train per repo, not per fleet instance: a PR of a peer's joins the
+    same line, and a train whose fleet died is tended by whichever instance has
+    a PR on it — in the worktree the train already had, with a new worker."""
     with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
         gate = _counted(w)
-        for n in (1, 2):
-            with_pr(w, n, n * 10, gate=gate)
+        d1, _ = with_pr(w, 1, 10, gate=gate, instance="old")
+        d2, _ = with_pr(w, 2, 20, gate=gate)
         base0 = _target(w)
-        b = w.afk(*_turn_batch(*gate))
-        r = w.afk(*_abandon(b["batch"], *gate, now=T0 + 600))
-        assert (r["issues"], r["prs"], r["landed"]) == ([1, 2], [10, 20], []), r
-        assert _target(w) == base0 and [w.issue(n)["state"] for n in (1, 2)] == ["open"] * 2
-        assert _batch_rows(w, gate) == ({n: ("awaiting_turn", None, "abandoned") for n in (1, 2)},
-                                        [1, 2], [])
+        assert _land(w, 1, d1["worktree"], *gate)["outcome"] == "joined"
+        twt = w.afk(*_turn_train(*gate, instance="old"))["worktree"]
+        assert _land(w, 2, d2["worktree"], *gate)["outcome"] == "joined"
+        # `old` is gone, its train worker with it: the terminal is closed
+        terms = w.terminals()
+        terms[-1]["open"] = False
+        w.orca(terminals=terms)
+        assert _statuses(w, gate) == {2: "joined"}
+        r = w.afk(*_turn_train(*gate))
+        assert (r["outcome"], r["delivery"], r["worktree"]) == ("granted", "worker", twt), r
+        assert len([x for x in w.worktrees() if x["linkedIssue"] is None]) == 1
+        # it lands everything on the train, the dead fleet's PR included
+        r = _land_train(w, twt, *gate)
+        assert (r["outcome"], r["prs"]) == ("landed", [10, 20]), r
+        assert [s for _, s, _ in _history(w, base0)] == ["feature 1 (#10)", "feature 2 (#20)"]
+        assert [w.issue(n)["state"] for n in (1, 2)] == ["closed"] * 2
 
 
-def test_a_batch_is_formed_only_from_prs_that_are_free_to_land_together():
-    """Who is batched. Never with the option off, in `required` mode, or while
-    every PR owes an adversarial verify of its own; never a PR whose own worker
-    is still working; never while one PR holds the turn. With one eligible PR
-    the turn goes to it alone (ADR-0027)."""
-    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2)]) as w:
-        off = local_gate("true")
-        gate = (*off, *BATCH)
-        d = {n: with_pr(w, n, n * 10, gate=gate)[0] for n in (1, 2)}
-        w.orca_calls()
-
-        def too_few(*cfg):
-            r = w.afk(*_turn_batch(*cfg))
-            assert r["outcome"] == "too_few" and _turns(w, 10) == _turns(w, 20) == [], r
-            return r
-
-        too_few()                                                   # `required`: each PR's checks gate it
-        too_few(*gate, "--set", "gate.adversarial_verify_prompt=re-derive it")     # each owes its own verify
-        # there is no switch: the key that used to be one is refused, with the reason
-        for value in ("true", "false"):
-            assert "'merge.batch' was removed" in \
-                w.error(*_turn_batch(*gate, "--set", f"merge.batch={value}"))
-        # #2's own worker is still working: its PR may yet move, so one is eligible
-        w.worker(output=T0, state="working", since=T0, n=1)
-        assert too_few(*gate)["busy"] == [2]
-        assert w.orca_calls().count("worktree create") == 0
-
-        # one eligible PR: the cycle gives it the turn as it always did (ADR-0027)
-        c = cycle(w, None, *gate)
-        assert c["progress"].startswith("landing turn to #1; "), c
-        [note] = _turns(w, 10)
-        assert note.startswith(f"<!--afk:turn instance=me at={T0}-->\n") and _turns(w, 20) == []
-        assert [x["linkedIssue"] for x in w.worktrees()] == [1, 2]
-        assert "land it now" in w.terminals()[0]["sent"][-1]["text"]
-
-        # while ONE PR holds the turn no batch forms, however many now wait
-        w.worker(output=T0, state="done", since=T0, n=1)
-        w.set(issues=w.state()["issues"] + [issue(3, "ready-for-agent")])
-        with_pr(w, 3, 30, gate=gate)
-        r = w.afk(*_turn_batch(*gate))
-        assert (r["outcome"], r["holder"]) == ("waiting", 1), r
-        c = cycle(w, c["state"], *gate)
-        assert "landing turn" not in c["progress"] and _turns(w, 20) == _turns(w, 30) == []
-        assert _batch_rows(w, gate)[2] == []
-
-        # #1 lands: the cycle that settles it gives the two that wait ONE turn
-        assert _land(w, 1, d[1]["worktree"], *gate)["outcome"] == "merged"
-        c = cycle(w, c["state"], *gate)
-        assert c["progress"].startswith("landing turn to #2, #3; cleared #1; "), c
-        assert _batch_rows(w, gate)[0] == {2: ("landing", "stacking", None),
-                                           3: ("landing", "stacking", None)}
+def _github_reads(calls):
+    """The gh calls that only read GitHub, each as the thing it read → sorted."""
+    return sorted(c[1] if c[0] == "pr" else c[-3].split("/issues/")[1] if "--paginate" in c
+                  else "issue " + c[1].split("/issues/")[1]
+                  for c in calls if c[:2] == ["pr", "list"] or (c[0] == "api" and "--method" not in c))
 
 
 def test_an_orca_that_cannot_be_asked_is_an_error_for_every_observation_of_a_worker():
@@ -6404,47 +6063,3 @@ def test_every_flow_anchor_still_names_something():
     for path, symbol in anchors:
         with open(os.path.join(root, path)) as f:
             assert re.search(r"(?<!\w)%s(?!\w)" % re.escape(symbol), f.read()), f"{path}:{symbol}"
-
-
-def test_a_batchs_members_are_read_from_the_turn_markers_on_its_prs():
-    """Which PRs a batch holds has ONE home: the turn marker on each of them. The
-    batch's worktree keeps no list, so its landing follows the markers — a PR
-    whose marker says it left is not stacked, with nothing else to update — and
-    asks GitHub for no more than the markers, the open PRs and each issue it
-    closes."""
-    with world(issues=[issue(n, "ready-for-agent") for n in (1, 2, 3, 4)]) as w:
-        gate = _counted(w)
-        for n in (2, 3, 4):
-            with_pr(w, n, n * 10, gate=gate)
-        w.afk("claim", "1", *ME, *R, *NOW)                            # mine, and no PR yet
-        base0 = _target(w)
-        b = w.afk(*_turn_batch(*gate))
-        assert (b["issues"], _fleet_files(b["worktree"])) == ([2, 3, 4], ["afk-worker-prompt.md"])
-
-        # #3 leaves the batch — only its own marker says so
-        marked = w.state()["comments"]
-        [note] = marked["30"]
-        w.set(comments={**marked, "30": [{**note, "body": afk_decide.turn_comment(
-            afk_decide.unbatched_turn(afk_decide.latest_turn([note]), "me", T0, b["batch"],
-                                      "abandoned"))}]})
-        w.calls()
-        r = _land_batch(w, b, *gate)
-        assert (r["outcome"], r["issues"], r["prs"], r["left_out"]) == \
-            ("landed", [2, 4], [20, 40], []), r
-        assert [s for _, s, _ in _history(w, base0)] == ["feature 2 (#20)", "feature 4 (#40)"]
-        assert w.pr(30).get("state", "open") == "open" and w.issue(3)["state"] == "open"
-        # the reads of one landing: each marker once, the open PRs (again once
-        # the PRs it closes changed them), and each landed issue's state and board
-        assert _github_reads(w.calls()) == [
-            "2/comments", "20/comments", "30/comments", "4/comments", "40/comments",
-            "issue 2", "issue 4", "list", "list"]
-        # a member is found through any PR that carries the marker: the batch
-        # whose every PR is closed is still the same batch
-        again = _land_batch(w, b, *gate)
-        assert (again["outcome"], again["landed"]) == ("landed", r["landed"])
-        assert _gate_runs(w) == 1
-
-        # no PR carries the marker: there is no batch to land
-        w.set(comments={})
-        err = w.error("land", "--batch", b["batch"], *R, *NOW, *gate, cwd=b["worktree"])
-        assert "no PR carries the turn marker" in err, err

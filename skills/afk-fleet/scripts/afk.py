@@ -3162,7 +3162,7 @@ def _merged_onto(run: _Run, path: str, base: str, head: str, message: str) -> st
         return None
     if p.returncode != 0:
         raise RuntimeError(f"git merge-tree of {head} onto {base} failed: {p.stderr.strip()}")
-    tree, at = p.stdout.split()[0], f"{run.now()} +0000"
+    tree, at = p.stdout.split()[0], f"@{int(run.now())} +0000"
     made = subprocess.run(["git", "-C", path, "commit-tree", tree, "-p", base, "-p", head,
                            "-m", message], capture_output=True, text=True,
                           env={**os.environ, **_GIT_LOCALE, "GIT_AUTHOR_DATE": at,
@@ -3385,6 +3385,8 @@ def _land_train(run: _Run, limits: _GateLimits, merged_timeout: float) -> Obj:
                            "here. Do not hunt for the PR at fault and drop nothing. Then run "
                            "this again")
     out["gate"] = gate
+    # read before the push: GitHub takes a PR off the open list the moment its head lands
+    branches = {p["number"]: p["headRefName"] for p in _open_prs(run.repo)}
     p = _push_branch(run.repo, rem, path, head, target, check=False)
     if p.returncode != 0:
         if _remote_sha(rem, f"refs/heads/{target}") == train.target:
@@ -3396,7 +3398,6 @@ def _land_train(run: _Run, limits: _GateLimits, merged_timeout: float) -> Obj:
                            f"gates that")
 
     # --- on the target: landed. The claims and the PRs' worktrees are the next cycle's ---
-    branches = {p["number"]: p["headRefName"] for p in _open_prs(run.repo)}
     landed = [j for j in joins if _finish_landed(run, j)]
     numbers = sorted({j["pr"] for j in landed})
     still_open = _await_merged(run.repo, numbers, merged_timeout)
