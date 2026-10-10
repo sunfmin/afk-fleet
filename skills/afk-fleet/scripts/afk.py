@@ -780,24 +780,13 @@ def cmd_takeover(a: argparse.Namespace) -> Obj:
                          if lost else "")}
 
 
-def _release(run: _Run, number: int) -> Obj:
-    """Delete one claim ref. Already gone counts as released — idempotent cleanup.
-    A delete that failed with the claim still there is a phantom lock in the
-    making, so it raises."""
-    rem, ref = run.rem, _claim_ref(run.cfg, number)
-    p = _git(["push", rem, "--delete", ref], check=False)
-    if p.returncode != 0 and _remote_sha(rem, ref):
-        raise RuntimeError(f"release failed and {ref} is still on the remote: "
-                           f"{p.stderr.strip()}")
-    _claim_written(run, number)
-    return {"released": True, "issue": number, "ref": ref}
-
-
-def _clear(run: _Run, number: int, expect_sha: str) -> Obj:
-    """Delete one claim ref that is NOT mine — a `stale_closed` row — only while it
-    still points at the sha rebuild read: the same lease a reclaim takes it under,
-    so a claim somebody took meanwhile is never deleted from under them. Already
-    gone counts as released; a claim that moved raises."""
+def _release(run: _Run, number: int, expect_sha: str) -> Obj:
+    """Delete one claim ref, only while it still points at the sha it was read
+    at — the one delete behind every release, under the same lease a reclaim
+    takes a claim with, so a claim somebody took meanwhile is never deleted from
+    under them. Already gone counts as released — idempotent cleanup. A delete
+    that failed with the claim still there is a phantom lock in the making, so
+    it raises; so does a claim that moved, which the caller no longer holds."""
     rem, ref = run.rem, _claim_ref(run.cfg, number)
     p = _git(["push", rem, f"--force-with-lease={ref}:{expect_sha}", f":{ref}"], check=False)
     now_at = "" if p.returncode == 0 else _remote_sha(rem, ref)
@@ -805,8 +794,10 @@ def _clear(run: _Run, number: int, expect_sha: str) -> Obj:
         raise RuntimeError(f"release failed and {ref} is still on the remote: "
                            f"{p.stderr.strip()}")
     if now_at:
+        _forget(_scan_key(run))      # the claim is not where it showed it
         raise RuntimeError(f"{ref} moved since it was read (expected {expect_sha}, now "
-                           f"{now_at}): somebody took the claim; nothing was changed")
+                           f"{now_at}): somebody took the claim, which is no longer the "
+                           f"caller's to release; it was left alone")
     _claim_written(run, number)
     return {"released": True, "issue": number, "ref": ref}
 
@@ -816,7 +807,8 @@ def cmd_release(a: argparse.Namespace) -> Obj:
 
       afk release <n> --instance <id>
           a claim of MINE — an orphan-release, a `closed` row, the drain. Refuses
-          a claim another instance holds. With `--repo`, a claim whose issue is
+          a claim another instance holds, and one a peer took since this process
+          read it. With `--repo`, a claim whose issue is
           CLOSED — the `closed` row: its worker landed the PR, and `afk land`
           can neither release the claim nor remove the worktree it runs in — has
           its worktree removed too (`cleanup`). An open
@@ -826,7 +818,9 @@ def cmd_release(a: argparse.Namespace) -> Obj:
           checkout (`synced`, ADR-0037). An OPEN issue whose landing is
           already on the target — a merge batch pushed it and was cut before
           it closed the issue: a `landed` row — is closed first, its status
-          board says merged, and it is settled like any closed one.
+          board says merged, and it is settled like any closed one. All of
+          that comes before the delete: a run that raised on the way still
+          holds the claim, and the next tick releases it again.
       afk release <n> --instance <id> --expect-sha <sha>
           a `stale_closed` row of rebuild — a dead peer's claim on an issue that
           is already closed: a phantom lock, deleted instead of reclaimed."""
@@ -835,34 +829,47 @@ def cmd_release(a: argparse.Namespace) -> Obj:
 
 def _release_claim(run: _Run, instance: str, number: int,
                    expect_sha: str | None = None) -> Obj:
-    """`afk release` — of `instance`'s own claim on issue <number>
-    (`_release_mine`), or, with `expect_sha`, of a dead peer's `stale_closed`
-    row read at that sha (`_clear`). Two operations behind one subcommand: only
-    the first asks whose the claim is, and only it cleans up after a landing."""
+    """`afk release` — of `instance`'s own claim on issue <number>, or, with
+    `expect_sha`, of a dead peer's `stale_closed` row read at that sha. Two
+    operations behind one subcommand: only the first asks whose the claim is,
+    and only it settles what a landing left behind (`_settle_landed`) — before
+    the claim is deleted, so that a settling that raised is still this fleet's
+    to finish. An OPEN issue a merge batch landed (`_cut_landing`) is closed
+    first, and so settled the same way."""
     if expect_sha:
-        return _clear(run, number, expect_sha)
-    return _release_mine(run, instance, number)
-
-
-def _release_mine(run: _Run, instance: str, number: int) -> Obj:
-    """Release `instance`'s claim on issue <number> — refused for a claim
-    another instance holds — and, when the issue is CLOSED, settle what its
-    landing left behind (`_settle_landed`). An OPEN issue a merge batch landed
-    (`_cut_landing`) is closed first, and so settled the same way."""
-    owner = _claim_owner(run, number)
-    if owner not in (None, instance):
-        raise RuntimeError(f"issue #{number} is not this fleet's claim "
-                           f"({_claim_ref(run.cfg, number)} is held by {owner!r}); nothing was "
-                           f"changed. A dead peer's claim on a closed issue — a `stale_closed` "
-                           f"row — is released with --expect-sha <the sha rebuild reported>")
-    claim = next((c for c in _scan(run)[0] if c["number"] == number), None)
+        return _release(run, number, expect_sha)
+    claim = _mine_or_gone(run, number, instance)
     landed = _cut_landing(run, claim) if run.repo and claim else None
     if landed:          # the issue first: closed, it is settled below whatever cuts this short
         _finish_member(run, instance, {"issue": number, "pr": landed})
-    released = _release(run, number)
-    if run.repo and _issue_state(run.repo, number) == "closed":
-        released.update(_settle_landed(run, number))
-    return released
+    settled = (_settle_landed(run, number)
+               if run.repo and _issue_state(run.repo, number) == "closed" else {})
+    return {**_release_mine(run, instance, number), **settled}
+
+
+def _release_mine(run: _Run, instance: str, number: int) -> Obj:
+    """Release `instance`'s claim on issue <number> — the last step of every
+    transition that ends a claim. The delete is leased to the claim the scan
+    showed as `instance`'s, so one a peer took since is left alone and raises;
+    a claim another instance holds is refused, and one already gone counts as
+    released."""
+    claim = _mine_or_gone(run, number, instance)
+    if not claim:
+        return {"released": True, "issue": number, "ref": _claim_ref(run.cfg, number)}
+    return _release(run, number, claim["sha"])
+
+
+def _mine_or_gone(run: _Run, number: int, instance: str) -> Claim | None:
+    """Issue <number>'s claim when it is `instance`'s, None when there is none;
+    a claim another instance holds raises."""
+    claim = _claim_of(run, number)
+    if claim and claim["instance"] != instance:
+        raise RuntimeError(f"issue #{number} is not this fleet's claim "
+                           f"({_claim_ref(run.cfg, number)} is held by "
+                           f"{claim['instance'] or ''!r}); nothing was "
+                           f"changed. A dead peer's claim on a closed issue — a `stale_closed` "
+                           f"row — is released with --expect-sha <the sha rebuild reported>")
+    return claim
 
 
 def _settle_landed(run: _Run, number: int) -> Obj:
@@ -1322,7 +1329,7 @@ def _drain(run: _Run, instance: str, ws: WorkingSet) -> tuple[list[int], list[in
             kept.append(row["number"])
             continue
         try:
-            _release_mine(run, instance, row["number"])
+            _release_claim(run, instance, row["number"])
             released.append(row["number"])
         except _FAILURES as e:
             errors.append({"step": "release", "issue": row["number"], "error": str(e)})
@@ -3447,7 +3454,7 @@ def _escalate(run: _Run, instance: str, issue: IssueRead, attempt: int, reason: 
     add, remove = afk_decide.escalation_labels(issue["labels"], cfg)
     _ensure_label(run.repo, add[0])
     _edit_labels(run.repo, number, add, remove)
-    _release(run, number)
+    _release_mine(run, instance, number)
     cleanup = idle.remove() if idle else None
     return {"issue": number, "action": "escalate", "attempt": attempt, "pr": pr_number,
             "labels": {"added": add, "removed": remove}, "comment_id": comment_id,
@@ -3573,7 +3580,7 @@ def _park_claim(run: _Run, instance: str, number: int) -> Obj:
     for n in added:
         _add_blocker(run.repo, number, n)
     _upsert_board(run, number, "parked", blocked_by=waiting)
-    _release(run, number)
+    _release_mine(run, instance, number)
     cleanup = idle.remove() if idle else None
     return {"issue": number, "action": "parked", "blocked_by": waiting, "edges_added": added,
             "released": True, **({"cleanup": cleanup} if cleanup else {})}
@@ -3583,14 +3590,18 @@ def cmd_close(a: argparse.Namespace) -> Obj:
     """Close one of my claims whose issue needed no change (`afk no-pr` →
     `idle_done`), after the tick has verified the empty diff against base: status
     board → close the issue → release the claim → remove the worktree."""
-    run = _run(a)
-    _require_mine(run, a.number, a.instance)
-    _upsert_board(run, a.number, "closed", instance=a.instance)
-    _close_issue(run.repo, a.number)
-    _release(run, a.number)
-    wt = _Worktree.of_issue(run.repo, a.number)
+    return _close_claim(_run(a), a.instance, a.number)
+
+
+def _close_claim(run: _Run, instance: str, number: int) -> Obj:
+    """`afk close` — of `instance`'s claim on issue <number>."""
+    _require_mine(run, number, instance)
+    _upsert_board(run, number, "closed", instance=instance)
+    _close_issue(run.repo, number)
+    _release_mine(run, instance, number)
+    wt = _Worktree.of_issue(run.repo, number)
     cleanup = wt.remove() if wt.remembered else None
-    return {"issue": a.number, "action": "closed", "released": True,
+    return {"issue": number, "action": "closed", "released": True,
             **({"cleanup": cleanup} if cleanup else {})}
 
 

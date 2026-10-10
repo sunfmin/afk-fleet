@@ -98,6 +98,14 @@ second-guess a live owner's workers).
 - **Cleanup is load-bearing:** the claim ref must be deleted on merge, escalate, and release. A missed
   delete is a silent phantom lock (the one failure mode to guard hardest). ADR-0001's aversion to a
   second source of truth stands — the ref *is* the source of truth, and nothing reads the assignee.
+- **A release is leased, like a reclaim** *(amended)*. Whose a claim is, is read off the one scan a
+  process makes, and the delete comes later; a peer may have taken the claim in between (a takeover
+  of a fleet that was slow, not dead). So every delete of a claim ref — the release that ends a
+  transition, the drain, a landed claim's, a phantom lock's — is
+  `git push --force-with-lease=<ref>:<sha-it-read> :<ref>`: a claim that moved is left alone and the
+  caller is told it no longer holds it. And the delete is the last thing a release does: a landed
+  claim is settled (its batch-landed PR closed, its worktree removed, the checkout synced) *before*
+  its ref is deleted, so a settling that raised leaves the claim held for the next tick to finish.
 - **Graceful stop** releases no-PR claims immediately and retains has-PR claims, so a peer inherits
   and merges the finished PR after the lease expires (bounded merge latency, only at stop).
 - **Single-fleet is unchanged in behaviour** — one instance simply never sees a foreign claim, and its

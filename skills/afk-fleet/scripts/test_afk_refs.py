@@ -408,7 +408,7 @@ def test_release_deletes_only_my_claim_or_the_exact_claim_it_was_shown():
         taken = afk(w, "reclaim", "9", "--instance", "third", "--expect-sha", peer["sha"],
                     "--now", str(T0 + 1))
         err = afk_error(w, "release", "9", *ME, "--expect-sha", peer["sha"])
-        assert "moved" in err and "nothing was changed" in err
+        assert "moved" in err and "it was left alone" in err
         assert sb.remote_ref("refs/afk/claim/9") == taken["sha"]
 
         # shown the sha it has now, the phantom lock is gone — and stays gone, quietly
