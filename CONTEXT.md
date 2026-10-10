@@ -130,7 +130,7 @@ committed tree only when the worktree is exactly its commit before the run and a
 uncommitted, nothing untracked; a landing refuses to merge on any other run. GitHub checks
 are never read in this mode — the repo is
 expected to scope remote CI away from worker branches, and a target branch whose protection requires
-checks is rejected at bootstrap. A red run at landing is the worker's to fix in place; its log
+checks is rejected at bootstrap. A red run at landing is the worker's to fix in place — off the turn, the first time (ADR-0045); its log
 excerpt is also posted as a PR comment, so a failure that does reach the retry ladder is re-read
 from where it lives, never from anyone's context. In a **merge batch** the landing's run is
 made once, on the batch's stack, and proves the stack rather than each PR alone — the invariant
@@ -155,7 +155,7 @@ The one way a worker branch catches up with its base: merging `origin/<base>` in
 never rebasing (ADR-0012). It happens twice in a PR's life: the **worker** syncs and pushes right
 before its pre-PR **local gate**, so integration conflicts surface inside the worker's own session,
 where they are cheapest to fix; and the worker's **landing** syncs again, on its **landing turn**, picking up
-whatever the base gained since — a conflict there is left in progress for the same worker to resolve. Merge rather than rebase because a rebase drops
+whatever the base gained since — a conflict there is left in progress for the same worker to resolve, off the turn the first time (ADR-0045). Merge rather than rebase because a rebase drops
 merge commits and re-ignites the conflicts already resolved inside them — and those merge commits
 land on the target as they are: a PR lands as a merge commit, never squashed (ADR-0034). It is not an option: there is no config key for it (ADR-0038).
 _Avoid_: rebase (retired from the merge path), rebase onto latest, update branch
@@ -364,7 +364,7 @@ verdict; park is what the fleet does about it), escalate (that hands the issue t
 
 **Wake**:
 The one line a **worker** types into the **launcher**'s terminal once its outcome is on GitHub — a PR,
-a verdict marker, a **landing** that merged or stopped for the tick: `afk-wake #<n>`. It ends the launcher's sleep
+a verdict marker, a **landing** that merged, stopped for the tick, gave its turn up or made its PR ready again: `afk-wake #<n>`. It ends the launcher's sleep
 so the next cycle opens now rather than a busy interval later, and it carries nothing: the cycle it
 triggers reads GitHub like any other, and the launcher never acts on the line itself. One that arrives
 while a cycle is running is passed to the next (`afk cycle --wake`), which then ticks whatever its
@@ -382,29 +382,40 @@ the several PRs of one **merge batch** at once (ADR-0029): one turn, two kinds o
 in different ways and are deliberately not one abstraction (ADR-0036). It is recorded as a single marker
 comment on the PR naming the instance that granted it — so it dies with the PR, and does not survive
 a **takeover** — and it carries the tick's judgments made *before* the grant (the head an adversarial
-verify passed, a PR with no checks waived) and where the worker's last `afk land` stopped. While its
-PR holds the turn the claim is `landing`, and its worker is watched like a PR-less one: silent past
+verify passed, a PR with no checks waived) and where the worker's last `afk land` stopped. A turn
+covers the bounded part of a **landing** — sync, gate, merge: the first time a PR's landing stops on
+a conflict or a red gate the PR **gives its turn up** — the marker says so, for good, and holds no
+turn; the claim is `fixing`, the same worker fixes in the same worktree, and the next cycle grants
+the turn elsewhere. A PR gives its turn up **once**: on its next turn the same stop keeps the turn
+(ADR-0045). While its
+PR holds the turn the claim is `landing`, and its worker is watched like a PR-less one — as is one
+fixing off a turn its PR gave up, on the same rungs: silent past
 grace it is **nudged**; silent again it is **restarted onto the turn** — the idle session closed, a
 worker started by **continuation** in the same worktree (or one recreated at the PR's head, never
 from base), briefed only to land the PR, with the PR, branch, worktree and attempt untouched and the
 restart recorded on the turn marker — once per turn; silent again after the restarted worker's own
 nudge, the claim is **escalated**: the PR stays open, the branch and worktree stay, no attempt is
 spent, and the released claim holds no turn — so the next PR gets it (ADR-0035). That is the whole
-bound of a turn — told → grace → nudge → grace → restart → grace → nudge → grace → escalate — and
+bound of a turn, and of a fix off one — told → grace → nudge → grace → restart → grace → nudge → grace → escalate — and
 nothing is discarded at any step: `afk fail` reaches a landing claim only by the tick's own
 judgments (red checks in `required`, a refuted verify), never by silence. A worker whose terminal
 is gone gets that same continuation at once, unbounded. The check
 guards against a worker that strays, not a malicious one — worker and launcher share one `gh`
 credential (ADR-0027).
 _Avoid_: lock, merge lock (nothing is held on the target; the turn is a record on the PR), token,
-approval (no human or review is involved)
+approval (no human or review is involved), turn lost / revoked / taken back (the landing gives it up
+itself; nobody takes it)
 
 **Landing**:
 What a **worker** does on its **landing turn**, with one command in its own worktree (`afk land`):
 **sync** with the merge target → push → the machine gate on that exact head → merge pinned to the
 gated head. It stops with an outcome the worker acts on itself: a **sync** conflict is left in
 progress and resolved in place, a red gate is fixed in place, and the worker lands again — no round
-trip through the tick, no **retry** spent, the PR and the turn kept. Checks that must run on the head
+trip through the tick, no **retry** spent, the PR kept. The turn is kept only from a PR's second turn
+on: the first such stop **gives the turn up**, and the worker fixes off it. Run off the turn, the
+same command still syncs and gates and merges nothing; green there, the PR is **ready again**
+(`awaiting_turn`), the worker **wakes** the launcher and stops, and the PR waits for its next turn at
+the head of the **merge queue**. Nothing lands off a turn (ADR-0045). Checks that must run on the head
 it pushed are waited for by the landing itself, up to a bound. A gate run or that wait is long, so
 right before the merge the landing reads the turn and the target's tip again: a turn no longer its
 own lands nothing, and a target that moved is synced with and gated by the next run. Where the next move is the
@@ -428,7 +439,9 @@ on the target has landed, whatever cut the batch worker short after the push: a 
 still open is settled by the next **tick** from its commit there, and an abandon leaves it alone. A red stack is repaired with a fix commit on top, never
 bisected. Whether the turn goes to a batch or to one PR is decided in code
 (`afk_decide.batch_candidates`): never while a turn is out, never a PR that owes an adversarial
-verify, whose own worker is still working, or that is a peer's. A PR that leaves a batch without
+verify, whose own worker is still working, that gave a turn up, or that is a peer's. A PR being fixed
+off a turn it gave up holds no turn, so a batch forms beside it; ready again, it takes a single turn
+first (ADR-0045). A PR that leaves a batch without
 landing — *left out* because it conflicts with the stack, or because the batch was *abandoned* or
 *dissolved* — takes a single turn next and is never batched again.
 _Avoid_: merge train (nothing is speculatively gated, and there is one batch at a time, not a
@@ -447,14 +460,18 @@ whether to batch at all are the tick's, in code)
 
 **Merge queue**:
 The order **landing turns** are granted in (ADR-0027): among a **fleet instance**'s ready PRs, the
-one that already holds a turn first, then one that left a **merge batch** without landing, then the
+one that already holds a turn first, then one that gave a turn up and is ready again (ADR-0045), then
+one that left a **merge batch** without landing, then the
 lower PR number, then — one PR closing several issues — the lower issue number: a total order,
 whatever order the claims were read in. `afk rebuild` returns it as
 `merge_order`, and the **tick** grants the turn to its first PR only when none of its claims is
 landing. Every other ready PR waits as `awaiting_turn` — not synced, not told anything, holding its
-slot, its **status board** saying so — so PRs that conflict with each other are each resolved once,
-against a target that already holds everything landed before them. Waiting is bounded by the
-silent-worker ladder on the PR that holds the turn, and spends no **retry**. Turns are per fleet
+slot, its **status board** saying so. A PR that gave its turn up and is still being fixed is not in
+the queue, and holds nobody back. PRs that conflict with each other are each resolved against a
+target that holds everything landed before their turn — once, unless a PR gave that turn up, which
+may cost it one more resolution, on its second turn (ADR-0045). Waiting is bounded by a turn's own
+length — a sync, a gate run and a merge, or on a PR's second turn the
+silent-worker ladder on the PR that holds it — and spends no **retry**. Turns are per fleet
 instance: two fleets on one repo each grant their own. When two or more of
 those PRs may land together the turn goes to all of them as one **merge batch**, in this same order.
 _Avoid_: merge train (nothing is speculatively gated; a **merge batch** is one turn, not a train),
@@ -479,7 +496,7 @@ progress)
 **Status board** (a.k.a. progress comment):
 The human-facing projection of an issue's lifecycle onto the issue surface: a **single** comment the
 owning **fleet instance**'s **tick** upserts each **rebuild**, rendering a milestone checklist (claimed
-→ PR open → landing turn → merged, with the *ci-failed*, *awaiting-turn*, *escalated* and *parked* off-ramps) **derived** from
+→ PR open → landing turn → merged, with the *ci-failed*, *awaiting-turn*, *fixing* (turn given up), *ready-again*, *escalated* and *parked* off-ramps) **derived** from
 **fleet state**. It exists because the **claim** lives in a hidden ref namespace and the assignee is
 unused, so the "claimed but no PR yet" phase is otherwise invisible to a reader. It is a *rendering* of
 existing state, **never a source of truth** and **never read back by a tick**; it is edited in place

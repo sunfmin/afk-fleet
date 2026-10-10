@@ -86,7 +86,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   empty diff and closes it, `skills/afk-fleet/scripts/afk.py:cmd_close`.
 - The PR's checks are red before any turn is granted: the retry mainline below.
 - Another PR of this fleet holds the landing turn: this one waits, awaiting its turn — not synced,
-  not told anything, its slot held — so each PR of a conflicting group is resolved once, against a
+  not told anything, its slot held — so each PR of a conflicting group is resolved against a
   target that already holds the ones before it, `skills/afk-fleet/scripts/afk_decide.py:turn_order`
   (ADR-0027).
 - Two or more PRs may land together (`gate.ci: local`, no adversarial verify owed): the turn goes to all of them as one
@@ -97,10 +97,15 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   left out and takes a single turn; a batch whose worker stays silent is abandoned
   (ADR-0029, ADR-0034).
 - The landing's sync conflicts: the merge is left in progress in the worker's own worktree, and the
-  worker resolves it, commits and lands again — claim, PR, branch, worktree and turn kept, no
+  worker resolves it, commits and lands again — claim, PR, branch and worktree kept, no
   attempt spent, `skills/afk-fleet/scripts/afk_decide.py:land_outcome`.
 - The landing's gate is red: the worker fixes the code, commits and lands again; the excerpt is
   also a PR comment, `skills/afk-fleet/scripts/afk_decide.py:gate_comment`.
+- Either of those two, the first time for a PR: the landing gives the turn up,
+  `skills/afk-fleet/scripts/afk_decide.py:gives_turn_up` — the claim is `fixing`, the next cycle
+  grants the turn to the next PR or to a merge batch, and the worker fixes off the turn, where
+  `afk land` syncs and gates and merges nothing. Ready again, the PR takes its next turn ahead of
+  PRs that never held one, and on that turn the same stop keeps the turn (ADR-0045).
 - A recorded gate run of the command configured now stands for the tree that would land: step 13
   does not run the local gate again, `skills/afk-fleet/scripts/afk_decide.py:gate_record_void`
   (ADR-0030). Any sync that moved the head, any later commit, a record past its day, or no record,
@@ -315,7 +320,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   (ADR-0011; `test_select_recovery`, `test_dispatch_continues_from_whatever_progress_survived`)
 - A PR lands only through its worker's `afk land`, and only while it holds the landing turn of the
   fleet instance that holds its claim; turns are granted one at a time, in one order, so mutually
-  conflicting PRs are each resolved once. (ADR-0027;
+  conflicting PRs are each resolved against what landed before their turn. (ADR-0027;
   `test_a_worker_lands_its_own_pr_on_the_turn_the_fleet_grants`,
   `test_turns_are_granted_one_at_a_time_in_merge_order`)
 - A sync conflict or a red gate at landing is not a failure of the work: the worker fixes it in
