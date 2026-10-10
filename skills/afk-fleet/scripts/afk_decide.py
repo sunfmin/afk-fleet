@@ -2752,8 +2752,6 @@ PROMPT_VARIANTS: tuple[PromptVariant, ...] = get_args(PromptVariant)
 PROMPT_FIELDS = ("n", "title", "repo", "base_branch", "local_command", "afk_path", "config",
                  "branch", "worktree_path", "launcher_terminal")
 LANDING_FIELDS = ("pr", "pr_branch", "target")
-_PROMPT_SLOTS = ("opening", "step1", "retry_reason")
-_PROMPT_DERIVED = ("wake_command", "gate_command", "land_command", "verdict_marker")
 _NO_LOCAL_COMMAND = "true   # (no gate.local_command configured: run the repo's own build/test, if any)"
 _NO_WAKE = "true   # (no coordinator terminal to wake: it finds your outcome at its next poll)"
 _TERMINAL_HANDLE_RE = re.compile(r"[A-Za-z0-9_.:-]+")
@@ -2827,12 +2825,25 @@ def land_command(afk_path: str, number: int, repo: str, config: str) -> str:
             f"--config {shlex.quote(config)}")
 
 
+_PLACEHOLDER_RE = re.compile(r"\{([a-z_0-9]+)\}")
+
+
+def _fill(text: str, values: dict[str, str], what: str) -> str:
+    """Fill every `{name}` of an assembled template text from `values`, in one
+    pass: a value is written into the result and never read again, so one that
+    holds placeholder-shaped text — a title naming `{branch}`, a gate command's
+    `${var}` — arrives verbatim. Raises ValueError on a placeholder `values`
+    does not name; `what` names the brief in the message."""
+    left = sorted({m.group(0) for m in _PLACEHOLDER_RE.finditer(text) if m.group(1) not in values})
+    if left:
+        raise ValueError(f"{what}: unfilled placeholder(s) {', '.join(left)}")
+    return _PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], text).strip() + "\n"
+
+
 def _fill_prompt(text: str, fields: Obj, landing: Obj | None = None,
                  reason: str | None = None) -> str:
     """Fill every field of an assembled prompt text. Raises ValueError on a missing
-    field or a placeholder left unfilled; the free-text values (title, reason, the
-    land command's config) go in last and in one pass, so one that happens to
-    contain "{branch}" is never itself substituted into."""
+    field or a placeholder left unfilled."""
     missing = [k for k in PROMPT_FIELDS if k not in fields]
     missing += [k for k in LANDING_FIELDS if landing is not None and k not in landing]
     if missing:
@@ -2844,20 +2855,10 @@ def _fill_prompt(text: str, fields: Obj, landing: Obj | None = None,
     values["local_command"] = values["local_command"].strip() or _NO_LOCAL_COMMAND
     values["wake_command"] = wake_command(values.pop("launcher_terminal"), fields["n"])
     values["verdict_marker"] = verdict_marker_format(fields["n"])
-    # the land command carries the whole config, and a config may hold braces
-    free_text = {"title": values.pop("title"), "reason": (reason or "").strip(),
-                 "land_command": values.pop("land_command")}
+    values["reason"] = (reason or "").strip()
     if landing is not None:
         values.update({k: str(landing[k]) for k in LANDING_FIELDS})
-    for name, value in values.items():
-        text = text.replace("{" + name + "}", value)
-    known = (*PROMPT_FIELDS, *LANDING_FIELDS, *_PROMPT_SLOTS, *_PROMPT_DERIVED)
-    left = sorted(set(re.findall(r"\{(?:%s)\}" % "|".join(known), text))
-                  - {"{%s}" % k for k in free_text})
-    if left:
-        raise ValueError(f"worker prompt: unfilled placeholder(s) {', '.join(left)}")
-    text = re.sub(r"\{(%s)\}" % "|".join(free_text), lambda m: free_text[m.group(1)], text)
-    return text.strip() + "\n"
+    return _fill(text, values, "worker prompt")
 
 
 def render_worker_prompt(template: str, variant: PromptVariant, fields: Obj,
@@ -2918,18 +2919,11 @@ def render_batch_brief(template: str, fields: Obj) -> str:
     batch = str(fields["batch"])
     values = {k: str(fields[k]) for k in ("batch", "repo", "target", "branch", "worktree_path")}
     values["wake_command"] = wake_command(fields["launcher_terminal"], f"batch-{batch}")
-    # free text — titles, and a config that may hold braces — goes in last
-    free_text = {"members": "\n".join(f"- PR #{m['pr']} — closes #{m['issue']} — {m['title']}"
-                                      for m in fields["members"]),
-                 "batch_land_command": batch_land_command(str(fields["afk_path"]), batch,
-                                                          values["repo"], str(fields["config"]))}
-    for name, value in values.items():
-        text = text.replace("{" + name + "}", value)
-    left = sorted(set(re.findall(r"\{[a-z_]+\}", text)) - {"{%s}" % k for k in free_text})
-    if left:
-        raise ValueError(f"batch brief: unfilled placeholder(s) {', '.join(left)}")
-    text = re.sub(r"\{(%s)\}" % "|".join(free_text), lambda m: free_text[m.group(1)], text)
-    return text.strip() + "\n"
+    values["members"] = "\n".join(f"- PR #{m['pr']} — closes #{m['issue']} — {m['title']}"
+                                  for m in fields["members"])
+    values["batch_land_command"] = batch_land_command(str(fields["afk_path"]), batch,
+                                                      values["repo"], str(fields["config"]))
+    return _fill(text, values, "batch brief")
 
 
 def render_landing(template: str, fields: Obj, landing: Obj) -> str:

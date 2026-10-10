@@ -43,8 +43,11 @@ none (ADR-0020) — `{gate_command}` — the line the worker runs the **local ga
 carrying `gate.local_command`, so a green run is on record for the landing (ADR-0030), or a no-op when
 no local gate is configured — `{land_command}` — the line the worker **lands** its PR with: `afk land`
 carrying the run's whole config — and `{verdict_marker}`, the `<!--afk:verdict …-->` line a worker that opens no PR
-must post, written by the same code that parses it back. A field or slot the code cannot fill is an error: no
-worker is ever started on a prompt with a literal placeholder in it. A test renders every variant.
+must post, written by the same code that parses it back. A field or slot the code cannot fill is an error — and so is a placeholder no field answers to: no
+worker is ever started on a prompt with a literal placeholder in it. Every field of a brief is
+filled in one pass, so a value is never itself read for placeholders: a title naming `{branch}`, or
+a gate command using the shell's `${branch}`, reaches the worker as it was given. A test renders
+every variant.
 
 <!--afk:block prompt-->
 {opening}

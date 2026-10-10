@@ -2923,7 +2923,7 @@ def test_a_worker_is_not_sent_to_this_repos_adrs():
 
 def test_render_worker_prompt_never_ships_a_placeholder():
     t = _prompt_template()
-    # free text is substituted LAST, so a title or reason that looks like a
+    # every field goes in in one pass, so a title or reason that looks like a
     # placeholder is delivered verbatim rather than filled in
     odd = d.render_worker_prompt(t, "fresh", {**PROMPT_FIELDS, "title": "Support {branch} and {n}"},
                                  reason="it printed {worktree_path}")
@@ -2946,11 +2946,80 @@ def test_render_worker_prompt_never_ships_a_placeholder():
     looping = (block("prompt", "{opening} {step1}") + block("opening.fresh", "O")
                + block("step1.fresh", "see {opening}"))
     refuses(looping, "fresh", PROMPT_FIELDS, why="unfilled")
+    # and so is a placeholder no field answers to — in any of the three briefs
+    unknown = block("prompt", "{opening} {step1} {nope}") + block("opening.fresh", "O") + block("step1.fresh", "S")
+    refuses(unknown, "fresh", PROMPT_FIELDS, why="unfilled placeholder(s) {nope}")
+    refuses(block("prompt", "{opening} {step1} {pr}") + block("opening.fresh", "O") + block("step1.fresh", "S"),
+            "fresh", PROMPT_FIELDS, why="unfilled placeholder(s) {pr}")
+    for render in (lambda: d.render_landing(block("landing", "{n} {nope}"), PROMPT_FIELDS, LANDING),
+                   lambda: d.render_batch_brief(block("batch", "{batch} {nope}"), BATCH_FIELDS)):
+        try:
+            render()
+            assert False, "expected ValueError"
+        except ValueError as e:
+            assert "unfilled placeholder(s) {nope}" in str(e), e
     # the minimal well-formed template renders
     ok = (block("prompt", "{opening}|{step1}|{n}{retry_reason}") + block("opening.fresh", "O")
           + block("step1.fresh", "S") + block("retry_reason", " because {reason}"))
     assert d.render_worker_prompt(ok, "fresh", PROMPT_FIELDS) == "O|S|31\n"
     assert d.render_worker_prompt(ok, "fresh", PROMPT_FIELDS, reason="R") == "O|S|31 because R\n"
+
+
+BATCH_FIELDS = {"batch": "me-100", "repo": "acme/widgets", "target": "main",
+                "branch": "u/afk-batch-me-100", "worktree_path": "/w/batch",
+                "members": [{"issue": 1, "pr": 10, "title": "one"}, {"issue": 2, "pr": 20, "title": "two"}],
+                "afk_path": "/s/afk.py", "config": '{"retry": 2}', "launcher_terminal": "term_1"}
+
+
+def test_no_field_value_is_scanned_for_placeholders():
+    """A value is written into the brief and never read again: whatever
+    placeholder-shaped text it holds arrives verbatim, for every field of every
+    brief. Held by rendering each field twice — once carrying every known
+    placeholder, once with the braces swapped for brackets no template reads —
+    and finding the two renderings equal but for the brackets."""
+    t = _prompt_template()
+    names = sorted(set(re.findall(r"\{([a-z_0-9]+)\}", t)))
+    assert {"title", "branch", "pr", "reason", "land_command", "batch", "members"} <= set(names)
+    braces = " ".join("${%s}" % n for n in names)
+    inert = braces.replace("{", "\u27e6").replace("}", "\u27e7")
+    restore = lambda body: body.replace("\u27e6", "{").replace("\u27e7", "}")
+
+    def held(render, field):
+        assert braces in restore(render(inert)) or field == "launcher_terminal", field
+        assert render(braces) == restore(render(inert)), field
+
+    for k in d.PROMPT_FIELDS:
+        with_k = lambda v: {**PROMPT_FIELDS, k: f"{PROMPT_FIELDS[k]}{v}"}
+        held(lambda v: d.render_worker_prompt(t, "fresh", with_k(v), reason="red")
+             + d.render_worker_prompt(t, "continue", with_k(v))
+             + d.render_landing(t, with_k(v), LANDING), k)
+    held(lambda v: d.render_worker_prompt(t, "fresh", PROMPT_FIELDS, reason=f"red{v}"), "reason")
+    for k in d.LANDING_FIELDS:
+        held(lambda v: d.render_landing(t, PROMPT_FIELDS, {**LANDING, k: f"{LANDING[k]}{v}"}), k)
+    for k in d.BATCH_FIELDS:
+        if k == "members":
+            for part in ("issue", "pr", "title"):
+                held(lambda v: d.render_batch_brief(t, {**BATCH_FIELDS, k: [
+                    {**m, part: f"{m[part]}{v}"} for m in BATCH_FIELDS[k]]}), f"members.{part}")
+        else:
+            held(lambda v: d.render_batch_brief(t, {**BATCH_FIELDS, k: f"{BATCH_FIELDS[k]}{v}"}), k)
+
+
+def test_a_gate_command_with_shell_variables_reaches_the_worker_as_configured():
+    """`${branch}` and `${title}` in `gate.local_command` are the shell's, not the
+    template's: the prompt renders, and the gate line and the land command's
+    config carry the one command the config holds."""
+    t = _prompt_template()
+    command = 'BRANCH=${branch} make test && echo "${title}" {pr}'
+    config = json.dumps({"gate": {"local_command": command}})
+    fields = {**PROMPT_FIELDS, "local_command": command, "config": config}
+    gate = d.gate_command(fields["afk_path"], command)
+    for variant in d.PROMPT_VARIANTS:
+        assert d.render_worker_prompt(t, variant, fields).count(gate) == 1, variant
+    land = d.land_command(fields["afk_path"], 31, "acme/widgets", config)
+    assert d.render_landing(t, fields, LANDING).count(land) == 1
+    carried = lambda line: json.loads(shlex.split(line)[-1])["gate"]["local_command"]
+    assert carried(gate) == carried(land) == command
 
 
 def test_fingerprint():
