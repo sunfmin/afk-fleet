@@ -1,0 +1,7 @@
+# Linted: that every function of the production scripts says its types (ADR-0039).
+# The tests are held to running green instead.
+extend-exclude = ["test_*.py"]
+
+[lint]
+select = ["ANN"]
+ignore = ["ANN401"]     # `Any` is what a JSON value is
