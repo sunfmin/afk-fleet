@@ -26,8 +26,8 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    label, is not an epic, is unclaimed, has no open linked PR and has zero open blockers.
    `skills/afk-fleet/scripts/afk_decide.py:select_frontier`
 3. For each free slot under `concurrency`, the tick **dispatches** an issue, and the dispatch begins
-   by **claiming** it: creating its claim ref, which the server accepts for exactly one **fleet
-   instance**; a loser starts nothing.
+   by **claiming** it: refreshing the fleet's **heartbeat** if it is due, and only then creating the
+   claim ref, which the server accepts for exactly one **fleet instance**; a loser starts nothing.
    `skills/afk-fleet/scripts/afk.py:cmd_dispatch`
 4. The dispatch fetches the base's tip from the remote and has orca create the worktree and branch
    at that sha, then asserts the worktree contains it.
@@ -37,8 +37,8 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    file plus one submitted line pointing at it. A tick filling several slots begins every start
    first and then waits for all the agents together.
    `skills/afk-fleet/scripts/afk.py:put`
-6. It upserts the issue's **status board** to "claimed"; the tick refreshes its **heartbeat**
-   and ends, without waiting for the worker.
+6. It upserts the issue's **status board** to "claimed"; the tick ends without waiting for the
+   worker, its **heartbeat** fresh since before step 3's claim.
    `skills/afk-fleet/scripts/afk.py:_upsert_board`
 7. The worker implements the issue's acceptance criteria, committing and pushing its own branch
    after every completed step so a hard stop loses at most the step in flight.
@@ -173,14 +173,14 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 
 ## What happens to an issue when the fleet working on it dies?
 
-1. While it holds any claim, a fleet instance refreshes its one **heartbeat** ref whenever it is
-   older than a third of the lease.
+1. Before it takes a claim and while it holds any, a fleet instance refreshes its one **heartbeat**
+   ref whenever it is older than a third of the lease.
    `skills/afk-fleet/scripts/afk_decide.py:heartbeat_due`
 2. The fleet hard-stops and runs no code; a peer's next rebuild finds a claim whose owner's heartbeat
    is older than the claim lease, and classifies it a **stale claim**.
    `skills/afk-fleet/scripts/afk_decide.py:classify_claims`
-3. The peer takes the claim by re-stamping the ref with its own instance, a push the server rejects
-   unless the ref still points at the sha the peer read.
+3. The peer takes the claim: it refreshes its own heartbeat if due, then re-stamps the ref with its
+   own instance, a push the server rejects unless the ref still points at the sha the peer read.
    `skills/afk-fleet/scripts/afk.py:cmd_reclaim`
 4. The peer **dispatches** the issue it now holds; the dispatch asks what survived the death: a
    worktree for the issue still on this machine, and the issue's branch on the remote ahead of base.
@@ -263,6 +263,12 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 - A fleet never takes a peer's claim unattended while that peer's heartbeat is within the lease, and
   its own claims stay its own even when its heartbeat has expired. (ADR-0003;
   `test_classify_claims`, `test_classify_claims_my_own_expired_stays_mine`)
+- A claim is never on the remote without its owner's heartbeat within the lease: every push that
+  puts a claim in an instance's name — a claim, a stale reclaim, a takeover — refreshes that
+  instance's heartbeat first, so a peer scanning the instant the claim lands reads a live owner. A
+  fleet that holds nothing and claims nothing writes no heartbeat. (ADR-0003;
+  `test_a_claim_is_never_on_the_remote_without_its_owners_fresh_heartbeat`,
+  `test_a_peer_scanning_mid_tick_reads_a_first_claim_as_live`)
 - A claim is deleted at every terminal transition (escalate, park, close, release) and as its
   last step — after the relabel, after the dependency edge; a landed PR's claim by the next cycle's
   release, which also removes its worktree — and a release that
