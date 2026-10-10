@@ -2512,6 +2512,16 @@ def _unmerged(path: str) -> list[str]:
     return [ln for ln in out.splitlines() if ln]
 
 
+def _require_committed(path: str) -> None:
+    """Refuse a worktree whose tracked files differ from its commit: what a
+    landing would gate there is not what would land."""
+    dirty = _git(["-C", path, "status", "--porcelain", "--untracked-files=no"]).stdout.strip()
+    if dirty:
+        raise RuntimeError(f"the worktree {path} has uncommitted changes to tracked files — "
+                           f"what would be gated is not what would land. Commit them (a "
+                           f"resolved sync conflict must be committed) or discard them:\n{dirty}")
+
+
 def _sync(rem: str, path: str, target: str) -> list[str]:
     """Merge the remote's `target` tip into the worktree's branch — never a rebase
     (ADR-0012) → the conflicted file list, empty when the sync is clean. A
@@ -2521,11 +2531,7 @@ def _sync(rem: str, path: str, target: str) -> list[str]:
     files = _unmerged(path)
     if files:
         return files
-    dirty = _git(["-C", path, "status", "--porcelain", "--untracked-files=no"]).stdout.strip()
-    if dirty:
-        raise RuntimeError(f"the worktree {path} has uncommitted changes to tracked files — "
-                           f"what would be gated is not what would land. Commit them (a "
-                           f"resolved sync conflict must be committed) or discard them:\n{dirty}")
+    _require_committed(path)
     sha = _fetch_tip(rem, target, cwd=path)
     p = _git_as_caller(path, ["merge", "--no-edit", sha])
     if p.returncode != 0:
@@ -2728,6 +2734,19 @@ def _await_checks(repo: str, number: int, head: str, had_checks: bool, timeout: 
         time.sleep(min(poll, left))
 
 
+def _require_same_turn(run: _Run, number: int, pr_number: int,
+                       held: tuple[str | None, Turn | None]) -> None:
+    """Refuse a landing whose turn is no longer the one it started on (`held`,
+    `_single_turn`'s answer then) — read again now, a gate run or a wait for
+    checks being long. Nothing is written: the marker is not this landing's to
+    write on."""
+    if _single_turn(run, number, pr_number, fresh=True) != held:
+        raise RuntimeError(f"PR #{pr_number} no longer holds the landing turn this landing "
+                           f"started on (it was released, taken over or granted afresh while "
+                           f"the gate ran); nothing was merged. Do not land it any other way — "
+                           f"you are told when its turn comes")
+
+
 def cmd_land(a: argparse.Namespace) -> Obj:
     """A WORKER lands its own PR, in the worktree it is called from — the only way
     a PR lands (ADR-0027). Refused (exit 3, nothing changed) unless the PR holds
@@ -2815,6 +2834,9 @@ def cmd_land(a: argparse.Namespace) -> Obj:
     branch, target = pr["headRefName"], _base(cfg)
     pr_number: int = pr["number"]
     on_turn = not turn["released"]      # else the PR gave its turn up: nothing merges
+    stacks = afk_decide.batches_form(cfg)
+    if stacks:                          # a stacked landing cut short left the stack checked out
+        _back_on_branch(path)
     _aim_pr(run, pr)
     out = {"issue": a.number, "pr": pr_number, "turn": "held" if on_turn else "given_up"}
 
@@ -2845,6 +2867,15 @@ def cmd_land(a: argparse.Namespace) -> Obj:
     if here != pr_tip and not merging and _git(
             ["-C", path, "merge-base", "--is-ancestor", here, pr_tip], check=False).returncode == 0:
         _git(["-C", path, "merge", "--ff-only", pr_tip])
+
+    # --- where merge batches form, a PR alone lands as a batch of one: stacked on
+    # the target's tip, its branch left as it is. One that cannot be stacked — it
+    # conflicts with the tip, or a resolution is under way here — is synced below ---
+    if stacks and not merging:
+        landed = _land_stacked(run, path, pr, pr_tip, a.number, (owner, turn), limits,
+                               a.merged_timeout, stop, out)
+        if landed:
+            return landed
 
     # --- sync: merge the target in, push what that produced ---
     files = _sync(rem, path, target)
@@ -2903,11 +2934,7 @@ def cmd_land(a: argparse.Namespace) -> Obj:
     # --- a gate run or a wait for checks is long: what the merge rests on is read
     # again. The turn first — a refusal there writes nothing, the turn not being
     # this landing's to write on ---
-    if _single_turn(run, a.number, pr_number, fresh=True) != (owner, turn):
-        raise RuntimeError(f"PR #{pr_number} no longer holds the landing turn this landing "
-                           f"started on (it was released, taken over or granted afresh while "
-                           f"the gate ran); nothing was merged. Do not land it any other way — "
-                           f"you are told when its turn comes")
+    _require_same_turn(run, a.number, pr_number, (owner, turn))
     tip = _remote_sha(rem, f"refs/heads/{target}")
     if _git(["-C", path, "merge-base", "--is-ancestor", tip, head], check=False).returncode != 0:
         return stop("target_moved",
@@ -2918,6 +2945,110 @@ def cmd_land(a: argparse.Namespace) -> Obj:
     # --- land it. The claim and this worktree are the next cycle's to settle ---
     _merge_pr(run.repo, rem, pr, head)
     _upsert_board(run, a.number, "merged", instance=owner, pr=pr["number"])
+    return {**out, "outcome": afk_decide.land_outcome("merged"),
+            "detail": "landed — send your wake and stop"}
+
+
+def _back_on_branch(path: str) -> None:
+    """Put a worktree whose HEAD is detached back on the branch it was on — where
+    a stacked landing leaves its worker's worktree, however it ended, and where
+    the next one puts it when that one was killed. git remembers the branch
+    (`@{-1}`): its local name need not be the PR's. A worktree already on a
+    branch, or gone, is left alone."""
+    if os.path.isdir(path) and _git(["-C", path, "symbolic-ref", "-q", "HEAD"],
+                                    check=False).returncode != 0:
+        _git(["-C", path, "checkout", "-q", "-"])
+
+
+def _land_stacked(run: _Run, path: str, pr: PullRequest, pr_tip: str, issue: int,
+                  held: tuple[str | None, Turn], limits: _GateLimits, merged_timeout: float,
+                  stop: Callable[..., Obj], out: Obj) -> Obj | None:
+    """One PR landed as a merge batch of one, by its own worker in its own
+    worktree (ADR-0046) → `afk land`'s result, or None when the PR's head cannot
+    be stacked on the target's tip — it conflicts with it, or changes nothing
+    against it: the caller's sync is what that PR needs. In order:
+
+      push    the commits the worker made since `pr_tip`, the PR's head on the
+              remote — a resolution, a fix
+      stack   the target's tip checked out detached, the PR's head merged onto
+              it with ONE merge commit (`_stack_pr`) — the branch itself is not
+              touched, so the landing leaves no sync merge on it
+      gate    `gate.local_command` on that commit, or the run on record for
+              its tree (`_gated`)
+      land    the turn read again, then the commit pushed to the target as a
+              FAST-FORWARD: a target that moved refuses it (`target_moved`),
+              and the next run stacks on the new tip
+      finish  status board, the issues closed; GitHub shows the PR merged —
+              its head is the merge's second parent — and its branch is
+              deleted once it does
+
+    A red gate is the worker's to fix where it works, so the tip the stack was
+    made on is merged into the branch and pushed before `gate_red` is returned:
+    the red tree is then the one in front of it. Off the turn (`held` is a
+    marker that gave it up) nothing is pushed to the target: green is
+    `awaiting_turn`. `stop` and `out` are `cmd_land`'s. The worktree is back
+    on its branch whenever this returns or raises."""
+    rem, target = run.rem, _base(run.cfg)
+    owner, turn = held
+    number, branch = pr["number"], pr["headRefName"]
+    _require_committed(path)
+    head = _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip()
+    pushed = head != pr_tip
+    if pushed:
+        _push_branch(run.repo, rem, path, head, branch)
+    tip = _fetch_tip(rem, target, cwd=path)
+
+    def stopped(outcome: afk_decide.LandOutcome, **more: Any) -> Obj:
+        _back_on_branch(path)
+        return stop(outcome, **more)
+
+    _git(["-C", path, "checkout", "-q", "--detach", tip])
+    try:
+        commit, _, _ = _stack_pr(rem, path, pr, issue)
+        if commit is None:
+            return None
+        out.update(head=head, synced=pushed, commit=commit)
+        gate = _gated(run, path, limits)
+        if gate["status"] != "green":
+            _pr_comment(run.repo, number, afk_decide.gate_comment(gate, gate["command"]))
+            _back_on_branch(path)
+            if _git_as_caller(path, ["merge", "--no-edit", tip]).returncode != 0:
+                _git(["-C", path, "merge", "--abort"], check=False)   # the next run meets it
+            merged = _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip()
+            if merged != head:
+                _push_branch(run.repo, rem, path, merged, branch)
+                out.update(head=merged, synced=True)
+            return stop("gate_red", gate=gate,
+                        detail=f"the gate is red on {target} with this PR merged onto it. "
+                               f"{target} is merged into the branch here, so that tree is the "
+                               f"one in front of you — fix the code, commit, and run this again")
+        out["gate"] = gate
+        if turn["released"]:
+            _upsert_board(run, issue, "ready_again", instance=owner, pr=number)
+            return stopped("awaiting_turn",
+                           detail=f"this PR gave its landing turn up and is ready again: gated "
+                                  f"here as it would land on {target}, nothing merged — send "
+                                  f"your wake and stop; you are told when its next turn comes")
+        _require_same_turn(run, issue, number, held)
+        p = _push_branch(run.repo, rem, path, commit, target, check=False)
+        if p.returncode != 0:
+            if _remote_sha(rem, f"refs/heads/{target}") == tip:
+                raise RuntimeError(f"the push of PR #{number} to {target} failed although "
+                                   f"{target} has not moved: {p.stderr.strip()}")
+            return stopped("target_moved",
+                           detail=f"{target} moved while the gate ran: the fast-forward was "
+                                  f"refused and nothing landed — run this again; it stacks on "
+                                  f"the new tip and gates that")
+    finally:
+        _back_on_branch(path)
+
+    # --- on the target: landed. The claim and this worktree are the next cycle's ---
+    _upsert_board(run, issue, "merged", instance=owner, pr=number)
+    for n in sorted({issue, *(ref["number"] for ref in pr["closingIssuesReferences"] or [])}):
+        if _issue_state(run.repo, n) == "open":
+            _close_issue(run.repo, n)
+    if not _await_merged(run.repo, [number], merged_timeout):
+        _delete_branch(rem, branch, check=False)
     return {**out, "outcome": afk_decide.land_outcome("merged"),
             "detail": "landed — send your wake and stop"}
 
@@ -3245,21 +3376,15 @@ def _close_landed_pr(run: _Run, number: int) -> int | None:
     it is left alone."""
     pr = afk_decide.closing_pr(_open_prs(run.repo), number)
     turn = _turn(run.repo, pr["number"]) if pr else None
-    if not pr or not turn or not turn["batch"] or turn["released"]:
+    if not pr or not turn or turn["released"]:
         return None
     target = _base(run.cfg)
     commit = _landed_commit(".", _fetch_tip(run.rem, target), pr["number"])
     if not commit:
         return None
-    _close_batched_pr(run, pr, commit, turn["batch"], [m["pr"] for m in turn["members"]])
+    _close_pr(run.repo, run.rem, pr["number"], afk_decide.landed_comment(
+        commit, target, turn["batch"], [m["pr"] for m in turn["members"]]))
     return pr["number"]
-
-
-def _close_batched_pr(run: _Run, pr: PullRequest, commit: str, batch: str, prs: list[int]) -> None:
-    """Close one PR a batch landed, with the comment that names its commit."""
-    cfg = run.cfg
-    _close_pr(run.repo, run.rem, pr["number"],
-              afk_decide.batch_landed_comment(commit, _base(cfg), batch, prs))
 
 
 def _stack_pr(rem: str, path: str, pr: PullRequest,

@@ -2451,13 +2451,13 @@ def landed_under(turn: Turn | None, claim: Claim) -> bool:
     of a PR whose merge commit on the target closes that issue — which a PR
     landed long ago does too, for an issue since reopened and claimed again.
 
-    Only as a member of a merge batch (`batch`, never `released`: a PR that
-    left its batch landed nothing), whose turn the claim's own instance granted
-    (`held_turn`) no earlier than the claim was made — both times are the
-    fleet's own clock.
+    Only on a turn it still holds — a merge batch's or its own, never
+    `released`: a PR that left its batch, or gave its turn up, landed nothing
+    on that marker — which the claim's own instance granted (`held_turn`) no
+    earlier than the claim was made; both times are the fleet's own clock.
     """
     held = held_turn(turn, claim["instance"])
-    return bool(held and held["batch"] and held["at"] is not None
+    return bool(held and held["at"] is not None
                 and claim["ts"] is not None and held["at"] >= claim["ts"])
 
 
@@ -2704,13 +2704,16 @@ def read_stack(commits: Iterable[tuple[str, str, str]],
     return stacked, fixes
 
 
-def batch_landed_comment(commit: str, target: str, batch: str, prs: Iterable[int]) -> str:
-    """The comment a batched PR is closed with when GitHub did not show it merged
+def landed_comment(commit: str, target: str, batch: str | None = None,
+                   prs: Iterable[int] = ()) -> str:
+    """The comment a stacked PR is closed with when GitHub did not show it merged
     — its head moved after it was stacked, or GitHub never caught up: the PR
-    itself says which commit landed it."""
+    itself says which commit landed it. `batch` and `prs`: the merge batch it
+    landed in and that batch's PRs; None for a PR that landed alone."""
     others = ", ".join(f"#{p}" for p in prs)
-    return (f"**afk-fleet: landed on `{target}` as {commit}** — in merge batch `{batch}` "
-            f"({others}), stacked as one merge commit per PR and gated once as a stack. "
+    how = (f"in merge batch `{batch}` ({others}), stacked as one merge commit per PR and gated "
+           f"once as a stack" if batch else "stacked on it as one merge commit and gated there")
+    return (f"**afk-fleet: landed on `{target}` as {commit}** — {how}. "
             f"GitHub did not mark this PR merged, so it is closed here; what was stacked "
             f"is on `{target}`.")
 
