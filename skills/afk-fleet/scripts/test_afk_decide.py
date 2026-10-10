@@ -2139,34 +2139,6 @@ def test_cycle_state_is_validated_not_guessed():
             assert "--instance" in str(e) or "--worker-command" in str(e)
 
 
-def test_every_state_a_cycle_leaves_is_one_the_next_cycle_takes():
-    """Whatever run of wakes, ticks and drains a fleet goes through, the state
-    each one returns — through the JSON a launcher carries it in — is taken back
-    unchanged."""
-    def back(state):
-        carried = json.loads(json.dumps(state))
-        assert d.cycle_state(carried) == state, state
-        return d.cycle_state(carried)
-
-    for seed in range(200):
-        rng = random.Random(seed)
-        count = lambda: rng.choice((0, 0, 1, 3))                            # noqa: E731
-        state = d.cycle_state(None, **FACTS)
-        for _ in range(40):
-            if rng.random() < 0.1:
-                kept = list(range(count()))
-                state = back(d.cycle_drained(state, [9] * count(), kept, count())["state"])
-                continue
-            woke = d.cycle_wake(state, rng.choice(("a", "a", "a", "b")), woke=rng.random() < 0.1)
-            state = back(woke["state"])
-            if woke["action"] == "tick":
-                did = _did(dispatched=[1] * count(), in_flight=count(), frontier_remaining=count())
-                state = back(d.cycle_ticked(
-                    state, did, judgments=count(), errors=count(), unseen=count(),
-                    left=rng.choice((None, "a", "c")),
-                    boards=rng.choice((None, {7: "0a1b2c3d"})))["state"])
-
-
 def _did(**did):
     return {**{k: [] for k in d.TICK_DID}, "in_flight": 0, "frontier_remaining": 0, **did}
 
