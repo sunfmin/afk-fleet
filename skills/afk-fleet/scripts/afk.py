@@ -892,12 +892,16 @@ def _sync_checkout(run: _Run) -> Obj:
         return {"branch": target, "skipped": str(e)}
 
 
+def _claim_of(run: _Run, number: int) -> Claim | None:
+    """Issue <number>'s claim, as the scan has it; None when it has none."""
+    return next((c for c in _scan(run)[0] if c["number"] == number), None)
+
+
 def _claim_owner(run: _Run, number: int) -> str | None:
     """The instance id issue <number>'s claim is stamped with, as the scan has
     it: None when there is no such claim, "" when there is one whose marker names
     nobody — which is never mine."""
-    claim = next((c for c in _scan(run)[0] if c["number"] == number),
-                 None)
+    claim = _claim_of(run, number)
     return None if claim is None else claim["instance"] or ""
 
 
@@ -3255,26 +3259,49 @@ def _workless_worktree(run: _Run, number: int) -> _Worktree | None:
     return wt if empty else None
 
 
+def _escalation_begun(run: _Run, number: int) -> afk_decide.Escalation | None:
+    """The escalation my claim on issue <number> is already in — one cut short
+    after its comment, the claim still held — else None."""
+    claim = _claim_of(run, number)
+    if claim is None:
+        return None
+    return afk_decide.escalation_begun(_issue_comments(run.repo, number), claim["sha"])
+
+
 def _escalate(run: _Run, instance: str, issue: IssueRead, attempt: int, reason: str) -> Obj:
     """Hand an issue to a human, in the one order that leaves no gap: status board
-    → labels → comment → release → remove the worktree, when its branch holds no
+    → comment → labels → release → remove the worktree, when its branch holds no
     work. The claim is released before anything is removed, and after the
     relabel: released first, a PR-less issue still carrying `ready_label` is
     back on the frontier for a peer to dispatch before the relabel lands. A
     worktree with work in it stays for the human, with its PR; an empty one is
-    only an idle worker (ADR-0041)."""
+    only an idle worker (ADR-0041).
+
+    Any write of it can be refused with the claim still held, and it is then run
+    again — by hand, or by the tick that finds the same failure. The comment goes
+    before the relabel because the relabel strips the attempt count: the comment
+    records whose escalation it is and after how many retries, so a run that
+    finds it posts no second one, reports the count the labels no longer say,
+    and does what is left, each step of which is safe to repeat (ADR-0033)."""
     cfg = run.cfg
     number = issue["number"]
     idle = _workless_worktree(run, number)
     pr = afk_decide.closing_pr(_open_prs(run.repo), number)
     pr_number = pr["number"] if pr else None
+    begun = _escalation_begun(run, number)
+    if begun:
+        attempt = begun["attempt"]
     _upsert_board(run, number, "escalated", instance=instance,
                   pr=pr_number, attempt=attempt)
+    claim = _claim_of(run, number)
+    if claim is None:
+        raise RuntimeError(f"issue #{number} is not claimed; nothing was changed")
+    comment_id = begun["comment_id"] if begun else _comment(
+        run.repo, number,
+        afk_decide.escalation_comment(reason, attempt, claim["sha"], pr_number))
     add, remove = afk_decide.escalation_labels(issue["labels"], cfg)
     _ensure_label(run.repo, add[0])
     _edit_labels(run.repo, number, add, remove)
-    comment_id = _comment(run.repo, number,
-                          afk_decide.escalation_comment(reason, attempt, pr_number))
     _release(run, number)
     cleanup = idle.remove() if idle else None
     return {"issue": number, "action": "escalate", "attempt": attempt, "pr": pr_number,
@@ -3300,8 +3327,8 @@ def cmd_fail(a: argparse.Namespace) -> Obj:
       retry     swap the label up by one, discard the failed attempt (close its PR,
                 delete its branch, remove its worktree) and start a FRESH worker
                 under the same claim, handed `--reason`; or
-      escalate  when the attempts are exhausted: status board → relabel → comment
-                `--reason` → release the claim.
+      escalate  when the attempts are exhausted: status board → comment
+                `--reason` → relabel → release the claim.
 
     `--reason` is the tick's judgment — the failure, re-read from where it lives.
     This is the one writer of the attempt label, as `current_attempt` is its one
@@ -3316,7 +3343,13 @@ def cmd_fail(a: argparse.Namespace) -> Obj:
     label, adds nothing, and does what is left. A failure of the fresh attempt
     finds no such label and is counted. The one step that is not covered is that
     removal: refused after the worker has started, it leaves the label on a
-    running attempt, whose next failure is then retried without being counted."""
+    running attempt, whose next failure is then retried without being counted.
+
+    An escalation is finished the same way. Its relabel strips the count, so a
+    failure whose escalation was cut short after that reads as attempt 0; the
+    escalation's comment, posted first, says it is this claim's, and run again
+    this escalates — it never starts the ladder over on an issue already
+    handed to a human."""
     return _fail_claim(_run(a), a.instance, _agent(a), a.number, a.reason)
 
 
@@ -3329,7 +3362,8 @@ def _fail_claim(run: _Run, instance: str, agent: _Agent, number: int, reason: st
     reason = _stalled_reason(run.repo, number, reason)     # before the worktree is discarded
     labels = issue["labels"]
     decision = afk_decide.next_attempt(afk_decide.current_attempt(labels), cfg["retry"],
-                                       counted=afk_decide.attempt_starting(labels))
+                                       counted=afk_decide.attempt_starting(labels),
+                                       escalation=_escalation_begun(run, number))
     if decision["action"] == "escalate":
         return _escalate(run, instance, issue, decision["attempt"], reason)
     add, remove = afk_decide.retry_labels(labels, decision["to_label"])

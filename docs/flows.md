@@ -224,12 +224,13 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 5. A fresh worker is started from the base under the same claim, its prompt ending with the failure
    reason.
    `skills/afk-fleet/scripts/afk.py:cmd_fail`
-6. When the attempts are exhausted, the status board is upserted to "escalated" and the issue is
-   relabelled: the escalate label on, the ready label and the attempt label off.
-   `skills/afk-fleet/scripts/afk_decide.py:escalation_labels`
-7. The stuck point is commented with the PR, and only then is the claim released; the issue is now
-   a human's, with its PR and worktree left as evidence — a worktree with no work on its branch is
-   removed instead.
+6. When the attempts are exhausted, the status board is upserted to "escalated" and the stuck
+   point is commented with the PR, under a record of whose escalation it is and after how many
+   retries — what a run that finds the claim still held finishes the escalation from.
+   `skills/afk-fleet/scripts/afk_decide.py:escalation_comment`
+7. The issue is relabelled — the escalate label on, the ready label and the attempt label off —
+   and only then is the claim released; the issue is now a human's, with its PR and worktree left
+   as evidence — a worktree with no work on its branch is removed instead.
    `skills/afk-fleet/scripts/afk.py:_escalate`
 
 **Where it forks.**

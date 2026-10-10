@@ -184,7 +184,7 @@ One change of a **claim**'s state, performed as a single `afk` call that runs it
 sequence in code: **dispatch** (claim → worktree at the right commit → worker started → prompt
 delivered → status board), **turn** (grant the **landing turn**: the tick's judgments checked → the
 brief written → the turn recorded on the PR → the worker told, or continued onto it → status board), **fail** (count the attempt, then a fresh retry or an escalation), **escalate**
-(status board → relabel → comment → release, the release last), **park** (dependency edge → status
+(status board → comment → relabel → release, the release last), **park** (dependency edge → status
 board → release → cleanup), **close** (status board → close → release → cleanup). A transition stops with an **outcome** exactly where the next move is judgment —
 a PR with no checks, a verification still owed — and takes the tick's judgment as an
 argument (a reason, a verified head, "start fresh"). The tick therefore types no raw `git`, `gh` or
@@ -313,7 +313,10 @@ counted **once**: the edit that raises the number also adds `afk-attempt/startin
 counted, its fresh worker has not started — and starting a worker removes it, so an `afk fail` that
 was cut short after counting and runs again (by hand, or from the next **tick**, which reads the
 label as the row's `starting`) finishes the same retry instead of spending another. A new failure
-of the fresh attempt finds no such label and is counted.
+of the fresh attempt finds no such label and is counted. An escalation cut short is finished the
+same way: its comment records whose it is — the **claim**'s — and after how many retries, before
+the relabel strips the count, so the same failure failed again escalates, with no second comment,
+and never starts the retries over (ADR-0033).
 _Avoid_: re-dispatch (that is a **continuation**: nothing discarded, nothing counted), nudge,
 restart (a silent worker on a **landing turn** is restarted onto it by continuation — nothing
 discarded, nothing counted; ADR-0035), attempt (the attempt is the thing that failed; the retry is
