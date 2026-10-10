@@ -4914,6 +4914,8 @@ def test_a_train_is_the_repos_and_the_next_fleet_instance_tends_it():
         # it lands everything on the train, the dead fleet's PR included
         r = _land_train(w, twt, *gate)
         assert (r["outcome"], r["prs"]) == ("landed", [10, 20]), r
+        # and the landing put it back on the branch it was cut with
+        assert git(twt, "symbolic-ref", "--short", "HEAD") == "tester/afk-train"
         assert [s for _, s, _ in _history(w, base0)] == ["feature 1 (#10)", "feature 2 (#20)"]
         assert [w.issue(n)["state"] for n in (1, 2)] == ["closed"] * 2
 

@@ -1729,6 +1729,7 @@ class _Worktree:
         if not self.path:
             return {"cleared": False, "path": self.remembered}
         self._close_terminals()
+        _on_branch(self.path)
         for args in (["merge", "--abort"], ["reset", "-q", "--hard", at], ["clean", "-qfd"]):
             _git(["-C", self.path, *args], check=False)
         for mark in (_NUDGE_MARK, _TOLD_MARK):
@@ -2612,6 +2613,24 @@ def _unmerged(path: str) -> list[str]:
     return [ln for ln in out.splitlines() if ln]
 
 
+def _on_branch(path: str) -> None:
+    """Have the worktree at `path` on a branch, at the commit and with the
+    index and files it has: one left on a detached HEAD is put back on the
+    branch it was cut with — the local branch named as its directory, behind
+    whatever prefix orca gave it — or, that branch gone, on one of that name.
+    Only refs move, so a merge in progress there stays in progress."""
+    at = ["-C", path]
+    if _git([*at, "symbolic-ref", "-q", "HEAD"], check=False).returncode == 0:
+        return
+    name = os.path.basename(path.rstrip("/"))
+    heads = _git([*at, "for-each-ref", "--format=%(refname:short)", "refs/heads"]).stdout.split()
+    for branch in [*(h for h in heads if h.rpartition("/")[2] == name), name]:
+        # refused for a branch another worktree has checked out
+        if _git([*at, "branch", "-f", branch, "HEAD"], check=False).returncode == 0:
+            _git([*at, "symbolic-ref", "HEAD", f"refs/heads/{branch}"])
+            return
+
+
 def _require_committed(path: str) -> None:
     """Refuse a worktree whose tracked files differ from its commit: what a
     landing would gate there is not what would land."""
@@ -3361,6 +3380,7 @@ def _land_train(run: _Run, limits: _GateLimits, merged_timeout: float) -> Obj:
                            f"progress here — resolve every file, `git add` it, COMMIT the "
                            f"merge, and run this again")
 
+    _on_branch(path)
     if _unmerged(path):
         return conflict("it", _unmerged(path))
     _require_committed(path)

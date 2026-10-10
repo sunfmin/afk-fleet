@@ -328,7 +328,8 @@ run one command, which gates the train as it stands and lands it on `{target}`, 
 it says — again and again, until the train is empty.
 
 **Your train:** in `{repo}`, landing on `{target}`.
-**Your worktree:** `{worktree_path}` — work only here.
+**Your worktree:** `{worktree_path}` — work only here, on the branch it is on: never check out a
+commit or another branch.
 
 **This command is the only way the train lands.** Run it in your worktree, exactly as written:
 ```bash
