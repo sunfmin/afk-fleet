@@ -24,7 +24,8 @@ orchestrator, manager, main agent
 
 **Fleet instance**:
 One launcher run and everything it owns — the ticks it runs, the workers they dispatch, and the
-**claims** it holds — identified by an id minted at bootstrap. That id
+**claims** it holds — identified by an id minted at bootstrap, in the one grammar `afk` admits as
+`--instance` (lowercase letters, digits and `-`: ADR-0044). That id
 and the **worker launch command** are the run's two launcher-held facts:
 settled once at bootstrap, passed to the first cycle and riding in the **cycle state** from then on —
 not in the launcher's own memory, which a compaction may cut —

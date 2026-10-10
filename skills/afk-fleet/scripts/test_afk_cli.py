@@ -2726,7 +2726,7 @@ def test_what_a_turn_marker_says_survives_a_landing_that_stops_and_a_turn_grante
         on = (*local_gate("true"), "--set", "gate.adversarial_verify_prompt=re-derive it")
         d, head = with_pr(w, 7, 70)
         wt = d["worktree"]
-        left = afk_decide.unbatched_turn(None, "me", T0, "me-1", "left_out")
+        left = afk_decide.unbatched_turn(None, "me", T0, "me-t1", "left_out")
         w.set(comments={"70": [{"id": 2001, "html_url": "u", "body": afk_decide.turn_comment(
             afk_decide.single_turn(left, "me", T0, verified="0" * 40, allow_no_checks=True))}]})
 
@@ -2739,7 +2739,7 @@ def test_what_a_turn_marker_says_survives_a_landing_that_stops_and_a_turn_grante
         r = _land(w, 7, wt, *on, now=T0 + 10)
         assert r["outcome"] == "needs_verify", r
         assert marker() == {**before, "at": T0 + 10, "stopped": "needs_verify", "head": r["head"]}
-        assert (marker()["unbatched"], marker()["of"]) == ("left_out", "me-1")
+        assert (marker()["unbatched"], marker()["of"]) == ("left_out", "me-t1")
         assert (marker()["verified"], marker()["allow_no_checks"]) == ("0" * 40, True)
         # the turn is granted again, on a verify of that head
         assert w.afk(*_turn(7, *on, "--verified", r["head"], now=T0 + 20))["again"] is True
@@ -4299,7 +4299,7 @@ def test_land_batch_without_the_batchs_turn_changes_nothing():
 
         # not in the batch's worktree; not this batch
         assert "is not merge batch" in refused(cwd=d[1]["worktree"])
-        assert "is not merge batch" in refused(name="me-1")
+        assert "is not merge batch" in refused(name="me-t1")
         # a member whose marker is gone, or names another fleet instance
         w.set(comments={**marked, "20": []})
         assert "does not hold the landing turn of merge batch" in refused()
@@ -5391,6 +5391,26 @@ def test_the_subcommands_that_start_a_worker_are_the_ones_a_judgment_writes_the_
                 if any(act.required and "--worker-command" in act.option_strings
                        for act in sub._actions)}
     assert requires == set(afk_decide.STARTS_WORKER)
+
+
+def test_an_instance_outside_the_grammar_is_refused_on_every_subcommand_that_takes_one():
+    """The instance id's grammar is checked where `--instance` enters, on every
+    subcommand that has the flag — nothing downstream meets an id it would read
+    back as another's — and SKILL.md's "mint an instance id" step names it."""
+    parser = afk.build_parser()
+    takes = [n for n, sub in parser.subcommands.items()
+             if any("--instance" in act.option_strings for act in sub._actions)]
+    assert {"cycle", "claim", "heartbeat", "takeover", "turn", "status"} <= set(takes)
+    with world() as w:
+        for name in takes:
+            argv = [a for a in _minimal_argv(name, parser.subcommands[name])
+                    if a not in ("--instance", "me")]
+            for bad in ("fl/1", "fl 1", "Fl", ""):
+                err = w.error(*argv, "--instance", bad, "--config", "{}")
+                assert "--instance" in err and afk_decide.INSTANCE_ID_GRAMMAR in err, (name, err)
+    step = next(ln for ln in _skill_docs()["SKILL.md"].split("\n\n")
+                if "mint a short unique **instance id**" in ln)
+    assert f"`{afk_decide.INSTANCE_ID_GRAMMAR}`" in step
 
 
 def test_config_is_required_and_resolves_one_way_on_every_subcommand():

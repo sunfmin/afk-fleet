@@ -369,14 +369,14 @@ def test_a_field_no_rewrite_names_survives_it():
 
 
 def test_a_batch_is_known_by_its_id_wherever_orca_puts_its_branch():
-    batch = d.batch_id("fl/1 x", 1700000000)
-    assert batch == "fl-1-x-1700000000" and d.batch_name(batch) == "afk-batch-fl-1-x-1700000000"
-    heads = ["main", "felix/afk-batch-fl-1-170", "afk-batch-fl-1-170-2", "felix/afk-batch-fl-1-1700",
-             "felix/afk-batch-fl-2-170", "felix/issue-3-x", "felix/afk-batch-fl-1-170-x"]
-    assert d.batch_branches(heads, "fl-1-170") == ["afk-batch-fl-1-170-2", "felix/afk-batch-fl-1-170"]
+    batch = d.batch_id("fl-1-x", 1700000000)
+    assert batch == "fl-1-x-t1700000000" and d.batch_name(batch) == "afk-batch-fl-1-x-t1700000000"
+    heads = ["main", "felix/afk-batch-fl-1-t170", "afk-batch-fl-1-t170-2", "felix/afk-batch-fl-1-t1700",
+             "felix/afk-batch-fl-2-t170", "felix/issue-3-x", "felix/afk-batch-fl-1-t170-x"]
+    assert d.batch_branches(heads, "fl-1-t170") == ["afk-batch-fl-1-t170-2", "felix/afk-batch-fl-1-t170"]
     # a batch's id says which instance formed it — and only that one
-    assert d.batch_formed_by(batch, "fl-1/x") and not d.batch_formed_by(batch, "fl-1")
-    assert not d.batch_formed_by(batch, "") and not d.batch_formed_by(None, "fl-1/x")
+    assert d.batch_formed_by(batch, "fl-1-x") and not d.batch_formed_by(batch, "fl-1")
+    assert not d.batch_formed_by(batch, "") and not d.batch_formed_by(None, "fl-1-x")
     # the PR a stacked merge commit's subject names
     subject = d.stack_message("a title", 12, 3).splitlines()[0]
     assert d.stacked_pr("p1 p2", subject) == 12
@@ -385,26 +385,73 @@ def test_a_batch_is_known_by_its_id_wherever_orca_puts_its_branch():
     assert d.stacked_pr("p1", subject) is None and d.stacked_pr("", subject) is None
     # the subject ENDS with it: a revert quotes it, and names no PR
     assert d.stacked_pr("p1 p2", f'Revert "{subject}"') is None
-    assert d.batch_branches(heads, "fl-9-1") == [] and d.batch_branches(None, "fl-1-170") == []
+    assert d.batch_branches(heads, "fl-9-t1") == [] and d.batch_branches(None, "fl-1-t170") == []
 
     def wt(branch, at=1, **more):
         return {"path": f"/wt/{branch}", "branch": f"refs/heads/{branch}",
                 "projectId": "github:acme/widgets", "lastActivityAt": at, **more}
 
-    rows = [wt("felix/afk-batch-fl-1-170"), wt("felix/afk-batch-fl-1-170-2", at=5),
-            wt("felix/afk-batch-fl-1-200"), wt("felix/afk-batch-fl-2-170"),
-            wt("felix/afk-batch-fl-1-300", isArchived=True), wt("felix/issue-3-x", linkedIssue=3),
-            wt("felix/afk-batch-fl-1-400", projectId="github:other/repo")]
+    rows = [wt("felix/afk-batch-fl-1-t170"), wt("felix/afk-batch-fl-1-t170-2", at=5),
+            wt("felix/afk-batch-fl-1-t200"), wt("felix/afk-batch-fl-2-t170"),
+            wt("felix/afk-batch-fl-1-t300", isArchived=True), wt("felix/issue-3-x", linkedIssue=3),
+            wt("felix/afk-batch-fl-1-t400", projectId="github:other/repo")]
     # one batch's worktrees, the most recently active first
-    assert [w["path"] for w in d.batch_worktrees(rows, "acme/widgets", batch="fl-1-170")] == \
-        ["/wt/felix/afk-batch-fl-1-170-2", "/wt/felix/afk-batch-fl-1-170"]
+    assert [w["path"] for w in d.batch_worktrees(rows, "acme/widgets", batch="fl-1-t170")] == \
+        ["/wt/felix/afk-batch-fl-1-t170-2", "/wt/felix/afk-batch-fl-1-t170"]
     # every batch of one instance, each under its own id — never another fleet's, another repo's
     mine = d.batch_worktrees(rows, "acme/widgets", instance="fl-1")
-    assert sorted({w["batch"] for w in mine}) == ["fl-1-170", "fl-1-200"]
+    assert sorted({w["batch"] for w in mine}) == ["fl-1-t170", "fl-1-t200"]
     assert d.batch_worktrees(rows, "acme/widgets", instance="fl-3") == []
     # orca lower-cases the project id: a repo with a capital still owns its worktrees
-    assert d.batch_worktrees(rows, "Acme/Widgets", batch="fl-1-170") == \
-        d.batch_worktrees(rows, "acme/widgets", batch="fl-1-170")
+    assert d.batch_worktrees(rows, "Acme/Widgets", batch="fl-1-t170") == \
+        d.batch_worktrees(rows, "acme/widgets", batch="fl-1-t170")
+
+
+def test_an_instance_id_has_one_grammar():
+    for ok in ("fl", "fl-1", "fleet-789a05", "7", "a--b-", "a" * 40):
+        assert d.instance_id(ok) == ok
+    # one ref path segment, one bare token of a branch name, never two that differ by case
+    for bad in ("", "-fl", "fl/1", "fl 1", "fl.1", "fl_1", "Fl", "fl\n", "é", "a" * 41):
+        try:
+            d.instance_id(bad)
+            raise AssertionError(bad)
+        except ValueError as e:
+            assert "is not an instance id" in str(e) and d.INSTANCE_ID_GRAMMAR in str(e)
+
+
+def _some_instance_ids():
+    """Every instance id of up to four characters over an alphabet that holds each
+    kind the grammar has — a letter, the `t` of a batch id, a digit, the `-` —
+    and the prefix pairs by name."""
+    short = ["".join(c) for n in range(1, 5) for c in itertools.product("at1-", repeat=n)]
+    named = ["fl", "fl-1", "fl-t1", "fl-1-t1", "felix", "felix-2", "felix-2-2", "fl-t170-2"]
+    ids = [i for i in dict.fromkeys(short + named) if re.fullmatch(d.INSTANCE_ID_GRAMMAR, i)]
+    assert len(ids) > 200 and set(named) <= set(ids)
+    return ids
+
+
+def test_a_batch_branch_is_one_instances_and_never_another_s():
+    """Whatever second a batch was formed in and whatever continuation suffix orca
+    put behind its branch, the branch matches the batches of the instance that
+    formed it and of no other — so a sweep never deletes a peer's — and distinct
+    instances never form one batch id."""
+    ids = _some_instance_ids()
+    owners = {}             # branch → the one instance it is a batch branch of
+    for instance in ids:
+        for now in (1, 170, 1700000000):
+            batch = d.batch_id(instance, now)
+            assert d.batch_formed_by(batch, instance)
+            for suffix in ("", "-1", "-2", "-170"):
+                for user in ("", "felix/"):
+                    branch = f"{user}{d.batch_name(batch)}{suffix}"
+                    assert owners.setdefault(branch, instance) == instance, branch
+                    assert d.batch_branch_regex(batch).match(branch)
+    for instance in ids:
+        rx = d.batch_branch_regex(instance=instance)
+        claimed = {branch for branch in owners if rx.match(branch)}
+        assert claimed == {b for b, owner in owners.items() if owner == instance}, instance
+        # and the id it reads off a branch is the batch's own
+        assert all(d.batch_formed_by(rx.match(b).group(1), instance) for b in claimed)
 
 
 def test_the_cycle_forms_a_batch_only_from_two_or_more_eligible_prs():
@@ -870,16 +917,16 @@ def test_a_batch_shows_on_the_board_in_the_brief_and_in_the_working_set():
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "..", "references", "worker-prompt.md")) as f:
         template = f.read()
-    fields = {"batch": "me-100", "repo": "acme/widgets", "target": "main",
-              "branch": "u/afk-batch-me-100", "worktree_path": "/w/batch",
+    fields = {"batch": "me-t100", "repo": "acme/widgets", "target": "main",
+              "branch": "u/afk-batch-me-t100", "worktree_path": "/w/batch",
               "members": [{"issue": 1, "pr": 10, "title": "one {braces}"},
                           {"issue": 2, "pr": 20, "title": "two"}],
               "afk_path": "/s/afk.py", "config": '{"retry": 2}',
               "launcher_terminal": "term_1"}
     brief = d.render_batch_brief(template, fields)
-    assert "/s/afk.py land --batch me-100 --repo acme/widgets --config " in brief
+    assert "/s/afk.py land --batch me-t100 --repo acme/widgets --config " in brief
     assert brief.index("PR #10 — closes #1 — one {braces}") < brief.index("PR #20 — closes #2 — two")
-    assert d.wake_command("term_1", "batch-me-100") in brief and "/w/batch" in brief
+    assert d.wake_command("term_1", "batch-me-t100") in brief and "/w/batch" in brief
     for outcome in d.BATCH_OUTCOMES:
         assert f"`{outcome}`" in brief
     try:
@@ -906,17 +953,17 @@ def test_a_batch_shows_on_the_board_in_the_brief_and_in_the_working_set():
     def turn(body):
         return d.latest_turn([{"id": 1, "body": body}])
 
-    mine = turn(d.turn_comment(d.batch_turn(None, "me", 1000, "me-100", members, "gating")))
+    mine = turn(d.turn_comment(d.batch_turn(None, "me", 1000, "me-t100", members, "gating")))
     issues, prs, claims = _gathered(issues, prs, claims)
     ws = d.assemble_working_set(issues, prs, claims, beats, "me", 1000, cfg,
                                 turns={1: mine, 2: mine,
-                                       3: turn(d.turn_comment(d.unbatched_turn(None, "me", 1000, "me-100", "left_out")))})
+                                       3: turn(d.turn_comment(d.unbatched_turn(None, "me", 1000, "me-t100", "left_out")))})
     rows = {m["number"]: (m["status"], m["board_phase"], m["batch"], m["unbatched"]) for m in ws["mine"]}
-    in_batch = {"id": "me-100", "members": [1, 2], "phase": "gating"}
+    in_batch = {"id": "me-t100", "members": [1, 2], "phase": "gating"}
     # (a batch row has no board phase: its board is the batch's to write, not the tick's)
     assert rows == {1: ("landing", None, in_batch, None), 2: ("landing", None, in_batch, None),
                     3: ("awaiting_turn", "awaiting_turn", None, "left_out")}
-    assert ws["batches"] == [{"id": "me-100", "instance": "me", "members": members,
+    assert ws["batches"] == [{"id": "me-t100", "instance": "me", "members": members,
                               "phase": "gating", "at": 1000}]
     assert ws["merge_order"] == [1, 2, 3]
     assert d.asks_after(ws["mine"]) == []            # the batch's worker is asked after, not theirs

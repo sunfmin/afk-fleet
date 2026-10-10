@@ -98,7 +98,9 @@ launch command (step 3).
    template ([references/config-template.md](references/config-template.md)) and stop; never run on
    guessed settings.
 2. **Establish this fleet instance** — mint a short unique **instance id** (this launcher run's
-   identity, passed to the first cycle and carried in the cycle `state` from then on). Then
+   identity, passed to the first cycle and carried in the cycle `state` from then on). It must match
+   `[a-z0-9][a-z0-9-]{0,39}` — lowercase letters, digits and `-`, e.g. `fl-7fbd5e`; `afk` refuses
+   any other `--instance`. Then
    `afk probe --repo <repo> --config '<config>' [--base-branch <name>]`, which answers four
    compatibility questions and returns the run's config — **hold its `config` from here on, in
    place of step 1's**:

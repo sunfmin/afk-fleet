@@ -3617,6 +3617,14 @@ def _count(text: str) -> int:
     return n
 
 
+def _instance_id(text: str) -> str:
+    """An `--instance` value: an instance id, in its one grammar."""
+    try:
+        return afk_decide.instance_id(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
 class _Parser(argparse.ArgumentParser):
     """argparse whose usage errors are the CLI's one error shape — `{"error": …}`,
     exit 3 — so a missing `--config` reads exactly like any other failure."""
@@ -3663,7 +3671,7 @@ def build_parser() -> _Parser:
         return p
 
     def mine(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--instance", required=True, metavar="id", help="my fleet instance id")
+        p.add_argument("--instance", type=_instance_id, required=True, metavar="id", help="my fleet instance id")
 
     def stamp(p: argparse.ArgumentParser) -> None:
         mine(p)
@@ -3752,7 +3760,7 @@ def build_parser() -> _Parser:
     p.add_argument("--state", default=None, metavar="json",
                    help="the `state` the previous `afk cycle` returned, verbatim (omit on "
                         "the first cycle, which always ticks)")
-    p.add_argument("--instance", default=None, metavar="id",
+    p.add_argument("--instance", type=_instance_id, default=None, metavar="id",
                    help="my fleet instance id — the first cycle only; then --state carries it")
     p.add_argument("--host", default=socket.gethostname())
     p.add_argument("--worker-command", default=None, metavar="cmd",
@@ -3912,7 +3920,7 @@ def build_parser() -> _Parser:
     p.add_argument("number", type=int, metavar="n")
     p.add_argument("--phase", required=True, choices=list(afk_decide.STATUS_PHASES), metavar="phase",
                    help="the lifecycle phase — a `mine` row's board_phase")
-    p.add_argument("--instance", default=None, metavar="id", help="owning fleet instance id (shown in the header)")
+    p.add_argument("--instance", type=_instance_id, default=None, metavar="id", help="owning fleet instance id (shown in the header)")
     p.add_argument("--pr", type=int, default=None, metavar="pr", help="the PR number, once one is open")
     p.add_argument("--attempt", type=int, default=0, metavar="k",
                    help="the `mine` row's attempt (shown for ci_failed)")

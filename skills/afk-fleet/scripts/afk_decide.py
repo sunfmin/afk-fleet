@@ -2226,20 +2226,41 @@ def turn_order(rows: list[MineRow]) -> list[int]:
 # fast-forward (`afk land --batch`). Still one turn out at a time; what the
 # gate proves is the stack, in the form it lands.
 
-_BATCH_ID_UNSAFE = re.compile(r"[^A-Za-z0-9_.-]")
+# The instance id's one grammar, checked once where `--instance` enters
+# (`afk.py`): lowercase letters, digits and `-`, opening with a letter or digit,
+# at most 40 characters. So an id is a bare token wherever it is written — one
+# ref path segment (its heartbeat is read back under exactly that name), part of
+# a branch name — and two ids never differ by case alone, which a
+# case-insensitive checkout would fold into one ref.
+INSTANCE_ID_GRAMMAR = r"[a-z0-9][a-z0-9-]{0,39}"
+
+
+def instance_id(text: str) -> str:
+    """`text` when it is an instance id (`INSTANCE_ID_GRAMMAR`); raises otherwise."""
+    if not re.fullmatch(INSTANCE_ID_GRAMMAR, text):
+        raise ValueError(f"{text!r} is not an instance id: it must match {INSTANCE_ID_GRAMMAR}")
+    return text
+
+
+def _batch_ids(instance: str) -> str:
+    """The regex of every batch id of `instance`. The `-t` in front of the second
+    is what keeps one instance's ids apart from another's: no id of `fl-1` is an
+    id of `fl`, and none is an id of `fl` behind orca's `-<k>` continuation
+    suffix either."""
+    return rf"{re.escape(instance)}-t\d+"
 
 
 def batch_id(instance: str, now: float) -> str:
     """A new merge batch's id: the granting fleet instance and the second it was
-    formed — unique, since an instance has one turn out at a time. It is a bare
-    token: it names a branch, a worktree and a marker field."""
-    return f"{_BATCH_ID_UNSAFE.sub('-', instance)}-{int(now)}"
+    formed — unique, since an instance has one turn out at a time, and never
+    another instance's (`_batch_ids`). It is a bare token: it names a branch, a
+    worktree and a marker field."""
+    return f"{instance}-t{int(now)}"
 
 
 def batch_formed_by(batch: str | None, instance: str | None) -> bool:
     """Is `batch` an id `batch_id` gives a batch of `instance`?"""
-    return bool(instance) and bool(
-        re.fullmatch(rf"{re.escape(_BATCH_ID_UNSAFE.sub('-', instance))}-\d+", batch or ""))
+    return bool(instance) and bool(re.fullmatch(_batch_ids(instance), batch or ""))
 
 
 def batch_name(batch: str) -> str:
@@ -2256,7 +2277,7 @@ def batch_branch_regex(batch: str | None = None,
     if batch:
         which = re.escape(batch)
     elif instance:
-        which = rf"({re.escape(_BATCH_ID_UNSAFE.sub('-', instance))}-\d+)"
+        which = f"({_batch_ids(instance)})"
     else:
         raise ValueError("batch_branch_regex takes a batch or an instance")
     return re.compile(rf"^(?:[^/]+/)?afk-batch-{which}(?:-\d+)?$")
