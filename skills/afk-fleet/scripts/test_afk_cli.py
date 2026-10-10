@@ -39,6 +39,7 @@ A test that counts round trips, or needs to see two of them overlap, asks for
 `spans`: every gh, orca and git call is then logged with when it started and
 ended, and the ones a test names are made slow enough to overlap visibly.
 """
+import dataclasses
 import json
 import os
 import re
@@ -51,7 +52,8 @@ from contextlib import contextmanager
 
 import afk
 import afk_decide
-from test_afk_refs import ENV, NO_CONFIG, T0, TTL, afk as run, afk_error, git, sandbox, settled
+from test_afk_refs import (ENV, NO_CONFIG, T0, TTL, afk as run, afk_error, git, last_beat,
+                           sandbox, settled)
 
 REPO = "acme/widgets"
 LAUNCHER = "term_launcher"      # the orca terminal the launcher runs in (ADR-0020)
@@ -802,8 +804,8 @@ def test_rebuild_assembles_the_working_set_from_gh_and_refs():
     with world(issues=issues, prs=[pr(30, closes=3)]) as w:
         for n, inst in ((3, "me"), (4, "me"), (5, "peer-live"), (6, "peer-dead")):
             assert w.afk("claim", str(n), "--instance", inst, "--now", str(T0), *R)["won"]
-        w.afk("heartbeat", "--instance", "peer-live", "--now", str(T0 - 60), *R)
-        w.afk("heartbeat", "--instance", "peer-dead", "--now", str(T0 - TTL - 60), *R)
+        last_beat(w.cwd, "peer-live", T0 - 60)
+        last_beat(w.cwd, "peer-dead", T0 - TTL - 60)
         w.calls()
 
         ws = w.afk("rebuild", "--instance", "me", "--now", str(T0), *R)
@@ -907,8 +909,8 @@ def test_rebuild_sets_a_dead_peers_claim_on_a_closed_issue_apart_from_work_to_re
     with world(issues=issues) as w:
         for n, inst in ((2, "peer-dead"), (3, "peer-dead"), (4, "peer-live")):
             w.afk("claim", str(n), "--instance", inst, *NOW, *R)
-        w.afk("heartbeat", "--instance", "peer-dead", "--now", str(T0 - TTL - 60), *R)
-        w.afk("heartbeat", "--instance", "peer-live", "--now", str(T0 - 60), *R)
+        last_beat(w.cwd, "peer-dead", T0 - TTL - 60)
+        last_beat(w.cwd, "peer-live", T0 - 60)
 
         ws = w.afk("rebuild", *ME, *R, *NOW)
         sha = {n: w.sb.remote_ref(f"refs/afk/claim/{n}") for n in (2, 3)}
@@ -1047,6 +1049,26 @@ def test_cycle_gates_ticks_paces_and_beats_through_a_whole_run():
                                                      "--repo", "acme/other")
 
 
+def test_a_peer_scanning_mid_tick_reads_a_first_claim_as_live():
+    """A tick's heartbeat step is its last, and a fleet holding nothing has not
+    beaten: a peer whose scan falls between a first claim's push and the end of
+    that tick — here the instant the claim lands — must still read a live owner,
+    or it reclaims the issue and works it a second time (#123)."""
+    with world(issues=[issue(1)]) as w:
+        git(w.sb.root, "clone", "--quiet", w.sb.bare, "peer")
+        seen_by_peer = w.sb.scan_as_claims_land(os.path.join(w.sb.root, "peer"), "peer", T0)
+
+        # holding nothing and claiming nothing: no heartbeat is written
+        idle = cycle(w)
+        assert idle["progress"] == "0 in flight, 0 left on the frontier"
+        assert not [ref for ref in w.sb.all_refs() if "heartbeat" in ref]
+
+        w.set(issues=[issue(1, "ready-for-agent")])
+        first = cycle(w, idle["state"])
+        assert first["progress"] == "dispatched #1; 1 in flight, 0 left on the frontier"
+        assert (seen_by_peer()["peer_live"], seen_by_peer()["stale"]) == ([1], [])
+
+
 def test_the_cycle_state_carries_the_instance_and_the_worker_launch_command():
     """The run's two launcher-held facts are passed once. Afterwards a caller that
     kept nothing but `state` — a launcher after a context compaction — still
@@ -1143,7 +1165,7 @@ def test_the_drain_releases_claims_with_no_pr_and_keeps_those_with_one():
         with_pr(w, 1, 10, conclusion="PENDING")                      # finished, checks running
         w.afk(*dispatch(2))                                          # still coding
         w.afk("claim", "4", "--instance", "peer-live", *NOW, *R)
-        w.afk("heartbeat", "--instance", "peer-live", "--now", str(T0 - 60), *R)
+        last_beat(w.cwd, "peer-live", T0 - 60)
         r = cycle(w, None, "--set", "concurrency=2")
         assert r["progress"] == "2 in flight, 1 left on the frontier"
         w.afk("claim", "5", *ME, *NOW, *R)                           # mine, outlived its issue
@@ -1183,8 +1205,8 @@ def test_a_tick_in_code_settles_every_row_the_rebuild_routes():
         assert w.afk(*_turn(7))["outcome"] == "granted"              # #7 is landing
         for n, inst in ((4, "me"), (8, "me"), (5, "peer-dead"), (6, "peer-dead"), (9, "peer-live")):
             w.afk("claim", str(n), "--instance", inst, *NOW, *R)     # #8: mine, and no worker
-        w.afk("heartbeat", "--instance", "peer-dead", "--now", str(T0 - TTL - 60), *R)
-        w.afk("heartbeat", "--instance", "peer-live", "--now", str(T0 - 60), *R)
+        last_beat(w.cwd, "peer-dead", T0 - TTL - 60)
+        last_beat(w.cwd, "peer-live", T0 - 60)
         phantom = w.sb.remote_ref("refs/afk/claim/5")
         told, turns = len(w.terminals()[0]["sent"]), _turns(w, 70)
 
@@ -1369,14 +1391,14 @@ def test_a_claim_ref_write_is_in_the_scan_made_before_it():
                 return {c["number"]: c["instance"] for c in afk._scan(run)[0]}
 
             scan = afk._scan(run)
-            assert owners() == {2: "peer"} and scan[1] == {}
-            assert afk._claim(run, 1, "me", "host")["won"]
-            assert owners() == {1: "me", 2: "peer"}
+            assert owners() == {2: "peer"} and scan[1] == {"peer": T0}
+            assert afk._claim(run, 1, "me", "host")["won"]         # which beat first
+            assert owners() == {1: "me", 2: "peer"} and scan[1] == {"peer": T0, "me": T0}
             peer = next(c["sha"] for c in scan[0] if c["number"] == 2)
             assert afk._force_take(run, 2, peer, "me", "host")["won"]
             assert owners() == {1: "me", 2: "me"}
-            assert afk._beat(run, "me")["refreshed"]
-            assert afk._scan(run)[1] == {"me": T0}
+            assert afk._beat(dataclasses.replace(run, clock=T0 + TTL), "me")["refreshed"]
+            assert afk._scan(run)[1] == {"peer": T0, "me": T0 + TTL}
             afk._release(run, 1)
             mine = next(c["sha"] for c in scan[0] if c["number"] == 2)
             afk._clear(run, 2, mine)
@@ -1516,7 +1538,7 @@ def test_one_tick_reads_each_thing_once_and_sees_its_own_writes():
         with_pr(w, 6, 60)                                             # ready for its turn
         w.afk(*dispatch(7, "--now", str(T0 + 1)))                     # its worker stopped
         w.afk("claim", "8", "--instance", "peer-dead", *NOW, *R)
-        w.afk("heartbeat", "--instance", "peer-dead", "--now", str(T0 - TTL - 60), *R)
+        last_beat(w.cwd, "peer-dead", T0 - TTL - 60)
         now = int(time.time()) + 5000
         w.afk("heartbeat", *ME, "--now", str(now - 30), *R)
         w.worker(output=now - 3, state="working", since=now - 900, n=0)
@@ -3908,6 +3930,78 @@ def test_a_batched_pr_github_does_not_show_merged_keeps_its_branch_and_is_closed
             assert not w.sb.remote_ref(f"refs/heads/{d[n][0]['branch']}")
 
 
+def _line_repo(root):
+    """A throwaway repo whose `main` is a target's own line → (path, commit,
+    stack): `commit(subject, body)` puts one plain commit on it, and
+    `stack(title, pr, issue)` one PR the way a batch stacks it — a merge commit
+    with `afk_decide.stack_message`. Each returns the commit it made."""
+    path, n = str(root), iter(range(10 ** 6))
+    git(path, "init", "-q", "--initial-branch=main")
+
+    def commit(subject, body=""):
+        git(path, "commit", "-q", "--allow-empty", "-m", subject, *(["-m", body] if body else []))
+        return git(path, "rev-parse", "HEAD")
+
+    def stack(title, pr, issue):
+        git(path, "checkout", "-q", "-b", f"pr-{pr}-{next(n)}")
+        commit(f"work for {pr}", f"Closes #{issue}")
+        git(path, "checkout", "-q", "main")
+        git(path, "merge", "-q", "--no-ff", "-m", afk_decide.stack_message(title, pr, issue), "-")
+        return git(path, "rev-parse", "HEAD")
+
+    commit("init")
+    return path, commit, stack
+
+
+def test_a_landed_commit_is_found_by_its_subject_whatever_came_after(tmp_path):
+    """What a batch landed is read from the target's own line: the merge commit
+    a PR was stacked with is the one whose SUBJECT ends ` (#<pr>)`. Nothing that
+    landed later hides it — not a revert that quotes the subject, not a fix
+    titled after the PR, not a message that mentions the PR or says it closes
+    the issue."""
+    path, commit, stack = _line_repo(tmp_path)
+    assert afk._landed_commit(path, "main", 10) is None and afk._landed_pr(path, "main", 1) is None
+    # a mention before the landing is not the landing
+    commit("get ready for feature (#10)", "Closes #1")
+    assert afk._landed_commit(path, "main", 10) is None and afk._landed_pr(path, "main", 1) is None
+    ten, twenty = stack("feature (#9)", 10, 1), stack("other", 20, 2)
+    found = (ten, twenty, 10, 20)
+
+    def read():
+        return (afk._landed_commit(path, "main", 10), afk._landed_commit(path, "main", 20),
+                afk._landed_pr(path, "main", 1), afk._landed_pr(path, "main", 2))
+
+    assert read() == found
+    for subject, body in [
+            ('Revert "feature (#9) (#10)"', "This reverts the commit.\n\nCloses #1"),
+            ("unrelated", "see feature (#10)\n\n (#10)\nCloses #1\nCloses #2"),
+            ("a fix on top of feature (#10)", "Closes #1"),
+            ("another (#20)", ""),
+            ("docs", "the stack's commit was `feature (#9) (#10)`")]:
+        commit(subject, body)
+        assert read() == found, subject
+    # a PR the batch did not stack is not found by the subject another one quotes
+    assert afk._landed_commit(path, "main", 9) is None
+    # the issue landed again, by a later batch: its newest landing is the one named
+    again = stack("feature, again", 30, 1)
+    assert read() == found[:2] + (30, 20) and afk._landed_commit(path, "main", 30) == again
+
+
+def test_a_fix_commit_titled_after_a_member_is_read_as_a_fix(tmp_path):
+    """A batch worktree's own line is read back as members and fixes: only a
+    merge commit is a member's. A fix whose subject ends in a member's
+    ` (#<pr>)` is carried as a fix — also when that member is not on the stack."""
+    path, commit, stack = _line_repo(tmp_path)
+    tip = git(path, "rev-parse", "HEAD")
+    ten, thirty = stack("feature 1", 10, 1), stack("feature 3", 30, 3)
+    fixes = [commit("make feature 1 pass with feature 3 (#10)"),
+             commit("what feature 2 needed (#20)", "Closes #2"),      # 20 was left out
+             commit("make the stack green")]
+    line = afk._own_line(path, f"{tip}..HEAD")
+    assert [sha for sha, _, _ in line] == [ten, thirty, *fixes]
+    assert afk_decide.read_stack(line, {10, 20, 30}) == ({10: ten, 30: thirty}, fixes)
+
+
 def _fleet_files(wt):
     """What the fleet keeps about the worker of a worktree, in its git dir."""
     return sorted(f for f in os.listdir(git(wt, "rev-parse", "--absolute-git-dir"))
@@ -4303,7 +4397,7 @@ def test_a_dead_fleets_batch_is_abandoned_by_the_fleet_that_takes_its_claims():
             with_pr(w, n, n * 10, instance="old", gate=gate)
         base0 = _target(w)
         b = w.afk(*_turn_batch(*gate, instance="old"))
-        w.afk("heartbeat", "--instance", "old", "--now", str(T0 - TTL - 60), *R)
+        last_beat(w.cwd, "old", T0 - TTL - 60)
 
         c = tick(w, None, *gate)
         assert c["progress"].startswith("reclaimed #1, #2; "), c
@@ -4665,7 +4759,7 @@ def test_the_base_branch_is_confirmed_at_a_launch_and_kept_on_the_remote():
         assert probe("--base-branch", "release")["base"]["status"] == "settled"
         w.afk("release", "1", "--instance", "peer", *R)
         # ... nor while a fleet instance is live
-        w.afk("heartbeat", "--instance", "peer-live", "--now", str(T0 - 60), *R)
+        last_beat(w.cwd, "peer-live", T0 - 60)
         assert "peer-live" in refused(base)
         assert probe()["base"]["recorded"] == "release"
         # ... which it is up to the lease's last second, as a claim's owner is
