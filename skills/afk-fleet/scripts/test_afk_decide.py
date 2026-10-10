@@ -6,8 +6,10 @@ Run: under pytest — the command is `gate.local_command` in docs/agents/afk-fle
 These cover the correctness-critical verdicts (esp. classify_claims: the
 mine/peer_live/stale partition whose wrong answer silently corrupts state).
 """
+import itertools
 import json
 import os
+import random
 import re
 import shlex
 import typing
@@ -78,6 +80,12 @@ def test_is_stale_and_due():
     assert d.is_stale(None, 1000, TTL) is True          # never beat → dead
     assert d.is_stale(1000, 1000 + TTL, TTL) is False   # exactly ttl → still live
     assert d.is_stale(1000, 1000 + TTL + 1, TTL) is True
+    # the one lease comparison: the takeover picker reads a heartbeat exactly at
+    # the lease as live, as the partition of claims does
+    at_lease = {"claims": [{"number": 1, "instance": "peer", "host": "h", "sha": "s"}],
+                "heartbeats": {"peer": 1000}, "me": "me", "now": 1000 + TTL, "ttl": TTL}
+    assert d.classify_claims(**at_lease)["peer_live"] == [1]
+    assert d.group_instances(**at_lease)[0]["fresh"] is True
     assert d.heartbeat_due(None, 1000, TTL) is True
     assert d.heartbeat_due(1000, 1000 + TTL // 3, TTL) is False
     assert d.heartbeat_due(1000, 1000 + TTL // 3 + 2, TTL) is True
@@ -466,6 +474,14 @@ def test_turns_are_granted_in_one_order_a_held_turn_first_then_pr_number():
             row(7, "closed", None)]
     assert d.turn_order(rows) == [4, 3, 1]
     assert d.turn_order(reversed(rows)) == [4, 3, 1]                # not input order
+    # one PR closing several issues: its rows share everything but the issue number,
+    # and still come out one way under every order they could be scanned in
+    shared = [row(9, "awaiting_turn", 10), row(8, "awaiting_turn", 10), row(3, "awaiting_turn", 10),
+              row(6, "landing", 40), row(4, "landing", 40), row(1, "awaiting_turn", 30),
+              _mine(2, "awaiting_turn", pr=50, unbatched="left_out"),
+              _mine(5, "awaiting_turn", pr=50, unbatched="left_out")]
+    assert {tuple(d.turn_order(list(p))) for p in itertools.permutations(shared)} == \
+        {(4, 6, 2, 5, 3, 8, 9, 1)}
     assert d.turn_order([]) == [] and d.turn_order(rows[1:2]) == []
 
 
@@ -539,6 +555,9 @@ def test_gate_verdict():
     assert r["excerpt"] == "one\ntwo" and r["omitted_lines"] == 0
     assert d.gate_verdict(0, "")["excerpt"] == ""
     assert d.gate_verdict(0, None)["excerpt"] == ""
+    # an excerpt of no lines is none of the log, all of it reported as omitted
+    r = d.gate_verdict(1, log, max_lines=0)
+    assert (r["excerpt"], r["omitted_lines"], r["status"]) == ("", 100, "red")
 
     # a timed-out run is RED, never green-by-default, whatever it exited with
     r = d.gate_verdict(0, "hung", timed_out=True)
@@ -1746,8 +1765,8 @@ def test_cycle_state_is_validated_not_guessed():
     assert first == {**d.CYCLE_START, **FACTS} == d.cycle_state("", **FACTS)
     assert d.cycle_state(first) == first                      # …so a later cycle passes neither
     assert d.cycle_state(first, **FACTS) == first             # the same ones again are harmless
-    st = {"fingerprint": "abc", "skips": 2, "empty_streak": 1, "in_flight": 0,
-          "frontier_remaining": 4, "unsettled": True, "boards": {"7": "0a1b2c3d"}, **FACTS}
+    st = {"fingerprint": "abc", "skips": 2, "empty_streak": 0, "in_flight": 1,
+          "frontier_remaining": 4, "unsettled": False, "boards": {"7": "0a1b2c3d"}, **FACTS}
     assert d.cycle_state(st) == st
     assert d.cycle_state(None, **FACTS)["boards"] is not d.CYCLE_START["boards"]   # never shared
     # a caller that mangled the state must hear so — run on zeros, a fleet holding
@@ -1755,12 +1774,29 @@ def test_cycle_state_is_validated_not_guessed():
     no_facts = {k: v for k, v in st.items() if k not in FACTS}
     for bad in ({"fingerprint": "abc"}, {**st, "extra": 1}, [], "abc", {**st, "skips": "x"},
                 no_facts, {**no_facts, "instance": "fl-1"}, {**st, "worker_command": ""},
-                {**st, "instance": None}):
+                {**st, "instance": None},
+                # a field of the wrong type — never coerced into one of the right type
+                {**st, "skips": "2"}, {**st, "skips": [2]}, {**st, "skips": 2.0},
+                {**st, "skips": True}, {**st, "in_flight": None}, {**st, "empty_streak": {}},
+                {**st, "unsettled": 0}, {**st, "fingerprint": None}, {**st, "boards": []},
+                {**st, "boards": {"7": 1}},
+                # a count no cycle leaves: negative (it would put the forced tick
+                # off by that many cycles), or at the forced tick and past it
+                {**st, "skips": -39}, {**st, "in_flight": -1}, {**st, "frontier_remaining": -1},
+                {**st, "empty_streak": -1}, {**st, "skips": d.FORCE_TICK_AFTER_SKIPS},
+                # counts that contradict each other
+                {**st, "unsettled": True}, {**st, "empty_streak": 1},
+                {**st, "skips": 0, "in_flight": 0, "empty_streak": 1},
+                {**st, "skips": 0, "in_flight": 0, "frontier_remaining": 0, "empty_streak": 1,
+                 "unsettled": True}):
         try:
             d.cycle_state(bad)
             assert False, f"expected ValueError for {bad!r}"
         except ValueError:
             pass
+    assert d.cycle_state({**st, "skips": 0, "unsettled": True})["unsettled"] is True
+    assert d.cycle_state({**st, "skips": 0, "in_flight": 0, "frontier_remaining": 0,
+                          "empty_streak": 9})["empty_streak"] == 9
     # a first cycle without them, and a fact that disagrees with the state's
     for raw, given in ((None, {}), (None, {"instance": "fl-1"}), ("", {"worker_command": "x"}),
                        (st, {"instance": "fl-2"}), (st, {"worker_command": "claude"})):
@@ -1769,6 +1805,34 @@ def test_cycle_state_is_validated_not_guessed():
             assert False, f"expected ValueError for {given!r}"
         except ValueError as e:
             assert "--instance" in str(e) or "--worker-command" in str(e)
+
+
+def test_every_state_a_cycle_leaves_is_one_the_next_cycle_takes():
+    """Whatever run of wakes, ticks and drains a fleet goes through, the state
+    each one returns — through the JSON a launcher carries it in — is taken back
+    unchanged."""
+    def back(state):
+        carried = json.loads(json.dumps(state))
+        assert d.cycle_state(carried) == state, state
+        return d.cycle_state(carried)
+
+    for seed in range(200):
+        rng = random.Random(seed)
+        count = lambda: rng.choice((0, 0, 1, 3))                            # noqa: E731
+        state = d.cycle_state(None, **FACTS)
+        for _ in range(40):
+            if rng.random() < 0.1:
+                kept = list(range(count()))
+                state = back(d.cycle_drained(state, [9] * count(), kept, count())["state"])
+                continue
+            woke = d.cycle_wake(state, rng.choice(("a", "a", "a", "b")), woke=rng.random() < 0.1)
+            state = back(woke["state"])
+            if woke["action"] == "tick":
+                did = _did(dispatched=[1] * count(), in_flight=count(), frontier_remaining=count())
+                state = back(d.cycle_ticked(
+                    state, did, judgments=count(), errors=count(), unseen=count(),
+                    left=rng.choice((None, "a", "c")),
+                    boards=rng.choice((None, {7: "0a1b2c3d"})))["state"])
 
 
 def _did(**did):
@@ -1847,6 +1911,14 @@ def test_cycle_drained_folds_the_stop_and_schedules_nothing():
     failed = d.cycle_drained(st, [1], [2, 7], errors=1)
     assert failed["progress"] == "drained; released #1; kept #2, #7; 1 error"
     assert failed["state"]["unsettled"] is True
+    # claims found held by a fleet that thought itself idle (a takeover's): no longer empty
+    idle = {**d.cycle_state(None, **FACTS), "fingerprint": "abc", "skips": 2, "empty_streak": 5}
+    assert d.cycle_drained(idle, [], [])["state"] == idle
+    kept = d.cycle_drained(idle, [], [7])["state"]
+    assert (kept["empty_streak"], kept["skips"], kept["in_flight"]) == (0, 2, 1)
+    failed = d.cycle_drained(idle, [], [], errors=1)["state"]
+    assert (failed["empty_streak"], failed["skips"], failed["unsettled"]) == (0, 0, True)
+    assert d.cycle_state(kept) == kept and d.cycle_state(failed) == failed
 
 
 def test_cycle_wake_gates_beats_and_paces_a_skipped_cycle():

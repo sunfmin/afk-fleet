@@ -2822,7 +2822,12 @@ def test_a_red_gate_on_the_turn_is_the_workers_to_fix_and_spends_nothing():
         assert "timed out after 1s" in r["gate"]["excerpt"]
         r = _land(w, 4, wt, *local_gate("seq 1 200; exit 1"), "--excerpt-lines", "3")
         assert (r["gate"]["excerpt"], r["gate"]["omitted_lines"]) == ("198\n199\n200", 197)
-        assert len(w.state()["pr_comments"]["40"]) == 3 and len(_turns(w, 40)) == 1
+        # no lines is none of the log — and a negative count is a usage error
+        r = _land(w, 4, wt, *local_gate("seq 1 200; exit 1"), "--excerpt-lines", "0")
+        assert (r["gate"]["excerpt"], r["gate"]["omitted_lines"]) == ("", 200)
+        assert "```" not in w.state()["pr_comments"]["40"][-1]
+        assert "--excerpt-lines" in _land_error(w, 4, wt, *red, "--excerpt-lines", "-1")
+        assert len(w.state()["pr_comments"]["40"]) == 4 and len(_turns(w, 40)) == 1
 
         # the worker fixes the code, commits, and lands again — its commit is pushed
         fixed = w.work(wt, "fixed.txt", push=False)
@@ -3959,6 +3964,11 @@ def test_land_batch_without_the_batchs_turn_changes_nothing():
               afk_decide.turn_comment(afk_decide.single_turn(None, "me", T0))}]})
         assert "does not hold the landing turn of merge batch" in refused()
         w.set(comments=marked)
+        # a member PR closed by hand
+        open_prs = w.state()["prs"]
+        w.set(prs=[{**p, "state": "closed"} if p["number"] == 20 else p for p in open_prs])
+        assert "PR(s) [20] of merge batch" in refused()
+        w.set(prs=open_prs)
 
         # abandoned while its gate runs: the gate goes green, and still nothing lands
         cfg = json.dumps({"base_branch": w.sb.base,
@@ -4375,6 +4385,10 @@ def test_the_base_branch_is_confirmed_at_a_launch_and_kept_on_the_remote():
         w.afk("heartbeat", "--instance", "peer-live", "--now", str(T0 - 60), *R)
         assert "peer-live" in refused(base)
         assert probe()["base"]["recorded"] == "release"
+        # ... which it is up to the lease's last second, as a claim's owner is
+        w.afk("heartbeat", "--instance", "peer-edge", "--now", str(T0 - TTL), *R)
+        w.afk("heartbeat", "--instance", "peer-dead", "--now", str(T0 - TTL - 1), *R)
+        assert "peer-edge" in refused(base) and "peer-dead" not in refused(base)
 
 
 def test_a_landing_aims_a_pr_open_against_an_earlier_base_at_the_base_branch():
@@ -4752,6 +4766,13 @@ def test_every_failure_is_one_json_error():
         # every operational failure is exit 3 with one {"error": …} object — bad JSON
         # in, a missing file, a failing gh — so a tick never has to parse a traceback
         w.error("cycle", *R, "--state", "{not json")
+        # a state that is JSON but not a cycle's — a counter of the wrong type, a
+        # negative one — is that same error, never a traceback
+        state = cycle(w)["state"]
+        for bad in ({**state, "skips": [1]}, {**state, "in_flight": None}, {**state, "skips": -39},
+                    {**state, "skips": "0"}, [state]):
+            assert "--state is not a cycle state" in w.error("cycle", *R, "--state", json.dumps(bad))
+        assert cycle(w, state)["state"]["instance"] == state["instance"]
         w.error("rebuild", *ME, *R, "--config", "{not json")
         assert "gh api --paginate failed" in w.error("rebuild", *ME, "--repo", "acme/other")
         # …and so is a bad command line: argparse's usage error is the same one shape
