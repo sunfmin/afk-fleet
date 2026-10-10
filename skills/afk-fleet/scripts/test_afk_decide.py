@@ -3354,14 +3354,77 @@ def test_a_closed_vocabulary_and_its_table_list_the_same_words():
 
 
 
-def test_issues_closed_by_reads_the_links_and_the_closing_keywords_of_the_body():
-    assert d.issues_closed_by(None, None) == []
-    assert d.issues_closed_by("Closes #7\n", []) == [{"number": 7}]
-    assert d.issues_closed_by("Closes #7", [{"number": 7}, {"number": 3}]) == \
+# The GitHub documentation each row of CLOSING_BODIES encodes (docs.github.com):
+#   KEYWORDS    "Linking a pull request to an issue" § using a keyword — the nine
+#               keywords; "can be followed by colons or in uppercase"; the syntax
+#               table: `KEYWORD #ISSUE-NUMBER` in the same repository,
+#               `KEYWORD OWNER/REPOSITORY#ISSUE-NUMBER` in a different one, and
+#               "Multiple issues: use full syntax for each issue".
+#   REFERENCES  "Autolinked references and URLs" § Issues and pull requests — what
+#               "a reference to the issue" after a keyword may be: the URL, `#26`,
+#               `GH-26`, `Username/Repository#26`.
+#   CODE        "Basic writing and formatting syntax" § Quoting code — "the text
+#               within the backticks will not be formatted" — and "Creating and
+#               highlighting code blocks" § Fenced code blocks.
+#   COMMENTS    "Basic writing and formatting syntax" § Hiding content with
+#               comments — an HTML comment is hidden from the rendered Markdown.
+#   PROSE       No rule exempts a quote (§ Quoting text formats what it quotes) or
+#               a sentence's meaning: the keyword and its reference are all
+#               GitHub reads.
+CLOSING_BODIES = [
+    # (body, the issues of acme/widgets it closes, the rule)
+    ("Closes #7\n", [7], "KEYWORDS"),
+    ("close #1 closed #2 fix #3 fixes #4 fixed #5 resolve #6 resolves #7 resolved #8",
+     [1, 2, 3, 4, 5, 6, 7, 8], "KEYWORDS"),
+    ("Closes: #10, CLOSES #11 and CLOSES: #12.", [10, 11, 12], "KEYWORDS"),
+    ("Resolves #10, resolves #123", [10, 123], "KEYWORDS"),
+    ("Closes #10, #123 and #124", [10], "KEYWORDS"),
+    ("see #7; encloses #8; prefix #9; closes#10; closes 11", [], "KEYWORDS"),
+    ("Fixes acme/widgets#100", [100], "KEYWORDS"),
+    ("Fixes Acme/Widgets#100", [100], "KEYWORDS"),
+    ("Fixes octo-org/octo-repo#100", [], "KEYWORDS"),
+    ("Fixes acme/widgets-old#100, fixes other/widgets#101", [], "KEYWORDS"),
+    ("Resolves #10, resolves octo-org/octo-repo#100", [10], "KEYWORDS"),
+    ("Closes https://github.com/acme/widgets/issues/26", [26], "REFERENCES"),
+    ("Closes https://github.com/jlord/sheetsee.js/issues/26", [], "REFERENCES"),
+    ("Closes https://github.com/acme/widgets/labels/26", [], "REFERENCES"),
+    ("Fixes GH-26", [26], "REFERENCES"),
+    ("Run `gh pr create --body 'Closes #3'` to open it. Fixes #4", [4], "CODE"),
+    ("``Closes #3 with a ` in it`` and fixes #4", [4], "CODE"),
+    ("a stray ` then Closes #3\n\nand another ` much later", [3], "CODE"),
+    ("```\nCloses #3\n```\nCloses #4", [4], "CODE"),
+    ("```bash\ngit commit -m 'Fixes #3'\n```\n", [], "CODE"),
+    ("~~~\nCloses #3\n```\nCloses #5\n~~~\nCloses #4", [4], "CODE"),
+    ("````\n```\nCloses #3\n```\nCloses #5\n````\nCloses #4", [4], "CODE"),
+    ("> ```\n> Closes #3\n> ```\nCloses #4", [4], "CODE"),
+    ("Closes #4\n```\nCloses #3, never closed", [4], "CODE"),
+    ("<!-- Closes #3 -->\nCloses #4", [4], "COMMENTS"),
+    ("<!--\ntemplate: write `Closes #3`\n```\n-->\nCloses #4", [4], "COMMENTS"),
+    ("<!--afk:turn fixes #3-->", [], "COMMENTS"),
+    ("```\n<!--\n```\nCloses #4\n<!-- -->", [4], "CODE"),
+    ("> Closes #3", [3], "PROSE"),
+    ("This does not fix #3", [3], "PROSE"),
+]
+
+
+def test_issues_closed_by_reads_closing_references_as_github_documents_them():
+    for body, numbers, rule in CLOSING_BODIES:
+        assert d.issues_closed_by(body, None, "acme/widgets") == \
+            [{"number": n} for n in numbers], (rule, body)
+
+
+def test_issues_closed_by_adds_the_body_to_the_links_github_made():
+    assert d.issues_closed_by(None, None, "o/r") == []
+    assert d.issues_closed_by("Closes #7", [{"number": 7}, {"number": 3}], "o/r") == \
         [{"number": 3}, {"number": 7}]
-    assert d.issues_closed_by("fixes: #2, Resolved #10 and closed #4.", None) == \
-        [{"number": 2}, {"number": 4}, {"number": 10}]
-    assert d.issues_closed_by("see #7; encloses #8; closes o/r#9", None) == []
+    assert d.issues_closed_by("`Closes #7`", [{"number": 7}], "o/r") == [{"number": 7}]
+
+
+def test_the_pr_body_the_worker_prompt_asks_for_closes_the_workers_issue():
+    prompt = d.render_worker_prompt(_prompt_template(), "fresh", PROMPT_FIELDS)
+    body = re.search(r'gh pr create .*?--body "(.*?)"', prompt, re.S)[1]
+    assert d.issues_closed_by(body, None, PROMPT_FIELDS["repo"]) == \
+        [{"number": PROMPT_FIELDS["n"]}]
 
 
 def test_base_refusal_lets_the_base_branch_change_only_while_nothing_stands_on_it():
