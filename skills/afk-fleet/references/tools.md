@@ -16,7 +16,9 @@ function in `afk_decide.py` (fixture-tested); `afk.py` only gathers their inputs
   `afk probe` — and, when it touches GitHub, **`--repo <owner/name>`**. Pass both on every call; the
   table omits them. Only `afk config` and `afk worker-command` take no config (they run before one
   exists). Resolution is one order everywhere: `--set` → `--config` → the defaults table for keys
-  the JSON omits (ADR-0009), and the result is validated like the config file is.
+  the JSON omits (ADR-0009), and the result is validated like the config file is. The JSON itself
+  is held to the file's schema: an unknown, renamed or removed key, or a value of the wrong type, is
+  an `{"error": …}` naming the key — never dropped, never defaulted.
 - `--set <key>=<value>` (repeatable) overrides one config key for one call, by the config file's own
   key name — `--set concurrency=1`, `--set gate.ci=local`. Its value is typed as the file's is,
   except that a string is taken verbatim, quotes and `#` included: the shell already unquoted

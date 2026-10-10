@@ -797,6 +797,67 @@ def _renamed(dotted: str) -> str | None:
     return f"config: {dotted!r} was renamed to {new!r} — {why}"
 
 
+def _schema_default(section: str | None, key: str) -> Any:
+    """The default of one key of the schema — a top-level one's, or one of
+    `section`'s (a section's own default is its table). A key the schema does not
+    have raises, naming itself: with its migration note if it was renamed or
+    removed, else as unknown."""
+    if section is not None:
+        table = CONFIG_DEFAULTS.get(section, {})        # a retired section holds no key
+        if key not in table:
+            raise ValueError(_renamed(f"{section}.{key}") or f"config: unknown key {section}.{key}")
+        return table[key]
+    if key not in CONFIG_DEFAULTS:
+        raise ValueError(_renamed(key)
+                         or f"config: unknown key {key!r} (note: the instance id and "
+                            f"the worker launch command are per-run facts, never config keys)")
+    return CONFIG_DEFAULTS[key]
+
+
+def _typed(key: str, value: object, default: object) -> None:
+    """Raise unless `value` — one key's, as JSON carries it — has the type of the
+    key's default: what `_coerce` makes of the file's text, or nothing else."""
+    if isinstance(default, bool):
+        ok, want = isinstance(value, bool), "true/false"
+    elif isinstance(default, int):
+        ok, want = isinstance(value, int) and not isinstance(value, bool), "an integer"
+    elif isinstance(default, list):
+        ok = isinstance(value, list) and all(isinstance(item, str) for item in value)
+        want = "[a, b, ...]"
+    else:
+        ok, want = isinstance(value, str), "a string"
+    if not ok:
+        raise ValueError(f"config key {key!r}: expected {want}, got {value!r}")
+
+
+def check_config(partial: object) -> Obj:
+    """
+    A config as JSON carries it — partial or canonical, the `--config` of every
+    subcommand — held to the schema the file is held to (`parse_config_yaml`):
+    an unknown key raises, a renamed or removed one raises with its migration
+    note, and so does a value that is not of its key's type. The one difference
+    from the file is the settled fields, which the canonical config carries and
+    no file may set. Returns `partial`, every key of it one of the schema's.
+    """
+    if not isinstance(partial, dict):
+        raise ValueError(f"config: expected a JSON object of config keys, got {partial!r}")
+    for key, value in partial.items():
+        if key in CONFIG_SETTLED:
+            _typed(key, value, CONFIG_SETTLED[key])
+        elif key in _RETIRED_SECTIONS and isinstance(value, dict):
+            for sub in value:                       # each key under it has its own note
+                _schema_default(key, sub)
+        elif not isinstance(default := _schema_default(None, key), dict):
+            _typed(key, value, default)
+        elif not isinstance(value, dict):
+            raise ValueError(f"config key {key!r} is a section — expected an object of its "
+                             f"keys, got {value!r}")
+        else:
+            for sub, item in value.items():
+                _typed(f"{key}.{sub}", item, _schema_default(key, sub))
+    return partial
+
+
 def validate_config(cfg: Config) -> Config:
     """
     The semantic checks a per-key type cannot express, run on the CANONICAL config
@@ -973,22 +1034,15 @@ def parse_config_yaml(text: str) -> Obj:
         if indented:
             if section is None:
                 raise ValueError(f"config: indented key {key!r} outside a gate: section")
-            sub = CONFIG_DEFAULTS.get(section, {})
-            if key not in sub:
-                raise ValueError(_renamed(f"{section}.{key}")
-                                 or f"config: unknown key {section}.{key}")
-            partial.setdefault(section, {})[key] = _coerce(f"{section}.{key}", raw, sub[key])
+            default = _schema_default(section, key)
+            partial.setdefault(section, {})[key] = _coerce(f"{section}.{key}", raw, default)
         else:
             if key in _RETIRED_SECTIONS and not raw:
                 section = key           # read on: each key under it has its own note
                 continue
             if key in CONFIG_SETTLED:
                 raise ValueError(_SETTLED_NOTES[key])
-            if key not in CONFIG_DEFAULTS:
-                raise ValueError(_renamed(key)
-                                 or f"config: unknown key {key!r} (note: the instance id and "
-                                    f"the worker launch command are per-run facts, never config keys)")
-            default = CONFIG_DEFAULTS[key]
+            default = _schema_default(None, key)
             if isinstance(default, dict):
                 if raw:
                     raise ValueError(f"config key {key!r} is a section — write `{key}:` "
@@ -1001,16 +1055,20 @@ def parse_config_yaml(text: str) -> Obj:
     return partial
 
 
-def resolve_config(partial: Obj) -> Config:
+def resolve_config(partial: object) -> Config:
     """Partial config → the complete canonical config: every key present,
     defaults filled from CONFIG_DEFAULTS (one level deep for gate), and the
-    settled fields beside them. Idempotent — resolving an already-canonical
-    config is a no-op."""
+    settled fields beside them. The partial is held to the schema first
+    (`check_config`), whichever route it came by — a key the schema does not
+    have, or a value of the wrong type, raises ValueError and is never dropped
+    or carried through. Idempotent — resolving an already-canonical config is a
+    no-op."""
+    partial = check_config(partial)
     out: Obj = {}
     for k, dv in {**CONFIG_DEFAULTS, **CONFIG_SETTLED}.items():
         if isinstance(dv, dict):
             merged = dict(dv)
-            merged.update(partial.get(k) or {})
+            merged.update(partial.get(k, {}))
             out[k] = merged
         elif k in partial:
             out[k] = partial[k]

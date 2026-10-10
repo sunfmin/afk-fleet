@@ -3616,6 +3616,49 @@ def test_resolve_config():
     assert d.resolve_config(r) == r
 
 
+def test_a_canonical_config_is_always_accepted_and_resolving_it_again_changes_nothing():
+    """Whatever `afk config`, `afk probe` or `--set` can make of a config is JSON
+    the `--config` route takes back whole: the schema check refuses nothing a
+    resolution produced, and a second resolution is the first."""
+    rng = random.Random(113)
+    words = ["", "a", "ready-for-agent", "make test && echo 'ok'", "需要人", "[a, b]", "3", "true"]
+    samples = {int: lambda: rng.randrange(-2, 50), str: lambda: rng.choice(words),
+               list: lambda: rng.sample(words, rng.randrange(0, 4))}
+    for _ in range(200):
+        partial: dict = {}
+        for dotted, default in _leaves({**d.CONFIG_DEFAULTS, **d.CONFIG_SETTLED}):
+            if rng.random() < 0.5:
+                section, _, key = dotted.rpartition(".")
+                (partial.setdefault(section, {}) if section else partial)[key] = samples[type(default)]()
+        canonical = d.resolve_config(partial)
+        assert set(canonical) == set(d.CONFIG_DEFAULTS) | set(d.CONFIG_SETTLED)
+        assert d.resolve_config(canonical) == canonical
+        assert d.resolve_config(json.loads(json.dumps(canonical))) == canonical     # as --config carries it
+
+
+def test_json_config_is_held_to_the_schema_where_the_file_cannot_say_it():
+    """What only JSON can spell — the file's text is typed by its key, JSON's
+    values come typed — is refused by the same check, each key naming itself."""
+    for bad, why in (([], "expected a JSON object"), ("retry: 3", "expected a JSON object"),
+                     (None, "expected a JSON object"),
+                     ({"ready_label": 3}, "'ready_label': expected a string"),
+                     ({"retry": None}, "'retry': expected an integer"),
+                     ({"retry": True}, "'retry': expected an integer"),
+                     ({"retry": 2.0}, "'retry': expected an integer"),
+                     ({"epic_labels": ["epic", 1]}, "'epic_labels': expected [a, b, ...]"),
+                     ({"gate": None}, "'gate' is a section"),
+                     ({"gate": ["ci"]}, "'gate' is a section"),
+                     ({"gate": {"local_command": ["make"]}}, "'gate.local_command': expected a string"),
+                     ({"base_branch": None}, "'base_branch': expected a string"),
+                     ({"claim_namespace": ["refs/afk"]}, "'claim_namespace': expected a string"),
+                     ({"merge": "x"}, "unknown key 'merge'")):
+        try:
+            d.resolve_config(bad)
+            assert False, f"expected ValueError for {bad!r}"
+        except ValueError as e:
+            assert why in str(e), (bad, str(e))
+
+
 def _leaves(table, prefix=""):
     for k, v in table.items():
         if isinstance(v, dict):

@@ -2428,6 +2428,78 @@ def test_config_file_loads_validates_and_round_trips():
         assert "No such file" in w.error("config", "--file", "/no/such/file.md")
 
 
+def _as_yaml(partial, indent=""):
+    """A partial config, as JSON carries it → the same content as the file says it."""
+    lines = []
+    for key, value in partial.items():
+        if isinstance(value, dict):
+            lines += [f"{indent}{key}:", _as_yaml(value, indent + "  ")]
+        elif isinstance(value, list):
+            lines.append(f"{indent}{key}: [{', '.join(map(str, value))}]")
+        else:
+            lines.append(f"{indent}{key}: {json.dumps(value) if isinstance(value, bool) else value}")
+    return "\n".join(lines)
+
+
+# Configs no route takes, each with what its error names. One table, read by both
+# routes: as the file's yaml by `afk config --file`, as JSON by `--config`.
+BAD_CONFIGS = (
+    ({"retyr": 4}, "unknown key 'retyr'"),                                  # unknown
+    ({"gate": {"cii": "local"}}, "unknown key gate.cii"),
+    ({"worker_command": "ckimi"}, "per-run"),
+    ({"instance": "me"}, "unknown key 'instance'"),
+    ({"merge": {"target": "main"}}, "'merge.target' was removed"),          # renamed / removed
+    ({"merge": {"strategy": "squash"}}, "'merge.strategy' was removed"),
+    ({"merge": {"delete_branch": False}}, "'merge.delete_branch' was removed"),
+    ({"merge": {"nope": 1}}, "unknown key merge.nope"),
+    ({"gate": {"trust_recorded_run": False}}, "'gate.trust_recorded_run' was removed"),
+    ({"gate": {"adversarial_verify": True}}, "adversarial_verify_prompt"),
+    ({"fingerprint_gate": False}, "'fingerprint_gate' was removed"),
+    ({"claim_lease_ttl_seconds": 60}, "'claim_lease_ttl_seconds' was removed"),
+    ({"worker": "orca"}, "'worker' was removed"),
+    ({"retry": "soon"}, "'retry': expected an integer"),                    # wrong-typed
+    ({"retry": True}, "'retry': expected an integer"),
+    ({"concurrency": 1.5}, "'concurrency': expected an integer"),
+    ({"concurrency": [3]}, "'concurrency': expected an integer"),
+    ({"epic_labels": "epic"}, "'epic_labels': expected [a, b, ...]"),
+    ({"gate": "on"}, "'gate' is a section"),
+    ({"gate": {"ci": "local"}}, "local_command"),                           # refused as a whole
+    ({"gate": {"ci": "optional"}}, "config gate.ci"),
+    ({"escalate_label": "ready-for-agent"}, "config escalate_label"),
+    ({"ready_label": "x", "escalate_label": "afk-attempt/human"}, "config escalate_label"),
+)
+
+
+def test_the_config_route_refuses_whatever_the_file_route_refuses():
+    """One schema, two routes (#113): a config the file route refuses is refused
+    as JSON handed to `--config` — the one JSON error, exit 3, naming the key —
+    so a launcher that mangles the config it re-types on every call hears of it
+    at once. And what `afk config` prints is JSON `--config` always takes."""
+    with world() as w:
+        path = os.path.join(w.sb.root, "afk-fleet.md")
+        for bad, why in BAD_CONFIGS:
+            with open(path, "w") as f:
+                f.write("# config\n\n```yaml\n" + _as_yaml(bad) + "\n```\n")
+            by_file = w.error("config", "--file", path)
+            by_json = w.error("rebuild", *ME, *R, *NOW, "--config", json.dumps(bad))
+            assert why in by_file and why in by_json, (bad, by_file, by_json)
+
+        # the settled fields are the one difference: no file sets them, and the
+        # canonical config carries them — typed, as every other key is
+        assert "'base_branch': expected a string" in w.error(
+            "rebuild", *ME, *R, *NOW, "--config", json.dumps({"base_branch": 7}))
+
+        # the canonical output of `afk config` is accepted, and comes back unchanged
+        with open(path, "w") as f:
+            f.write("```yaml\nretry: 4\nepic_labels: [epic]\ngate:\n  ci: local\n"
+                    "  local_command: make test\n```\n")
+        cfg = w.afk("config", "--file", path)
+        again = w.afk("probe", "--config", json.dumps(cfg), "--now", str(T0))["config"]
+        assert again == cfg == afk_decide.resolve_config(cfg)
+        assert w.afk("probe", "--config", json.dumps(w.afk("config", "--defaults")),
+                     "--now", str(T0))["config"] == afk_decide.resolve_config({})
+
+
 # --------------------------------------------------------------------------- #
 # recovery via orca                                                            #
 # --------------------------------------------------------------------------- #
