@@ -661,6 +661,20 @@ def test_every_kind_of_record_kept_on_a_ref_round_trips_through_the_remote():
         assert git(b, "rev-parse", "FETCH_HEAD^{tree}") == tree
 
 
+def test_a_heartbeat_is_read_back_under_exactly_the_id_it_was_written_for():
+    """Whose a heartbeat is is its ref's name: every shape of id the grammar
+    admits is one ref path segment, so the scan reads each beat back under the
+    id that wrote it — prefix pairs and the longest id included."""
+    ids = ["fl", "fl-1", "fl-1-t170", "felix", "felix-2", "7", "a--b-", "a" * 40]
+    assert all(afk_decide.instance_id(i) == i for i in ids)
+    with sandbox() as sb:
+        w = sb.clones[0]
+        for k, instance in enumerate(ids):
+            beat = afk(w, "heartbeat", "--instance", instance, "--now", str(T0 + k))
+            assert beat["ref"] == f"refs/afk/heartbeat/{instance}"
+        assert afk(w, "scan")["heartbeats"] == {i: T0 + k for k, i in enumerate(ids)}
+
+
 def test_a_claim_and_a_heartbeat_already_on_the_remote_are_still_read():
     """A fleet that updates mid-run loses no claim: the refs a fleet wrote before
     records shared one encoding are read as what they are, and what is written
