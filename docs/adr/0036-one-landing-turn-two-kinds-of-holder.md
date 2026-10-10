@@ -1,5 +1,7 @@
 # ADR-0036 — The landing turn is one concept; the PR and the merge batch that hold it stay two
 
+**Amended by [ADR-0048](0048-finished-prs-join-a-landing-train-gated-whenever-the-gate-is-free.md) (#157):** the merge batch is gone, so the landing turn has one kind of holder — a single PR — and exists only where no landing train runs.
+
 **Status:** accepted — changes no behaviour. Records a question an architecture review raised (#73)
 so that later reviews do not raise it again:
 [ADR-0027](0027-a-worker-lands-its-own-pr-on-a-landing-turn.md) and

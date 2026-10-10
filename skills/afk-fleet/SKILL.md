@@ -130,7 +130,7 @@ launch command (step 3).
      local gate is: **stop here** — drop the required checks on that branch or
      switch to `gate.ci: required`. (`gh pr merge --admin` is not an option: it bypasses human review
      too.) Unless `gate.adversarial_verify_prompt` is set, it is also an `"error"` when the target would refuse a direct push
-     (required pull request reviews, push restrictions, a locked branch) — a merge batch lands by
+     (required pull request reviews, push restrictions, a locked branch) — the landing train lands by
      pushing; **stop here** too. A `"warn"` verdict (the read was inconclusive — no admin rights) is reported and continues.
    - **Gate records** (only when `gate.ci: local`) — `gate_records.verdict == "warn"` means the
      remote refuses `refs/afk/gate/*`, so no gate run can be put on record and every landing runs
@@ -330,9 +330,9 @@ In this order, each step the same `afk` transition you could type yourself
 2. **Ask after the workers it is waiting on** (`afk no-pr`): every claim with no PR or being fixed
    off a turn its PR gave up, and every landing one whose worker has not stopped for the tick. A worker's state is what its runtime
    reported to orca, never its screen (ADR-0021).
-3. **The landing turn** (`afk turn`) — at most one a cycle: to the head of the merge queue, or,
-   when two or more may land together, to a merge batch of them. See
-   [Landing](#landing--the-worker-lands-its-own-pr-on-its-turn).
+3. **The landing turn** (`afk turn`) — at most one a cycle, to the head of the merge queue; where a
+   landing train runs, no turn: PRs join by themselves and the pass keeps the train's worker on it
+   (`afk turn --train`). See [Landing](#landing--the-worker-lands-its-own-pr-on-its-turn).
 4. **Settle what a stopped worker left** where the reason is on record: a worker idle with no
    outcome is nudged once (`afk nudge`, ADR-0018), and one on a landing turn — or fixing off one
    its PR gave up — that stays silent is then restarted once (`afk turn --restart`) and, silent
@@ -340,8 +340,8 @@ In this order, each step the same `afk` transition you could type yourself
    `already-satisfied`, a PR-less silence that outlasted its nudge is failed (`afk fail`); a
    `blocked` verdict is parked while the backlog will resolve its blockers (`afk park`, ADR-0022)
    and escalated when nothing will — as a `needs-decision` one is at once (`afk escalate`, ADR-0041).
-5. **Release** every claim that outlived its issue — a PR its worker landed — or whose landing a
-   merge batch pushed and was cut before closing the issue; delete every dead peer's phantom lock.
+5. **Release** every claim that outlived its issue — a PR its worker landed — or whose landing the
+   landing train pushed and was cut before closing the issue; delete every dead peer's phantom lock.
 6. **Start workers** (`afk dispatch`): first by [continuation](references/recovery.md) for claims
    already held — an **orphaned claim** (always continued, never released back), one whose blockers
    have all closed. Then, into the free slots only ([Concurrency](#concurrency)): the **stale** peer
@@ -425,28 +425,27 @@ adversarial verify or switching a repo to `gate.ci: local`. `afk gate` and `afk 
 **Nobody but its worker merges a PR.** A finished PR is landed by the worker that wrote it, with
 `afk land`, in its own worktree, one of two ways:
 
-- **Where merge batches form** (`gate.ci: local`, no adversarial verify) it lands **like a batch of
-  one**: the PR's head is merged onto `base_branch`'s tip with ONE merge commit → the machine gate
-  on that commit → the turn read again → the commit pushed to `base_branch` as a **fast-forward**.
-  The branch itself is not synced, so a landing leaves no `Merge commit '<sha>' into <branch>` on
-  the history, however often it is repeated; a target that moved while the gate ran refuses the
-  push (`target_moved` — it lands again, stacked and gated on the new tip). Only a PR that
-  **conflicts** with the tip, or whose stack was **red**, has `base_branch` merged into its branch,
-  for its worker to resolve or fix there
-  ([ADR-0046](../../docs/adr/0046-a-single-landing-stacks-on-the-target-like-a-batch-of-one.md)).
-- **Everywhere else** — checks and verifications are of the PR's head: sync with `base_branch` (by
+- **Where a landing train runs** (`gate.ci: local`, no adversarial verify) it **joins the train**:
+  `afk land` merges the PR's head onto the train's tip with ONE merge commit and pushes that as the
+  train's new tip. No turn is asked for, no gate runs, and the push is the only lock. The train's
+  own worker gates the train and lands it — see
+  [the landing train](#the-landing-train--finished-prs-behind-whichever-gate-run-is-next) below
+  ([ADR-0048](../../docs/adr/0048-finished-prs-join-a-landing-train-gated-whenever-the-gate-is-free.md)).
+- **Everywhere else** — checks and verifications are of the PR's head, and it lands on a **landing
+  turn**: sync with `base_branch` (by
   **merging, never rebasing** — ADR-0012) → push → the machine gate on that exact head →
   `gh pr merge` **pinned to the gated head**. That merge is pinned to the PR's head, not to the
   target, and a gate run is long: right before it the landing reads its turn and the target's tip
   again, and merges only if the turn is still the one it started on and the gated head still holds
   that tip (`target_moved` otherwise — it lands again, synced and gated on the new tip).
 
-A conflict or a red gate at landing is fixed where the context is: by that worker, in place,
+The rest of this section, down to the landing train, is about that second way. A conflict or a red
+gate at landing is fixed where the context is: by that worker, in place,
 with no round trip through the launcher
 ([ADR-0027](../../docs/adr/0027-a-worker-lands-its-own-pr-on-a-landing-turn.md)). What the fleet
 gives is the **landing turn**: `afk land` merges nothing until its PR has the turn, and turns go out
 **one at a time**, so no PR is merged against a tip that is about to move. A turn covers the
-bounded part of a landing — sync or stack, gate, merge: a PR whose landing stops on a conflict or a red gate
+bounded part of a landing — sync, gate, merge: a PR whose landing stops on a conflict or a red gate
 **gives its turn up**, once, and is fixed off it
 ([ADR-0045](../../docs/adr/0045-a-landing-that-stops-on-a-conflict-or-a-red-gate-gives-its-turn-up.md)).
 
@@ -472,8 +471,7 @@ stopped on the PR:
 
 - a `conflict` or a `gate_red` is the worker's own, fixed in place — and, the first time, **off
   the turn**: the landing writes on the turn marker that the PR gave its turn up (`given_up`), the
-  claim is `fixing`, and the next cycle grants the turn to the next PR of the merge queue, or to a
-  merge batch. The worker is told nothing new: it fixes, commits and runs `afk land` again, which
+  claim is `fixing`, and the next cycle grants the turn to the next PR of the merge queue. The worker is told nothing new: it fixes, commits and runs `afk land` again, which
   off the turn syncs, runs no local gate (ADR-0047 — the target moves under a PR that waits, so the
   run that counts is its next turn's) and merges nothing; a clean sync there is `awaiting_turn` — the
   worker wakes the launcher and stops, the PR is ready again, and it is granted its next turn
@@ -505,22 +503,32 @@ the branch moved after the gate. No landing outcome spends an attempt or closes 
 does a landing worker's silence; only `afk fail` does, and it reaches a landing claim only by your
 own judgments — red checks in `required` mode, a refuted verify — never by silence.
 
-**A merge batch — several PRs on one turn** (`gate.ci: local` with no `gate.adversarial_verify_prompt`;
-there is no switch —
-[ADR-0029](../../docs/adr/0029-a-merge-batch-lands-n-prs-behind-one-gate-run.md),
-[ADR-0034](../../docs/adr/0034-every-pr-lands-as-a-merge-commit-and-batches-need-no-switch.md)). When two or more
-finished PRs may land together, the pass gives the turn to all of them at once — `afk turn --batch`
-— instead of to the first: it records one marker on every member PR and starts a **batch worker**
-in a worktree of the batch's own. That worker runs `afk land --batch`, which stacks the PRs on the
-target with one merge commit each, runs the gate **once** on the stack, and pushes the stack to the
-target; each PR's own head is then on the target, so GitHub shows it **merged**, and its issue
-is closed. Which PRs are batched, and whether any are, is decided in code — you never choose. The
-members' own workers are told nothing, and a batch worker holds no claim and no slot. The pass
-watches the batch worker as it watches any worker on a turn: gone, it is continued; silent, it is
-nudged once and then the batch is **abandoned** (`afk turn --abandon`) with nothing landed — which
-fails no PR and spends no attempt. A batch cut short after its push has landed: its members are
-settled from the target by the next pass, and an abandon does not touch them. A PR the batch left out (it conflicts with the others) or an
-abandoned batch's PRs land on single turns, as above, and are never batched again.
+### The landing train — finished PRs behind whichever gate run is next
+
+Where the local gate is the completion gate and no adversarial verify is owed (`gate.ci: local`
+with no `gate.adversarial_verify_prompt`; there is no switch — [ADR-0048](../../docs/adr/0048-finished-prs-join-a-landing-train-gated-whenever-the-gate-is-free.md)), **no PR is given a landing
+turn**. `afk turn --issue` refuses there, and you never choose what lands with what.
+
+- **A worker joins by itself.** Before it opens its PR it gates with the train already merged into
+  its branch (`afk gate --train`); then `afk land` puts the PR on the train. Its claim reads
+  `joining` until its PR's current head is on the train, then `joined` — read off the train
+  itself, never off a marker. A PR that conflicts with what is on the train has the train merged
+  into its branch and resolves it there, once: nothing on a train is rewritten. A worker silent
+  while joining is nudged, restarted onto the join once, then escalated with everything kept — the
+  same ladder as a landing turn's.
+- **The train's worker lands it.** While a PR of this fleet is `joined`, the pass runs
+  `afk turn --train`: it starts the **train worker** in the train's worktree (one per repo, kept
+  across launches), or tells the one that stopped that more joined. That worker runs
+  `afk land --train`: it gates the train's tip — or finds that tree's run on record, so a train of
+  one lands on its own worker's run — pushes it to `base_branch` as a fast-forward, closes the
+  issues, and runs again. PRs that joined during a gate run land behind the next one. A red train
+  is fixed with one more commit on top, never bisected; a target that moved is merged into the
+  train. The train worker holds no claim and no slot.
+- **A silent train worker** is asked after (`afk no-pr --train`), nudged once (`afk nudge --train`)
+  and, silent again, the train is **abandoned** (`afk turn --abandon`) with nothing landed — which
+  fails no PR and spends no attempt: its PRs are told to join the next train. A PR taken off an
+  abandoned train a second time is escalated instead. A train cut short after its push has landed:
+  its PRs are settled from the target by the next pass, and an abandon does not touch them.
 
 The turn guards against a worker that **strays**, not a malicious one: worker and launcher share one
 `gh` credential, so nothing here stops a worker that decides to run `gh pr merge` itself.
@@ -633,9 +641,9 @@ touch shared root config are naturally throttled by the DAG — chain them with 
   `afk nudge` / `afk fail` / `afk escalate` taking the last screen of a worker that went silent, to
   say *where* it stopped — never its result (ADR-0018).
 - **Never merge a PR yourself.** No `gh pr merge`, no push to `base_branch`: a PR lands only through
-  its worker's `afk land`, on the turn `afk turn` gave it — or, in a merge batch, through the batch
-  worker's `afk land --batch`. A turn nobody lands is escalated with its PR kept, and a batch nobody
-  lands abandoned, not merged around (ADR-0027, ADR-0029, ADR-0035).
+  its worker's `afk land`, on the turn `afk turn` gave it — or, on a landing train, through the train
+  worker's `afk land --train`. A turn nobody lands is escalated with its PR kept, and a train nobody
+  lands abandoned, not merged around (ADR-0027, ADR-0035, ADR-0048).
 - **Claim before work; release on every terminal transition.** `afk dispatch` creates the
   `refs/afk/claim/<n>` ref first — if the create is rejected, a peer owns it and nothing is started.
   `afk escalate`, `afk park` and `afk close` each delete it as their last step; a claim that outlived

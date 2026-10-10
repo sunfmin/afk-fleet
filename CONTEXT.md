@@ -3,8 +3,8 @@
 An unattended fleet that works a GitHub-issue backlog on its own, for days, in one session that can
 be compacted at any point and lose nothing: a **launcher** runs one cycle after another, and each
 cycle's **tick** — one reconciliation pass, run in code — dispatches worktree-isolated **workers** per ready issue and gives each finished PR its
-**landing turn**, on which its worker gates it and lands it on the target branch — one PR at a time, or, where
-several may land together, as one **merge batch** behind a single gate run.
+**landing turn**, on which its worker gates it and lands it on the target branch, one PR at a time — or, where
+the **local gate** is the gate and no verify is owed, puts finished PRs on one **landing train** that is gated whenever the gate is free.
 
 ## Language
 
@@ -132,9 +132,11 @@ are never read in this mode — the repo is
 expected to scope remote CI away from worker branches, and a target branch whose protection requires
 checks is rejected at bootstrap. A red run at landing is the worker's to fix in place — off the turn, the first time (ADR-0045); its log
 excerpt is also posted as a PR comment, so a failure that does reach the retry ladder is re-read
-from where it lives, never from anyone's context. In a **merge batch** the landing's run is
-made once, on the batch's stack, and proves the stack rather than each PR alone — the invariant
-holds for the commit the target is moved to (ADR-0029).
+from where it lives, never from anyone's context. On a **landing train** the landing's run is
+the **train worker**'s, made on the train's tip, and proves everything that had joined rather than
+each PR alone — the invariant holds for the commit the target is moved to; a worker's own run there
+is made with the train already merged into its branch (`afk gate --train`), so a train of one needs
+no second run (ADR-0048).
 _Avoid_: local CI (it substitutes for CI; it is not CI), pre-push check, local build
 
 **Recorded gate run**:
@@ -142,7 +144,7 @@ The evidence that the **local gate** passed on a piece of content: one green run
 one committed tree. It is made by the tool that saw the exit code — never by a worker saying so —
 and kept on GitHub under the tree it tested, so it stands wherever that same content is about to
 land: the worker's worktree, one recreated from the pushed branch, another machine, another commit
-holding the same files, a **merge batch**'s stack. It is always trusted while it stands, and it
+holding the same files, a **landing train**'s tip. It is always trusted while it stands, and it
 stops standing when the same tree is later run red, or after a day. One stamped from the future
 never stood (see **heartbeat**). A **sync** that brought the
 target in or a later commit makes a different tree, which has its own record or none — and with
@@ -155,7 +157,7 @@ The one way a worker branch catches up with its base: merging `origin/<base>` in
 never rebasing (ADR-0012). It happens twice in a PR's life: the **worker** syncs and pushes right
 before its pre-PR **local gate**, so integration conflicts surface inside the worker's own session,
 where they are cheapest to fix; and the worker's **landing** syncs again, on its **landing turn**, picking up
-whatever the base gained since — a conflict there is left in progress for the same worker to resolve, off the turn the first time (ADR-0045). Where **merge batches** form, that second sync is made only for a PR that needs one — it conflicts with the base's tip, or its landing's gate was red: a PR that merges cleanly is stacked on the base instead, and its branch gains no merge (ADR-0046). Merge rather than rebase because a rebase drops
+whatever the base gained since — a conflict there is left in progress for the same worker to resolve, off the turn the first time (ADR-0045). Where a **landing train** runs there is no second sync with the base: the worker's pre-PR sync takes in the train (what its PR will land behind — the base when no train is ahead), and a PR that conflicts when it joins has the train's tip merged into its branch for the same worker to resolve, once (ADR-0048). Merge rather than rebase because a rebase drops
 merge commits and re-ignites the conflicts already resolved inside them — and those merge commits
 land on the target as they are: a PR lands as a merge commit, never squashed (ADR-0034). It is not an option: there is no config key for it (ADR-0038).
 _Avoid_: rebase (retired from the merge path), rebase onto latest, update branch
@@ -377,9 +379,9 @@ is the PR or the verdict, not this), **nudge** (that is fleet → worker; a wake
 
 **Landing turn**:
 The fleet's permission for one finished PR to land, granted by the **tick** in one **transition**
-(`afk turn`) and held by one PR of a **fleet instance** at a time — or by
-the several PRs of one **merge batch** at once (ADR-0029): one turn, two kinds of holder, which land
-in different ways and are deliberately not one abstraction (ADR-0036). It is recorded as a single marker
+(`afk turn`) and held by one PR of a **fleet instance** at a time. It exists only where a PR lands
+alone — `gate.ci: required`, or any config with an adversarial verify: where a **landing train**
+runs no PR is given one (ADR-0048). It is recorded as a single marker
 comment on the PR naming the instance that granted it — so it dies with the PR, and does not survive
 a **takeover** — and it carries the tick's judgments made *before* the grant (the head an adversarial
 verify passed, a PR with no checks waived) and where the worker's last `afk land` stopped. A turn
@@ -409,9 +411,8 @@ itself; nobody takes it)
 **Landing**:
 What a **worker** does on its **landing turn**, with one command in its own worktree (`afk land`):
 **sync** with the merge target → push → the machine gate on that exact head → merge pinned to the
-gated head. Where **merge batches** form it lands as a batch of one instead, with no sync of the
-branch: the PR's head is merged onto the target's tip with one merge commit, that commit is gated,
-and it is pushed to the target as a fast-forward — the push a moved target refuses (ADR-0046). It stops with an outcome the worker acts on itself: a **sync** conflict is left in
+gated head. Where a **landing train** runs the same command joins the train instead, with no turn
+and no gate run (ADR-0048). It stops with an outcome the worker acts on itself: a **sync** conflict is left in
 progress and resolved in place, a red gate is fixed in place, and the worker lands again — no round
 trip through the tick, no **retry** spent, the PR kept. The turn is kept only from a PR's second turn
 on: the first such stop **gives the turn up**, and the worker fixes off it. Run off the turn, the
@@ -428,43 +429,42 @@ _Avoid_: hand-back (retired: the tick no longer syncs a PR and returns its confl
 meets the conflict itself, on its turn), tick-side merge, auto-merge (the tick merges nothing),
 merge-time gate run (the gate run is the landing's)
 
-**Merge batch**:
-One **landing turn** held by several finished PRs of a **fleet instance** at once, so that they land
-behind ONE run of the **local gate** instead of one each (ADR-0029; `gate.ci: local` only, and
-never an option: where it can form it does, ADR-0034). Where it can form, a PR that lands alone lands
-the same way — stacked, gated, pushed — by its own worker, on a turn that is still a single PR's (ADR-0046). Its whole record is the turn marker on every member PR, naming the batch,
-its members and its phase — `stacking`, `gating` or `fixing` — and it is the only place the members
-are kept: the batch's worktree holds no list of them. A **batch worker** stacks the members
-on the target's tip with one merge commit per PR, in **merge queue** order, gates the stack once, and
-pushes it to the target as a fast-forward: that push is the only lock, and a target that moved
-refuses it. Each PR's own head is then on the target, so GitHub shows it *merged* by itself. What is
-on the target has landed, whatever cut the batch worker short after the push: a member whose issue is
-still open is settled by the next **tick** from its commit there, and an abandon leaves it alone. A red stack is repaired with a fix commit on top, never
-bisected. Whether the turn goes to a batch or to one PR is decided in code
-(`afk_decide.batch_candidates`): never while a turn is out, never a PR that owes an adversarial
-verify, whose own worker is still working, that gave a turn up, or that is a peer's. A PR being fixed
-off a turn it gave up holds no turn, so a batch forms beside it; ready again, it takes a single turn
-first (ADR-0045). A PR that leaves a batch without
-landing — *left out* because it conflicts with the stack, or because the batch was *abandoned* or
-*dissolved* — takes a single turn next and is never batched again.
-_Avoid_: merge train (nothing is speculatively gated, and there is one batch at a time, not a
-pipeline of them), rollup PR (no PR is opened for a batch), bisect (a red batch is fixed, not
-searched)
+**Landing train**:
+Where the **local gate** is the completion gate and no adversarial verify is owed (`gate.ci: local`,
+`afk_decide.train_runs`), the one append-only line of commits ahead of the target that finished PRs
+**join** and that is gated whenever the gate is free (ADR-0048). It is one ref on the remote; each
+PR on it is one merge commit — the train's tip before it, the PR's head — naming the PR and the
+issue it closes. A worker joins with the command it always lands with (`afk land`): no **landing
+turn** is asked for and no gate runs — the push of the line is the only lock, and a join that loses
+it is made again on the new tip. A PR that conflicts has the train's tip merged into its branch,
+resolves against it, and joins: nothing on a train is ever rewritten, so that resolution is made
+once. Whether a PR is on the train — and at which head — is read off the line itself, never off a
+marker: a claim is `joining` until its PR's current head is on the train, then `joined`. The
+**train worker** gates the tip and pushes it to the target as a fast-forward — the push a moved
+target refuses — so PRs that joined during a gate run land behind the next one. A red train is
+repaired with a fix commit on top, never bisected, and is not merged into anyone's branch
+meanwhile. What is on the target has landed, whatever cut the train worker short after the push. A
+train is the repo's, not a launch's: any **fleet instance** tends it.
+_Avoid_: merge batch (retired: a batch was fixed when it formed), queue (there is
+no order to wait in — join order is push order), speculative train (one gate run at a
+time, of everything joined), bisect (a red train is fixed, not searched)
 
-**Batch worker**:
-The **worker** that lands a **merge batch**, with one command (`afk land --batch`) in a worktree of
-the batch's own, cut at the target's tip and linked to no issue. It wrote none of the PRs it lands,
-holds no **claim**, takes no dispatch slot and spends nobody's **retry**. It is watched like any
-worker holding a turn: gone, it is replaced by **continuation** in the batch's worktree, else from
-the batch's pushed branch; silent past grace it is **nudged** once, and silent again the batch is
-abandoned with nothing landed — which fails no PR (ADR-0029).
-_Avoid_: merger, integrator, release manager (it decides nothing: which PRs, in what order, and
-whether to batch at all are the tick's, in code)
+**Train worker**:
+The **worker** that lands the **landing train**, with one command (`afk land --train`) in the
+train's own worktree — one per repo, linked to no issue, **kept** across trains and launches (it
+holds what the gate's runs built) and never swept as an orphan. It wrote none of the PRs it lands,
+holds no **claim**, takes no dispatch slot and spends nobody's **retry**. The **tick** keeps it on
+the train while one of its PRs is `joined` (`afk turn --train`): gone, it is started again in that
+worktree; stopped with nothing new, it is left while it shows life, **nudged** once, and silent
+again the train is **abandoned** — its refs deleted, its worktree cleared, its PRs told to join the
+next train, which fails no PR. A PR taken off an abandoned train a second time is escalated,
+everything kept (ADR-0048).
+_Avoid_: batch worker (retired), merger, integrator, release manager (it decides nothing: what is on
+the train is whoever joined)
 
 **Merge queue**:
 The order **landing turns** are granted in (ADR-0027): among a **fleet instance**'s ready PRs, the
-one that already holds a turn first, then one that gave a turn up and is ready again (ADR-0045), then
-one that left a **merge batch** without landing, then the
+one that already holds a turn first, then one that gave a turn up and is ready again (ADR-0045), then the
 lower PR number, then — one PR closing several issues — the lower issue number: a total order,
 whatever order the claims were read in. `afk rebuild` returns it as
 `merge_order`, and the **tick** grants the turn to its first PR only when none of its claims is
@@ -475,9 +475,9 @@ target that holds everything landed before their turn — once, unless a PR gave
 may cost it one more resolution, on its second turn (ADR-0045). Waiting is bounded by a turn's own
 length — a sync, a gate run and a merge, or on a PR's second turn the
 silent-worker ladder on the PR that holds it — and spends no **retry**. Turns are per fleet
-instance: two fleets on one repo each grant their own. When two or more of
-those PRs may land together the turn goes to all of them as one **merge batch**, in this same order.
-_Avoid_: merge train (nothing is speculatively gated; a **merge batch** is one turn, not a train),
+instance: two fleets on one repo each grant their own. Where a **landing train** runs there is no
+queue: no turn is granted, and PRs join in the order they finish (ADR-0048).
+_Avoid_: merge train (that is the **landing train**, which has no queue),
 lock (nothing is held: the order
 is recomputed from GitHub every time), priority (it is not configurable)
 

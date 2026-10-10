@@ -1,5 +1,7 @@
 # ADR-0027 — A worker lands its own PR, on a landing turn the fleet grants one at a time
 
+**Amended by [ADR-0048](0048-finished-prs-join-a-landing-train-gated-whenever-the-gate-is-free.md) (#157):** with `gate.ci: local` and no adversarial verify no PR is given a landing turn — a finished PR joins the landing train, and the train's worker lands it. What is decided below stands for `gate.ci: required` and for any config with the adversarial verify on.
+
 **Status:** accepted — moves the landing of a PR out of the tick. Supersedes the **tick-side**
 merge-time gate run of [ADR-0012](0012-local-completion-gate.md) (its invariant, and merge-never-
 rebase, are kept: the run moves to the worker's landing); the `merge` transition of

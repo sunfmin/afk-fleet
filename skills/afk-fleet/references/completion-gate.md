@@ -18,16 +18,15 @@ A PR may land only when **all** configured gates are green. Which **machine gate
   PR has no checks at all — `rebuild` reports it `awaiting_turn` (there is nothing to wait for), `afk turn` returns `no_checks`, the gate is then the issue's acceptance
   criteria + whatever local build/test exists, and `--allow-no-checks` is how you say it passed.
 - **`local` — `gate.local_command` *is* the completion gate.** GitHub checks are **never read** in this
-  mode (`rebuild` reports every open PR as `awaiting_turn`: gating is an **action the landing takes**,
+  mode (`rebuild` reports every open PR as `awaiting_turn` — or, where a landing train runs, as
+  `joining` until it is on the train: gating is an **action the landing takes**,
   not an observation waited on). It runs twice in a PR's life — the worker runs it after its
   pre-PR sync, and **the landing runs it again** in the same worktree, on the head that lands — because
   the pre-PR pass tested pre-sync code, and two PRs can each be locally green yet conflict semantically. The
   invariant both runs serve: *what lands on the target branch was tested in the form it lands.* The
-  landing's run happens inside `afk land`. Where merge batches form (no adversarial verify) it is
-  a run of the commit that lands: the PR's head merged onto the target's tip, pushed afterwards as
-  a fast-forward that a moved target refuses (`target_moved`; the next run stacks and gates again)
-  — the branch is not synced for it, and gains a merge of the target only when the PR conflicts
-  with the tip or that run was red (ADR-0046). With the verify on, the run is after the landing's
+  landing's run happens inside `afk land`. Where a landing train runs (no adversarial verify) it is
+  the **train worker's** — `afk land --train`, on the train's tip; the PR's own `afk land` only
+  joins and runs no gate (below). With the verify on, the run is after the landing's
   sync and before `gh pr merge`: a target that moved while it ran would make the merge commit a
   tree no run saw, so the landing reads the target's tip again before merging and stops with
   `target_moved` instead — its next run syncs and gates again. A red run is the
@@ -55,7 +54,7 @@ A PR may land only when **all** configured gates are green. Which **machine gate
   the run was over uncommitted or untracked files or left a tracked file changed (no record), the
   same tree was run red or timed out since (that deletes the record), the remote refused the ref.
   **The landing's own run is held to the rule a record is written by** — `afk land` and
-  `afk land --batch` alike: a green run counts only when the worktree was exactly its commit before
+  `afk land --train` alike: a green run counts only when the worktree was exactly its commit before
   the run (nothing uncommitted, nothing untracked) and is exactly its commit after it. Otherwise the
   landing **refuses** — an `"error"` naming the paths, nothing merged, nothing recorded, no attempt
   spent: with files lying around it does not run the gate at all, and a run that rewrote a tracked
@@ -67,24 +66,25 @@ A PR may land only when **all** configured gates are green. Which **machine gate
   green" proves nothing and leaves none. There is no switch. What is given up is a second,
   independent sample on unchanged content — a flaky test that passed once, or a gate that depends
   on the machine, is not asked again for a day.
-- **A merge batch — one landing run for several PRs**
-  ([ADR-0029](../../../docs/adr/0029-a-merge-batch-lands-n-prs-behind-one-gate-run.md); `local`
-  only, with no `gate.adversarial_verify_prompt`; not an option). The landing's run is the fleet's landing throughput: N finished PRs are N runs.
-  So when two or more finished PRs may land together the landing turn goes to all
-  of them as a **merge batch**: a batch worker, in a worktree of the batch's own, stacks them on the
-  target's tip — one merge commit per PR, in merge order — and `afk land --batch` runs
-  `gate.local_command` **once, on the stack**, then pushes the stack to the target as a
-  fast-forward. The invariant is kept literally — the commit the target is moved to is the commit
-  the gate passed on — but what the gate proves is the **stack**, not each PR alone: the
-  intermediate commits were never gated by themselves. The stack's tree is recorded and looked up
-  like any other (ADR-0030): a stack already gated green — a landing cut short after its gate — is
-  not gated again. A red run lands nothing and
-  is the batch worker's `outcome: gate_red`: it fixes the stack with one more commit on top and runs
-  the command again — nobody bisects for the PR at fault. The push is the only lock: a target that
-  moved while the gate ran refuses it (`target_moved`), nothing lands, and the same command
-  re-stacks and gates again. A PR that conflicts with the stack is left out and lands on a single
-  turn. Never batched: a PR that owes an adversarial verify (so with `gate.adversarial_verify_prompt` set,
-  none is), one whose own worker is still working, a peer's. The target must accept a direct push:
+- **The landing train — one landing run for whatever has joined**
+  ([ADR-0048](../../../docs/adr/0048-finished-prs-join-a-landing-train-gated-whenever-the-gate-is-free.md); `local` only, with no `gate.adversarial_verify_prompt`; not an option). The landing's run
+  is the fleet's landing throughput, so it is not spent per PR. A finished PR **joins the landing
+  train** — one append-only line of commits ahead of the target, each PR one merge commit — with its
+  own `afk land`, which takes no turn and runs no gate. The **train worker**, in the train's own
+  worktree, runs `afk land --train`: it gates the train's tip **once** and pushes that commit to the
+  target as a fast-forward; PRs that joined while the gate ran land behind the next run. The
+  invariant is kept literally — the commit the target is moved to is the commit the gate passed on
+  — but what the gate proves is the **train**, not each PR alone: the commits below the tip were
+  never gated by themselves. The tip's tree is recorded and looked up like any other (ADR-0030),
+  and that is what makes a PR alone cost one run, not two: the worker's pre-PR run is
+  `afk gate --train`, which first merges the train into its branch — so its green run is of the
+  very tree it joins with, and the train worker finds it on record. A red run lands nothing and is
+  the train worker's `outcome: gate_red`: it fixes the train with one more commit on top and runs
+  the command again — nobody bisects for the PR at fault, and meanwhile `afk gate --train` merges
+  in the train's last green commit instead of its red tip. The push is the only lock: a target
+  that moved while the gate ran refuses it (`target_moved`), nothing lands, and the same command
+  merges the new tip into the train and gates again. A PR that conflicts with the train has the
+  train merged into its branch and resolves it there, once. The target must accept a direct push:
   bootstrap **hard-errors** when its protection requires pull request reviews, restricts pushes, or
   is locked.
 - **Independent adversarial verification** (if `gate.adversarial_verify_prompt` is set) — a *separate* agent (not

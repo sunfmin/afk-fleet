@@ -1,5 +1,7 @@
 # ADR-0035 — A silent landing worker is restarted onto its turn, never failed for its silence alone
 
+**Amended by [ADR-0048](0048-finished-prs-join-a-landing-train-gated-whenever-the-gate-is-free.md) (#157):** where a landing train runs the same ladder bounds a worker that is *joining* (nudged, restarted onto the join brief, escalated); the train's own worker is nudged once and then the train is abandoned.
+
 **Status:** accepted — adds one rung to the ladder of
 [ADR-0018](0018-nudge-a-silent-worker-before-failing-it.md) where a claim holds a **landing turn**,
 and amends "What bounds a turn" of

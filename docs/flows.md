@@ -89,13 +89,15 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   not told anything, its slot held — so each PR of a conflicting group is resolved against a
   target that already holds the ones before it, `skills/afk-fleet/scripts/afk_decide.py:turn_order`
   (ADR-0027).
-- Two or more PRs may land together (`gate.ci: local`, no adversarial verify owed): the turn goes to all of them as one
-  **merge batch**, `skills/afk-fleet/scripts/afk_decide.py:batch_candidates` — a batch worker in a
-  worktree of the batch's own stacks them on the target with one merge commit per PR, gates the stack
-  once and pushes it to the target as a fast-forward, `skills/afk-fleet/scripts/afk.py:_land_batch`;
-  each PR's own head is then on the target, so GitHub shows it merged. A PR that conflicts with the stack is
-  left out and takes a single turn; a batch whose worker stays silent is abandoned
-  (ADR-0029, ADR-0034).
+- A landing train runs (`gate.ci: local`, no adversarial verify owed,
+  `skills/afk-fleet/scripts/afk_decide.py:train_runs`): no turn is granted. The worker joins the train itself — its PR's
+  head merged onto the train's tip as one merge commit, pushed as the new tip,
+  `skills/afk-fleet/scripts/afk.py:_join_train` — after resolving any conflict against the train, once. The train's own
+  worker, kept on it by `skills/afk-fleet/scripts/afk_decide.py:_train_plan`, gates the tip whenever the gate is free and
+  pushes it to the target as a fast-forward, `skills/afk-fleet/scripts/afk.py:_land_train`; each PR's own head is then on
+  the target, so GitHub shows it merged. A red train is fixed with a commit on top; a train whose
+  worker stays silent is abandoned and its PRs join the next one, `skills/afk-fleet/scripts/afk.py:_abandon_train`
+  (ADR-0048).
 - The landing's sync conflicts: the merge is left in progress in the worker's own worktree, and the
   worker resolves it, commits and lands again — claim, PR, branch and worktree kept, no
   attempt spent, `skills/afk-fleet/scripts/afk_decide.py:land_outcome`.
@@ -103,8 +105,8 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   also a PR comment, `skills/afk-fleet/scripts/afk_decide.py:gate_comment`.
 - Either of those two, the first time for a PR: the landing gives the turn up,
   `skills/afk-fleet/scripts/afk_decide.py:gives_turn_up` — the claim is `fixing`, the next cycle
-  grants the turn to the next PR or to a merge batch, and the worker fixes off the turn, where
-  `afk land` syncs and gates and merges nothing. Ready again, the PR takes its next turn ahead of
+  grants the turn to the next PR, and the worker fixes off the turn, where
+  `afk land` syncs, runs no local gate and merges nothing (ADR-0047). Ready again, the PR takes its next turn ahead of
   PRs that never held one, and on that turn the same stop keeps the turn (ADR-0045).
 - A recorded gate run of the command configured now stands for the tree that would land: step 13
   does not run the local gate again, `skills/afk-fleet/scripts/afk_decide.py:gate_record_void`
@@ -302,8 +304,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   (ADR-0030; `test_a_recorded_worker_gate_run_is_not_repeated_by_the_landing`,
   `test_a_recorded_gate_run_is_void_unless_it_is_of_the_tree_that_lands`) A run counts — for a
   record and for a landing alike — only when the worktree is exactly its commit before the run and
-  after it. (ADR-0030; `test_a_landing_accepts_only_a_gate_run_of_the_committed_tree`,
-  `test_a_batch_lands_only_on_a_gate_run_of_the_committed_stack`)
+  after it. (ADR-0030; `test_a_landing_accepts_only_a_gate_run_of_the_committed_tree`)
 - A worker starts from the commit the remote has, never a stale local branch, and is told the branch
   orca actually created. (ADR-0017;
   `test_dispatch_starts_a_worker_on_the_remote_base_tip_and_submits_its_prompt`)
@@ -337,16 +338,20 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 - A turn whose worker is gone is delivered by continuation in the PR's own worktree or at its head,
   never from base, and there is no launcher-side merge. (ADR-0027;
   `test_a_turn_with_no_terminal_is_delivered_by_continuation_never_from_base`)
-- A batch of PRs lands behind exactly one gate run, as one merge commit per PR
-  in merge order; the target is only ever moved — by a fast-forward push — to a commit the gate
-  passed on, so a red stack, a moved target and an abandoned batch each land nothing; and a PR that
-  left a batch is never batched again. (ADR-0029;
-  `test_a_merge_batch_lands_three_prs_behind_one_gate_run`,
-  `test_a_red_batch_lands_nothing_and_is_repaired_with_a_fix_commit_on_top`,
-  `test_a_target_that_moves_while_the_batch_gates_refuses_the_push`,
-  `test_land_batch_without_the_batchs_turn_changes_nothing`,
-  `test_a_pr_that_conflicts_with_the_stack_is_left_out_and_never_batched_again`,
-  `test_a_silent_batch_worker_is_nudged_once_then_the_batch_is_abandoned`)
+- Where a landing train runs, finished PRs join one append-only line with no turn and no gate run,
+  and land as one merge commit each behind whichever gate run is next; the target is only ever
+  moved — by a fast-forward push — to a commit the gate passed on, so a red train, a moved target
+  and an abandoned train each land nothing; a conflict is resolved against the train once; and N
+  PRs cost fewer gate runs than a turn each. (ADR-0048;
+  `test_three_prs_that_join_during_one_gate_run_land_behind_the_next`,
+  `test_a_train_of_one_lands_on_its_workers_own_gate_run`,
+  `test_a_join_conflict_is_resolved_against_the_train_and_lands_without_a_second`,
+  `test_a_red_train_lands_nothing_and_is_repaired_with_a_fix_commit_on_top`,
+  `test_a_target_moved_from_outside_is_merged_into_the_train_never_rebased_onto`,
+  `test_a_train_worker_cut_after_the_push_is_finished_by_the_next_cycle_from_the_target`,
+  `test_five_prs_two_of_them_conflicting_land_behind_six_gate_runs_not_nine`,
+  `test_a_silent_train_worker_is_nudged_once_then_the_train_is_abandoned`,
+  `test_a_train_is_the_repos_and_the_next_fleet_instance_tends_it`)
 - A wake carries no state and nothing waits on one: the cycle it opens reads GitHub like any other,
   and a worker with no launcher terminal to wake is given a no-op. (ADR-0020;
   `test_a_worker_is_told_how_to_wake_the_launcher_and_nothing_else`)
@@ -370,9 +375,10 @@ stateDiagram-v2
   pr_open --> awaiting_turn: checks green, or local gate mode
   pr_open --> ci_failed: checks red
   awaiting_turn --> landing: the fleet grants it the landing turn, one PR at a time
-  awaiting_turn --> landing: the turn goes to a merge batch it is in
-  landing --> merged: its batch stacked, gated once and pushed (GitHub shows the PR merged)
-  landing --> awaiting_turn: left out of its batch, or the batch abandoned (single turns from here)
+  pr_open --> joining: a landing train runs, its worker is joining it (no turn)
+  joining --> joined: its head is on the train
+  joined --> merged: the train worker gated the train and pushed it (GitHub shows the PR merged)
+  joined --> joining: its worker pushed again, or the train was abandoned
   landing --> merged: its worker synced, gated and merged it
   landing --> landing: conflict or red gate fixed in place; or the tick settles checks or a verify on a moved head
   landing --> landing: worker died, continued onto the turn

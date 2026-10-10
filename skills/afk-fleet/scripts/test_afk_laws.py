@@ -18,7 +18,7 @@ import random
 import typing
 
 import afk_decide as d
-from test_afk_decide import CALL, FACTS, GRACE, NOW, _batch, _did, _mine, _worker, _working_set
+from test_afk_decide import CALL, FACTS, GRACE, NOW, _did, _mine, _worker, _working_set
 
 TTL = d.CLAIM_LEASE_TTL_SECONDS
 SKEW = d.CLOCK_SKEW_TOLERANCE_SECONDS
@@ -57,8 +57,8 @@ DECLARED = (
     (_said("blocked", [1, 2]), {1: "waiting", 2: "unmet"}),
     (_said("blocked", [1]), {1: "no such standing"}))
 NUDGED = (None, UNDER, AT, OLD, AHEAD)
-# one PR's turn, a marker that only remembers a batch it left, a merge batch's turn
-TURN_KINDS = ({}, {"released": True}, {"batch": "b1"})
+# one PR's turn, and a marker that holds none: it only remembers a train abandoned
+TURN_KINDS = ({}, {"released": True, "abandoned": 5})
 
 
 def _turns(ats):
@@ -146,9 +146,8 @@ def test_a_held_landing_turn_with_no_verdict_never_spends_an_attempt():
     nudged, restarted onto the turn or escalated (ADR-0035).
 
     Hidden precondition: the turn is one PR's and it is held — `at` set, not
-    `released`, no merge batch's (`single_turn_held`) — and the worker posted
-    no verdict. A released marker and a batch's turn climb the PR-less ladder,
-    which does fail; a verdict is routed on what it declared, whatever turn is
+    `released` (`single_turn_held`) — and the worker posted no verdict. A
+    marker that holds no turn climbs the PR-less ladder, which does fail; a verdict is routed on what it declared, whatever turn is
     held."""
     reached = set()
     for gathered, seen in _stopped_workers():
@@ -168,30 +167,31 @@ def test_a_held_landing_turn_with_no_verdict_never_spends_an_attempt():
         assert d.WORKER_CAUSES[seen["cause"]].step == "fail", kind
 
 
-def test_a_batch_worker_always_gets_a_batch_step():
-    """However a merge batch's worker is read — its terminal, every clock, its
-    nudge, whether it can be nudged at all — the cause it is classified with
-    has a `batch_step`, so `batch_step` never raises. Exhaustive.
+def test_the_train_worker_always_gets_a_train_step():
+    """However the landing train's worker is read — its terminal, every clock,
+    its nudge, whether it can be nudged at all — the cause it is classified with
+    has a `train_step`, so `train_step` never raises. Exhaustive.
 
-    Hidden precondition: it is classified the way `afk no-pr --batch` does it —
-    no verdict, no blocker, and a turn that is the BATCH's. The table gives a
-    batch step to only some causes; the others need a verdict or one PR's held
-    turn, which a batch worker never has."""
+    Hidden precondition: it is classified the way `afk no-pr --train` does it —
+    no verdict, no blocker, and no turn: when it was last told something is
+    handed in as the `at` of a record that holds none. The table gives a train
+    step to only some causes; the others need a verdict or one PR's held turn,
+    which the train worker never has."""
     steps = set()
     for terminal, idle, nudged_at, progress, told, can_nudge in itertools.product(
             ("none", "busy", "idle"), TERMINAL_IDLE, NUDGED, PROGRESS, STAMPS, (True, False)):
         reading = {"terminal": terminal, "terminal_idle_seconds": idle, "state": None}
         seen = d.settled_by_worker_state(reading, NOW, GRACE, nudged_at) or d.classify_stopped(
             progress, idle, None, {}, NOW, GRACE, nudged_at=nudged_at, can_nudge=can_nudge,
-            turn=d.next_turn(None, at=told, batch="b1"))
-        steps.add(d.batch_step({**_worker(seen["cause"]), "batch": "b1", "worker_state": None}))
-    assert steps == set(typing.get_args(d.BatchStep))
+            turn=d.next_turn(None, at=told, released=True) if told else None)
+        steps.add(d.train_step({**_worker(seen["cause"]), "worker_state": None}))
+    assert steps == set(typing.get_args(d.TrainStep))
     # …and the precondition is what holds it: classified as ONE PR's worker
-    # would be, the same silence has no batch step
+    # would be, the same silence has no train step
     single = d.classify_stopped(None, 9000, None, {}, NOW, GRACE, nudged_at=OLD,
                                 turn=d.next_turn(None, at=OLD))
     try:
-        d.batch_step({**_worker(single["cause"]), "batch": "b1", "worker_state": None})
+        d.train_step({**_worker(single["cause"]), "worker_state": None})
         assert False, single
     except ValueError:
         pass
@@ -328,41 +328,37 @@ NO_PR_CAUSES = tuple(c for c in d.WORKER_CAUSES
                      if c not in ("awaiting_tick", "silent_on_turn", "silent_past_restart"))
 LANDING_CAUSES = tuple(c for c in d.WORKER_CAUSES
                        if c not in ("silent_after_nudge", "silent_unnudgeable"))
-BATCH_CAUSES = tuple(c for c, row in d.WORKER_CAUSES.items() if row.batch_step)
-HAS_PR = ("awaiting_turn", "awaiting_ci", "failure")
+# a PR that is to join the landing train holds no turn, and its silence after the
+# nudge escalates it (`classify_stopped(joining=True)`)
+JOINING_CAUSES = tuple(c for c in NO_PR_CAUSES if c not in ("silent_after_nudge",
+                                                            "silent_unnudgeable"))
+TRAIN_CAUSES = tuple(c for c, row in d.WORKER_CAUSES.items() if row.train_step)
+HAS_PR = ("awaiting_turn", "awaiting_ci", "failure", "joining", "joined")
 
 
-def _tick_world(rng):
+def _tick_world(rng, train):
     """One working set as a rebuild hands it over: claims of mine in every
-    status, at most ONE landing turn out — one PR's, my merge batch's, or a
-    dead fleet's batch on claims I took — and stale claims, phantom locks and a
-    frontier, no issue in two of those lists."""
+    status — where a landing train runs (`train`), PRs that are to join it and
+    PRs on it, and no turn anywhere; elsewhere at most ONE landing turn out —
+    and stale claims, phantom locks and a frontier, no issue in two of those
+    lists."""
     numbers = rng.sample(range(1, 60), 16)
+    ready = ("joining", "joining", "joined") if train else ("awaiting_turn", "awaiting_turn",
+                                                           "awaiting_ci", "failure")
     mine = []
     for n in numbers[:rng.randrange(7)]:
-        status = rng.choice(("no_pr", "no_pr", "awaiting_turn", "awaiting_turn", "awaiting_ci",
-                             "failure", "closed", "landed"))
+        status = rng.choice(("no_pr", "no_pr", *ready, "closed", "landed"))
         mine.append(_mine(n, status, pr=n * 10 if status in HAS_PR else None,
                           board_phase=d.BOARD_PHASE_OF[status],
-                          starting=status == "no_pr" and rng.random() < 0.15,
-                          unbatched=rng.choice(d.UNBATCHED)
-                          if status == "awaiting_turn" and rng.random() < 0.15 else None))
+                          starting=status == "no_pr" and rng.random() < 0.15))
     waiting = [r for r in mine if r["status"] == "awaiting_turn"]
-    out, batches = rng.choice(("none", "none", "single", "mine", "dead", "both")), []
-    if waiting and out == "single":
+    if waiting and rng.random() < 0.3:
         waiting[0].update(status="landing", stopped=rng.choice(
-            (None, None, None, *(s for s in d.LAND_OUTCOMES if s != "merged"))))
-    if waiting and out in ("dead", "both"):
-        batches.append(_batch([waiting.pop()["number"]], instance="dead", batch="old"))
-    if waiting and out in ("mine", "both"):
-        held = {"id": "b1", "members": [r["number"] for r in waiting[:2]], "phase": "stacking"}
-        for row in waiting[:2]:
-            row.update(status="landing", batch=held)
-        batches.append(_batch(held["members"]))
+            (None, None, None, *(s for s in d.LAND_OUTCOMES if s not in ("merged", "joined")))))
     rest = iter(numbers[7:])
     stale, stale_closed, frontier = (sorted(itertools.islice(rest, rng.randrange(size)))
                                      for size in (4, 3, 5))
-    return _working_set(mine, frontier, stale, stale_closed, batches)
+    return _working_set(mine, frontier, stale, stale_closed)
 
 
 def _carried_out(ws, config, rng):
@@ -370,13 +366,17 @@ def _carried_out(ws, config, rng):
     way it can → ([(the step, its result, what it raised)...], what the plan
     returned)."""
     rows = {r["number"]: r for r in ws["mine"]}
-    members = {b["id"]: [m["issue"] for m in b["members"]] for b in ws["batches"]}
+    joined = [r["number"] for r in ws["mine"] if r["status"] == "joined"]
     log = []
 
     def cause(asked):
-        if asked in members:
-            return rng.choice(BATCH_CAUSES)
-        return rng.choice(LANDING_CAUSES if rows[asked]["status"] == "landing" else NO_PR_CAUSES)
+        return rng.choice({"landing": LANDING_CAUSES, "joining": JOINING_CAUSES}.get(
+            rows[asked]["status"], NO_PR_CAUSES))
+
+    def abandoned():
+        twice = [n for n in joined if rng.random() < 0.3]
+        return {"outcome": "abandoned", "issues": [n for n in joined if n not in twice],
+                "escalated": twice}
 
     def answer(step):
         do, n = step["do"], step.get("issue")
@@ -385,17 +385,16 @@ def _carried_out(ws, config, rng):
                     for _ in step["issues"]]
         if rng.random() < 0.12:
             raise RuntimeError(f"{do} failed")
+        if do == "no-pr" and step.get("train"):
+            return {"workers": [_worker(rng.choice(TRAIN_CAUSES))]}
         if do == "no-pr":
-            return {"workers": [_worker(cause(asked), issue=asked)
-                                for asked in step.get("issues") or [step["batch"]]]}
+            return {"workers": [_worker(cause(asked), issue=asked) for asked in step["issues"]]}
         if do in ("turn", "restart"):
             return {"issue": n, "pr": n * 10, "head": "abc",
                     "outcome": rng.choice(("granted", "granted", *d.TURN_OUTCOMES))}
-        if do == "batch-turn":
-            formed = members.get("b1") or d.batch_candidates(ws["mine"], ws["merge_order"], config)
-            return rng.choice(({"outcome": "granted", "batch": "b1", "issues": formed},) * 3
-                              + ({"outcome": "too_few"}, {"outcome": "landing"}))
-        return {"abandon": lambda: {"issues": members[step["batch"]]},
+        if do == "train":
+            return {"outcome": rng.choice(("granted", "landing", "idle", "stopped", "stopped"))}
+        return {"abandon": abandoned,
                 "fail": lambda: {"action": rng.choice(("retry", "retry", "escalate"))},
                 "escalate": lambda: {"action": "escalate"},
                 "reclaim": lambda: {"won": rng.random() < 0.7},
@@ -421,8 +420,9 @@ def _ticks():
     ticks = []
     for seed in range(3000):
         rng = random.Random(seed)
-        ws = _tick_world(rng)
-        ticks.append((ws, *_carried_out(ws, rng.choice(CONFIGS), rng)))
+        config = rng.choice(CONFIGS)
+        ws = _tick_world(rng, d.train_runs(config))
+        ticks.append((ws, *_carried_out(ws, config, rng)))
     return ticks
 
 
@@ -439,7 +439,7 @@ def test_a_tick_hands_each_issue_at_most_one_transition_step():
     Hidden precondition: the working set names each issue ONCE — one `mine`
     row, and no issue in two of mine / stale / phantom locks / frontier
     (`assemble_working_set`'s partition) — at most one landing turn is out as
-    the tick begins, and `afk no-pr` answers one row per claim asked after. A
+    the tick begins, a nudge of the train's worker is no issue's step, and `afk no-pr` answers one row per claim asked after. A
     stale claim's `reclaim` and `begin` are one start, in that order."""
     twice = 0
     for ws, log, done in _ticks():
@@ -458,25 +458,34 @@ def test_a_tick_hands_each_issue_at_most_one_transition_step():
 
 def test_a_tick_hands_out_at_most_one_landing_turn():
     """At most one of a tick's steps is answered with a landing turn granted —
-    to one PR, to one merge batch, or as a restart onto the turn already held
-    (ADR-0029) — and the issues the tick reports granted or restarted are that
-    one grant's.
+    to one PR, or as a restart onto the turn already held (ADR-0029) — and the
+    issues the tick reports granted or restarted are that one grant's. Where a
+    landing train runs no PR is granted a turn at all: the tick asks for none,
+    and at most once puts the train's worker on what joined (ADR-0048).
 
-    Hidden precondition: at most one turn is out as the tick begins. The tick
-    grants against the working set it was handed and never re-reads who holds
-    the turn; and a step that was ASKED is not a grant — a batch too small to
-    form is followed by a single turn in the same tick."""
-    kinds, asked_twice = set(), 0
+    Hidden precondition: at most one turn is out as the tick begins, and none
+    where a train runs — a PR there is `joining` or `joined`, never waiting
+    for a turn or holding one. The tick grants against the working set it was
+    handed and never re-reads who holds the turn."""
+    kinds, trains = set(), 0
     for ws, log, done in _ticks():
         grants = [(step, result) for step, result, error in log
-                  if step["do"] in ("turn", "batch-turn", "restart") and error is None
+                  if step["do"] in ("turn", "restart") and error is None
                   and result["outcome"] == "granted"]
         assert len(grants) <= 1, grants
-        told = [n for step, result in grants for n in result.get("issues", [step.get("issue")])]
+        told = [step["issue"] for step, _ in grants]
         assert done["did"]["granted"] + done["did"]["restarted"] == told
         kinds |= {step["do"] for step, _ in grants}
-        asked_twice += sum(step["do"] in ("turn", "batch-turn") for step, _, _ in log) == 2
-    assert kinds == {"turn", "batch-turn", "restart"} and asked_twice > 10
+        does = [step["do"] for step, _, _ in log]
+        on_train = [r for r in ws["mine"] if r["status"] in ("joining", "joined")]
+        assert does.count("train") <= 1 and does.count("abandon") <= 1
+        if on_train:
+            assert not {"turn", "restart"} & set(does), does
+            assert ("train" in does) == any(r["status"] == "joined" for r in on_train)
+            trains += "train" in does
+        else:
+            assert not {"train", "abandon"} & set(does), does
+    assert kinds == {"turn", "restart"} and trains > 100
 
 
 def test_a_tick_never_both_settles_and_starts_an_issue():
@@ -514,20 +523,21 @@ def test_a_ticks_counts_read_back_from_its_steps():
         did = {k: [] for k in d.TICK_DID}
         mine = {r["number"] for r in ws["mine"]}
         frontier = {i["number"] for i in ws["frontier"]["dispatch"]}
-        members = {b["id"]: [m["issue"] for m in b["members"]] for b in ws["batches"]}
+        joined = [r["number"] for r in ws["mine"] if r["status"] == "joined"]
         took, off_frontier = set(), set()
         for step, result, error in log:
             do, n = step["do"], step.get("issue")
             if error is not None:
                 continue
-            if do in ("turn", "batch-turn") and result["outcome"] == "granted":
-                did["granted"] += result.get("issues", [n])
+            if do == "turn" and result["outcome"] == "granted":
+                did["granted"].append(n)
             elif do == "restart" and result["outcome"] == "granted":
                 did["restarted"].append(n)
             elif do == "abandon":
                 did["abandoned"] += result["issues"]
+                did["escalated"] += result["escalated"]
             elif do == "nudge":
-                did["nudged"] += members[step["batch"]] if n is None else [n]
+                did["nudged"] += joined if n is None else [n]
             elif do in ("fail", "escalate"):
                 did["escalated" if result["action"] == "escalate" else "retried"].append(n)
             elif do in ("park", "release"):

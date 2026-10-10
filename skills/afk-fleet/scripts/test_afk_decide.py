@@ -182,12 +182,23 @@ def test_claim_status():
     # CLAIM_STATUSES is exactly what it can return: no status the docs were never
     # held to, and none listed that cannot happen
     seen = {d.claim_status(has_pr, checks, ci, closed=closed, landing=landing, landed=landed,
-                           fixing=fixing)
+                           fixing=fixing, train=train, joined=joined)
             for ci in d.GATE_CI_MODES for has_pr in (True, False)
             for checks in ("green", "red", "pending", None)
             for closed in (True, False) for landing in (True, False)
-            for landed in (True, False) for fixing in (True, False)}
+            for landed in (True, False) for fixing in (True, False)
+            for train in (True, False) for joined in (True, False)}
     assert seen == set(d.CLAIM_STATUSES)
+
+    # where a landing train runs (ADR-0048) no PR waits for a turn: an open PR is
+    # on the train (`joined`) or its worker is to put it there (`joining`),
+    # whatever its checks say — and without a PR nothing is on a train
+    for checks in ("green", "red", "pending", None):
+        assert d.claim_status(True, checks, "local", train=True) == "joining", checks
+        assert d.claim_status(True, checks, "local", train=True, joined=True) == "joined", checks
+    assert d.claim_status(False, None, "local", train=True, joined=True) == "no_pr"
+    assert d.claim_status(True, None, "local", closed=True, train=True, joined=True) == "closed"
+    assert (d.BOARD_PHASE_OF["joining"], d.BOARD_PHASE_OF["joined"]) == ("joining", "joined")
 
     # a PR that gave its turn up and is being fixed off it (ADR-0045): `fixing`
     # whatever its checks say — the red run is what its worker is fixing, never a
@@ -199,15 +210,15 @@ def test_claim_status():
         assert d.claim_status(False, None, ci, fixing=True) == "no_pr"
     assert d.BOARD_PHASE_OF["fixing"] == "fixing"
 
-    # no open PR, the issue open, and its landing on the target: a merge batch
-    # pushed it and was cut before it closed the issue. Never `no_pr` — nobody is
-    # asked why work that landed has no PR. An open PR is still landing, and a
-    # closed issue is closed
+    # the issue open, and its landing on the target: the landing train pushed it
+    # and was cut before it closed the issue. Never `no_pr` — nobody is asked why
+    # work that landed has no PR — and never a worker's to join again, with the
+    # PR GitHub has not yet shown merged still open. A closed issue is closed
     for ci in d.GATE_CI_MODES:
         assert d.claim_status(False, None, ci, landed=True) == "landed"
         assert d.claim_status(False, None, ci, closed=True, landed=True) == "closed"
-        assert d.claim_status(True, "green", ci, landed=True) == "awaiting_turn"
-        assert d.claim_status(True, "green", ci, landing=True, landed=True) == "landing"
+        assert d.claim_status(True, "green", ci, landed=True, train=True) == "landed"
+        assert d.claim_status(True, "green", ci, landed=True, train=True, joined=True) == "landed"
 
     # the issue is CLOSED but the claim is still mine — its worker landed the PR, or
     # an `afk close` crashed before releasing. Nothing else about it matters, and
@@ -233,8 +244,7 @@ def test_turn_record_round_trips_and_is_held_only_by_the_claims_owner():
     assert body.startswith("<!--afk:turn instance=fl-1 at=1234-->\n")
     assert "holds the landing turn" in body and "`fl-1`" in body and "`afk land`" in body
     rec = d.latest_turn([{"id": 7, "body": "a human note"}, {"id": 8, "body": body}])
-    single = {"restarted": None, "given_up": None, "batch": None, "members": [], "phase": None,
-              "unbatched": None, "of": None, "released": False}
+    single = {"restarted": None, "given_up": None, "abandoned": None, "released": False}
     assert rec == {"instance": "fl-1", "at": 1234, "verified": None, "allow_no_checks": False,
                    "stopped": None, "head": None, "comment_id": 8, **single}
     assert d.latest_turn([]) is None and d.latest_turn([{"id": 1, "body": "x"}]) is None
@@ -264,16 +274,17 @@ def test_turn_record_round_trips_and_is_held_only_by_the_claims_owner():
     # each vocabulary is closed: neither subcommand can stop with a word nobody routes
     assert all(d.land_outcome(o) == o for o in d.LAND_OUTCOMES)
     assert all(d.turn_outcome(o) == o for o in d.TURN_OUTCOMES)
-    assert all(d.batch_turn_outcome(o) == o for o in d.BATCH_TURN_OUTCOMES)
+    assert all(d.train_turn_outcome(o) == o for o in d.TRAIN_TURN_OUTCOMES)
+    assert all(d.train_outcome(o) == o for o in d.TRAIN_OUTCOMES)
     assert set(d.LAND_WAITS) < set(d.LAND_OUTCOMES) and "merged" not in d.LAND_WAITS
-    # one PR's turn and a merge batch's are two holders with a vocabulary each
+    # one PR's landing and the landing train's are two with a vocabulary each
     # (ADR-0036): neither stops with a word only the other is routed on
     for check, word in ((d.land_outcome, "granted"), (d.turn_outcome, "merged"),
-                        (d.land_outcome, "handed_back"),
-                        (d.turn_outcome, "too_few"), (d.turn_outcome, "abandoned"),
-                        (d.batch_turn_outcome, "gate_red"),
-                        (d.batch_turn_outcome, "needs_verify"),
-                        (d.batch_turn_outcome, "merged")):
+                        (d.land_outcome, "handed_back"), (d.land_outcome, "landed"),
+                        (d.turn_outcome, "stopped"), (d.turn_outcome, "abandoned"),
+                        (d.train_turn_outcome, "gate_red"),
+                        (d.train_turn_outcome, "needs_verify"),
+                        (d.train_outcome, "joined"), (d.train_outcome, "merged")):
         try:
             check(word)
             raise AssertionError(word)
@@ -281,88 +292,30 @@ def test_turn_record_round_trips_and_is_held_only_by_the_claims_owner():
             pass
 
 
-def test_a_batchs_turn_is_one_marker_on_every_member_and_leaving_it_is_remembered():
-    """ADR-0029: a merge batch's turn is the turn marker, on every member PR,
-    naming the batch, its members and its phase. A PR that leaves a batch
-    without landing holds no turn — and says so on every marker written for it
-    afterwards, so it is never batched again."""
-    members = [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}, {"issue": 3, "pr": 30}]
-    body = d.turn_comment(d.batch_turn(None, "fl-1", 500, "fl-1-500", members, "gating"))
-    assert body.startswith("<!--afk:turn instance=fl-1 at=500 batch=fl-1-500 "
-                           "members=1:10,2:20,3:30 phase=gating-->\n")
-    assert "#10, #20, #30" in body and "one merge commit each" in body
-    rec = d.latest_turn([{"id": 4, "body": body}])
-    assert (rec["batch"], rec["members"], rec["phase"]) == ("fl-1-500", members, "gating")
-    assert (rec["unbatched"], rec["released"], rec["stopped"]) == (None, False, None)
-    # held like any turn: by the instance that holds the claim, and by no other
-    assert d.held_turn(rec, "fl-1") is rec and d.held_turn(rec, "fl-2") is None
-    # the PR landed its issue under a claim made before the batch's turn, by the
-    # instance that granted it — not one made since (the issue was reopened), not
-    # another instance's, not a claim that names nobody
-    claim = {"number": 1, "instance": "fl-1", "host": "h", "ts": 500, "sha": "c"}
-    assert d.landed_under(rec, claim) and d.landed_under(rec, {**claim, "ts": 100})
-    for other in ({"ts": 501}, {"instance": "fl-2"}, {"instance": None, "ts": None}):
-        assert not d.landed_under(rec, {**claim, **other}), other
-    assert not d.landed_under(None, claim)
-    # …and so did a PR stacked alone, on a turn of its own (ADR-0046) — but not on
-    # a marker that holds no turn: it gave that turn up, and landed nothing on it
-    own = d.single_turn(None, "fl-1", 600)
-    assert d.landed_under(own, claim)
-    assert not d.landed_under(d.given_up_turn(own, 700, "conflict", "h"), claim)
-
-    # leaving: the marker holds NO turn, whoever reads it — and remembers why
-    for why in d.UNBATCHED:
-        left = d.latest_turn([{"id": 4, "body": body},
-                              {"id": 5, "body": d.turn_comment(d.unbatched_turn(None, "fl-1", 600, "fl-1-500", why))}])
-        assert (left["unbatched"], left["released"], left["batch"]) == (why, True, None)
-        assert d.held_turn(left, "fl-1") is None
-    # a single turn granted afterwards carries the fact along, and IS held
-    later = d.latest_turn([{"id": 6, "body": d.turn_comment(d.single_turn(left, "fl-1", 700))}])
-    assert (later["unbatched"], later["of"], later["released"]) == (left["unbatched"], "fl-1-500",
-                                                                    False)
-    assert d.held_turn(later, "fl-1") is later
-
-    # closed vocabularies; a phase or a reason nobody knows is not written, nor read
-    assert all(d.batch_outcome(o) == o for o in d.BATCH_OUTCOMES)
-    for bad in (lambda: d.batch_outcome("merged"),
-                lambda: d.turn_comment(d.batch_turn(None, "fl-1", 1, "b", members, "bisecting")),
-                lambda: d.turn_comment(d.unbatched_turn(None, "fl-1", 1, "b", "bored")),
-                lambda: d.next_turn(None, at=1, bogus=1)):
-        try:
-            bad()
-            raise AssertionError("accepted")
-        except ValueError:
-            pass
-    odd = d.latest_turn([{"id": 1, "body": "<!--afk:turn instance=x at=5 batch=b members=1:10,zz,3 "
-                                           "phase=bogus unbatched=bored-->"}])
-    assert (odd["members"], odd["phase"], odd["unbatched"]) == ([{"issue": 1, "pr": 10}], None, None)
-
-
 def _turn_shapes():
     """One record of every shape a turn marker takes, as a rewrite makes them."""
-    members = [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}]
     single = d.single_turn(None, "fl-1", 100)
     judged = d.single_turn(None, "fl-1", 100, verified="v" * 40, allow_no_checks=True)
-    left = d.unbatched_turn(d.batch_turn(None, "fl-1", 200, "fl-1-200", members, "stacking"),
-                            "fl-1", 300, "fl-1-200", "left_out")
+    gave_up = d.given_up_turn(single, 200, "conflict", "h" * 40)
     return {"single": single,
             "single, judged and stopped": d.next_turn(judged, at=150, stopped="needs_verify",
                                                       head="h" * 40),
             "single, restarted": d.single_turn(judged, "fl-1", 160, verified="v" * 40,
                                                allow_no_checks=True, restarted=160),
-            "batch": d.batch_turn(None, "fl-1", 200, "fl-1-200", members, "gating"),
-            "left a batch": left,
-            "single, after leaving a batch": d.single_turn(left, "fl-1", 400, verified="v" * 40)}
+            "gave its turn up": gave_up,
+            "off an abandoned train": d.abandoned_turn(None, "fl-1", 300),
+            "off an abandoned train, after giving a turn up": d.abandoned_turn(gave_up, "fl-2", 400)}
 
 
 def test_a_turn_marker_round_trips_in_every_shape():
-    """Render then parse gives the record back — one PR's turn, a merge batch's,
-    and the marker of a PR that left a batch — so a marker rewritten from the
-    record it was read as loses nothing."""
+    """Render then parse gives the record back — one PR's turn, one given up,
+    and the marker of a PR taken off an abandoned train — so a marker rewritten
+    from the record it was read as loses nothing."""
     wording = {"single": "holds the landing turn", "single, judged and stopped": "stopped with",
                "single, restarted": "a new one was started onto it",
-               "batch": "is in a merge batch", "left a batch": "was in merge batch `fl-1-200`",
-               "single, after leaving a batch": "holds the landing turn"}
+               "gave its turn up": "gave its landing turn up",
+               "off an abandoned train": "on a landing train that was abandoned",
+               "off an abandoned train, after giving a turn up": "by fleet instance `fl-2`"}
     for shape, record in _turn_shapes().items():
         record = {**record, "comment_id": 7}
         body = d.turn_comment(record)
@@ -373,27 +326,24 @@ def test_a_turn_marker_round_trips_in_every_shape():
 
 
 def test_a_field_no_rewrite_names_survives_it():
-    """A marker is rewritten as the record read plus what changed: that a PR left
-    a batch survives a landing that stops and a turn granted again, and the
+    """A marker is rewritten as the record read plus what changed: that a PR gave
+    a turn up survives a landing that stops and a turn granted again, and the
     tick's two judgments survive a landing that stops — by construction, not
     because each rewrite remembers to pass them along."""
     def read(record):
         return d.latest_turn([{"id": 9, "body": d.turn_comment({**record, "comment_id": 9})}])
 
-    members = [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}]
-    left = read(d.unbatched_turn(read(d.batch_turn(None, "fl-1", 1, "fl-1-1", members, "gating")),
-                                 "fl-1", 2, "fl-1-1", "dissolved"))
-    assert (left["unbatched"], left["of"], left["released"], left["batch"]) == \
-        ("dissolved", "fl-1-1", True, None)
+    left = read(d.given_up_turn(read(d.single_turn(None, "fl-1", 1)), 2, "conflict", "c" * 40))
+    assert (left["given_up"], left["released"], left["stopped"]) == (2, True, "conflict")
     granted = read(d.single_turn(left, "fl-1", 3, verified="v" * 40, allow_no_checks=True))
     # a landing that stops names only when, with what, and on which head
     stopped = read(d.next_turn(granted, at=4, stopped="awaiting_ci", head="h" * 40))
     assert stopped == {**granted, "at": 4, "stopped": "awaiting_ci", "head": "h" * 40}
-    assert (stopped["unbatched"], stopped["of"]) == ("dissolved", "fl-1-1")
+    assert stopped["given_up"] == 2
     assert (stopped["verified"], stopped["allow_no_checks"]) == ("v" * 40, True)
     # a turn granted again names the instance, when, and the judgments it was granted on
     again = read(d.single_turn(stopped, "fl-1", 5, verified="w" * 40))
-    assert (again["unbatched"], again["of"], again["released"]) == ("dissolved", "fl-1-1", False)
+    assert (again["given_up"], again["released"]) == (2, False)
     assert (again["stopped"], again["head"], again["verified"], again["allow_no_checks"]) == \
         (None, None, "w" * 40, False)
     # the comment a record was read from is the one its rewrite replaces
@@ -408,48 +358,14 @@ def test_a_field_no_rewrite_names_survives_it():
     assert stopped["restarted"] == 7
     assert read(d.single_turn(stopped, "fl-1", 9, restarted=stopped["restarted"]))["restarted"] == 7
     assert read(d.single_turn(stopped, "fl-2", 9))["restarted"] is None
-    # and nothing of a turn says a batch's worker was restarted: a batch is abandoned
-    assert d.batch_turn(stopped, "fl-1", 10, "fl-1-10", members, "stacking")["restarted"] == 7
-    assert d.restartable_turn(d.batch_turn(None, "fl-1", 10, "fl-1-10", members, "stacking")) is False
-
-
-def test_a_batch_is_known_by_its_id_wherever_orca_puts_its_branch():
-    batch = d.batch_id("fl-1-x", 1700000000)
-    assert batch == "fl-1-x-t1700000000" and d.batch_name(batch) == "afk-batch-fl-1-x-t1700000000"
-    heads = ["main", "felix/afk-batch-fl-1-t170", "afk-batch-fl-1-t170-2", "felix/afk-batch-fl-1-t1700",
-             "felix/afk-batch-fl-2-t170", "felix/issue-3-x", "felix/afk-batch-fl-1-t170-x"]
-    assert d.batch_branches(heads, "fl-1-t170") == ["afk-batch-fl-1-t170-2", "felix/afk-batch-fl-1-t170"]
-    # a batch's id says which instance formed it — and only that one
-    assert d.batch_formed_by(batch, "fl-1-x") and not d.batch_formed_by(batch, "fl-1")
-    assert not d.batch_formed_by(batch, "") and not d.batch_formed_by(None, "fl-1-x")
-    # the PR a stacked merge commit's subject names
-    subject = d.stack_message("a title", 12, 3).splitlines()[0]
-    assert d.stacked_pr("p1 p2", subject) == 12
-    assert d.stacked_pr("p1 p2", "work: fix.txt") is None and d.stacked_pr("p1 p2", None) is None
-    # …and only a merge commit's: the same subject on a commit with one parent, or none, names no PR
-    assert d.stacked_pr("p1", subject) is None and d.stacked_pr("", subject) is None
-    # the subject ENDS with it: a revert quotes it, and names no PR
-    assert d.stacked_pr("p1 p2", f'Revert "{subject}"') is None
-    assert d.batch_branches(heads, "fl-9-t1") == [] and d.batch_branches(None, "fl-1-t170") == []
-
-    def wt(branch, at=1, **more):
-        return {"path": f"/wt/{branch}", "branch": f"refs/heads/{branch}",
-                "projectId": "github:acme/widgets", "lastActivityAt": at, **more}
-
-    rows = [wt("felix/afk-batch-fl-1-t170"), wt("felix/afk-batch-fl-1-t170-2", at=5),
-            wt("felix/afk-batch-fl-1-t200"), wt("felix/afk-batch-fl-2-t170"),
-            wt("felix/afk-batch-fl-1-t300", isArchived=True), wt("felix/issue-3-x", linkedIssue=3),
-            wt("felix/afk-batch-fl-1-t400", projectId="github:other/repo")]
-    # one batch's worktrees, the most recently active first
-    assert [w["path"] for w in d.batch_worktrees(rows, "acme/widgets", batch="fl-1-t170")] == \
-        ["/wt/felix/afk-batch-fl-1-t170-2", "/wt/felix/afk-batch-fl-1-t170"]
-    # every batch of one instance, each under its own id — never another fleet's, another repo's
-    mine = d.batch_worktrees(rows, "acme/widgets", instance="fl-1")
-    assert sorted({w["batch"] for w in mine}) == ["fl-1-t170", "fl-1-t200"]
-    assert d.batch_worktrees(rows, "acme/widgets", instance="fl-3") == []
-    # orca lower-cases the project id: a repo with a capital still owns its worktrees
-    assert d.batch_worktrees(rows, "Acme/Widgets", batch="fl-1-t170") == \
-        d.batch_worktrees(rows, "acme/widgets", batch="fl-1-t170")
+    # a PR taken off an abandoned train holds no turn, was not restarted, and
+    # gave nothing up by it — and a turn granted to it later forgets the train
+    off = read(d.abandoned_turn(stopped, "fl-1", 10))
+    assert (off["abandoned"], off["released"], off["restarted"], off["stopped"]) == \
+        (10, True, None, None)
+    assert d.restartable_turn(off) is False and d.held_turn(off, "fl-1") is None
+    assert not d.turn_given_up(off) and d.own_landing(off, "fl-1") is None
+    assert read(d.single_turn(off, "fl-1", 11))["abandoned"] is None
 
 
 def test_an_instance_id_has_one_grammar():
@@ -473,98 +389,6 @@ def _some_instance_ids():
     ids = [i for i in dict.fromkeys(short + named) if re.fullmatch(d.INSTANCE_ID_GRAMMAR, i)]
     assert len(ids) > 200 and set(named) <= set(ids)
     return ids
-
-
-def test_a_batch_branch_is_one_instances_and_never_another_s():
-    """Whatever second a batch was formed in and whatever continuation suffix orca
-    put behind its branch, the branch matches the batches of the instance that
-    formed it and of no other — so a sweep never deletes a peer's — and distinct
-    instances never form one batch id."""
-    ids = _some_instance_ids()
-    owners = {}             # branch → the one instance it is a batch branch of
-    for instance in ids:
-        for now in (1, 170, 1700000000):
-            batch = d.batch_id(instance, now)
-            assert d.batch_formed_by(batch, instance)
-            for suffix in ("", "-1", "-2", "-170"):
-                for user in ("", "felix/"):
-                    branch = f"{user}{d.batch_name(batch)}{suffix}"
-                    assert owners.setdefault(branch, instance) == instance, branch
-                    assert d.batch_branch_regex(batch).match(branch)
-    for instance in ids:
-        rx = d.batch_branch_regex(instance=instance)
-        claimed = {branch for branch in owners if rx.match(branch)}
-        assert claimed == {b for b, owner in owners.items() if owner == instance}, instance
-        # and the id it reads off a branch is the batch's own
-        assert all(d.batch_formed_by(rx.match(b).group(1), instance) for b in claimed)
-
-
-def test_the_cycle_forms_a_batch_only_from_two_or_more_eligible_prs():
-    """The batch-or-single decision, whole (ADR-0029) — a table lookup, so it is
-    this function and not a paragraph."""
-    on = d.resolve_config({"gate": {"ci": "local", "local_command": "make test"}})
-    off = d.resolve_config({})                    # `required`: the gate is each PR's own checks
-
-    def rows(*specs):
-        mine = [_mine(n, status, pr=n * 10, **more) for n, status, more in specs]
-        return mine, d.turn_order(mine)
-
-    def picked(specs, cfg=on, busy=()):
-        return d.batch_candidates(*rows(*specs), cfg, busy=busy)
-
-    waiting = [(n, "awaiting_turn", {}) for n in (3, 1, 2)]
-    assert picked(waiting) == [1, 2, 3]                            # in merge order
-    assert picked(waiting, cfg=off) == []                          # only the local gate
-    assert picked(waiting[:1]) == []                               # one PR is a single turn
-    assert picked(waiting[:2]) == [1, 3]
-    # a claim with no PR, a failed one, one still waiting on CI are not in the queue at all
-    assert picked([*waiting[:2], (4, "no_pr", {}), (5, "failure", {}), (6, "closed", {})]) == [1, 3]
-    # a worker still working may yet move its PR: it is not stacked
-    assert picked(waiting, busy=[2]) == [1, 3] and picked(waiting, busy=[1, 2]) == []
-    # one turn out at a time: while a PR — or a batch — holds it, no batch is formed
-    assert picked([*waiting, (4, "landing", {})]) == []
-    assert picked([*waiting, (4, "landing", {"batch": {"id": "b", "members": [4, 5], "phase": "gating"}})]) == []
-    # a PR that left a batch goes first, on a single turn, and is never batched again
-    left = [*waiting, (4, "awaiting_turn", {"unbatched": "left_out"})]
-    assert picked(left) == [] and d.turn_order(rows(*left)[0])[0] == 4
-    assert d.turn_due(*rows(*left)) == 4
-    # so does a PR that gave its turn up and is ready again (ADR-0045) — while one
-    # still being fixed off that turn holds nothing back: the batch forms beside it
-    again = [*waiting, (4, "awaiting_turn", {"given_up": True})]
-    assert picked(again) == [] and d.turn_due(*rows(*again)) == 4
-    fixing = [*waiting, (4, "fixing", {"given_up": True, "stopped": "conflict"})]
-    assert picked(fixing) == [1, 2, 3]
-    assert d.turn_due(*rows(waiting[0], fixing[-1])) == 3         # …and so does a single turn
-    # every PR owes its own adversarial verify before its turn: none is eligible
-    verify = d.resolve_config({"gate": {"ci": "local", "local_command": "x",
-                                        "adversarial_verify_prompt": "re-derive it"}})
-    assert picked(waiting, cfg=verify) == []
-    assert [d.batches_form(c) for c in (on, off, verify)] == [True, False, False]
-
-    # a row in a batch is not asked after as its own worker's: the batch's worker is
-    mine = [_mine(1, "landing", pr=10, batch={"id": "b", "members": [1, 2], "phase": "gating"}),
-            _mine(2, "landing", pr=20, batch={"id": "b", "members": [1, 2], "phase": "gating"}),
-            _mine(3, "landing", pr=30), _mine(4)]
-    assert d.asks_after(mine) == [3, 4]
-    assert d.turn_due(mine[:2], [1, 2]) is None
-    # its worker's reading routes the batch: left, continued, nudged once, abandoned
-    assert [d.batch_step({"cause": c}) for c in ("working", "gone", "silent", "silent_after_nudge")] == \
-        ["leave", "continue", "nudge", "abandon"]
-
-
-def test_a_stack_is_read_back_from_its_commits():
-    assert d.stack_message("Add the thing", 12, 7) == "Add the thing (#12)\n\nCloses #7\n"
-    assert d.stack_message("  ", 12, 7).startswith("PR 12 (#12)\n")
-    m, fix = "p1 p2", "p1"                        # a member is a merge commit; a fix has one parent
-    log = [("a1", m, "Add the thing (#12)"), ("b2", m, "Fix a typo (#13)"),
-           ("c3", fix, "make the stack green"), ("d4", m, "refs issue (#99)"),
-           ("e5", m, "Add the thing (#12)"), ("f6", fix, "repair the other thing (#14)")]
-    stacked, fixes = d.read_stack(log, {12, 13, 14})
-    # a fix titled like member 14's commit is still a fix: 14 is not on this stack
-    assert stacked == {12: "a1", 13: "b2"} and fixes == ["c3", "d4", "e5", "f6"]
-    assert d.read_stack([], {12}) == ({}, [])
-    said = d.landed_comment("abc123", "main", "fl-1-5", [12, 13])
-    assert "landed on `main` as abc123" in said and "#12, #13" in said and "did not mark this PR merged" in said
 
 
 def test_the_ticks_judgments_are_settled_before_a_turn_is_granted():
@@ -606,18 +430,19 @@ def test_turns_are_granted_in_one_order_a_held_turn_first_then_pr_number():
     # and still come out one way under every order they could be scanned in
     shared = [row(9, "awaiting_turn", 10), row(8, "awaiting_turn", 10), row(3, "awaiting_turn", 10),
               row(6, "landing", 40), row(4, "landing", 40), row(1, "awaiting_turn", 30),
-              _mine(2, "awaiting_turn", pr=50, unbatched="left_out"),
-              _mine(5, "awaiting_turn", pr=50, unbatched="left_out")]
+              _mine(2, "awaiting_turn", pr=50, given_up=True),
+              _mine(5, "awaiting_turn", pr=50, given_up=True)]
     assert {tuple(d.turn_order(list(p))) for p in itertools.permutations(shared)} == \
         {(4, 6, 2, 5, 3, 8, 9, 1)}
     assert d.turn_order([]) == [] and d.turn_order(rows[1:2]) == []
     # a PR that gave its turn up (ADR-0045): out of the queue while it is being
-    # fixed, and ready again it goes behind a held turn only — ahead of a PR that
-    # left a batch and of every PR that never held a turn
-    queue = [row(1, "awaiting_turn", 10), _mine(2, "awaiting_turn", pr=20, unbatched="left_out"),
+    # fixed, and ready again it goes behind a held turn only — ahead of every PR
+    # that never held a turn. Where a landing train runs nothing is in the queue
+    queue = [row(1, "awaiting_turn", 10), row(2, "awaiting_turn", 20),
+             row(6, "joining", 60), row(7, "joined", 70),
              _mine(3, "awaiting_turn", pr=90, given_up=True), row(4, "landing", 40),
              _mine(5, "fixing", pr=5, given_up=True, stopped="gate_red")]
-    assert {tuple(d.turn_order(list(p))) for p in itertools.permutations(queue)} == {(4, 3, 2, 1)}
+    assert {tuple(d.turn_order(list(p))) for p in itertools.permutations(queue)} == {(4, 3, 1, 2)}
 
 
 def test_an_escalate_label_the_escalation_edit_would_also_remove_is_refused():
@@ -720,7 +545,6 @@ def test_records_kept_in_comments_share_the_encoding_of_records_on_refs():
     """ADR-0032. The landing turn, a worker's verdict and the status board each
     declare a word and their fields; the pair that writes and reads a record on a
     ref writes and reads them, with a comment's marker as the carrier."""
-    members = [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}]
     kinds = [
         (d.TURN_RECORD, [
             ({"instance": "fl-1", "at": 100}, "<!--afk:turn instance=fl-1 at=100-->"),
@@ -728,12 +552,12 @@ def test_records_kept_in_comments_share_the_encoding_of_records_on_refs():
               "stopped": "needs_verify", "head": "h" * 40},
              f"<!--afk:turn instance=fl-1 at=150 verified={'v' * 40} allow_no_checks=1 "
              f"stopped=needs_verify head={'h' * 40}-->"),
-            ({"instance": "fl-1", "at": 200, "batch": "fl-1-200", "members": members,
-              "phase": "gating"},
-             "<!--afk:turn instance=fl-1 at=200 batch=fl-1-200 members=1:10,2:20 phase=gating-->"),
-            ({"instance": "fl-1", "at": 300, "unbatched": "left_out", "of": "fl-1-200",
-              "released": True},
-             "<!--afk:turn instance=fl-1 at=300 unbatched=left_out of=fl-1-200 released=1-->"),
+            ({"instance": "fl-1", "at": 200, "stopped": "conflict", "head": "c" * 40,
+              "given_up": 200, "released": True},
+             f"<!--afk:turn instance=fl-1 at=200 stopped=conflict head={'c' * 40} given_up=200 "
+             f"released=1-->"),
+            ({"instance": "fl-1", "at": 300, "abandoned": 300, "released": True},
+             "<!--afk:turn instance=fl-1 at=300 abandoned=300 released=1-->"),
             ({"instance": "fl-1", "at": 400, "restarted": 400},
              "<!--afk:turn instance=fl-1 at=400 restarted=400-->")]),
         (d.VERDICT_RECORD, [
@@ -776,8 +600,8 @@ def test_records_kept_in_comments_share_the_encoding_of_records_on_refs():
     # read like a commit's subject: an unknown field is read past, a value not of
     # its type is a field that is missing, and spacing is free
     assert d.read_marker(d.TURN_RECORD, "<!--  afk:turn instance=x at=soon pid=7 stopped=bogus "
-                                        "phase=bisecting released=yes\n members=zz,3:30 -->") == \
-        {"instance": "x", "members": [{"issue": 3, "pr": 30}]}
+                                        "phase=bisecting released=yes\n abandoned=zz -->") == \
+        {"instance": "x"}
     assert d.read_marker(d.VERDICT_RECORD, "<!--afk:verdict blocked_by=3, x, 4 n=5 reason= -->") == \
         {"n": 5, "blocked_by": [3, 4]}
     # the first marker of a body is the one read, and another kind's is not this kind's
@@ -807,11 +631,6 @@ def _generated_text(rng):
     return "".join(rng.choice(_VALUE_PIECES) for _ in range(rng.randint(1, 8)))
 
 
-def _generated_members(rng):
-    return [{"issue": rng.randrange(10**6), "pr": rng.randrange(10**6)}
-            for _ in range(rng.randint(0, 4))]
-
-
 # One generator per way a field's value is spelled. A kind that declares a type
 # with none here fails the test below until it is given one.
 _GENERATED = {
@@ -819,10 +638,7 @@ _GENERATED = {
     int: lambda rng: rng.randrange(10**12),
     d.FLAG: lambda rng: rng.random() < 0.5,
     d.INTS: lambda rng: [rng.randrange(10**6) for _ in range(rng.randint(0, 4))],
-    d.TURN_RECORD.fields["members"]: _generated_members,
     d.TURN_RECORD.fields["stopped"]: lambda rng: rng.choice(d.LAND_OUTCOMES),
-    d.TURN_RECORD.fields["phase"]: lambda rng: rng.choice(d.BATCH_PHASES),
-    d.TURN_RECORD.fields["unbatched"]: lambda rng: rng.choice(d.UNBATCHED),
 }
 
 
@@ -858,7 +674,7 @@ def test_every_record_value_round_trips_on_both_carriers():
     assert d.read_record(d.GATE_RUN_RECORD, d.record_message(d.GATE_RUN_RECORD, gate)) == gate
     marker = d.verdict_marker(9, "giving-up", reason="it --> broke")
     assert marker.count("-->") == 1 and _verdict_in(marker)["reason"] == "it --> broke"
-    turn = {"instance": "fl-1", "of": "a-->b,"}
+    turn = {"instance": "fl-1", "verified": "a-->b,"}
     assert d.read_marker(d.TURN_RECORD, d.record_marker(d.TURN_RECORD, turn)) == turn
 
 
@@ -875,9 +691,6 @@ def test_a_hand_written_blocked_by_reads_as_the_issues_it_names():
         {"n": 5, "phase": "blocked"}
     assert d.read_record(d.BASE_RECORD, "afk-base branch=release, ts=5") == \
         {"branch": "release,", "ts": 5}
-    # a batch's members are a list too
-    assert d.read_marker(d.TURN_RECORD, "<!--afk:turn instance=x members=1:10, 2:20 at=3-->") == \
-        {"instance": "x", "members": [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}], "at": 3}
 
 
 def test_each_record_in_a_comment_round_trips_through_its_own_reader():
@@ -899,8 +712,8 @@ def test_each_record_in_a_comment_round_trips_through_its_own_reader():
         "comment_url": "u"}
 
     no_turn = {"verified": None, "allow_no_checks": False, "stopped": None, "head": None,
-               "restarted": None, "given_up": None, "batch": None, "members": [], "phase": None,
-               "unbatched": None, "of": None, "released": False, "comment_id": 5}
+               "restarted": None, "given_up": None, "abandoned": None, "released": False,
+               "comment_id": 5}
     literals = {
         "<!--afk:turn instance=fl-7fbd5e at=1759676212-->\n**afk-fleet: this PR holds the landing turn**":
             {"instance": "fl-7fbd5e", "at": 1759676212},
@@ -908,14 +721,9 @@ def test_each_record_in_a_comment_round_trips_through_its_own_reader():
         "stopped=awaiting_ci head=8ca0ee2-->\n…":
             {"instance": "fl-7fbd5e", "at": 1759676300, "verified": "0af4df0",
              "allow_no_checks": True, "stopped": "awaiting_ci", "head": "8ca0ee2"},
-        "<!--afk:turn instance=fl-7fbd5e at=1759676400 batch=fl-7fbd5e-1759676400 "
-        "members=59:66,60:67 phase=stacking-->\n…":
-            {"instance": "fl-7fbd5e", "at": 1759676400, "batch": "fl-7fbd5e-1759676400",
-             "members": [{"issue": 59, "pr": 66}, {"issue": 60, "pr": 67}], "phase": "stacking"},
-        "<!--afk:turn instance=fl-7fbd5e at=1759676500 unbatched=dissolved "
-        "of=fl-7fbd5e-1759676400 released=1-->\n…":
-            {"instance": "fl-7fbd5e", "at": 1759676500, "unbatched": "dissolved",
-             "of": "fl-7fbd5e-1759676400", "released": True},
+        "<!--afk:turn instance=fl-7fbd5e at=1759676500 abandoned=1759676500 released=1-->\n…":
+            {"instance": "fl-7fbd5e", "at": 1759676500, "abandoned": 1759676500,
+             "released": True},
         "<!--afk:turn instance=fl-7fbd5e at=1759676600 restarted=1759676600-->\n…":
             {"instance": "fl-7fbd5e", "at": 1759676600, "restarted": 1759676600},
         "<!--afk:turn instance=fl-7fbd5e at=1759676700 stopped=conflict head=abc "
@@ -1031,101 +839,6 @@ def test_a_recorded_gate_run_counts_only_for_the_tree_and_command_it_ran():
     assert "no gate.local_command configured" in d.gate_command("/s/afk.py", "  ")
 
 
-def test_a_merge_batch_needs_the_local_gate_and_a_target_that_takes_a_push():
-    """What bootstrap refuses (ADR-0029). A batch is gated by ONE run of
-    `gate.local_command` on the stack, and lands by pushing to the target."""
-    refusing = ({"required_pull_request_reviews": {"required_approving_review_count": 1}},
-                {"restrictions": {"users": ["a"], "teams": []}},
-                {"lock_branch": {"enabled": True}})
-    for prot in refusing:
-        r = d.protection_verdict("local", prot, batch=True)
-        assert r["verdict"] == "error" and "merge batch" in r["detail"], r
-        assert d.protection_verdict("local", prot)["verdict"] == "ok"      # only where batches form
-    for fine in (None, {}, {"lock_branch": {"enabled": False}}, {"restrictions": None},
-                 {"enforce_admins": {"enabled": True}}):
-        assert d.protection_verdict("local", fine, batch=True)["verdict"] == "ok", fine
-    # required checks stay the error they were; an unreadable protection still warns
-    checks = {"required_status_checks": {"contexts": ["ci"]}}
-    assert d.protection_verdict("local", checks, batch=True)["required_checks"] == ["ci"]
-    assert d.protection_verdict("local", None, "HTTP 403", batch=True)["verdict"] == "warn"
-
-
-def test_a_batch_shows_on_the_board_in_the_brief_and_in_the_working_set():
-    # --- the status board of every member: the batch's PRs, and what is being done ---
-    for phase, word in zip(d.BATCH_PHASES, ("stacking", "gating", "being fixed")):
-        board = d.render_status_board("landing", "local", 2, instance="me", pr=20,
-                                      batch={"prs": [10, 20, 30], "phase": phase})
-        assert "#10、#20、#30" in board and word in board and "merge batch" in board, board
-    plain = d.render_status_board("landing", "local", 2, instance="me", pr=20)
-    assert "merge batch" not in plain
-
-    # --- the batch brief: the one command, the members in stack order, its own wake ---
-    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "..", "references", "worker-prompt.md")) as f:
-        template = f.read()
-    fields = {"batch": "me-t100", "repo": "acme/widgets", "target": "main",
-              "branch": "u/afk-batch-me-t100", "worktree_path": "/w/batch",
-              "members": [{"issue": 1, "pr": 10, "title": "one {braces}"},
-                          {"issue": 2, "pr": 20, "title": "two"}],
-              "afk_path": "/s/afk.py", "config": '{"retry": 2}',
-              "launcher_terminal": "term_1"}
-    brief = d.render_batch_brief(template, fields)
-    assert "/s/afk.py land --batch me-t100 --repo acme/widgets --config " in brief
-    assert brief.index("PR #10 — closes #1 — one {braces}") < brief.index("PR #20 — closes #2 — two")
-    assert d.wake_command("term_1", "batch-me-t100") in brief and "/w/batch" in brief
-    for outcome in d.BATCH_OUTCOMES:
-        assert f"`{outcome}`" in brief
-    try:
-        d.render_batch_brief(template, {k: v for k, v in fields.items() if k != "target"})
-    except ValueError as e:
-        assert "target" in str(e)
-    else:
-        raise AssertionError("a brief with a field missing was rendered")
-
-    # --- what the tick does about the batch's worker ---
-    assert [d.batch_step({"cause": c}) for c in ("working", "gone", "silent", "silent_after_nudge")] == \
-        ["leave", "continue", "nudge", "abandon"]
-
-    # --- the working set: a batch's members are `landing` rows that name it ---
-    cfg = d.resolve_config({"gate": {"ci": "local", "local_command": "make test"}})
-    issues = [{"number": n, "title": f"i{n}", "labels": ["ready-for-agent"], "updatedAt": "t"}
-              for n in (1, 2, 3)]
-    prs = [{"number": n * 10, "headRefOid": f"h{n}", "statusCheckRollup": [],
-            "closingIssuesReferences": [{"number": n}]} for n in (1, 2, 3)]
-    claims = [{"number": n, "instance": "me", "sha": f"s{n}"} for n in (1, 2, 3)]
-    beats = [{"instance": "me", "ts": 1000}]
-    members = [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}]
-
-    def turn(body):
-        return d.latest_turn([{"id": 1, "body": body}])
-
-    mine = turn(d.turn_comment(d.batch_turn(None, "me", 1000, "me-t100", members, "gating")))
-    issues, prs, claims = _gathered(issues, prs, claims)
-    ws = d.assemble_working_set(issues, prs, claims, beats, "me", 1000, cfg,
-                                turns={1: mine, 2: mine,
-                                       3: turn(d.turn_comment(d.unbatched_turn(None, "me", 1000, "me-t100", "left_out")))})
-    rows = {m["number"]: (m["status"], m["board_phase"], m["batch"], m["unbatched"]) for m in ws["mine"]}
-    in_batch = {"id": "me-t100", "members": [1, 2], "phase": "gating"}
-    # (a batch row has no board phase: its board is the batch's to write, not the tick's)
-    assert rows == {1: ("landing", None, in_batch, None), 2: ("landing", None, in_batch, None),
-                    3: ("awaiting_turn", "awaiting_turn", None, "left_out")}
-    assert ws["batches"] == [{"id": "me-t100", "instance": "me", "members": members,
-                              "phase": "gating", "at": 1000}]
-    assert ws["merge_order"] == [1, 2, 3]
-    assert d.asks_after(ws["mine"]) == []            # the batch's worker is asked after, not theirs
-    assert d.batch_candidates(ws["mine"], ws["merge_order"], cfg) == []
-    assert d.turn_due(ws["mine"], ws["merge_order"]) is None
-
-    # a batch a DEAD fleet recorded on claims I took holds no turn of mine — and is
-    # listed, so the tick abandons it before it grants anything
-    theirs = turn(d.turn_comment(d.batch_turn(None, "old", 900, "old-90", members, "stacking")))
-    ws = d.assemble_working_set(issues, prs, claims, beats, "me", 1000, cfg,
-                                turns={1: theirs, 2: theirs})
-    assert {m["number"]: (m["status"], m["batch"]) for m in ws["mine"]} == \
-        {n: ("awaiting_turn", None) for n in (1, 2, 3)}
-    assert [(b["id"], b["instance"]) for b in ws["batches"]] == [("old-90", "old")]
-
-
 def test_a_landing_that_stops_on_a_fix_gives_its_turn_up_once():
     """ADR-0045, as the turn record says it: a held turn whose landing stops on a
     conflict or a red gate becomes a marker that holds no turn; granted again,
@@ -1184,21 +897,19 @@ def test_a_landing_that_stops_on_a_fix_gives_its_turn_up_once():
             assert "keeps its turn" in str(e)
         else:
             raise AssertionError(f"{outcome} gave the turn up")
-    # a merge batch's turn is its batch worker's, and a PR that only left a batch
-    # gave nothing up
-    members = [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}]
-    assert d.own_landing(d.batch_turn(None, "me", 10, "me-10", members, "gating"), "me") is None
-    left = d.unbatched_turn(None, "me", 10, "me-10", "left_out")
+    # a PR that was only taken off an abandoned train gave nothing up
+    left = d.abandoned_turn(None, "me", 10)
     assert d.own_landing(left, "me") is None and not d.turn_given_up(left)
-    # …and one that left a batch, took a single turn and gave THAT up says so
+    # …and one that then took a single turn and gave THAT up says so
     both = d.given_up_turn(d.single_turn(left, "me", 20), 30, "gate_red", "abc")
-    assert "gave its landing turn up" in d.turn_comment(both) and both["unbatched"] == "left_out"
+    assert "gave its landing turn up" in d.turn_comment(both)
 
 
 def test_the_working_set_keeps_a_pr_being_fixed_off_its_turn_out_of_the_queue():
     """ADR-0045, as `afk rebuild` reports it: `fixing` while the worker fixes —
     no turn out, not in the merge queue — then `awaiting_turn` at its head."""
-    cfg = d.resolve_config({"gate": {"ci": "local", "local_command": "make test"}})
+    cfg = d.resolve_config({"gate": {"ci": "local", "local_command": "make test",
+                                     "adversarial_verify_prompt": "prove it"}})
     issues = [{"number": n, "title": f"i{n}", "labels": ["ready-for-agent"], "updatedAt": "t"}
               for n in (1, 2, 3)]
     prs = [{"number": n * 10, "headRefOid": f"h{n}", "statusCheckRollup": [],
@@ -1217,8 +928,7 @@ def test_the_working_set_keeps_a_pr_being_fixed_off_its_turn_out_of_the_queue():
     assert said[3] == ("fixing", "fixing", "conflict", True)
     assert said[1] == ("awaiting_turn", "awaiting_turn", None, False)
     assert ws["merge_order"] == [1, 2] and d.asks_after(ws["mine"]) == [3]
-    assert d.turn_holder(ws, "me") == (None, None)                 # no turn is out
-    assert d.batch_candidates(ws["mine"], ws["merge_order"], cfg) == [1, 2]
+    assert not [m for m in ws["mine"] if m["status"] == "landing"]      # no turn is out
     # in `required` its red checks are what it is fixing, never a `failure`
     required = d.resolve_config({})
     red = [{**p, "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "FAILURE"}]}
@@ -1232,7 +942,7 @@ def test_the_working_set_keeps_a_pr_being_fixed_off_its_turn_out_of_the_queue():
     ws, said = rows(d.next_turn(given_up, at=980, stopped="awaiting_turn"))
     assert said[3] == ("awaiting_turn", "ready_again", None, True)
     assert ws["merge_order"] == [3, 1, 2] and d.turn_due(ws["mine"], ws["merge_order"]) == 3
-    assert d.asks_after(ws["mine"]) == [] and d.batch_candidates(ws["mine"], ws["merge_order"], cfg) == []
+    assert d.asks_after(ws["mine"]) == []
     # on its second turn it is an ordinary landing row that remembers
     ws, said = rows(d.next_turn(d.single_turn(given_up, "me", 990), stopped="conflict", head="h3"))
     assert said[3] == ("landing", "landing", "conflict", True) and ws["merge_order"] == [3, 1, 2]
@@ -1564,11 +1274,10 @@ def test_classification_nudges_a_silent_worker_once_before_failing_it():
     assert _classify(ZERO, "idle", 9000, can_nudge=False,
                      turn={"at": NOW - GRACE, "restarted": NOW - GRACE})["action"] == "escalate"
     assert _classify(ZERO, "idle", 9000, can_nudge=False)["cause"] == "silent_unnudgeable"
-    # a turn that is not one PR's — a merge batch's, or a marker that holds no turn
-    # — is never restarted or escalated for its silence; nor is a claim that has no
-    # turn (a no_pr claim)
-    for held in ({"at": NOW - 2 * GRACE, "batch": "b1"}, {"at": NOW - 2 * GRACE, "released": True},
-                 {}, None):
+    # a marker that holds no turn — the train worker's is read like one — is never
+    # restarted or escalated for its silence; nor is a claim that has no turn (a
+    # no_pr claim)
+    for held in ({"at": NOW - 2 * GRACE, "released": True}, {}, None):
         r = _classify(ZERO, "idle", 9000, nudged_at=NOW - GRACE, turn=held)
         assert (r["cause"], r["action"]) == ("silent_after_nudge", "next_attempt"), held
         r = _classify(ZERO, "idle", 9000, can_nudge=False, turn=held)
@@ -1594,7 +1303,8 @@ def test_classification_nudges_a_silent_worker_once_before_failing_it():
         "silent_after_nudge"
     a = lambda **said: d.next_turn(None, **said)
     assert d.restartable_turn(a(at=1)) and not d.restartable_turn(a(at=1, restarted=2))
-    assert d.single_turn_held(a(at=1, restarted=2)) and not d.single_turn_held(a(at=1, batch="b"))
+    assert d.single_turn_held(a(at=1, restarted=2))
+    assert not d.single_turn_held(a(at=1, abandoned=1, released=True))
     r = _classify(ZERO, "none", None, turn={"at": NOW - 10})
     assert (r["outcome"], r["action"]) == ("dead", "orphan")      # a gone terminal is still dead
     # a worker whose landing stopped FOR THE TICK (CI, a verify, absent checks) is
@@ -1977,17 +1687,6 @@ def test_remotes_of_names_the_remotes_that_are_the_target_repo():
     assert d.remotes_of({}, "acme/widgets") == d.remotes_of(None, "acme/widgets") == []
 
 
-def test_turn_holder_reads_one_precedence():
-    mine_b = {"id": "m", "instance": "me", "members": [], "phase": None}
-    dead_b = {"id": "x", "instance": "gone", "members": [], "phase": None}
-    rows = [_mine(1, "landing", pr=10), _mine(2, "awaiting_turn", pr=20)]
-    ws = lambda batches, mine=(): {"batches": batches, "mine": list(mine)}
-    assert d.turn_holder(ws([mine_b, dead_b], rows), "me") == ("dead", [dead_b])
-    assert d.turn_holder(ws([mine_b], rows), "me") == ("mine", mine_b)
-    assert d.turn_holder(ws([], rows), "me") == ("single", 1)
-    assert d.turn_holder(ws([], rows[1:]), "me") == (None, None)
-
-
 def test_current_attempt_is_the_one_reader_of_the_label():
     assert d.current_attempt([]) == 0 and d.current_attempt(None) == 0
     assert d.current_attempt(["ready-for-agent"]) == 0          # never retried
@@ -2158,15 +1857,12 @@ def test_no_number_from_outside_the_fleet_takes_a_record_reader_down():
             {"n": 5, "blocked_by": [3, 4]}, junk
         assert "blocked_by" not in d.read_marker(d.VERDICT_RECORD,
                                                  f"<!--afk:verdict n=5 blocked_by={junk}-->"), junk
-        # a batch's members: a pair with such a number on either side is no member
-        turn = d.read_marker(d.TURN_RECORD, "<!--afk:turn instance=a at=1 batch=a-1 "
-                                            f"members=1:10,{junk}:20,3:{junk},4:40-->")
-        assert turn["members"] == [{"issue": 1, "pr": 10}, {"issue": 4, "pr": 40}], junk
         # an attempt label: not an attempt
         assert d.current_attempt([f"afk-attempt/{junk}"]) == 0, junk
         assert d.current_attempt([f"afk-attempt/{junk}", "afk-attempt/2"]) == 2, junk
-        # a commit subject and a PR body: no PR stacked, no issue closed
-        assert d.stacked_pr("p1 p2", f"feature (#{junk})") is None, junk
+        # a commit message and a PR body: no PR joined, no issue closed
+        assert d.read_joins([("c1", "p1 p2", f"feature (#{junk})\n\nCloses #7\n")]) == [], junk
+        assert d.read_joins([("c1", "p1 p2", f"feature (#7)\n\nCloses #{junk}\n")]) == [], junk
     for junk in ("9" * 19, "7" * 4301, "٧", "１２", "²"):
         assert d.issues_closed_by(f"Closes #{junk}", None, "o/r") == [], junk
 
@@ -2471,8 +2167,8 @@ def _worker(cause, **more):
 def _mine(n, status="no_pr", **more):
     """A whole `mine` row (`afk_decide.MineRow`), saying nothing but what is named."""
     return {"number": n, "title": None, "status": status, "board_phase": None, "pr": None,
-            "checks": None, "attempt": 0, "starting": False, "stopped": None, "batch": None,
-            "unbatched": None, "given_up": False, **more}
+            "checks": None, "attempt": 0, "starting": False, "stopped": None,
+            "given_up": False, **more}
 
 
 def test_a_tick_asks_after_waiting_workers_and_grants_one_turn():
@@ -2638,16 +2334,16 @@ def test_worker_step_routes_every_cause_or_returns_the_judgment():
     for cause in d.WORKER_CAUSES:
         assert step(cause, worker_verdict=_declared())[0] in \
             ("leave", "dispatch", "park", "nudge", "restart", "escalate", "fail", "judge"), cause
-    for route in (lambda: step("on-holiday"), lambda: d.batch_step({"cause": "gave_up"})):
+    for route in (lambda: step("on-holiday"), lambda: d.train_step({"cause": "gave_up"})):
         try:
             route()
         except ValueError as e:
             assert "classified" in str(e)
         else:
             raise AssertionError("a cause with no route was routed")
-    assert {c for c, row in d.WORKER_CAUSES.items() if row.batch_step is None} == {
+    assert {c for c, row in d.WORKER_CAUSES.items() if row.train_step is None} == {
         "satisfied", "satisfied_refuted", "blockers_closed", "blockers_waiting", "blocker_unmet",
-        "no_blocker_named", "gave_up", "needs_decision",        # a batch worker declares nothing
+        "no_blocker_named", "gave_up", "needs_decision",        # the train worker declares nothing
         "unknown_phase",
         "silent_on_turn", "silent_past_restart"}                # …and is abandoned, never restarted
 
@@ -2837,27 +2533,22 @@ class _Raises(str):
 _row = _mine
 
 
-def _working_set(mine=(), frontier=(), stale=(), stale_closed=(), batches=()):
+def _working_set(mine=(), frontier=(), stale=(), stale_closed=()):
     mine = list(mine)
-    return {"mine": mine, "merge_order": d.turn_order(mine), "batches": list(batches),
+    return {"mine": mine, "merge_order": d.turn_order(mine),
             "frontier": {"dispatch": [{"number": n, "title": f"issue {n}"} for n in frontier]},
             "stale": [{"number": n, "instance": "dead", "sha": f"sha{n}"} for n in stale],
             "stale_closed": [{"number": n, "instance": "dead", "sha": f"sha{n}"}
                              for n in stale_closed]}
 
 
-def _batch(members, instance="fl-1", batch="b1"):
-    return {"id": batch, "instance": instance, "phase": "stacking", "at": NOW,
-            "members": [{"issue": n, "pr": n * 10} for n in members]}
-
-
 def _play(ws, answers=None, causes=None, config=None, concurrency=3):
     """Carry a tick's plan out against a scripted world — the way `afk._tick`
     does, with no process → (the steps it handed out, what it returned).
 
-      answers: {(do, issue or batch) | do: what that step's transition returns,
-                or `_Raises`}; a step with no answer here succeeds
-      causes:  {issue or batch id: the cause `afk no-pr` classifies its worker with}
+      answers: {(do, issue) | do: what that step's transition returns, or
+                `_Raises`}; a step with no answer here succeeds
+      causes:  {issue | "train": the cause `afk no-pr` classifies its worker with}
       concurrency: the config's, where no whole `config` is given
     """
     answers, causes, steps = answers or {}, causes or {}, []
@@ -2874,11 +2565,12 @@ def _play(ws, answers=None, causes=None, config=None, concurrency=3):
         assert do in d.TICK_STEPS, step
         if do == "finish":
             return [said(do, n) for n in step["issues"]], None
-        key = step.get("issue", step.get("batch"))
+        key = step.get("issue")
+        if do == "no-pr" and step.get("train"):
+            return {"workers": [_worker(causes.get("train", "working"))]}, None
         if do == "no-pr" and ("no-pr", key) not in answers and "no-pr" not in answers:
-            asked = step.get("issues") or [step["batch"]]
             return {"workers": [_worker(causes.get(n, "working"), issue=n)
-                                for n in asked]}, None
+                                for n in step["issues"]]}, None
         if do == "turn" and ("turn", key) not in answers and "turn" not in answers:
             return {"issue": key, "pr": key * 10, "head": "abc", "outcome": "granted"}, None
         return said(do, key)
@@ -2888,8 +2580,9 @@ def _play(ws, answers=None, causes=None, config=None, concurrency=3):
 
 
 def _brief(steps):
-    """The steps as (do, the issue / issues / batch it is about)."""
-    return [(s["do"], *(s[k] for k in ("issue", "issues", "batch") if k in s)) for s in steps]
+    """The steps as (do, the issue / issues it is about — or `train`)."""
+    return [(s["do"], *(s[k] for k in ("issue", "issues") if k in s),
+             *(["train"] if s.get("train") else [])) for s in steps]
 
 
 def _nothing_done(**did):
@@ -3108,84 +2801,123 @@ def test_a_tick_grants_at_most_one_landing_turn():
     assert [s for s in _brief(steps) if s[0] == "turn"] == [("turn", 1)]
     assert [(j["issue"], j["kind"]) for j in done["judgments"]] == [(1, "no_checks")]
     assert done["did"]["granted"] == []
-    # a merge batch is that one turn: formed from the PRs free to land together,
-    # and no single turn beside it
-    batching = d.resolve_config({"gate": {"ci": "local"}})
-    formed = {"outcome": "granted", "batch": "b9", "issues": [1, 2, 3]}
-    steps, done = _play(_working_set(mine=waiting), {"batch-turn": formed}, config=batching)
-    assert _brief(steps) == [("batch-turn",), ("heartbeat",), ("sweep",)]
-    assert steps[-1]["live"] == ["b9"] and done["did"]["granted"] == [1, 2, 3]
-    # too few of them were free after all: the turn goes to one PR, as before
-    steps, done = _play(_working_set(mine=waiting), {"batch-turn": {"outcome": "too_few"}},
-                        config=batching)
-    assert _brief(steps)[:2] == [("batch-turn",), ("turn", 1)] and steps[-1]["live"] == []
-    assert done["did"]["granted"] == [1]
-    # forming it failed: an error, and no turn is granted behind its back
-    steps, done = _play(_working_set(mine=waiting), {"batch-turn": _Raises("orca is down")},
-                        config=batching)
-    assert not [s for s in steps if s["do"] == "turn"] and done["did"]["granted"] == []
-    assert done["errors"] == [{"step": "turn", "error": "orca is down"}]
 
 
-def test_a_dead_fleets_batch_is_abandoned_before_anything_is_granted():
-    # claims I took carry a dead fleet's batch: it is abandoned, and no turn — a
-    # batch's or a single PR's — is granted until the next cycle reads the result
-    mine = [_row(n, "awaiting_turn", pr=n * 10) for n in (1, 2)]
-    ws = _working_set(mine=mine, batches=[_batch([1, 2], instance="dead", batch="old")])
-    steps, done = _play(ws, {"abandon": {"issues": [1, 2]}})
-    assert _brief(steps) == [("abandon", "old"), ("heartbeat",), ("sweep",)]
-    assert steps[-1]["live"] == [] and done["did"]["abandoned"] == [1, 2]
-    assert done["did"]["granted"] == [] and done["did"]["in_flight"] == 2
-    # the abandon failed: the batch still holds its turn, and its worktree is not swept
-    steps, done = _play(ws, {"abandon": _Raises("gh is down")})
-    assert _brief(steps) == [("abandon", "old"), ("heartbeat",), ("sweep",)]
-    assert steps[-1]["live"] == ["old"] and done["did"]["abandoned"] == []
-    assert done["errors"] == [{"step": "turn", "error": "gh is down"}]
-    # it comes before my own batch's worker is asked after, too
-    both = _working_set(mine=mine, batches=[_batch([1], instance="dead", batch="old"),
-                                            _batch([2], batch="new")])
-    steps, done = _play(both, {"abandon": {"issues": [1]}})
-    assert _brief(steps) == [("abandon", "old"), ("heartbeat",), ("sweep",)]
-    assert steps[-1]["live"] == ["new"]
-
-
-def test_a_batch_of_mine_is_left_continued_nudged_or_abandoned():
-    held = {"id": "b1", "members": [1, 2], "phase": "stacking"}
-    mine = [_row(n, "landing", pr=n * 10, batch=held) for n in (1, 2)]
-    ws = _working_set(mine=mine + [_row(3, "awaiting_turn", pr=30)], batches=[_batch([1, 2])])
-
-    def played(cause, **answers):
-        steps, done = _play(ws, answers, causes={"b1": cause})
-        # the batch's worker is asked after once, for the batch — never its members' own
-        assert _brief(steps)[0] == ("no-pr", "b1") and steps[0] == {"do": "no-pr", "batch": "b1"}
-        # the turn is out: #3 waits, whatever becomes of the batch this tick
-        assert not [s for s in steps if s["do"] == "turn"]
-        return _brief(steps)[1:-2], steps[-1]["live"], done
-
-    # its worker is at it: nothing
-    for cause in ("working", "just_stopped", "within_grace", "awaiting_tick"):
-        acted, live, done = played(cause)
-        assert (acted, live) == ([], ["b1"]) and done["did"] == _nothing_done(in_flight=3)
-    # its terminal is gone: continued, which is the turn told again
-    again = {"outcome": "granted", "batch": "b1", "issues": [1, 2]}
-    acted, live, done = played("gone", **{"batch-turn": again})
-    assert (acted, live, done["did"]["granted"]) == ([("batch-turn",)], ["b1"], [1, 2])
-    acted, live, done = played("gone", **{"batch-turn": {"outcome": "landing"}})
-    assert (acted, live, done["did"]["granted"]) == ([("batch-turn",)], ["b1"], [])
-    # silent past grace: nudged once, for every PR it carries
-    acted, live, done = played("silent")
-    assert (acted, live, done["did"]["nudged"]) == ([("nudge", "b1")], ["b1"], [1, 2])
-    # silent again: abandoned — nothing is live, and its worktree is swept this tick
+def test_where_the_train_runs_a_tick_grants_no_turn_and_keeps_the_train_worker_on_it():
+    """ADR-0048: no PR is granted a turn — one that is to join is asked after like
+    any worker, and while one of mine is on the train its worker is kept at it."""
+    local = d.resolve_config({"gate": {"ci": "local", "local_command": "make test"}})
+    assert d.train_runs(local) and not d.train_runs(d.resolve_config({}))
+    assert not d.train_runs(d.resolve_config(
+        {"gate": {"ci": "local", "adversarial_verify_prompt": "prove it"}}))
+    play = lambda mine, answers=None, **kw: _play(_working_set(mine=mine), answers,
+                                                  config=local, **kw)
+    stopped = {"train": {"outcome": "stopped"}}
+    joining = [_row(n, "joining", pr=n * 10) for n in (1, 2)]
+    on = [_row(3, "joined", pr=30)]
+    # PRs that are to join: their workers are asked after, nothing is granted,
+    # and with none on the train its worker is not even looked at
+    steps, done = play(joining)
+    assert _brief(steps) == [("no-pr", [1, 2]), ("heartbeat",)] and done["did"]["granted"] == []
+    # one is on the train: the train worker is put on it — a claim on the train
+    # is the train worker's now, so its own worker is not asked after
+    for moved in ("granted", "landing", "idle"):
+        steps, done = play(on, {"train": {"outcome": moved}})
+        assert _brief(steps) == [("train",), ("heartbeat",)], moved
+        assert done["did"] == _nothing_done(in_flight=1)
+    # it stopped with nothing new to land: asked after, and left while it shows life
+    steps, done = play(on, stopped)
+    assert _brief(steps) == [("train",), ("no-pr", "train"), ("heartbeat",)]
+    # …a gone one is started again by the next tick's `afk turn --train`
+    steps, done = play(on, stopped, causes={"train": "gone"})
+    assert _brief(steps) == [("train",), ("no-pr", "train"), ("heartbeat",)]
+    # silent: nudged once
+    steps, done = play(on, stopped, causes={"train": "silent"})
+    assert _brief(steps) == [("train",), ("no-pr", "train"), ("nudge", "train"), ("heartbeat",)]
+    assert done["did"]["nudged"] == [3]
+    # silent again: the train is abandoned — its PRs join the next one, and one
+    # taken off a train for the second time is escalated instead
+    gone = {"outcome": "abandoned", "issues": [3], "escalated": []}
     for cause in ("silent_after_nudge", "silent_unnudgeable"):
-        acted, live, done = played(cause, abandon={"issues": [1, 2]})
-        assert (acted, live, done["did"]["abandoned"]) == ([("abandon", "b1")], [], [1, 2])
-    # an abandon that failed leaves the batch holding its turn
-    acted, live, done = played("silent_after_nudge", abandon=_Raises("gh is down"))
-    assert live == ["b1"] and done["did"]["abandoned"] == []
-    # its worker could not be read: left, and reported
-    steps, done = _play(ws, {"no-pr": _Raises("orca is down")})
-    assert _brief(steps) == [("no-pr", "b1"), ("heartbeat",), ("sweep",)]
-    assert done["errors"] == [{"step": "no-pr", "error": "orca is down"}]
+        steps, done = play(on, {**stopped, "abandon": gone}, causes={"train": cause})
+        assert _brief(steps) == [("train",), ("no-pr", "train"), ("abandon",), ("heartbeat",)]
+        assert done["did"] == _nothing_done(abandoned=[3], in_flight=1), cause
+    twice = {"outcome": "abandoned", "issues": [], "escalated": [3]}
+    steps, done = play(on, {**stopped, "abandon": twice}, causes={"train": "silent_after_nudge"})
+    assert done["did"]["escalated"] == [3] and done["did"]["abandoned"] == []
+    # the train worker could not be reached: an error, and the rest of the tick runs
+    steps, done = play(on + joining, {"train": _Raises("orca is down")})
+    assert _brief(steps) == [("no-pr", [1, 2]), ("train",), ("heartbeat",)]
+    assert done["errors"] == [{"step": "turn", "error": "orca is down"}]
+    # a train worker is never classified with a cause that is an issue worker's alone
+    try:
+        play(on, stopped, causes={"train": "satisfied"})
+    except ValueError as e:
+        assert "no step for a train worker classified 'satisfied'" in str(e)
+    else:
+        raise AssertionError("a train worker was routed as an issue's")
+
+
+def test_what_is_on_the_train_is_read_off_the_train_itself():
+    """ADR-0048: no marker says a PR joined. A joining is the merge commit it
+    joined with — named for the PR, closing its issue, its second parent the
+    PR's head — and a PR is on the train while that head is still its own."""
+    msg = d.join_message("Add names", 77, 31)
+    assert msg == "Add names (#77)\n\nCloses #31\n"
+    assert d.join_message("  ", 77, 31).startswith("PR 77 (#77)\n")
+    commits = [("c1", "t0 h77", msg),
+               ("c2", "c1 h78", d.join_message("Other (#12)", 78, 32)),
+               ("c3", "c2", "fix the train (#77)\n\nCloses #31\n"),     # one parent: a fix
+               ("c4", "c3 t1", "Merge remote-tracking branch 'origin/main'"),
+               ("c5", "c4 h77b", msg)]                                    # joined again
+    joins = d.read_joins(commits)
+    assert joins == [{"issue": 31, "pr": 77, "commit": "c1", "head": "h77"},
+                     {"issue": 32, "pr": 78, "commit": "c2", "head": "h78"},
+                     {"issue": 31, "pr": 77, "commit": "c5", "head": "h77b"}]
+    pr = lambda n, head: {"number": n, "headRefOid": head}
+    # the newest joining of a PR is the one that counts, against the head it has now
+    assert d.on_train(joins, [pr(77, "h77b"), pr(78, "h78")]) == {31: joins[2], 32: joins[1]}
+    # a head that moved since is not on the train — its worker joins again — and
+    # neither is a PR that is no longer open
+    assert d.on_train(joins, [pr(77, "h77"), pr(78, "moved")]) == {}
+    assert d.on_train(joins, []) == {} and d.on_train([], [pr(77, "h77")]) == {}
+
+    # one train per repo and base branch, in the claim namespace's own refs
+    assert d.train_refs("refs/afk", "main") == ("refs/afk/train/line/main",
+                                                "refs/afk/train/red/main")
+    assert d.train_refs("refs/heads", "release/2") == ("refs/heads/afk-train/line/release/2",
+                                                       "refs/heads/afk-train/red/release/2")
+    # its worktree is the repo's, known by its branch — it is linked to no issue
+    rows = [{"path": "/wt/t", "branch": "refs/heads/u/afk-train", "projectId": "github:o/r",
+             "lastActivityAt": 5},
+            {"path": "/wt/t2", "branch": "afk-train-2", "projectId": "github:O/R",
+             "lastActivityAt": 9},
+            {"path": "/wt/x", "branch": "u/afk-train", "projectId": "github:o/other"},
+            {"path": "/wt/a", "branch": "u/afk-train", "projectId": "github:o/r", "isArchived": True},
+            {"path": "/wt/9", "branch": "u/issue-9-afk-train-fix", "projectId": "github:o/r"}]
+    assert d.train_worktrees(rows, "o/r") == [{"path": "/wt/t2", "branch": "afk-train-2"},
+                                              {"path": "/wt/t", "branch": "u/afk-train"}]
+    assert d.train_worktrees(None, "o/r") == []
+
+    # a claim's status where a train runs: to join, on it, or — cut after the
+    # train's push — landed, whatever GitHub still shows of its PR
+    status = lambda **kw: d.claim_status(True, None, "local", train=True, **kw)
+    assert status() == "joining" and status(joined=True) == "joined"
+    assert status(joined=True, landed=True) == "landed" and status(closed=True) == "closed"
+    assert d.claim_status(False, None, "local", train=True) == "no_pr"
+    assert d.claim_status(True, None, "local") == "awaiting_turn"
+    # what a train landed is a claim's own only when it joined no earlier than the claim
+    claim = {"ts": 100}
+    assert d.landed_under(100, claim) and d.landed_under(150, claim)
+    assert not d.landed_under(99, claim) and not d.landed_under(None, claim)
+
+    # a PR taken off an abandoned train holds no turn and remembers it was
+    once = d.abandoned_turn(None, "fl-1", 300)
+    assert (once["abandoned"], once["released"], once["instance"]) == (300, True, "fl-1")
+    assert "abandoned" in d.turn_comment(once) and not d.single_turn_held(once)
+    assert d.latest_turn([{"id": 1, "body": d.turn_comment(once)}])["abandoned"] == 300
+    assert "twice" in d.train_abandoned_reason(77) and "kept as they are" in d.train_abandoned_reason(77)
+    assert "`main` as abc" in d.landed_comment("abc", "main")
 
 
 def test_a_tick_runs_its_stages_in_one_order_and_writes_each_board_once():
@@ -3260,8 +2992,8 @@ def test_a_landing_worker_silent_after_its_nudge_is_restarted_onto_its_turn():
 
 
 def test_a_tick_grants_the_turn_elsewhere_while_a_pr_is_fixed_off_the_one_it_gave_up():
-    """ADR-0045: a `fixing` claim holds no turn — the head of the queue gets one,
-    or a batch forms — while its worker is watched on the landing's own ladder."""
+    """ADR-0045: a `fixing` claim holds no turn — the head of the queue gets one
+    — while its worker is watched on the landing's own ladder."""
     fixing = _row(5, "fixing", pr=50, stopped="conflict", given_up=True, board_phase="fixing")
     waiting = [_row(n, "awaiting_turn", pr=n * 10, board_phase="awaiting_turn") for n in (6, 7)]
     granted = {"issue": 6, "pr": 60, "head": "abc", "outcome": "granted", "delivery": "terminal"}
@@ -3270,13 +3002,6 @@ def test_a_tick_grants_the_turn_elsewhere_while_a_pr_is_fixed_off_the_one_it_gav
                         causes={5: "working"})
     assert _brief(steps) == [("no-pr", [5]), ("turn", 6), ("heartbeat",), ("status", 5)]
     assert done["did"] == _nothing_done(granted=[6], in_flight=2)
-    # two wait: they form a merge batch beside it
-    local = d.resolve_config({"gate": {"ci": "local", "local_command": "make test"}})
-    formed = {"outcome": "granted", "batch": "fl-1-9", "issues": [6, 7], "prs": [60, 70]}
-    steps, done = _play(_working_set(mine=[fixing, *waiting]), {"batch-turn": formed},
-                        causes={5: "working"}, config=local)
-    assert _brief(steps)[:2] == [("no-pr", [5]), ("batch-turn",)]
-    assert done["did"]["granted"] == [6, 7]
     # its worker went silent after its nudge: restarted to keep fixing — no turn
     # is granted by that, and the queue's head still gets its own in the same tick
     kept = {"issue": 5, "pr": 50, "head": "abc", "outcome": "fixing", "restarted": NOW,
@@ -3302,7 +3027,7 @@ def test_a_tick_grants_the_turn_elsewhere_while_a_pr_is_fixed_off_the_one_it_gav
 def test_a_plan_names_only_steps_the_table_lists_and_refuses_an_unknown_cause():
     assert set(d.TICK_STEPS.values()) == {"no-pr", "turn", "nudge", "park", "fail", "escalate",
                                           "release", "reclaim", "dispatch", "heartbeat",
-                                          "status", "sweep"}
+                                          "status"}
     # a cause the routing does not know is an error of the tick, never a step
     try:
         _play(_working_set(mine=[_row(1)]), causes={1: "levitating"})
@@ -3389,6 +3114,11 @@ def test_a_worker_is_told_how_to_wake_the_launcher_and_nothing_else():
 LANDING = {"pr": 77, "pr_branch": "sunfmin/issue-31-names", "target": "main"}
 
 
+def _outcomes(brief):
+    """The outcomes a brief's table routes on, in the order it lists them."""
+    return re.findall(r"^\| `(\w+)` \| ", brief, re.M)[1:]       # past the header row
+
+
 def test_a_worker_reads_the_one_way_its_pr_lands_when_it_holds_the_turn():
     """ADR-0027. `afk land` is the only way a PR lands, and the landing brief is
     the only place it is spelled: the command, and what to do on each outcome it
@@ -3407,8 +3137,14 @@ def test_a_worker_reads_the_one_way_its_pr_lands_when_it_holds_the_turn():
     cont = d.render_worker_prompt(t, "continue", fields)
     alone = d.render_landing(t, fields, LANDING)
     assert alone.count(land) == 1, alone.count(land)
-    for outcome in d.LAND_OUTCOMES:
-        assert f"| `{outcome}` |" in alone, outcome
+    joining = d.render_landing(t, fields, LANDING, train=True)
+    on_a_turn = [o for o in d.LAND_OUTCOMES if o != "joined"]
+    assert _outcomes(alone) == on_a_turn
+    # where a landing train runs the same command joins it: no turn, no gate, and
+    # the three ways a join can end
+    assert joining.count(land) == 1 and "landing turn" not in joining
+    assert _outcomes(joining) == ["joined", "conflict", "merged"]
+    assert {"joined", "conflict", "merged"} <= set(d.LAND_OUTCOMES)
     for body in (fresh, cont, alone):
         assert "gh pr merge" in body and "afk:block" not in body         # named only to forbid it
     assert "landing turn" in alone
@@ -3472,35 +3208,75 @@ def test_render_worker_prompt_never_ships_a_placeholder():
     refuses(t, "fresh", {k: v for k, v in PROMPT_FIELDS.items() if k != "branch"}, why="branch")
     refuses("no blocks here", "fresh", PROMPT_FIELDS, why="'prompt' block")
     block = lambda name, body: f"<!--afk:block {name}-->\n{body}\n<!--/afk:block-->\n"
-    partial = block("prompt", "{opening} {step1} {retry_reason}") + block("opening.fresh", "hi")
+    rest = block("finish.turn", "F") + block("finish.train", "T") + block("join", "J")
+    partial = (block("prompt", "{opening} {step1} {retry_reason}") + block("opening.fresh", "hi")
+               + rest)
     refuses(partial, "fresh", PROMPT_FIELDS, why="step1.fresh")
     # a template naming a slot it never fills is caught, not sent
     looping = (block("prompt", "{opening} {step1}") + block("opening.fresh", "O")
-               + block("step1.fresh", "see {opening}"))
+               + block("step1.fresh", "see {opening}") + rest)
     refuses(looping, "fresh", PROMPT_FIELDS, why="unfilled")
     # and so is a placeholder no field answers to — in any of the three briefs
-    unknown = block("prompt", "{opening} {step1} {nope}") + block("opening.fresh", "O") + block("step1.fresh", "S")
+    unknown = (block("prompt", "{opening} {step1} {nope}") + block("opening.fresh", "O")
+               + block("step1.fresh", "S") + rest)
     refuses(unknown, "fresh", PROMPT_FIELDS, why="unfilled placeholder(s) {nope}")
-    refuses(block("prompt", "{opening} {step1} {pr}") + block("opening.fresh", "O") + block("step1.fresh", "S"),
-            "fresh", PROMPT_FIELDS, why="unfilled placeholder(s) {pr}")
+    refuses(block("prompt", "{opening} {step1} {pr}") + block("opening.fresh", "O")
+            + block("step1.fresh", "S") + rest, "fresh", PROMPT_FIELDS,
+            why="unfilled placeholder(s) {pr}")
+    refuses(block("prompt", "{opening}") + block("opening.fresh", "O") + block("step1.fresh", "S"),
+            "fresh", PROMPT_FIELDS, why="'finish.turn' block")
     for render in (lambda: d.render_landing(block("landing", "{n} {nope}"), PROMPT_FIELDS, LANDING),
-                   lambda: d.render_batch_brief(block("batch", "{batch} {nope}"), BATCH_FIELDS)):
+                   lambda: d.render_train_brief(block("train", "{repo} {nope}"), TRAIN_FIELDS)):
         try:
             render()
             assert False, "expected ValueError"
         except ValueError as e:
             assert "unfilled placeholder(s) {nope}" in str(e), e
     # the minimal well-formed template renders
-    ok = (block("prompt", "{opening}|{step1}|{n}{retry_reason}") + block("opening.fresh", "O")
-          + block("step1.fresh", "S") + block("retry_reason", " because {reason}"))
-    assert d.render_worker_prompt(ok, "fresh", PROMPT_FIELDS) == "O|S|31\n"
-    assert d.render_worker_prompt(ok, "fresh", PROMPT_FIELDS, reason="R") == "O|S|31 because R\n"
+    ok = (block("prompt", "{opening}|{step1}|{finish}|{n}{retry_reason}")
+          + block("opening.fresh", "O") + block("step1.fresh", "S")
+          + block("retry_reason", " because {reason}") + block("finish.turn", "F")
+          + block("finish.train", "T {join}") + block("join", "J"))
+    assert d.render_worker_prompt(ok, "fresh", PROMPT_FIELDS) == "O|S|F|31\n"
+    assert d.render_worker_prompt(ok, "fresh", PROMPT_FIELDS, reason="R") == "O|S|F|31 because R\n"
+    # where a landing train runs, the worker finishes by joining it
+    assert d.render_worker_prompt(ok, "fresh", PROMPT_FIELDS, train=True) == "O|S|T J|31\n"
 
 
-BATCH_FIELDS = {"batch": "me-100", "repo": "acme/widgets", "target": "main",
-                "branch": "u/afk-batch-me-100", "worktree_path": "/w/batch",
-                "members": [{"issue": 1, "pr": 10, "title": "one"}, {"issue": 2, "pr": 20, "title": "two"}],
+TRAIN_FIELDS = {"repo": "acme/widgets", "target": "main", "worktree_path": "/w/afk-train",
                 "afk_path": "/s/afk.py", "config": '{"retry": 2}', "launcher_terminal": "term_1"}
+
+
+def test_the_train_worker_reads_the_one_way_the_train_lands():
+    """ADR-0048. The train brief is the only place `afk land --train` is spelled:
+    the command, and what to do on each outcome it can stop with."""
+    t = _prompt_template()
+    assert set(TRAIN_FIELDS) == set(d.TRAIN_FIELDS)
+    land = d.train_land_command("/s/afk.py", "acme/widgets", '{"retry": 2}')
+    assert land == "/s/afk.py land --train --repo acme/widgets --config '{\"retry\": 2}'"
+    brief = d.render_train_brief(t, TRAIN_FIELDS)
+    assert brief.count(land) == 1 and "/w/afk-train" in brief
+    assert _outcomes(brief) == ["landed", "idle", "gate_red", "conflict", "target_moved"]
+    assert set(_outcomes(brief)) == set(d.TRAIN_OUTCOMES)
+    # it wakes the launcher by the train's own word, never an issue's
+    assert d.wake_command("term_1", d.TRAIN_WAKE) in brief and "afk-wake #train" in brief
+    assert not re.search(r"ADR-\d", brief)
+    try:
+        d.render_train_brief(t, {k: v for k, v in TRAIN_FIELDS.items() if k != "target"})
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "missing field(s) target" in str(e)
+    # a worker where the train runs gates with the train merged in, and joins itself
+    config = '{"gate": {"ci": "local"}}'
+    fields = {**PROMPT_FIELDS, "config": config}
+    gate = d.gate_command(fields["afk_path"], fields["local_command"],
+                          train=(fields["repo"], config))
+    assert " gate --train --repo acme/widgets --config " in gate
+    fresh = d.render_worker_prompt(t, "fresh", fields, train=True)
+    assert gate in fresh and d.land_command(fields["afk_path"], 31, "acme/widgets", config) in fresh
+    assert "| `joined` |" in fresh and "you are told" not in fresh
+    turn = d.render_worker_prompt(t, "fresh", fields)
+    assert "--train" not in turn and "| `joined` |" not in turn and "landing train" not in turn
 
 
 def test_no_field_value_is_scanned_for_placeholders():
@@ -3511,7 +3287,7 @@ def test_no_field_value_is_scanned_for_placeholders():
     and finding the two renderings equal but for the brackets."""
     t = _prompt_template()
     names = sorted(set(re.findall(r"\{([a-z_0-9]+)\}", t)))
-    assert {"title", "branch", "pr", "reason", "land_command", "batch", "members"} <= set(names)
+    assert {"title", "branch", "pr", "reason", "land_command", "train_land_command"} <= set(names)
     braces = " ".join("${%s}" % n for n in names)
     inert = braces.replace("{", "\u27e6").replace("}", "\u27e7")
     restore = lambda body: body.replace("\u27e6", "{").replace("\u27e7", "}")
@@ -3524,17 +3300,14 @@ def test_no_field_value_is_scanned_for_placeholders():
         with_k = lambda v: {**PROMPT_FIELDS, k: f"{PROMPT_FIELDS[k]}{v}"}
         held(lambda v: d.render_worker_prompt(t, "fresh", with_k(v), reason="red")
              + d.render_worker_prompt(t, "continue", with_k(v))
-             + d.render_landing(t, with_k(v), LANDING), k)
+             + d.render_worker_prompt(t, "fresh", with_k(v), train=True)
+             + d.render_landing(t, with_k(v), LANDING)
+             + d.render_landing(t, with_k(v), LANDING, train=True), k)
     held(lambda v: d.render_worker_prompt(t, "fresh", PROMPT_FIELDS, reason=f"red{v}"), "reason")
     for k in d.LANDING_FIELDS:
         held(lambda v: d.render_landing(t, PROMPT_FIELDS, {**LANDING, k: f"{LANDING[k]}{v}"}), k)
-    for k in d.BATCH_FIELDS:
-        if k == "members":
-            for part in ("issue", "pr", "title"):
-                held(lambda v: d.render_batch_brief(t, {**BATCH_FIELDS, k: [
-                    {**m, part: f"{m[part]}{v}"} for m in BATCH_FIELDS[k]]}), f"members.{part}")
-        else:
-            held(lambda v: d.render_batch_brief(t, {**BATCH_FIELDS, k: f"{BATCH_FIELDS[k]}{v}"}), k)
+    for k in d.TRAIN_FIELDS:
+        held(lambda v: d.render_train_brief(t, {**TRAIN_FIELDS, k: f"{TRAIN_FIELDS[k]}{v}"}), k)
 
 
 def test_a_gate_command_with_shell_variables_reaches_the_worker_as_configured():
@@ -3617,7 +3390,7 @@ def test_fingerprint():
 #
 # Generated worlds: a small backlog, its PRs and its claims, drawn so that every
 # branch of the assembly is taken — a claim on a closed issue, two PRs closing one
-# issue, a turn held, a turn of a dead fleet's, a batch.
+# issue, a turn held, a turn of a dead fleet's, one taken off an abandoned train.
 
 _LABELS = ["ready-for-agent", "epic", "afk-attempt/1", "afk-attempt/2", d.ATTEMPT_STARTING, "bug"]
 _ROLLUPS = [None, [], [{"conclusion": "SUCCESS"}], [{"conclusion": "FAILURE"}],
@@ -3669,8 +3442,7 @@ def _world(rng):
         turn = rng.choice([
             None, d.single_turn(None, rng.choice(["me", "peerB"]), now),
             d.next_turn(d.single_turn(None, "me", now), stopped="awaiting_ci", head="aaa"),
-            d.next_turn(None, instance=rng.choice(["me", "peerB"]), at=now + n, batch="b1",
-                        members=[{"issue": n, "pr": 20}], phase=rng.choice(d.BATCH_PHASES))])
+            d.abandoned_turn(None, rng.choice(["me", "peerB"]), now + n)])
         if turn:
             turns[n] = d.latest_turn([{"id": n, "body": d.turn_comment(turn)}])
     outside = {
@@ -3774,7 +3546,11 @@ def test_what_the_working_set_reads_outside_the_digest_is_named():
     import inspect
     digested = set(inspect.signature(d.fingerprint).parameters)
     reads = set(inspect.signature(d.assemble_working_set).parameters)
-    assert digested == {"issues", "prs", "claims"} and digested <= reads
+    # …but for the train's tip: the working set reads which PRs are on the train
+    # (`joined`, outside the digest), and the tip is what moves when one joins
+    assert digested == {"issues", "prs", "claims", "train"}
+    digested -= {"train"}
+    assert digested <= reads
     assert reads - digested == set(d.OUTSIDE_THE_DIGEST)
 
     # the glossary and the ADRs live in the source repo only
@@ -3886,17 +3662,22 @@ def test_assemble_working_set():
                                  heartbeats, "me", now, cfg)
     assert {e["number"] for e in ws2["frontier"]["dispatch"]} == {1, 2}
 
-    # gate.ci: local — a PR whose remote checks are RED still awaits its turn,
-    # because those checks are not the gate; the landing runs the local one
-    # instead (ADR-0012). Everything else about the working set is unchanged.
+    # gate.ci: local — a PR whose remote checks are RED is still to join the
+    # landing train, because those checks are not the gate; the train's worker
+    # runs the local one instead (ADR-0012, ADR-0048). Everything else about the
+    # working set is unchanged.
     red = [{**prs[0], "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "FAILURE"}]}]
     local_cfg = {**cfg, "gate": {**cfg["gate"], "ci": "local", "local_command": "make test"}}
     strict = d.assemble_working_set(issues, red, claims, heartbeats, "me", now, cfg)
     local = d.assemble_working_set(issues, red, claims, heartbeats, "me", now, local_cfg)
     assert {m["number"]: m["status"] for m in strict["mine"]} == {3: "failure", 4: "no_pr"}
-    assert {m["number"]: m["status"] for m in local["mine"]} == {3: "awaiting_turn", 4: "no_pr"}
+    assert {m["number"]: m["status"] for m in local["mine"]} == {3: "joining", 4: "no_pr"}
     assert {m["number"]: m["board_phase"] for m in strict["mine"]} == {3: "ci_failed", 4: "claimed"}
-    assert {m["number"]: m["board_phase"] for m in local["mine"]} == {3: "awaiting_turn", 4: "claimed"}
+    assert {m["number"]: m["board_phase"] for m in local["mine"]} == {3: "joining", 4: "claimed"}
+    # …and one whose head the train already carries is on it
+    on = d.assemble_working_set(issues, red, claims, heartbeats, "me", now, local_cfg,
+                                joined=[3])
+    assert {m["number"]: m["status"] for m in on["mine"]} == {3: "joined", 4: "no_pr"}
 
     # the merge queue: `merge_order` is the ready rows in the order turns are
     # granted — the PR that holds the turn first, then PR number — and a `landing`
@@ -4382,11 +4163,11 @@ def test_a_record_that_states_nothing_reads_as_its_kinds_blank():
                                                 "reason": None}
     blank = d.blank_record(d.TURN_RECORD)
     assert set(blank) == set(d.TURN_RECORD.fields)
-    assert (blank["allow_no_checks"], blank["released"], blank["members"]) == (False, False, [])
-    assert all(v is None for k, v in blank.items()
-               if k not in ("allow_no_checks", "released", "members"))
-    # each read gets its own list: one record's members are never another's
-    assert d.blank_record(d.TURN_RECORD)["members"] is not blank["members"]
+    assert (blank["allow_no_checks"], blank["released"]) == (False, False)
+    assert all(v is None for k, v in blank.items() if k not in ("allow_no_checks", "released"))
+    # each read gets its own list: one record's blockers are never another's
+    assert d.blank_record(d.VERDICT_RECORD)["blocked_by"] is not \
+        d.blank_record(d.VERDICT_RECORD)["blocked_by"]
     bare = d.latest_turn([{"id": 3, "body": "<!--afk:turn instance=fl-1-->"}])
     assert bare == {**blank, "instance": "fl-1", "comment_id": 3}
     assert d.latest_verdict([{"body": "<!--afk:verdict-->", "url": "u"}])["blocked_by"] == []
@@ -4394,7 +4175,7 @@ def test_a_record_that_states_nothing_reads_as_its_kinds_blank():
 
 def test_a_cause_names_its_own_step_in_the_one_table():
     """What a tick does about a classified worker is the cause's row of
-    WORKER_CAUSES: `worker_step` and `batch_step` read it, and neither keeps a
+    WORKER_CAUSES: `worker_step` and `train_step` read it, and neither keeps a
     second mapping to fall out of step with it."""
     cfg = d.resolve_config({})
     for cause, row in d.WORKER_CAUSES.items():
@@ -4402,8 +4183,8 @@ def test_a_cause_names_its_own_step_in_the_one_table():
         # about whether an attempt is spent, or whether anything happens at all
         assert (row.step == "fail") == (row.action == "next_attempt"), cause
         assert (row.step == "leave") == (row.action == "leave"), cause
-        if row.batch_step:
-            assert d.batch_step({"cause": cause}) == row.batch_step
+        if row.train_step:
+            assert d.train_step({"cause": cause}) == row.train_step
         if row.step in ("leave", "dispatch", "park", "nudge", "restart"):
             assert d.worker_step(CALL, _mine(4), _worker(cause), cfg) == (row.step, None)
 
@@ -4414,7 +4195,7 @@ def test_a_closed_vocabulary_and_its_table_list_the_same_words():
     Literal has: this is that half."""
     for vocabulary, table in ((d.GateCiMode, d.GATE_CI_MODES), (d.ClaimStatus, d.BOARD_PHASE_OF),
                               (d.WorkerCause, d.WORKER_CAUSES), (d.StatusPhase, d.STATUS_PHASES),
-                              (d.BatchPhase, d._BATCH_DOING), (d.TickDid, d.TICK_DID),
+                              (d.TickDid, d.TICK_DID),
                               (d.TickStep, d.TICK_STEPS)):
         assert set(typing.get_args(vocabulary)) == set(table), vocabulary
 

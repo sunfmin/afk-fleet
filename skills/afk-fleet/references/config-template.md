@@ -78,11 +78,11 @@ escalate_label: ready-for-human        # applied (with ready_label removed, clai
 - **Adversarial verify** is the pluggable, domain-specific half. Leave `gate.adversarial_verify_prompt`
   empty for plain software repos; write one for content/correctness repos where a machine gate can't
   catch a wrong answer.
-- **Merge batches need no key.** With `gate.ci: local` and no adversarial verify, two or more finished
-  PRs that wait for the landing turn together always land as one batch (ADR-0029, ADR-0034) — stacked
-  on `base_branch` with one merge commit per PR, gated ONCE, pushed as a fast-forward. That needs a
-  `base_branch` that accepts a direct push (checked at bootstrap). A PR always lands as a MERGE COMMIT:
-  no squash, no rebase.
+- **The landing train needs no key.** With `gate.ci: local` and no adversarial verify, finished PRs
+  always land on the fleet's landing train (ADR-0048, ADR-0034) — each one merge commit on a line
+  ahead of `base_branch`, the line gated whenever the gate is free and pushed as a fast-forward. That
+  needs a `base_branch` that accepts a direct push (checked at bootstrap). A PR always lands as a
+  MERGE COMMIT: no squash, no rebase.
 - **Set `gate.local_command` as soon as the repo can build.** The fleet's most expensive failure is
   a retry: a red CI gate tears the worker down and a *fresh* worker re-reads the issue, the docs,
   and the failure from scratch. A local `build && test` gate catches most failures inside the same
@@ -91,8 +91,8 @@ escalate_label: ready-for-human        # applied (with ready_label removed, clai
   every completed step (progress preservation), so on `required` every one of those pushes fires the
   repo's `on: push` / `on: pull_request` workflows while the fleet reads only the last run — and then
   the landing waits for yet another full run. In `local` mode the local command is the
-  whole gate, run twice: by the worker after its pre-PR **sync**, and by its landing on the
-  PR stacked on `base_branch`'s tip — or once, when nothing moved in between (next note). Three obligations come with it:
+  whole gate, run twice: by the worker after its pre-PR **sync**, and by the landing — the landing
+  train's, on everything that joined — or once, when nothing moved in between (next note). Three obligations come with it:
   - **Scope remote CI away from worker branches** (e.g. trigger `on: push` for the target branch only,
     and drop `on: pull_request`). The fleet cannot edit your workflows — if you leave them broad you
     keep paying the congestion, you just stop reading it.
@@ -122,7 +122,7 @@ escalate_label: ready-for-human        # applied (with ready_label removed, clai
   (secrets, live infra) is never done by the fleet.
 - **Reserved labels, refs & the status comment.** The fleet manages, durably in GitHub, the
   `afk-attempt/<n>` labels (retry count) and `afk-attempt/starting` (a retry under way), the hidden `refs/afk/*` ref namespace — `refs/afk/claim/<n>` (the
-  claim, one per owned issue), `refs/afk/heartbeat/<id>` (per-instance liveness) and `refs/afk/base` (the base branch, as last confirmed) — and the single status-board comment tagged `<!--afk:status-->` (found and
+  claim, one per owned issue), `refs/afk/heartbeat/<id>` (per-instance liveness), `refs/afk/base` (the base branch, as last confirmed) and `refs/afk/train/…` (the landing train, where one runs) — and the single status-board comment tagged `<!--afk:status-->` (found and
   overwritten by that marker each tick), beside the `<!--afk:escalation …-->` marker that leads an escalation's comment. This is what keeps ticks stateless and lets fleets cooperate
   (see the skill's "Why it runs forever" and ADR-0003). Don't hand-edit them or reuse the
   `afk-attempt/*` / `refs/afk/*` prefixes or the `<!--afk:status-->` marker. If an org ruleset forbids

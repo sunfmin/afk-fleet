@@ -1,5 +1,7 @@
 # ADR-0029 — A merge batch lands N ready PRs behind one gate run
 
+**Superseded by [ADR-0048](0048-finished-prs-join-a-landing-train-gated-whenever-the-gate-is-free.md) (#157):** there is no merge batch any more. Where batches formed, finished PRs join a landing train — an append-only line gated whenever the gate is free — instead of being stacked by a batch formed once, on a turn. Everything below is as it was decided then.
+
 **Amended by [ADR-0034](0034-every-pr-lands-as-a-merge-commit-and-batches-need-no-switch.md):** a
 batch is no longer opt-in (`merge.batch` is removed), its stack is one **merge** commit per PR, and
 a batched PR reads *merged* on GitHub, not *closed*. Read "squash commit", "with the option on"
