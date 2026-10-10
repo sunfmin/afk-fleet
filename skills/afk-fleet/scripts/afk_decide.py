@@ -4249,6 +4249,9 @@ OUTSIDE_THE_DIGEST: dict[str, str] = {
     "closed": "asked only of a claim whose issue is missing from the open list: the issue "
               "leaving that list moved the digest; a read that failed is retried by the "
               "forced tick",
+    "landed": "asked only of a claim of mine on an open issue no open PR closes, and true "
+              "only once its PR was pushed to the target: GitHub showing that PR merged "
+              "took it off the open list, which moved the digest",
     "me": "the run's own instance id: no cycle changes it",
     "config": "the run's own config: no cycle changes it",
 }

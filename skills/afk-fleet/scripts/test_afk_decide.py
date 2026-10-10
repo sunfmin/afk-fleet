@@ -3078,6 +3078,7 @@ def _world(rng):
                        if rng.random() < 0.8},
         "turns": turns,
         "closed": [n for n in claimed if n not in numbers and rng.random() < 0.7],
+        "landed": [n for n in claimed if n in numbers and rng.random() < 0.3],
         "config": d.resolve_config({"epic_labels": ["epic"], "concurrency": rng.randrange(1, 5),
                                     "gate": {"ci": rng.choice(["required", "local"])}}),
     }
