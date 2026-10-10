@@ -160,10 +160,14 @@ class Config(TypedDict):
     claim_namespace: str
 
 
-class BatchMember(TypedDict):
-    """One PR a merge batch holds, with the issue it closes."""
+class Joined(TypedDict):
+    """One PR's joining of a landing train, as the merge commit it joined with
+    says it (`read_joins`): the issue it closes, the PR, the commit, and the
+    PR's head it merged — the commit's second parent."""
     issue: int
     pr: int
+    commit: str
+    head: str
 
 
 class Turn(TypedDict):
@@ -178,11 +182,7 @@ class Turn(TypedDict):
     head: str | None
     restarted: int | None
     given_up: int | None
-    batch: str | None
-    members: list[BatchMember]
-    phase: BatchPhase | None
-    unbatched: Unbatched | None
-    of: str | None
+    abandoned: int | None
     released: bool
     comment_id: int | None
 
@@ -241,10 +241,10 @@ class WorkerRow(Seen):
     turn_at: int | None
 
 
-class BatchWorkerRow(Seen):
-    """`afk no-pr --batch`'s row: a batch's worker declares no verdict and
-    names no blocker."""
-    batch: str
+class TrainWorkerRow(Seen):
+    """`afk no-pr --train`'s row: the train's worker declares no verdict and
+    names no blocker. `train` is the train's ref."""
+    train: str
     worktree: str | None
     progress: Progress | None
     nudged_at: int | None
@@ -297,13 +297,6 @@ class RecoveryPlan(TypedDict):
     reason: str
 
 
-class RowBatch(TypedDict):
-    """The merge batch a `landing` row's turn is in, as the row carries it."""
-    id: str
-    members: list[int]
-    phase: BatchPhase | None
-
-
 class MineRow(TypedDict):
     """One claim of mine in the working set (`assemble_working_set`)."""
     number: int
@@ -315,29 +308,7 @@ class MineRow(TypedDict):
     attempt: int
     starting: bool
     stopped: LandOutcome | None
-    batch: RowBatch | None
-    unbatched: Unbatched | None
     given_up: bool
-
-
-class BoardBatch(TypedDict):
-    """The merge batch a status board names: its PRs and what is being done."""
-    prs: list[int]
-    phase: BatchPhase
-
-
-class Stacked(BatchMember):
-    """A member whose PR is on the batch's stack, with the commit that put it there."""
-    commit: str
-
-
-class Batch(TypedDict):
-    """A merge batch on record on my claims' PRs, mine or a dead fleet's."""
-    id: str
-    instance: str
-    members: list[BatchMember]
-    phase: BatchPhase | None
-    at: int | None
 
 
 class Dispatchable(TypedDict):
@@ -371,7 +342,6 @@ class WorkingSet(TypedDict):
     frontier: Frontier
     mine: list[MineRow]
     merge_order: list[int]
-    batches: list[Batch]
     peer_live: list[PeerClaim]
     stale: list[StaleClaim]
     stale_closed: list[StaleClaim]
@@ -463,15 +433,17 @@ def stamp_age(stamp: float | None, now: float) -> int | None:
 
 
 # The two places claim + heartbeat refs can live, as namespace → (claim ref prefix,
-# heartbeat ref prefix, the ref of the base branch's record). `refs/afk` is hidden
-# from branch listings and `on: push` CI; `refs/heads` is the fallback for a remote
-# whose rules forbid non-branch refs, where the same markers are ordinary
-# `afk-claim/*` / `afk-heartbeat/*` branches and an `afk-base` one (ADR-0003). A
-# closed set: any other prefix would be a third layout no probe, warning or doc
-# describes.
+# heartbeat ref prefix, the ref of the base branch's record, landing-train ref
+# prefix — `train_refs`). `refs/afk` is hidden from branch listings and `on: push` CI;
+# `refs/heads` is the fallback for a remote whose rules forbid non-branch refs,
+# where the same markers are ordinary `afk-claim/*` / `afk-heartbeat/*` branches
+# and an `afk-base` one, and a train is an `afk-train/*` branch (ADR-0003,
+# ADR-0048). A closed set: any other prefix would be a third layout no probe,
+# warning or doc describes.
 CLAIM_NAMESPACES = {
-    "refs/afk": ("refs/afk/claim", "refs/afk/heartbeat", "refs/afk/base"),
-    "refs/heads": ("refs/heads/afk-claim", "refs/heads/afk-heartbeat", "refs/heads/afk-base"),
+    "refs/afk": ("refs/afk/claim", "refs/afk/heartbeat", "refs/afk/base", "refs/afk/train"),
+    "refs/heads": ("refs/heads/afk-claim", "refs/heads/afk-heartbeat", "refs/heads/afk-base",
+                   "refs/heads/afk-train"),
 }
 BRANCH_NAMESPACE = "refs/heads"
 
@@ -740,7 +712,7 @@ CONFIG_REMOVED = {
         "Delete the key."),
     "merge.strategy": (
         "every PR lands as a merge commit now (ADR-0034): a PR's own head reaches the target, so "
-        "GitHub shows it merged whether it landed alone or in a merge batch. There is no squash "
+        "GitHub shows it merged whether it landed alone or on a landing train. There is no squash "
         "and no rebase. Delete the key."),
     "claim": (
         "an issue is always claimed by its claim ref (ADR-0003): the key named the one way "
@@ -752,9 +724,9 @@ CONFIG_REMOVED = {
         "a worker is always started through orca (ADR-0005): the key named the one backend "
         "there is, and nothing read it. Delete the key."),
     "merge.batch": (
-        "merge batches are no longer an option (ADR-0034): with gate.ci 'local' and no "
-        "adversarial verify, two or more PRs that are ready together always land as "
-        "one batch. Delete the key."),
+        "landing together is not an option (ADR-0034, ADR-0048): with gate.ci 'local' and no "
+        "adversarial verify, finished PRs always land on the fleet's landing train, behind "
+        "whichever gate run is next. Delete the key."),
     "gate.adversarial_verify": (
         "a non-empty gate.adversarial_verify_prompt is what turns the adversarial verify on "
         "(ADR-0038): say what the verifier checks, or leave it empty for none. Delete the key."),
@@ -1265,11 +1237,12 @@ def classify_claims(claims: list[Claim], heartbeats: Mapping[str, float], me: st
 # re-rendered. The keys are the vocabulary the tick's instructions route on (a
 # test holds the docs to it). `merged` / `escalated` / `parked`, the board's
 # terminal phases, are written by the transitions that reach them.
-ClaimStatus = Literal["awaiting_turn", "landing", "fixing", "awaiting_ci", "failure", "no_pr",
-                      "landed", "closed"]
+ClaimStatus = Literal["awaiting_turn", "landing", "joining", "joined", "fixing", "awaiting_ci", "failure",
+                      "no_pr", "landed", "closed"]
 BOARD_PHASE_OF: dict[ClaimStatus, Optional[StatusPhase]] = {
-    "awaiting_turn": "awaiting_turn", "landing": "landing", "fixing": "fixing",
-    "awaiting_ci": "pr_open", "failure": "ci_failed", "no_pr": "claimed",
+    "awaiting_turn": "awaiting_turn", "landing": "landing", "joining": "joining",
+    "joined": "joined",
+    "fixing": "fixing", "awaiting_ci": "pr_open", "failure": "ci_failed", "no_pr": "claimed",
     "landed": None, "closed": None}
 CLAIM_STATUSES = tuple(BOARD_PHASE_OF)
 
@@ -1279,7 +1252,8 @@ ChecksState = Literal["green", "red", "pending"]
 
 def claim_status(has_pr: bool, checks_state: ChecksState | None, ci_mode: GateCiMode,
                  closed: bool = False, landing: bool = False,
-                 landed: bool = False, fixing: bool = False) -> ClaimStatus:
+                 landed: bool = False, fixing: bool = False,
+                 train: bool = False, joined: bool = False) -> ClaimStatus:
     """
     Classify one of MY in-flight claims from its PR + checks → its `status`, one
     of CLAIM_STATUSES: what the tick does next.
@@ -1291,12 +1265,17 @@ def claim_status(has_pr: bool, checks_state: ChecksState | None, ci_mode: GateCi
                     (`afk land` cannot release the claim), or a human finished it
                     by hand
       landing:      the PR holds this fleet instance's landing turn (`held_turn`)
-      landed:       no open PR closes the issue, the issue is still open, and the
-                    target holds the commit it was stacked with — by a merge
-                    batch, or alone: that landing's finishing was cut short
-                    after its push (ADR-0029, ADR-0046)
+      landed:       the issue is still open and the target already holds what
+                    lands it — the commit its PR joined the landing train with,
+                    or the head of the PR still open on it: the train's
+                    finishing was cut short after its push (ADR-0048)
       fixing:       the PR gave this fleet instance's landing turn up and its
                     worker has not said it is ready again (`fixing_off_turn`)
+      train:        a landing train runs under this config (`train_runs`): a
+                    finished PR joins it, and no PR is granted a turn
+      joined:       the PR's head is on the landing train — the train's newest
+                    merge commit for the PR merged exactly that head — and the
+                    train has not landed it yet
 
       closed         its leftover claim (and worktree) is released
       landed         the same release, which closes the issue first — never the
@@ -1305,6 +1284,12 @@ def claim_status(has_pr: bool, checks_state: ChecksState | None, ci_mode: GateCi
       no_pr          `afk no-pr` is asked why
       landing        `afk no-pr` is asked whether its worker is still at it — or,
                      when the landing stopped for the tick, `afk turn` again
+      joining        where a train runs, an open PR that is not on it: joining
+                     is its own worker's next step (`afk land`), with no turn
+                     to wait for — `afk no-pr` is asked whether that worker is
+                     still at it (ADR-0048)
+      joined         left: its own worker has nothing more to do — the train's
+                     worker gates and lands it, and is the one asked after
       fixing         `afk no-pr` is asked whether its worker is still at it; it
                      holds no turn and is not in `merge_order` (ADR-0045)
       awaiting_ci    left: checks exist and are still running
@@ -1319,19 +1304,24 @@ def claim_status(has_pr: bool, checks_state: ChecksState | None, ci_mode: GateCi
       `awaiting_ci` / `gate_red`), never a second route into `afk fail`. The
       same goes for a `fixing` one: the red run is what its worker is fixing.
     - In `local` mode (ADR-0012) every open PR without the turn is
-      `awaiting_turn`: gating is an action `afk land` takes, not an observation
-      the tick waits for, so a red remote run the fleet does not gate on must
-      not park the claim in `failure`.
+      `awaiting_turn` — or, where a train runs, `joining` / `joined`: gating
+      is an action a landing takes, not an observation the tick waits for, so
+      a red remote run the fleet does not gate on must not park the claim in
+      `failure`.
     - A PR with NO checks at all is `awaiting_turn` in `required` mode too:
       nothing is running, so `awaiting_ci` would park it forever. `afk turn` is
       where the tick's judgment is asked for (`no_checks`).
     """
     if closed:
         return "closed"
+    if landed:
+        return "landed"
     if not has_pr:
-        return "landed" if landed else "no_pr"
+        return "no_pr"
     if landing:
         return "landing"
+    if train:
+        return "joined" if joined else "joining"
     if fixing:
         return "fixing"
     if ci_mode == "local" or checks_state in ("green", None):
@@ -1344,11 +1334,12 @@ def claim_status(has_pr: bool, checks_state: ChecksState | None, ci_mode: GateCi
 # --------------------------------------------------------------------------- #
 #
 # In `gate.ci: local` the repo-local build/test command IS the completion gate:
-# the worker runs it after its pre-PR sync, and `afk land` runs it again on the
-# landing turn, after the landing's sync, in the same worktree. The invariant
+# the worker runs it after its pre-PR sync, and the landing runs it again on
+# what is about to land — the train's worker on the train (`afk land --train`),
+# or, with an adversarial verify, `afk land` on the synced head. The invariant
 # both runs serve: *what lands on the target branch was tested in the form it
 # lands.* A green run is put on record on the remote, under the TREE it tested and
-# the command that ran, so any run — the landing's, a batch's — is skipped when,
+# the command that ran, so any run — a landing's, the train's — is skipped when,
 # and only when, that tree was already tested green by that command, wherever it
 # ran (`gate_record_void`, ADR-0030). A red run comes back as a bounded excerpt,
 # never a raw log.
@@ -1394,7 +1385,7 @@ def gate_record_ref(tree: str, command: str) -> str:
 def gate_record(tree: str, command: str, at: float) -> Obj:
     """
     What a GREEN run of the local gate on a committed tree puts on record — by
-    `afk gate`, `afk land` and a batch's landing alike; never after a red or
+    `afk gate`, `afk land` and the train's landing alike; never after a red or
     timed-out run, and never for a run over uncommitted or untracked files, which
     tested a tree no commit holds:
 
@@ -1461,7 +1452,7 @@ def base_refusal(answer: str, recorded: str | None, heads: Iterable[str], claims
 
 
 def protection_verdict(ci_mode: GateCiMode, protection: Obj | None,
-                       unavailable: str | None = None, batch: bool = False) -> Obj:
+                       unavailable: str | None = None, train: bool = False) -> Obj:
     """
     Is the merge target's branch protection compatible with the configured gate?
     Read at bootstrap, with the human present (ADR-0012).
@@ -1470,9 +1461,9 @@ def protection_verdict(ci_mode: GateCiMode, protection: Obj | None,
       protection:  the target branch's protection object, or None if it has none
       unavailable: why protection could not be read (no admin rights, an API
                    error); None when the read succeeded
-      batch:       merge batches form under this config (`batches_form`) — one
-                   lands by PUSHING its stack to the target, so the target must
-                   also accept a direct push
+      train:       a landing train runs under this config (`train_runs`) — it
+                   lands by PUSHING its gated commit to the target, so the
+                   target must also accept a direct push
 
     Returns {"verdict": "ok"|"error"|"warn", "required_checks": [...], "detail"}.
 
@@ -1481,9 +1472,9 @@ def protection_verdict(ci_mode: GateCiMode, protection: Obj | None,
              `--admin` — also overrides human review, far too much power for an
              unattended fleet. So this is a hard error at bootstrap, not a
              surprise on the first merge.
-             Likewise `batch` + a target that refuses a direct push (it
-             requires a pull request, restricts who may push, or is locked): every
-             batch would gate its stack and then be refused (ADR-0029).
+             Likewise `train` + a target that refuses a direct push (it
+             requires a pull request, restricts who may push, or is locked): the
+             train would be gated and then refused (ADR-0048).
       warn   the probe itself was inconclusive: continue, but say so.
       ok     nothing incompatible. In `required` mode required checks are exactly
              what the fleet waits for, so they are never a problem.
@@ -1511,11 +1502,11 @@ def protection_verdict(ci_mode: GateCiMode, protection: Obj | None,
                 if (protection or {}).get(key)]
     if ((protection or {}).get("lock_branch") or {}).get("enabled"):
         refusals.append("is locked")
-    if batch and refusals:
+    if train and refusals:
         return {"verdict": "error", "required_checks": [],
                 "detail": f"the target branch {' and '.join(refusals)} — with gate.ci 'local', "
-                          f"PRs that are ready together land as a merge batch, by pushing its "
-                          f"stack to the target as a fast-forward, and that push would be "
+                          f"finished PRs land on a landing train, by pushing its gated commit "
+                          f"to the target as a fast-forward, and that push would be "
                           f"refused. Either lift that protection or use gate.ci: required."}
     return {"verdict": "ok", "required_checks": [],
             "detail": "target branch requires no status checks — a local gate can merge"}
@@ -1595,7 +1586,7 @@ def gate_comment(verdict: Obj, command: str) -> str:
 # — does signal 3 alone settle it (busy, gone)? — and, only when it does not,
 # `classify_stopped` over all three. Each answers with a CAUSE, one of
 # `WORKER_CAUSES`: the one thing decided here, and the one thing the tick routes
-# on (`worker_step`, `batch_step`). Of a WORKER, two words are kept apart: its
+# on (`worker_step`, `train_step`). Of a WORKER, two words are kept apart: its
 # VERDICT is what it declared in its marker (an input); its OUTCOME is what
 # this code concludes from all three signals. (A gate's verdict, or branch
 # protection's, is another thing: what one run or one read came to.) Whether to TRUST the marker
@@ -1610,7 +1601,7 @@ _SATISFIED, _BLOCKED, _GIVING_UP, _NEEDS_DECISION = VERDICT_PHASES
 # What a tick does about a worker, by the cause it was classified with: the two
 # columns of WORKER_CAUSES `tick_plan` and `_turn_plan` route on.
 WorkerStep = Literal["leave", "dispatch", "park", "nudge", "restart", "escalate", "fail", "judge"]
-BatchStep = Literal["leave", "continue", "nudge", "abandon"]
+TrainStep = Literal["leave", "continue", "nudge", "abandon"]
 
 
 class Cause(NamedTuple):
@@ -1619,13 +1610,13 @@ class Cause(NamedTuple):
     outcome: str            # } how `afk no-pr` prints it for a human; the tick
     action: str             # } routes on neither
     step: WorkerStep        # what a tick does about an ISSUE's worker (`worker_step`)
-    batch_step: BatchStep | None = None     # …about a MERGE BATCH's worker (`batch_step`);
-    #                         None: a batch's worker is never classified so
+    train_step: TrainStep | None = None     # …about a LANDING TRAIN's worker (`train_step`);
+    #                         None: a train's worker is never classified so
 
 
 # Every cause a classification can name. The cause is the one thing
 # `settled_by_worker_state` and `classify_stopped` decide; what the tick then
-# does is this table's, read by `worker_step` and `batch_step` and re-derived
+# does is this table's, read by `worker_step` and `train_step` and re-derived
 # by neither.
 #
 #   step        leave | dispatch | park | nudge | restart   run as it stands
@@ -1633,9 +1624,9 @@ class Cause(NamedTuple):
 #                                  the reason is not on record, the `reason`
 #                                  judgment that asks for it
 #               judge              the tick's own judgment (`empty_diff`)
-#   batch_step  leave | continue (a new batch worker, in its worktree or from
-#               its pushed branch) | nudge | abandon (nothing landed; its PRs
-#               take single turns)
+#   train_step  leave | continue (a new train worker, in the train's worktree
+#               or one cut at the train's tip) | nudge | abandon (the train is
+#               given up; the PRs on it join the next one)
 #
 # The silence ladder is the `silent*` rows: a worker that stopped with no
 # verdict is nudged once (`silent`, no attempt spent — ADR-0018); silent again
@@ -1644,7 +1635,9 @@ class Cause(NamedTuple):
 # escalated with its PR, branch and worktree kept (`silent_past_restart`) — a
 # landing turn's silence never spends an attempt (ADR-0035). A PR that gave its
 # turn up and is being fixed off it climbs those same two rungs (ADR-0045). A
-# batch has nothing to restart onto: its second silence abandons it.
+# PR that is to join the landing train has no turn to be restarted onto: its
+# worker's second silence escalates it as it is. The train worker's second
+# silence abandons the train (ADR-0048).
 #
 # What a worker DECLARED is routed by who can supply what it lacks: the backlog
 # (`blocked` → park), the next worker (`giving-up` → fail, a fresh retry), or
@@ -1671,7 +1664,7 @@ WORKER_CAUSES: dict[WorkerCause, Cause] = {
     "no_blocker_named":    Cause("idle_blocked", "escalate", "escalate"),     # `blocked`, naming none
     "silent":              Cause("idle_stalled", "nudge", "nudge", "nudge"),  # no verdict, never nudged
     "silent_on_turn":      Cause("idle_stalled", "restart", "restart"),       # silent after its nudge, on a landing turn — or fixing off one it gave up
-    "silent_past_restart": Cause("idle_stalled", "escalate", "escalate"),     # …and again, after the turn's one restart
+    "silent_past_restart": Cause("idle_stalled", "escalate", "escalate"),     # …and again, after the turn's one restart — or after its nudge, a PR that is to join the train
     "gave_up":             Cause("idle_failed", "next_attempt", "fail"),      # `giving-up`
     "needs_decision":      Cause("idle_undecided", "escalate", "escalate"),   # `needs-decision`: no attempt spent
     "unknown_phase":       Cause("idle_failed", "next_attempt", "fail"),      # a verdict naming no phase the fleet knows
@@ -1962,14 +1955,15 @@ def settled_by_worker_state(reading: WorkerReading, now: float, grace_seconds: f
 
 def single_turn_held(turn: Turn | None) -> bool:
     """Is `turn` (`latest_turn`, or {} / None) ONE PR's landing turn, held — `at`
-    set, not `released`, no merge batch's? A no_pr claim has no turn, so never."""
-    return bool(turn and turn["at"] is not None and not turn["released"] and not turn["batch"])
+    set, not `released`? A no_pr claim has no turn, so never."""
+    return bool(turn and turn["at"] is not None and not turn["released"])
 
 
 def turn_given_up(turn: Turn | None) -> bool:
     """Does `turn` say its PR gave its landing turn up and has been granted none
-    since (`given_up_turn`)? Such a marker holds no turn (`released`)."""
-    return bool(turn and turn["given_up"] and turn["released"])
+    since (`given_up_turn`)? Such a marker holds no turn (`released`). A PR
+    whose train was abandoned since carries that instead (`abandoned_turn`)."""
+    return bool(turn and turn["given_up"] and turn["released"] and not turn["abandoned"])
 
 
 def fixing_off_turn(turn: Turn | None) -> bool:
@@ -1997,7 +1991,8 @@ def restartable_turn(turn: Turn | None) -> bool:
 def classify_stopped(progress: Progress | None, terminal_idle_seconds: float | None,
                      worker_verdict: Verdict | None, blocker_states: Mapping[int, str] | None,
                      now: float, grace_seconds: float, nudged_at: float | None = None,
-                     can_nudge: bool = True, turn: Turn | None = None) -> Seen:
+                     can_nudge: bool = True, turn: Turn | None = None,
+                     joining: bool = False) -> Seen:
     """
     The classification of one of MY claims that is waiting on a worker which has
     STOPPED — a `no_pr` claim, or a `landing` one, that `settled_by_worker_state`
@@ -2022,9 +2017,16 @@ def classify_stopped(progress: Progress | None, terminal_idle_seconds: float | N
                        which is not a silence; and whether the PR's own worker
                        is at its landing under it, restarted yet or not
                        (`worker_at_landing`, `restartable_turn`), which picks the
-                       rung of the silence ladder. A merge batch's turn (`batch`)
-                       has no rungs of its own: its worker is classified like a
-                       PR-less claim's.
+                       rung of the silence ladder. The landing train's worker
+                       has no turn marker and no rungs of its own: it is
+                       classified like a PR-less claim's, the last time it was
+                       told something handed in as the `at` of a record that
+                       holds no turn.
+      joining:         the claim's PR is open and is to join the landing train
+                       (a `joining` row): finished work, so its worker's
+                       silence after the nudge never fails the claim — it is
+                       escalated with everything kept, as a landing past its
+                       restart is (ADR-0048).
 
     Returns {"cause", "outcome", "action", "idle_seconds", "pending_blockers"}.
     `cause` is the decision — one of the `classify_stopped` rows of WORKER_CAUSES,
@@ -2052,7 +2054,7 @@ def classify_stopped(progress: Progress | None, terminal_idle_seconds: float | N
         # …or, having declared nothing, why it is quiet
         if stopped in LAND_WAITS:
             return _seen("awaiting_tick", idle_seconds)
-        if worker_at_landing(turn) and (nudged_at is not None or not can_nudge):
+        if (worker_at_landing(turn) or joining) and (nudged_at is not None or not can_nudge):
             # one PR's landing climbs its own ladder: restart, then escalate
             return _seen("silent_on_turn" if restartable_turn(turn) else "silent_past_restart",
                          idle_seconds)
@@ -2137,16 +2139,12 @@ def stall_reason(reason: str, tail: Iterable[str] | None) -> str:
 # runs no local gate (ADR-0047) and merges nothing; `stopped=awaiting_turn` says
 # the PR is ready again.
 #
-# A turn is held by one PR or by one MERGE BATCH (ADR-0029). A batch's turn is
-# the same marker on every member PR, with three more fields:
-#
-#   batch=<id> members=<issue>:<pr>,… phase=<stacking|gating|fixing>
-#
-# and a PR that left a batch without landing — left out of the stack, or in a
-# batch that was abandoned or dissolved — carries `unbatched=<why> of=<batch>`
-# from then on, on every marker written for it: it lands on a single turn and
-# is never batched again. The marker that only says so holds no turn:
-# `released=1`.
+# Where a LANDING TRAIN runs (`train_runs`, ADR-0048) no PR is granted a turn
+# and none is recorded: a finished PR's worker joins the train by itself, and
+# the push of the train is the lock. The one thing a marker says there is that
+# the train a PR was on was abandoned before it landed the PR
+# (`abandoned=<epoch> released=1`, `abandoned_turn`): the PR joins the next
+# train, and a second abandonment hands it to a human instead.
 #
 # A marker is never written from loose fields: it is REWRITTEN from the record
 # it was read as (`latest_turn`) plus what changed (`next_turn`), and rendered
@@ -2157,7 +2155,7 @@ def stall_reason(reason: str, tail: Iterable[str] | None) -> str:
 # Every `outcome` `afk land` can stop with — the vocabulary the worker's prompt
 # routes on (a test holds the prompt and the docs to it). What each means is
 # `afk.cmd_land`'s docstring, and nowhere else in the code.
-LandOutcome = Literal["merged", "conflict", "gate_red", "target_moved", "awaiting_ci",
+LandOutcome = Literal["merged", "joined", "conflict", "gate_red", "target_moved", "awaiting_ci",
                       "needs_verify", "no_checks", "awaiting_turn"]
 LAND_OUTCOMES: tuple[LandOutcome, ...] = get_args(LandOutcome)
 
@@ -2178,47 +2176,22 @@ TurnOutcome = Literal["granted", "waiting", "landing", "fixing", "awaiting_ci", 
                       "no_checks", "needs_verify"]
 TURN_OUTCOMES: tuple[TurnOutcome, ...] = get_args(TurnOutcome)
 
-# Every `outcome` `afk turn --batch` and `afk turn --abandon` can stop with: the
-# three a single turn shares, `too_few` (no batch to form: the turn goes to one
-# PR) and `abandoned`. The pass routes them in code (`_turn_plan`).
-BatchTurnOutcome = Literal["granted", "waiting", "landing", "too_few", "abandoned"]
-BATCH_TURN_OUTCOMES: tuple[BatchTurnOutcome, ...] = get_args(BatchTurnOutcome)
+# Every `outcome` `afk turn --train` and `afk turn --abandon` can stop with.
+# The pass routes them in code (`_train_plan`).
+TrainTurnOutcome = Literal["granted", "landing", "stopped", "idle", "abandoned"]
+TRAIN_TURN_OUTCOMES: tuple[TrainTurnOutcome, ...] = get_args(TrainTurnOutcome)
 
-# What a merge batch's worker is doing with the stack, as its last
-# `afk land --batch` wrote it on the members' turn markers.
-BatchPhase = Literal["stacking", "gating", "fixing"]
-BATCH_PHASES: tuple[BatchPhase, ...] = get_args(BatchPhase)
-
-# Every `outcome` `afk land --batch` can stop with — the vocabulary the batch
+# Every `outcome` `afk land --train` can stop with — the vocabulary the train
 # brief routes on (a test holds the brief and the docs to it).
-BatchOutcome = Literal["landed", "gate_red", "target_moved", "too_small"]
-BATCH_OUTCOMES: tuple[BatchOutcome, ...] = get_args(BatchOutcome)
-
-# Why a PR left a merge batch without landing: it conflicted with the stack, the
-# batch's worker went silent (or its fleet died), or too few members remained.
-Unbatched = Literal["left_out", "abandoned", "dissolved"]
-UNBATCHED: tuple[Unbatched, ...] = get_args(Unbatched)
-
-
-def _batch_members(raw: str | None) -> list[dict[str, int]]:
-    """`1:10,2:20` → [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}]; anything
-    else in the list is dropped."""
-    pairs = [[fleet_number(part) for part in tok.split(":")] for tok in (raw or "").split(",")]
-    return [{"issue": p[0], "pr": p[1]} for p in pairs
-            if len(p) == 2 and p[0] is not None and p[1] is not None]
-
-
-# The PRs a merge batch holds, in stack order, each with the issue it closes.
-_MEMBERS = FieldType(lambda members: ",".join(f"{m['issue']}:{m['pr']}" for m in members),
-                     lambda raw: _batch_members(raw) or None, empty=(), many=True)
+TrainOutcome = Literal["landed", "gate_red", "conflict", "target_moved", "idle"]
+TRAIN_OUTCOMES: tuple[TrainOutcome, ...] = get_args(TrainOutcome)
 
 # The landing turn, as the marker of one comment on a PR. A marker that names no
 # instance is not a record — nobody could hold it.
 TURN_RECORD = RecordKind("afk:turn", {
     "instance": str, "at": int, "verified": str, "allow_no_checks": FLAG,
     "stopped": one_of(LAND_OUTCOMES), "head": str, "restarted": int, "given_up": int,
-    "batch": str, "members": _MEMBERS, "phase": one_of(BATCH_PHASES),
-    "unbatched": one_of(UNBATCHED), "of": str, "released": FLAG}, ("instance",))
+    "abandoned": int, "released": FLAG}, ("instance",))
 
 
 _Word = TypeVar("_Word", bound=str)
@@ -2235,12 +2208,12 @@ def _refusing(vocabulary: tuple[_Word, ...], what: str) -> Callable[[str], _Word
     return check
 
 
-# One guard per vocabulary: one PR's turn cannot stop with a word only a merge
-# batch's is routed on, nor the other way round (ADR-0036).
+# One guard per vocabulary: one PR's turn cannot stop with a word only the
+# train's is routed on, nor the other way round (ADR-0036).
 land_outcome = _refusing(LAND_OUTCOMES, "a landing outcome")
 turn_outcome = _refusing(TURN_OUTCOMES, "a turn outcome")
-batch_turn_outcome = _refusing(BATCH_TURN_OUTCOMES, "a batch turn outcome")
-batch_outcome = _refusing(BATCH_OUTCOMES, "a batch outcome")
+train_turn_outcome = _refusing(TRAIN_TURN_OUTCOMES, "a train turn outcome")
+train_outcome = _refusing(TRAIN_OUTCOMES, "a train outcome")
 
 
 # The record of a PR that was never granted a turn: every field of TURN_RECORD
@@ -2250,11 +2223,9 @@ _NO_TURN = {**blank_record(TURN_RECORD), "comment_id": None}
 
 
 def _whole_turn(fields: Obj) -> Obj:
-    """A turn's fields with the ones that say nothing alone taken out: `head` is
-    where a landing `stopped`, `members` and `phase` are a `batch`'s."""
-    return {**fields,
-            **({} if fields.get("stopped") else {"head": None}),
-            **({} if fields.get("batch") else {"members": [], "phase": None})}
+    """A turn's fields with the one that says nothing alone taken out: `head` is
+    where a landing `stopped`."""
+    return {**fields, **({} if fields.get("stopped") else {"head": None})}
 
 
 def next_turn(prev: Turn | None, **changed: Any) -> Turn:
@@ -2274,8 +2245,7 @@ def next_turn(prev: Turn | None, **changed: Any) -> Turn:
 def single_turn(prev: Turn | None, instance: str, at: float, verified: str | None = None,
                 allow_no_checks: bool = False, restarted: int | None = None) -> Turn:
     """The record of ONE PR's landing turn, granted now (or granted again) over
-    `prev`: the worker is told to land, so it has not stopped, and the turn is
-    no batch's.
+    `prev`: the worker is told to land, so it has not stopped.
 
       instance:        the fleet instance granting the turn
       at:              when the worker was told (epoch seconds) — the sign of
@@ -2290,7 +2260,7 @@ def single_turn(prev: Turn | None, instance: str, at: float, verified: str | Non
     """
     return next_turn(prev, instance=instance, at=at, verified=verified,
                      allow_no_checks=bool(allow_no_checks), stopped=None, head=None,
-                     restarted=restarted, batch=None, members=[], phase=None, released=False)
+                     restarted=restarted, abandoned=None, released=False)
 
 
 def gives_turn_up(turn: Turn, outcome: LandOutcome) -> bool:
@@ -2318,73 +2288,45 @@ def given_up_turn(prev: Turn, at: float, stopped: LandOutcome, head: str) -> Tur
                      released=True)
 
 
-def batch_turn(prev: Turn | None, instance: str, at: float, batch: str,
-               members: Iterable[BatchMember], phase: BatchPhase) -> Turn:
-    """The record of a MERGE BATCH's landing turn on one member PR, over that
-    PR's `prev` — the same on every member (ADR-0029).
-
-      batch:   the batch's id (`batch_id`)
-      members: [{"issue", "pr"}...], in stack order — every PR the batch holds
-      phase:   one of BATCH_PHASES
-    """
-    return next_turn(prev, instance=instance, at=at, verified=None, allow_no_checks=False,
-                     stopped=None, head=None, batch=batch, members=list(members), phase=phase,
-                     released=False)
-
-
-def unbatched_turn(prev: Turn | None, instance: str, at: float, batch: str,
-                   why: Unbatched) -> Turn:
-    """The record that replaces a batch's turn on a PR that left it without
-    landing. It holds no turn (`released`): the PR is back to waiting, takes a
-    single landing turn, and is never batched again.
-
-      why: one of UNBATCHED
-    """
-    return next_turn(prev, instance=instance, at=at, batch=None, members=[], phase=None,
-                     unbatched=why, of=batch, released=True)
+def abandoned_turn(prev: Turn | None, instance: str, at: float) -> Turn:
+    """The record written on a PR when the landing train it was on is abandoned
+    with the PR not landed (ADR-0048), by the `instance` that abandoned it. It
+    holds no turn — where a train runs nobody does — and says one thing: this
+    PR was taken off an abandoned train once. Its worker joins the next train;
+    a train abandoned with such a PR on it hands that PR to a human instead."""
+    return next_turn(prev, instance=instance, at=at, stopped=None, head=None, restarted=None,
+                     abandoned=int(at), released=True)
 
 
 def turn_comment(turn: Turn) -> str:
     """The PR comment that records a landing turn, from its record (`latest_turn`,
-    or one of `next_turn` / `single_turn` / `batch_turn` / `unbatched_turn`): the
-    marker `latest_turn` reads back — every field the record holds — then the
-    same facts worded for a human reading the PR. The record says which of the
-    four it is: a PR that gave its turn up (`turn_given_up`) or that left a batch
-    (`unbatched`) — neither holds a turn (`released`) — a merge batch's turn
-    (`batch`), or one PR's turn.
+    or one of `next_turn` / `single_turn` / `given_up_turn` / `abandoned_turn`):
+    the marker `latest_turn` reads back — every field the record holds — then
+    the same facts worded for a human reading the PR. The record says which of
+    the three it is: a PR that gave its turn up (`turn_given_up`), one whose
+    train was abandoned (`abandoned`) — neither holds a turn (`released`) — or
+    one PR's turn.
     """
-    instance, batch, stopped = turn["instance"], turn["batch"], turn["stopped"]
-    why = turn["unbatched"]
-    if batch and turn["phase"] not in BATCH_PHASES:
-        raise ValueError(f"not a batch phase: {turn['phase']!r}")
-    if turn["released"] and not turn["given_up"] and (why is None or why not in UNBATCHED):
-        raise ValueError(f"not a reason a PR leaves a batch: {why!r}")
-    if turn_given_up(turn):
+    instance, stopped = turn["instance"], turn["stopped"]
+    if turn["released"] and not (turn["given_up"] or turn["abandoned"]):
+        raise ValueError("a marker that holds no turn says why: the PR gave its turn up, or "
+                         "was on a train that was abandoned")
+    if turn["abandoned"]:
+        text = (f"**afk-fleet: this PR was on a landing train that was abandoned** (by fleet "
+                f"instance `{instance}`) before the train landed it — the train's worker went "
+                f"silent, was nudged, and stayed silent. Its own worker joins the next train "
+                f"with `afk land`. A PR is taken off an abandoned train once: the second time "
+                f"it is handed to a human as it is.")
+    elif turn_given_up(turn):
         state = (f"Its landing stopped with `{stopped}` on `{(turn['head'] or '')[:12]}`, and its "
                  f"worker is fixing that in place, off the turn — meanwhile other PRs land."
                  if fixing_off_turn(turn) else
                  "Its worker has fixed what the landing stopped on, and the PR is ready again: "
-                 "it waits for its next landing turn, ahead of PRs that never held one.")
+                 "it waits for its next landing turn.")
         text = (f"**afk-fleet: this PR gave its landing turn up** (fleet instance `{instance}`) "
-                f"— a turn covers only the sync, the gate and the merge. {state} A PR gives its "
+                f"— a turn covers only the bounded part of a landing. {state} A PR gives its "
                 f"turn up once: on its next turn a conflict or a red gate is fixed with the turn "
                 f"held.")
-    elif turn["released"] and why:
-        said = {"left_out": "it conflicted with the PRs stacked before it, and was left out",
-                "abandoned": "the batch was abandoned, and nothing landed",
-                "dissolved": "fewer than two PRs were left in the batch, so it was dissolved"
-                }[why]
-        text = (f"**afk-fleet: this PR was in merge batch `{turn['of']}`** — {said}. It now "
-                f"waits for a landing turn of its own, on which its worker lands it, and it is "
-                f"not batched again.")
-    elif batch:
-        prs = ", ".join(f"#{m['pr']}" for m in turn["members"])
-        text = (f"**afk-fleet: this PR is in a merge batch** (`{batch}`) of fleet instance "
-                f"`{instance}`: {prs} are stacked on the target as one merge commit each, gated "
-                f"once as a stack, and landed together by the batch's own worker "
-                f"(`afk land --batch`). This PR's branch is not touched; GitHub shows the PR "
-                f"merged once the stack is on the target. Phase: "
-                f"`{turn['phase']}`.")
     else:
         state = (f"Its last `afk land` stopped with `{stopped}` on `{(turn['head'] or '')[:12]}`."
                  if stopped else "The worker has been told to land it.")
@@ -2394,8 +2336,8 @@ def turn_comment(turn: Turn) -> str:
         again += (" This PR gave a turn up once already, so on this one a conflict or a red gate "
                   "is fixed with the turn held." if turn["given_up"] else "")
         text = (f"**afk-fleet: this PR holds the landing turn** of fleet instance `{instance}`. "
-                f"The worker that wrote the branch lands it with `afk land` — sync with the target, "
-                f"gate, merge — and the next PR's turn comes when this one has landed, failed or been escalated. "
+                f"The worker that wrote the branch lands it with `afk land`, and the next PR's "
+                f"turn comes when this one has landed, failed or been escalated. "
                 f"{state}{again}")
     stated = cast(Obj, turn)
     fields = _whole_turn({name: stated[name] for name in TURN_RECORD.fields})
@@ -2407,11 +2349,11 @@ def latest_turn(comments: Iterable[Comment] | None) -> Turn | None:
     The landing turn recorded on a PR, from its comments ([{"id", "body"}...],
     oldest first) → every field of TURN_RECORD — one the marker does not state
     at its type's `empty` — plus `comment_id`; or None when the PR was never
-    granted one (`latest_record`'s). `batch` / `members` / `phase` are set on a
-    merge batch's turn only, `stopped` / `head` once an `afk land` stopped;
-    `given_up` once the PR gave a turn up, for good; `released` says the marker
-    holds no turn at all. `turn_comment` renders the
-    record back: the two are a round trip.
+    granted one (`latest_record`'s). `stopped` / `head` are set once an
+    `afk land` stopped; `given_up` once the PR gave a turn up, for good;
+    `abandoned` once a landing train it was on was abandoned; `released` says
+    the marker holds no turn at all.
+    `turn_comment` renders the record back: the two are a round trip.
     """
     record, comment = latest_record(TURN_RECORD, comments)
     if record is None or comment is None:
@@ -2427,7 +2369,8 @@ def held_turn(turn: Turn | None, owner: str | None) -> Turn | None:
 
     A turn granted by another instance — the fleet the claim was taken over
     from — is nobody's: the new owner grants its own. So is a marker that only
-    says the PR left a batch, or gave its turn up (`released`).
+    says the PR gave its turn up, or was on a train that was abandoned
+    (`released`).
     """
     if turn and owner and turn["instance"] == owner and not turn["released"]:
         return turn
@@ -2437,30 +2380,26 @@ def held_turn(turn: Turn | None, owner: str | None) -> Turn | None:
 def own_landing(turn: Turn | None, owner: str | None) -> Turn | None:
     """`turn` (`latest_turn`) when the PR's OWN worker lands under it for the
     claim's `owner` — what `afk land` runs under, and what a worker started in
-    the PR's worktree is briefed to land by — else None: ONE PR's turn `owner`
-    granted and holds (`held_turn`, no merge batch's), or the marker of a PR
-    that gave `owner`'s turn up (`turn_given_up`), under which a landing syncs
-    and gates but merges nothing. A turn another instance gave up is nobody's,
-    like one it held: the new owner grants its own."""
-    if turn and owner and turn["instance"] == owner and not turn["batch"] and (
+    the PR's worktree is briefed to land by — else None: the turn `owner`
+    granted and the PR holds (`held_turn`), or the marker of a PR that gave
+    `owner`'s turn up (`turn_given_up`), under which a landing syncs but merges
+    nothing. A turn another instance gave up is nobody's, like one it held: the
+    new owner grants its own."""
+    if turn and owner and turn["instance"] == owner and (
             not turn["released"] or turn_given_up(turn)):
         return turn
     return None
 
 
-def landed_under(turn: Turn | None, claim: Claim) -> bool:
-    """Did the PR that carries `turn` (`latest_turn`) land `claim`'s issue? Asked
-    of a PR whose merge commit on the target closes that issue — which a PR
-    landed long ago does too, for an issue since reopened and claimed again.
-
-    Only on a turn it still holds — a merge batch's or its own, never
-    `released`: a PR that left its batch, or gave its turn up, landed nothing
-    on that marker — which the claim's own instance granted (`held_turn`) no
-    earlier than the claim was made; both times are the fleet's own clock.
-    """
-    held = held_turn(turn, claim["instance"])
-    return bool(held and held["at"] is not None
-                and claim["ts"] is not None and held["at"] >= claim["ts"])
+def landed_under(landed_at: int | None, claim: Claim) -> bool:
+    """Did the landing made at `landed_at` land `claim`'s issue? Asked of a
+    commit on the target that closes that issue — a turn's `at`, or the time of
+    the merge commit a PR joined the landing train with (`Joined`) — which a PR
+    landed long ago does too, for an issue since reopened and claimed again:
+    only one made no earlier than the claim was. Both times are the fleet's
+    own clock."""
+    return bool(landed_at is not None and claim["ts"] is not None
+                and landed_at >= claim["ts"])
 
 
 def turn_gate(ci_mode: GateCiMode, checks_state: ChecksState | None, allow_no_checks: bool,
@@ -2496,37 +2435,44 @@ def turn_order(rows: list[MineRow]) -> list[int]:
     """
     The order landing turns are granted in — the merge queue: the issue numbers
     of the `mine` rows whose PR is ready, a PR that already holds a turn first,
-    then a PR that gave a turn up and is ready again, then a PR that left a
-    merge batch without landing, then the lower PR number, then — one PR closing
-    several issues — the lower issue number. That is a total order, so the queue
-    never depends on the order the rows came in.
+    then a PR that gave a turn up and is ready again, then the lower PR number,
+    then — one PR closing several issues — the lower issue number. That is a
+    total order, so the queue never depends on the order the rows came in.
 
-      rows: `mine` rows {"number", "status", "pr", "given_up", "unbatched"}; only
-            `landing` and `awaiting_turn` ones are in the queue — a `fixing` PR
-            is not ready, and holds nobody back
+      rows: `mine` rows {"number", "status", "pr", "given_up"}; only `landing`
+            and `awaiting_turn` ones are in the queue — a `fixing` PR is not
+            ready, and neither is anything where a landing train runs: there no
+            PR waits for a turn (ADR-0048)
     """
     ready = [r for r in rows if r["status"] in ("landing", "awaiting_turn")]
     return [r["number"] for r in sorted(ready, key=lambda r: (
-        r["status"] != "landing", not r["given_up"], not r["unbatched"], r["pr"], r["number"]))]
+        r["status"] != "landing", not r["given_up"], r["pr"], r["number"]))]
 
 
 # --------------------------------------------------------------------------- #
-# The merge batch — N ready PRs behind one gate run (ADR-0029)                 #
+# The landing train — finished PRs behind whichever gate run is next (ADR-0048) #
 # --------------------------------------------------------------------------- #
 #
-# When two or more finished PRs wait for the landing turn, the turn goes to a
-# MERGE BATCH instead of to one PR: a batch worker, in a worktree of the
-# batch's own, stacks them on the target tip — one merge commit per PR — runs
-# the local gate once on the stack, and pushes the stack to the target as a
-# fast-forward (`afk land --batch`). Still one turn out at a time; what the
-# gate proves is the stack, in the form it lands.
+# Where the local gate is the gate and no adversarial verify is owed
+# (`train_runs`), finished PRs land on a LANDING TRAIN: one append-only line of
+# commits per repo and base branch, kept on the remote at a ref beside the
+# claims (`train_refs`). A PR's own worker JOINS it as soon as its PR is open —
+# the PR's head merged onto the train's tip, one merge commit, pushed; seconds,
+# no gate, and no turn: the push is the lock, and one that is refused is made
+# again on the new tip. A train worker, in the one worktree a repo keeps for it,
+# gates the train's tip whenever the gate is free and pushes the gated commit
+# to the target as a fast-forward (`afk land --train`). Nothing on a train is
+# dropped or rewritten, so a conflict resolved against its tip is resolved
+# once; what the gate proves is the commit the target is moved to, in the form
+# it lands. What is on the train is read off the train — the merge commits
+# PRs joined with (`read_joins`) — never off a marker a worker might not write.
 
 # The instance id's one grammar, checked once where `--instance` enters
 # (`afk.py`): lowercase letters, digits and `-`, opening with a letter or digit,
 # at most 40 characters. So an id is a bare token wherever it is written — one
-# ref path segment (its heartbeat is read back under exactly that name), part of
-# a branch name — and two ids never differ by case alone, which a
-# case-insensitive checkout would fold into one ref.
+# ref path segment (its heartbeat and its train are read back under exactly
+# that name), part of a branch name — and two ids never differ by case alone,
+# which a case-insensitive checkout would fold into one ref.
 INSTANCE_ID_GRAMMAR = r"[a-z0-9][a-z0-9-]{0,39}"
 
 
@@ -2537,198 +2483,113 @@ def instance_id(text: str) -> str:
     return text
 
 
-def _batch_ids(instance: str) -> str:
-    """The regex of every batch id of `instance`. The `-t` in front of the second
-    is what keeps one instance's ids apart from another's: no id of `fl-1` is an
-    id of `fl`, and none is an id of `fl` behind orca's `-<k>` continuation
-    suffix either."""
-    return rf"{re.escape(instance)}-t\d+"
+# The name the train worker's worktree is created under — one per repo on a
+# machine, kept across launches with what its gate runs built — and so, behind
+# orca's `<user>/` prefix and a `-<k>` when the name was taken, its branch.
+TRAIN_WORKTREE = "afk-train"
+_TRAIN_BRANCH_RE = re.compile(rf"^(?:[^/]+/)?{re.escape(TRAIN_WORKTREE)}(?:-\d+)?$")
 
 
-def batch_id(instance: str, now: float) -> str:
-    """A new merge batch's id: the granting fleet instance and the second it was
-    formed — unique, since an instance has one turn out at a time, and never
-    another instance's (`_batch_ids`). It is a bare token: it names a branch, a
-    worktree and a marker field."""
-    return f"{instance}-t{int(now)}"
-
-
-def batch_formed_by(batch: str | None, instance: str | None) -> bool:
-    """Is `batch` an id `batch_id` gives a batch of `instance`?"""
-    return bool(instance) and bool(re.fullmatch(_batch_ids(instance), batch or ""))
-
-
-def batch_name(batch: str) -> str:
-    """The name a batch's worktree is created under — and so, behind orca's
-    `<user>/` prefix, its branch (`batch_branch_regex`)."""
-    return f"afk-batch-{batch}"
-
-
-def batch_branch_regex(batch: str | None = None,
-                       instance: str | None = None) -> re.Pattern[str]:
-    """The regex a batch's branch matches, as orca names it: `<user>/` in front,
-    and `-<k>` behind when a continuation was cut under a name already taken.
-    For one `batch`, or — group 1 the id — for every batch of one `instance`."""
-    if batch:
-        which = re.escape(batch)
-    elif instance:
-        which = f"({_batch_ids(instance)})"
-    else:
-        raise ValueError("batch_branch_regex takes a batch or an instance")
-    return re.compile(rf"^(?:[^/]+/)?afk-batch-{which}(?:-\d+)?$")
-
-
-def batch_branches(heads: Iterable[str] | None, batch: str) -> list[str]:
-    """The remote branches that are one batch's, sorted: the stack its worker
-    pushed (ADR-0011) — what a continuation on another machine starts from."""
-    rx = batch_branch_regex(batch)
-    return sorted(h for h in (heads or []) if h and rx.match(h))
-
-
-def batch_worktrees(worktrees: Iterable[Obj] | None, repo: str | None,
-                    batch: str | None = None, instance: str | None = None) -> list[Obj]:
-    """The orca worktrees on this machine that are a batch's — one `batch`'s, or
-    every batch of `instance` — as [{"batch", "path", "branch"}...], the most
-    recently active first. Same row shape and repo check as `find_orca_worktree`;
-    a batch's worktree is linked to no issue, so it is known by its branch."""
-    rx = batch_branch_regex(batch, instance)
+def train_worktrees(worktrees: Iterable[Obj] | None, repo: str | None) -> list[Obj]:
+    """The orca worktrees on this machine that are the train worker's, as
+    [{"path", "branch"}...], the most recently active first. Same repo check as
+    `find_orca_worktree`; the train's worktree is linked to no issue, so it is
+    known by its branch."""
     hits = []
     for w in worktrees or []:
-        m = rx.match(short_branch(w.get("branch")))
-        if not m or w.get("isMainWorktree") or w.get("isArchived"):
+        if not _TRAIN_BRANCH_RE.match(short_branch(w.get("branch"))) \
+                or w.get("isMainWorktree") or w.get("isArchived"):
             continue
         if repo and not in_orca_project(w, repo):
             continue
         hits.append((int(w.get("lastActivityAt") or 0),
-                     {"batch": batch or m.group(1), "path": w.get("path"),
-                      "branch": short_branch(w.get("branch"))}))
+                     {"path": w.get("path"), "branch": short_branch(w.get("branch"))}))
     return [row for _, row in sorted(hits, key=lambda h: -h[0])]
 
 
-def batches_form(config: Config) -> bool:
-    """Whether this config's PRs may land as merge batches at all: the stack is
-    gated by ONE run of `gate.local_command`, which only `gate.ci: local` has,
-    and with an adversarial verify every PR owes one of its own head before
-    its turn (ADR-0029)."""
+def train_refs(namespace: str, target: str) -> tuple[str, str]:
+    """The two refs a landing train keeps on the remote, for the claim
+    `namespace` and the base branch it lands on → (line, red). `line` is the
+    train itself: its tip. `red` is the commit of the line the train worker
+    last gated RED — while that commit is on the line and not on the target,
+    the train is being repaired, which a worker about to merge the train into
+    its branch must be able to read (`afk gate`)."""
+    prefix = CLAIM_NAMESPACES[namespace][3]
+    return f"{prefix}/line/{target}", f"{prefix}/red/{target}"
+
+
+def train_runs(config: Config) -> bool:
+    """Whether this config's PRs land on a landing train: a train is gated by
+    runs of `gate.local_command`, which only `gate.ci: local` has, and with an
+    adversarial verify every PR owes one of its own head before it lands
+    (ADR-0048). Everywhere else a PR lands alone, on a turn of its own
+    (ADR-0027)."""
     return config["gate"]["ci"] == "local" and not verifies(config)
 
 
-def batch_candidates(mine: list[MineRow], merge_order: list[int], config: Config,
-                     busy: Iterable[int] = ()) -> list[int]:
-    """
-    The claims a merge batch is formed from — their issue numbers, in merge
-    order — or [] when the turn goes to ONE PR as before. The cycle's
-    batch-or-single decision, whole (ADR-0029):
-
-      mine, merge_order: the working set's
-      config:  read for gate.ci and gate.adversarial_verify_prompt (`batches_form`)
-      busy:    the issue numbers whose own worker is still working — its PR may
-               yet move, so it is not stacked
-
-    No batch unless batches form under this config; while any PR or batch
-    holds the turn; while a PR that left a batch, or that gave a turn up and is
-    ready again, still waits (those go first, on single turns); or when fewer
-    than two claims are eligible. A PR still being fixed off the turn it gave up
-    is not in `merge_order`, and holds no batch back. A peer fleet's PR is never
-    in `mine`.
-    """
-    if not batches_form(config):
-        return []
-    rows = {r["number"]: r for r in mine}
-    waiting = [rows[n] for n in merge_order]
-    if any(r["status"] != "awaiting_turn" or r["unbatched"] or r["given_up"] for r in waiting):
-        return []
-    picked = [r["number"] for r in waiting if r["number"] not in set(busy)]
-    return picked if len(picked) >= 2 else []
-
-
-def turn_holder(ws: WorkingSet,
-                instance: str) -> tuple[Literal["dead", "mine", "single"] | None, Any]:
-    """Who holds this fleet's landing turn, as far as a merge batch goes → (who,
-    what), the first of these that is so — the one precedence `tick_plan` and
-    `afk turn --batch` both read:
-
-      "dead"    the merge batches of other (dead) fleet instances still on record
-                on claims I took — nothing is granted until they are abandoned
-      "mine"    my own batch
-      "single"  the issue number of the one PR that holds the turn
-      None      no turn is out (what is None too)"""
-    dead = [b for b in ws["batches"] if b["instance"] != instance]
-    if dead:
-        return "dead", dead
-    mine = next((b for b in ws["batches"] if b["instance"] == instance), None)
-    if mine:
-        return "mine", mine
-    single = next((r["number"] for r in ws["mine"] if r["status"] == "landing"), None)
-    return ("single", single) if single is not None else (None, None)
-
-
-def stack_message(title: str | None, pr: int, issue: int) -> str:
-    """The message of the merge commit a batched PR is stacked with: the PR's
-    title, `(#<pr>)`, and the closing keyword. The `(#<pr>)` is also how the
-    stack is read back (`read_stack`)."""
+def join_message(title: str | None, pr: int, issue: int) -> str:
+    """The message of the merge commit a PR joins the train with: the PR's
+    title, `(#<pr>)`, and the closing keyword — which is how what is on a train,
+    and what a train landed, is read back (`read_joins`)."""
     return f"{(title or '').strip() or f'PR {pr}'} (#{pr})\n\nCloses #{issue}\n"
 
 
-def stacked_pr(parents: str, subject: str | None) -> int | None:
-    """The PR a commit was stacked with, or None: a merge commit — `parents` is
-    its `git log --format=%P`, two hashes — whose subject ends ` (#<pr>)`, the
-    way `stack_message` writes it. The subject alone decides, never the body;
-    and a commit with one parent is never a member's, whatever its subject says
-    — a fix titled `… (#<pr>)` is a fix."""
-    m = re.search(r" \(#([0-9]+)\)$", subject or "") if len(parents.split()) > 1 else None
-    return fleet_number(m.group(1)) if m else None
+def read_joins(commits: Iterable[tuple[str, str, str]]) -> list[Joined]:
+    """The joinings among `commits` — (sha, its parents as `git log
+    --format=%P` prints them, its whole message) — in the order given. A
+    joining is a merge commit whose subject ends ` (#<pr>)` and whose message
+    has a line `Closes #<issue>`, the way `join_message` writes it; its second
+    parent is the PR's head. A commit with one parent is never one, whatever
+    its message says — a fix titled `… (#<pr>)` is a fix."""
+    joins: list[Joined] = []
+    for sha, parents, message in commits:
+        heads = parents.split()
+        named = re.search(r" \(#([0-9]+)\)$", (message.splitlines() or [""])[0])
+        closes = re.search(r"^Closes #([0-9]+)$", message, re.MULTILINE)
+        pr = fleet_number(named.group(1)) if named and len(heads) == 2 else None
+        issue = fleet_number(closes.group(1)) if closes else None
+        if pr is not None and issue is not None:
+            joins.append({"issue": issue, "pr": pr, "commit": sha, "head": heads[1]})
+    return joins
 
 
-def read_stack(commits: Iterable[tuple[str, str, str]],
-               prs: Collection[int]) -> tuple[dict[int, str], list[str]]:
-    """
-    A batch worktree's commits above the target, read back → (stacked, fixes):
-
-      commits: [(sha, parents, subject)...] oldest first — `git log
-               --first-parent <target tip>..HEAD`: the stack's own line, without
-               the commits each PR brought
-      prs:     the member PR numbers
-
-      stacked: {pr: sha} — the merge commit each member was stacked with
-               (`stacked_pr`)
-      fixes:   [sha...] — every other commit, oldest first: what the batch
-               worker committed to turn a red stack green
-    """
-    stacked: dict[int, str] = {}
-    fixes: list[str] = []
-    for sha, parents, subject in commits:
-        pr = stacked_pr(parents, subject)
-        if pr is not None and pr in prs and pr not in stacked:
-            stacked[pr] = sha
-        else:
-            fixes.append(sha)
-    return stacked, fixes
+def on_train(joins: Iterable[Joined], prs: Iterable[PullRequest]) -> dict[int, Joined]:
+    """{issue number: its joining} for the open `prs` whose head is on the train:
+    of the joinings on the train and not yet on the target (`joins`, oldest
+    first), a PR's NEWEST one, when it merged the head the PR has now. A PR
+    whose head moved since it joined is not on the train: its worker joins
+    again with what it pushed."""
+    newest = {j["pr"]: j for j in joins}
+    heads = {p["number"]: p["headRefOid"] for p in prs}
+    return {j["issue"]: j for j in newest.values() if heads.get(j["pr"]) == j["head"]}
 
 
-def landed_comment(commit: str, target: str, batch: str | None = None,
-                   prs: Iterable[int] = ()) -> str:
-    """The comment a stacked PR is closed with when GitHub did not show it merged
-    — its head moved after it was stacked, or GitHub never caught up: the PR
-    itself says which commit landed it. `batch` and `prs`: the merge batch it
-    landed in and that batch's PRs; None for a PR that landed alone."""
-    others = ", ".join(f"#{p}" for p in prs)
-    how = (f"in merge batch `{batch}` ({others}), stacked as one merge commit per PR and gated "
-           f"once as a stack" if batch else "stacked on it as one merge commit and gated there")
-    return (f"**afk-fleet: landed on `{target}` as {commit}** — {how}. "
-            f"GitHub did not mark this PR merged, so it is closed here; what was stacked "
-            f"is on `{target}`.")
+def landed_comment(commit: str, target: str) -> str:
+    """The comment a PR the train landed is closed with when GitHub did not show
+    it merged — its head moved after it joined, or GitHub never caught up: the
+    PR itself says which commit landed it."""
+    return (f"**afk-fleet: landed on `{target}` as {commit}** — merged onto the landing train "
+            f"as one merge commit and gated with it. GitHub did not mark this PR merged, so it "
+            f"is closed here; what joined the train is on `{target}`.")
 
 
-def batch_step(worker: BatchWorkerRow) -> BatchStep:
-    """What a tick does about the batch that holds the turn, from the cause its
-    worker was classified with → that cause's `batch_step` in WORKER_CAUSES. A
-    batch's worker holds no claim and declares no verdict, so a cause with none
-    is an error."""
+def train_abandoned_reason(pr: int) -> str:
+    """The words a claim is escalated with when the train its PR was on is
+    abandoned for the second time (`abandoned_turn`)."""
+    return (f"PR #{pr} was on a landing train twice when the train was abandoned before it "
+            f"landed: the train's worker went silent, was nudged, and stayed silent. "
+            f"The PR, its branch and its worktree are kept as they are")
+
+
+def train_step(worker: TrainWorkerRow) -> TrainStep:
+    """What a tick does about the train's worker, from the cause it was
+    classified with → that cause's `train_step` in WORKER_CAUSES. The train's
+    worker holds no claim and declares no verdict, so a cause with none is an
+    error."""
     cause = WORKER_CAUSES.get(worker["cause"])
-    step = cause.batch_step if cause else None
+    step = cause.train_step if cause else None
     if step is None:
-        raise ValueError(f"no step for a batch worker classified {worker['cause']!r}")
+        raise ValueError(f"no step for a train worker classified {worker['cause']!r}")
     return step
 
 
@@ -2984,8 +2845,8 @@ def select_recovery(worktree: WorktreeSignal | None, branch: BranchSignal | None
                 {"name": str|None, "commits_ahead": int|None}   (ahead of base)
       fresh:    the previous attempt was discarded — a retry. Nothing is read:
                 tier 3, whatever the signals say.
-      landing_pr: the number of the issue's PR when it holds this fleet's landing
-                turn on its own (not in a merge batch), else None. The worker is
+      landing_pr: the number of the issue's PR when its own worker lands under
+                this fleet's turn (`own_landing`), else None. The worker is
                 then started ON the turn (ADR-0027): `prompt` is "landing", and
                 with no worktree here one is recreated at the PR's head — never
                 from base.
@@ -3052,16 +2913,21 @@ def select_recovery(worktree: WorktreeSignal | None, branch: BranchSignal | None
 #
 # references/worker-prompt.md is the template: named blocks between
 # `<!--afk:block NAME-->` and `<!--/afk:block-->`. The `prompt` block is the body;
-# it names three slots — {opening} and {step1}, each filled from the block of
-# that name for the chosen variant (`opening.fresh`, `step1.continue`, …), and
-# {retry_reason}, filled from the `retry_reason` block only when a failure reason
-# is handed over. The `landing` block is a brief of its own — `render_landing` —
-# pointed at when the worker is given its landing turn: the one command a worker
-# lands its PR with and what each of its outcomes asks for (ADR-0027). It is the
-# only place either is spelled; the body says no more than that the worker does
-# not merge its PR and is told when to land it. The `batch` block is a third
-# brief, for a merge batch's worker — `render_batch_brief`, with fields of its
-# own (ADR-0029). Everything else in braces is a
+# it names four slots — {opening} and {step1}, each filled from the block of
+# that name for the chosen variant (`opening.fresh`, `step1.continue`, …),
+# {finish}, the steps from the gate on, filled from `finish.turn` or — where a
+# landing train runs — `finish.train`, and {retry_reason}, filled from the
+# `retry_reason` block only when a failure reason is handed over. The `landing`
+# block is a brief of its own — `render_landing` — pointed at when the worker
+# is given its landing turn: the one command a worker lands its PR with and
+# what each of its outcomes asks for (ADR-0027). It is the only place either is
+# spelled; `finish.turn` says no more than that the worker does not merge its
+# PR and is told when to land it. Where a landing train runs a worker joins the
+# train by itself: `finish.train` carries the `join` block — the same command
+# and its outcomes there — and so does the `joining` block, the landing brief
+# of a worker started only to join. The `train` block is a third brief, for
+# the train's worker — `render_train_brief`, with fields of its own (ADR-0048).
+# Everything else in braces is a
 # field — four of them derived: {wake_command}, the line a worker runs to wake
 # the launcher once its outcome is on GitHub, built from the `launcher_terminal`
 # field (ADR-0020), {gate_command}, the line a worker runs the local gate with —
@@ -3108,7 +2974,8 @@ def wake_command(launcher_terminal: str | None, number: int | str) -> str:
     return f'orca terminal send --terminal {handle} --text "{wake_line(number)}" --enter'
 
 
-def gate_command(afk_path: str, local_command: str | None) -> str:
+def gate_command(afk_path: str, local_command: str | None,
+                 train: tuple[str, str] | None = None) -> str:
     """
     The command a worker runs the local gate with: `afk gate`, carrying the
     configured `gate.local_command` as its config, so the run is made — and, when
@@ -3116,6 +2983,11 @@ def gate_command(afk_path: str, local_command: str | None) -> str:
 
       afk_path:      the afk executable on this machine (the worker runs here)
       local_command: `gate.local_command`; empty → a no-op with a note
+      train:         where a landing train runs, (repo, the run's canonical
+                     config as its JSON text): the command is `afk gate
+                     --train`, which merges the train into the branch before it
+                     runs the gate, and needs the whole config to find it
+                     (ADR-0048)
 
     The command travels inside the line, so a config that changes after the worker
     was briefed records a command the landing no longer recognises: void, not wrong.
@@ -3123,6 +2995,10 @@ def gate_command(afk_path: str, local_command: str | None) -> str:
     command = (local_command or "").strip()
     if not command:
         return _NO_LOCAL_COMMAND
+    if train:
+        repo, whole = train
+        return (f"{shlex.quote(afk_path)} gate --train --repo {shlex.quote(repo)} "
+                f"--config {shlex.quote(whole)}")
     config = json.dumps({"gate": {"local_command": command}}, ensure_ascii=False)
     return f"{shlex.quote(afk_path)} gate --config {shlex.quote(config)}"
 
@@ -3139,9 +3015,10 @@ def _prompt_blocks(template: str | None) -> Callable[[str], str]:
 
 def land_command(afk_path: str, number: int, repo: str, config: str) -> str:
     """
-    The one command a worker lands its PR with, on its landing turn: `afk land`,
-    carrying the run's config — the merge target, the gate, the
-    claim namespace the turn is checked against (ADR-0027).
+    The one command a worker lands its PR with — on its landing turn, or, where
+    a landing train runs, by joining the train: `afk land`, carrying the run's
+    config — the merge target, the gate, the claim namespace the turn is
+    checked against and the train is kept in (ADR-0027, ADR-0048).
 
       afk_path: the afk executable on this machine (the worker runs here)
       config:   the run's canonical config, as its JSON text
@@ -3166,17 +3043,19 @@ def _fill(text: str, values: dict[str, str], what: str) -> str:
 
 
 def _fill_prompt(text: str, fields: Obj, landing: Obj | None = None,
-                 reason: str | None = None) -> str:
-    """Fill every field of an assembled prompt text. Raises ValueError on a missing
-    field or a placeholder left unfilled."""
+                 reason: str | None = None, train: bool = False) -> str:
+    """Fill every field of an assembled prompt text; `train` says a landing train
+    runs, which is what `{gate_command}` then merges in. Raises ValueError on a
+    missing field or a placeholder left unfilled."""
     missing = [k for k in PROMPT_FIELDS if k not in fields]
     missing += [k for k in LANDING_FIELDS if landing is not None and k not in landing]
     if missing:
         raise ValueError(f"worker prompt: missing field(s) {', '.join(missing)}")
     values = {k: str(fields[k]) for k in PROMPT_FIELDS}
-    values["land_command"] = land_command(values["afk_path"], fields["n"], values["repo"],
-                                          values.pop("config"))
-    values["gate_command"] = gate_command(values.pop("afk_path"), values["local_command"])
+    config = values.pop("config")
+    values["land_command"] = land_command(values["afk_path"], fields["n"], values["repo"], config)
+    values["gate_command"] = gate_command(values.pop("afk_path"), values["local_command"],
+                                          train=(values["repo"], config) if train else None)
     values["local_command"] = values["local_command"].strip() or _NO_LOCAL_COMMAND
     values["wake_command"] = wake_command(values.pop("launcher_terminal"), fields["n"])
     values["verdict_marker"] = verdict_marker_format(fields["n"])
@@ -3187,7 +3066,7 @@ def _fill_prompt(text: str, fields: Obj, landing: Obj | None = None,
 
 
 def render_worker_prompt(template: str, variant: PromptVariant, fields: Obj,
-                         reason: str | None = None) -> str:
+                         reason: str | None = None, train: bool = False) -> str:
     """
     The prompt one worker is started with, from the template file's text.
 
@@ -3199,6 +3078,9 @@ def render_worker_prompt(template: str, variant: PromptVariant, fields: Obj,
                 and so does the wake when `launcher_terminal` is empty
                 (`wake_command`).
       reason:   why the previous attempt failed, when this is a retry; None otherwise
+      train:    a landing train runs (`train_runs`): the worker gates with the
+                train merged in and joins the train itself (`finish.train`),
+                instead of waiting to be told when to land (`finish.turn`)
 
     Raises ValueError on a template missing a block, a missing field, or a
     placeholder left unfilled — a worker must never be started on a prompt with a
@@ -3209,59 +3091,61 @@ def render_worker_prompt(template: str, variant: PromptVariant, fields: Obj,
     block = _prompt_blocks(template)
     text = block("prompt")
     slots = {"opening": block(f"opening.{variant}"), "step1": block(f"step1.{variant}"),
+             "finish": block("finish.train" if train else "finish.turn"), "join": block("join"),
              "retry_reason": block("retry_reason") if reason else ""}
     for name, body in slots.items():
         text = text.replace("{" + name + "}", body)
     text = re.sub(r"\n{3,}", "\n\n", text)      # an unfilled slot leaves no gap behind
-    return _fill_prompt(text, fields, reason=reason)
+    return _fill_prompt(text, fields, reason=reason, train=train)
 
 
-BATCH_FIELDS = ("batch", "members", "repo", "target", "afk_path", "config", "branch",
-                "worktree_path", "launcher_terminal")
+TRAIN_FIELDS = ("repo", "target", "afk_path", "config", "worktree_path", "launcher_terminal")
+
+# What the train worker's wake names, where a worker's names its issue.
+TRAIN_WAKE = "train"
 
 
-def batch_land_command(afk_path: str, batch: str, repo: str, config: str) -> str:
-    """The one command a batch worker stacks, gates and lands its batch with:
-    `afk land --batch`, carrying the run's config (ADR-0029)."""
-    return (f"{shlex.quote(afk_path)} land --batch {shlex.quote(batch)} --repo {shlex.quote(repo)} "
+def train_land_command(afk_path: str, repo: str, config: str) -> str:
+    """The one command the train worker gates and lands the train with:
+    `afk land --train`, carrying the run's config (ADR-0048)."""
+    return (f"{shlex.quote(afk_path)} land --train --repo {shlex.quote(repo)} "
             f"--config {shlex.quote(config)}")
 
 
-def render_batch_brief(template: str, fields: Obj) -> str:
+def render_train_brief(template: str, fields: Obj) -> str:
     """
-    The brief a merge batch's worker is started on: the template's `batch` block
-    — the `afk land --batch` command and its outcome table.
+    The brief the landing train's worker is started on: the template's `train`
+    block — the `afk land --train` command and its outcome table.
 
-      fields: {name: value} for every one of BATCH_FIELDS. `members` is
-              [{"issue", "pr", "title"}...] in stack order, rendered as a list.
+      fields: {name: value} for every one of TRAIN_FIELDS
 
     Raises ValueError on a missing field or a placeholder left unfilled.
     """
-    missing = [k for k in BATCH_FIELDS if k not in fields]
+    missing = [k for k in TRAIN_FIELDS if k not in fields]
     if missing:
-        raise ValueError(f"batch brief: missing field(s) {', '.join(missing)}")
-    text = _prompt_blocks(template)("batch")
-    batch = str(fields["batch"])
-    values = {k: str(fields[k]) for k in ("batch", "repo", "target", "branch", "worktree_path")}
-    values["wake_command"] = wake_command(fields["launcher_terminal"], f"batch-{batch}")
-    values["members"] = "\n".join(f"- PR #{m['pr']} — closes #{m['issue']} — {m['title']}"
-                                  for m in fields["members"])
-    values["batch_land_command"] = batch_land_command(str(fields["afk_path"]), batch,
-                                                      values["repo"], str(fields["config"]))
-    return _fill(text, values, "batch brief")
+        raise ValueError(f"train brief: missing field(s) {', '.join(missing)}")
+    text = _prompt_blocks(template)("train")
+    values = {k: str(fields[k]) for k in ("repo", "target", "worktree_path")}
+    values["wake_command"] = wake_command(fields["launcher_terminal"], TRAIN_WAKE)
+    values["train_land_command"] = train_land_command(str(fields["afk_path"]), values["repo"],
+                                                      str(fields["config"]))
+    return _fill(text, values, "train brief")
 
 
-def render_landing(template: str, fields: Obj, landing: Obj) -> str:
+def render_landing(template: str, fields: Obj, landing: Obj, train: bool = False) -> str:
     """
-    The brief a worker is pointed at when its PR is given the landing turn: the
-    template's `landing` block — the `afk land` command and its outcome table —
-    filled from the same `fields` as `render_worker_prompt` plus `landing`,
-    {name: value} for every one of LANDING_FIELDS. It is the whole brief either way: for the worker that wrote
-    the branch and is still there, and for one started in its worktree because
-    it is gone — that one is briefed only to land the PR (ADR-0027).
+    The landing brief — the whole instruction of a worker that has only its PR
+    to land: the template's `landing` block, pointed at when the PR is given
+    the landing turn — or, where a landing train runs (`train`), its `joining`
+    block, which carries the `join` block: no turn is given there, and it is
+    the brief of a worker started in the worktree of a PR that is not on the
+    train. Either is the `afk land` command and its outcome table, filled from
+    the same `fields` as `render_worker_prompt` plus `landing`, {name: value}
+    for every one of LANDING_FIELDS (ADR-0027, ADR-0048).
     """
     block = _prompt_blocks(template)
-    return _fill_prompt(block("landing"), fields, landing)
+    text = block("joining").replace("{join}", block("join")) if train else block("landing")
+    return _fill_prompt(text, fields, landing, train=train)
 
 
 # --------------------------------------------------------------------------- #
@@ -3297,24 +3181,28 @@ _STATUS_STEPS = (
 # The closed set of lifecycle phases the board renders, each with everything the
 # board says about it: how far along the happy path it has reached (the key of
 # the last DONE step in _STATUS_STEPS) and its single ▸/✅/⚠️ 'where are we now' line. Happy path
-# plus seven off-ramps that reuse the same checkboxes + an annotation: ci_failed,
+# plus eight off-ramps that reuse the same checkboxes + an annotation: ci_failed,
 # awaiting_turn (the PR is ready and waits for the landing turn — one PR lands
-# at a time), fixing and ready_again (the PR gave its turn up: being fixed off
+# at a time), joining and joined (where a landing train runs: the PR's worker is
+# joining the train; the PR is on it, waiting for the train's gate — ADR-0048), fixing and ready_again (the PR gave its turn up: being fixed off
 # the turn, then waiting for its next one — ADR-0045), escalated (a terminal give-up, ticked specially in
 # `render_status_board`), closed (the worker found the issue already satisfied —
 # `afk close`), and parked (the worker found an open dependency; the claim is
 # released until it closes — `afk park`).
 _NOTHING_REACHED = None    # no step ticked: the phase is before, or outside, the happy path
-StatusPhase = Literal["claimed", "pr_open", "ci_failed", "awaiting_turn", "landing", "fixing",
-                      "ready_again", "merged", "escalated", "closed", "parked"]
+StatusPhase = Literal["claimed", "pr_open", "ci_failed", "awaiting_turn", "landing", "joining",
+                      "joined",
+                      "fixing", "ready_again", "merged", "escalated", "closed", "parked"]
 _PHASES: dict[StatusPhase, tuple[Optional[str], str]] = {
     "claimed":        ("claimed", "▸ 当前:worker 实现中,尚无 PR"),
     "pr_open":        ("pr_open", "▸ 当前:等 {gate}"),
     "ci_failed":      ("pr_open", "▸ 当前:{gate} 失败,修复重试中({attempt}/{retry_max}) —— 见下方 {gate} 与评论"),
     "awaiting_turn":  ("pr_open", "▸ 当前:PR 已就绪,排队等落地轮次 —— 一次只落地一个 PR,轮到后由 worker 自己合并"),
     "landing":        ("landing", "▸ 当前:已轮到落地,worker 正在与目标分支同步、过门并合并 —— 见 PR 评论"),
+    "joining":        ("pr_open", "▸ 当前:PR 已开,worker 正在并入落地列车(joining the landing train)—— 无需排队等轮次"),
+    "joined":         ("landing", "▸ 当前:已并入落地列车(joined the landing train)—— 列车的 worker 对整列过门(gating),门绿后随列车一起落地"),
     "fixing":         ("pr_open", "▸ 当前:落地时遇到冲突或 {gate} 失败,已让出落地轮次(turn given up)—— worker 正在原地修复(being fixed),其他 PR 照常落地"),
-    "ready_again":    ("pr_open", "▸ 当前:已修复,再次就绪(ready again)—— 优先排队等落地轮次(awaiting its turn),轮到后由 worker 自己合并"),
+    "ready_again":    ("pr_open", "▸ 当前:已修复,再次就绪(ready again)—— 排队等落地轮次(awaiting its turn),轮到后由 worker 自己落地"),
     "merged":         ("merged", "✅ 已合并,完成"),
     "escalated":      ("pr_open", "⚠️ 已升级给人处理 —— 见下方评论"),
     "closed":         ("claimed", "✅ 主干已满足此需求,无需改动 —— 已关闭"),
@@ -3322,18 +3210,9 @@ _PHASES: dict[StatusPhase, tuple[Optional[str], str]] = {
 }
 STATUS_PHASES = tuple(_PHASES)
 
-# The 'where are we now' line of a claim whose PR holds the turn as a member of
-# a merge batch (ADR-0029), and what its batch worker is doing, by BATCH_PHASES.
-_BATCH_LINE = ("▸ 当前:已轮到落地,与 {prs} 合为一个 merge batch —— batch worker {doing},"
-               "整批过一次门后一起落地")
-_BATCH_DOING: dict[BatchPhase, str] = {"stacking": "正在把各 PR 叠放到目标分支上(stacking)",
-                                       "gating": "正在对整批过门(gating)",
-                                       "fixing": "正在修复整批的红门(being fixed)"}
-
-
 def render_status_board(phase: StatusPhase, gate_ci: GateCiMode, retry_max: int,
                         instance: str | None = None, pr: int | None = None, attempt: int = 0,
-                        blocked_by: Iterable[int] = (), batch: BoardBatch | None = None) -> str:
+                        blocked_by: Iterable[int] = ()) -> str:
     """
     Render the human-facing progress *status board* comment body. Pure: a function
     of the discrete lifecycle state the tick already derived from fleet state; no
@@ -3348,9 +3227,6 @@ def render_status_board(phase: StatusPhase, gate_ci: GateCiMode, retry_max: int,
       pr:        the PR number, once one is open
       attempt:   the claim's current attempt (`current_attempt`)
       blocked_by: the open blockers the issue waits on, for parked only
-      batch:     {"prs": [pr...], "phase": one of BATCH_PHASES} when the PR holds
-                 the turn in a merge batch — for landing only: the line names
-                 the batch's PRs and what its worker is doing
 
     Returns the full markdown body, led by STATUS_MARKER (the find-or-create anchor).
     """
@@ -3373,9 +3249,6 @@ def render_status_board(phase: StatusPhase, gate_ci: GateCiMode, retry_max: int,
         label = label.format(pr=f" (#{pr})" if pr else "", gate=gate)
         lines.append(f"- [{'x' if done(key) else ' '}] {label}")
     lines.append("")
-    if batch and phase == "landing":
-        current = _BATCH_LINE.format(prs="、".join(f"#{n}" for n in batch["prs"]),
-                                     doing=_BATCH_DOING[batch["phase"]])
     lines.append(current.format(gate=gate, attempt=attempt, retry_max=retry_max,
                                 blockers="、".join(f"#{n}" for n in blocked_by)))
     return record_comment(STATUS_RECORD, {}, "\n".join(lines))
@@ -3589,7 +3462,7 @@ TICK_WORK: dict[TickDid, str] = {
     "cleared": "cleared",
     "escalated": "escalated",
     "parked": "parked",
-    "abandoned": "abandoned the batch of",
+    "abandoned": "abandoned the train of",
 }
 TICK_DID: dict[TickDid, str] = {**TICK_WORK, "retried": "retried", "nudged": "nudged", "restarted": "restarted"}
 TICK_COUNTS = ("in_flight", "frontier_remaining")
@@ -3828,12 +3701,13 @@ def reason_judgment(call: Call, number: int, sub: Literal["fail", "escalate"], d
 def asks_after(mine: list[MineRow]) -> list[int]:
     """The claims a tick asks `afk no-pr` about, in one call: every `no_pr` row,
     every `fixing` row, and every `landing` row whose worker has not stopped for
-    the tick. A row in a merge batch is not one of them: its own worker has
-    nothing to do, and the batch's worker is asked after once, for the batch."""
+    the tick — and, where a landing train runs, every `joining` row: joining is
+    its worker's own step. A `joined` row is not one of them: its own worker
+    has nothing more to do, and the train's worker is asked after once, for
+    the train."""
     return [r["number"] for r in mine
-            if r["status"] in ("no_pr", "fixing")
-            or (r["status"] == "landing" and not r["batch"]
-                and r["stopped"] not in LAND_WAITS)]
+            if r["status"] in ("no_pr", "fixing", "joining")
+            or (r["status"] == "landing" and r["stopped"] not in LAND_WAITS)]
 
 
 def turn_due(mine: list[MineRow], merge_order: list[int]) -> int | None:
@@ -3973,10 +3847,10 @@ def worker_step(call: Call, row: MineRow, worker: WorkerRow, config: Config) -> 
     Two rules sit on top of the table. A `starting` row — a retry already
     counted, cut short before its fresh worker started — is failed whatever its
     worker is, short of at work: the retry is finished, and nothing is counted
-    again. And a `landing` or `fixing` row is never failed for silence:
-    classified with one of the two causes that fail a PR-less claim, its PR's
-    own worker is not at a landing, which is an error (ADR-0035, ADR-0045). A
-    cause with no row is an error too.
+    again. And a `landing`, `fixing` or `joining` row is never failed for
+    silence: classified with one of the two causes that fail a PR-less claim,
+    its PR's own worker is not at a landing, which is an error (ADR-0035,
+    ADR-0045, ADR-0048). A cause with no row is an error too.
     """
     number, cause = row["number"], worker["cause"]
     if cause not in WORKER_CAUSES:
@@ -4002,8 +3876,8 @@ def worker_step(call: Call, row: MineRow, worker: WorkerRow, config: Config) -> 
             afk_command(call, "fail", number, "--reason",
                         f"its worker declared `already-satisfied`, but the branch's diff "
                         f"against {base} is not empty"))
-    if row["status"] in ("landing", "fixing") and cause in ("silent_after_nudge",
-                                                            "silent_unnudgeable"):
+    if row["status"] in ("landing", "fixing", "joining") and cause in (
+            "silent_after_nudge", "silent_unnudgeable"):
         raise ValueError(f"issue #{number}: a landing claim's silence is never a failure — "
                          f"its worker is restarted, then the claim escalated (ADR-0035); a "
                          f"`{row['status']}` row classified {cause!r} has no worker at a "
@@ -4030,16 +3904,15 @@ def worker_step(call: Call, row: MineRow, worker: WorkerRow, config: Config) -> 
 
 # Every step a plan hands out, as {"do": <key>, **arguments} → the name its
 # failure is reported under in the cycle's `errors`.
-TickStep = Literal["no-pr", "turn", "batch-turn", "abandon", "restart", "nudge", "park", "fail",
-                   "escalate", "release", "reclaim", "begin", "finish", "heartbeat", "status",
-                   "sweep"]
+TickStep = Literal["no-pr", "turn", "train", "abandon", "restart", "nudge", "park", "fail",
+                   "escalate", "release", "reclaim", "begin", "finish", "heartbeat", "status"]
 TICK_STEPS: dict[TickStep, str] = {
-    "no-pr": "no-pr",           # {issues} | {batch}: `afk no-pr`'s rows for them
+    "no-pr": "no-pr",           # {issues} | {train: True}: `afk no-pr`'s rows for them
     "turn": "turn",             # {issue}: `afk turn`
-    "batch-turn": "turn",       # `afk turn --batch`: form a merge batch, or continue mine
-    "abandon": "turn",          # {batch}: `afk turn --abandon`
+    "train": "turn",            # `afk turn --train`: put the train worker on what joined
+    "abandon": "turn",          # `afk turn --abandon`
     "restart": "turn",          # {issue}: `afk turn --restart`
-    "nudge": "nudge",           # {issue} | {batch}
+    "nudge": "nudge",           # {issue} | {train: True}
     "park": "park",             # {issue}
     "fail": "fail",             # {issue, reason}
     "escalate": "escalate",     # {issue, reason}
@@ -4049,7 +3922,6 @@ TICK_STEPS: dict[TickStep, str] = {
     "finish": "dispatch",       # {issues}: the rest of every start begun, at once
     "heartbeat": "heartbeat",
     "status": "status",         # {issue, phase, pr, attempt}
-    "sweep": "sweep",           # {live}: what a finished merge batch left behind
 }
 
 # How beginning a dispatch ended. A `begin` step answers with the first two;
@@ -4193,12 +4065,13 @@ def tick_plan(ws: WorkingSet, call: Call, config: Config) -> Plan:
     is still mine to remember}.
 
     In order: `no-pr` for the claims waiting on a worker → the landing turn, to
-    one PR or to one merge batch (`_turn_plan`) → nudge / restart / fail / park /
+    the head of the merge queue (`_turn_plan`) — or, where a landing train runs,
+    the train worker put on what joined it (`_train_plan`) → nudge / restart / fail / park /
     escalate where the reason is on record, or the judgment that stands in for one →
     release `closed` and `landed` rows and `stale_closed` phantom locks → begin the starts:
     continuations of claims already held, then the `stale` claims and then the
     frontier into the free slots → finish every start begun, at once → heartbeat
-    → status boards → what a finished batch left behind.
+    → status boards.
 
     A step that fails is recorded in `errors` and settles nothing: its claim is
     still held and the rest of the tick goes on. A start that fails to BEGIN
@@ -4223,8 +4096,11 @@ def tick_plan(ws: WorkingSet, call: Call, config: Config) -> Plan:
     routes = [(w["issue"], *worker_step(call, tick.mine[w["issue"]], w, config))
               for w in (seen or {}).get("workers", [])]
 
-    # --- the landing turn: at most one grant a tick, to one PR or to one merge batch ---
-    live = yield from _turn_plan(tick, call, config)
+    # --- the landing: the train where one runs, else at most one turn granted a tick ---
+    if train_runs(config):
+        yield from _train_plan(tick)
+    else:
+        yield from _turn_plan(tick, call, config)
 
     # --- nudge / restart / fail / park / escalate, or the judgment that stands in for one ---
     tick.judgments += [failure_judgment(call, r) for r in ws["mine"] if r["status"] == "failure"]
@@ -4297,74 +4173,56 @@ def tick_plan(ws: WorkingSet, call: Call, config: Config) -> Plan:
         if row["board_phase"] and row["number"] not in written:
             yield from run("status", issue=row["number"], phase=row["board_phase"],
                            pr=row["pr"], attempt=row["attempt"])
-    if batches_form(config) or ws["batches"]:
-        yield from run("sweep", live=sorted(live))
     return {"did": tick.account(), "judgments": tick.judgments, "errors": tick.errors,
             "held": tick.held}
 
 
 def _turn_plan(tick: TickBooks, call: Call, config: Config) -> Plan:
-    """The landing-turn stage of `tick_plan` → the ids of the merge batches that
-    hold a turn when it is done; what it did and what it could not decide go
-    into `tick`. One turn is out at a time, held by one PR or by one batch
-    (ADR-0029), so exactly one of these happens:
-
-      a dead fleet's batch on claims I took   abandoned; nothing is granted until
-                                              the next cycle reads the result
-      my batch holds the turn                 its worker is asked after: left,
-                                              continued, nudged once, or the
-                                              batch abandoned
-      two or more PRs are eligible            a batch is formed (`afk turn --batch`)
-      otherwise                               the head of the merge queue gets
-                                              the turn, as before"""
-    ws, run, instance = tick.ws, tick.run, call["instance"]
-
-    def abandon(batch: Batch) -> Plan:
-        gone = yield from run("abandon", batch=batch["id"])
-        if gone:
-            tick.did("abandoned", *gone["issues"])
-        return gone
-
-    who, what = turn_holder(ws, instance)
-    live = {b["id"] for b in ws["batches"] if b["instance"] == instance}
-    if who == "dead":
-        for batch in what:
-            if not (yield from abandon(batch)):
-                live.add(batch["id"])
-        return live
-    if who == "mine":
-        mine = what
-        seen = yield from run("no-pr", batch=mine["id"])
-        do = batch_step(seen["workers"][0]) if seen else "leave"
-        if do == "continue":
-            again = yield from run("batch-turn")
-            if again and again["outcome"] == "granted":
-                tick.did("granted", *again["issues"])
-        elif do == "nudge":
-            if (yield from run("nudge", batch=mine["id"])):
-                tick.did("nudged", *(m["issue"] for m in mine["members"]))
-        elif do == "abandon":
-            if (yield from abandon(mine)):
-                live = set()
-        elif do != "leave":
-            assert_never(do)
-        return live
-    if batch_candidates(ws["mine"], ws["merge_order"], config):
-        formed = yield from run("batch-turn")
-        if formed is None:
-            return live
-        if formed["outcome"] == "granted":
-            tick.did("granted", *formed["issues"])
-            return {formed["batch"]}
-    due = turn_due(ws["mine"], ws["merge_order"])
-    single = (yield from run("turn", issue=due)) if due else None
+    """The landing-turn stage of `tick_plan`: the head of the merge queue gets
+    the turn, unless its PR holds it and its worker is at it (`turn_due`). What
+    it did and what it could not decide go into `tick`. One turn is out at a
+    time. Not run where a landing train runs: there no PR is granted a turn."""
+    due = turn_due(tick.ws["mine"], tick.ws["merge_order"])
+    single = (yield from tick.run("turn", issue=due)) if due else None
     if due and single:
         do, asks = turn_step(call, single, config)
         if do == "granted":
             tick.did("granted", due)
         elif asks:      # "judge"
             tick.judgments.append(asks)
-    return live
+
+
+def _train_plan(tick: TickBooks) -> Plan:
+    """The landing-train stage of `tick_plan`, where one runs (ADR-0048): while a
+    PR of mine is on the train (`joined`), the train worker is kept on it —
+
+      afk turn --train   starts the train worker, or tells the one that
+                         stopped about what joined since: `granted`
+      it is at work      `landing`: left
+      it stopped, with   `stopped`: it is asked after (`afk no-pr --train`) and
+      nothing new        left, nudged once, or — silent again — the train is
+                         abandoned (`train_step`): the PRs on it are taken off
+                         and join the next one, and a PR taken off a train for
+                         the second time is escalated instead"""
+    ws, run = tick.ws, tick.run
+    joined = [r["number"] for r in ws["mine"] if r["status"] == "joined"]
+    if not joined:
+        return
+    moved = yield from run("train")
+    if not moved or moved["outcome"] != "stopped":
+        return
+    seen = yield from run("no-pr", train=True)
+    do = train_step(seen["workers"][0]) if seen else "leave"
+    if do == "nudge":
+        if (yield from run("nudge", train=True)):
+            tick.did("nudged", *joined)
+    elif do == "abandon":
+        gone = yield from run("abandon")
+        if gone:
+            tick.did("abandoned", *gone["issues"])
+            tick.did("escalated", *gone["escalated"])
+    elif do not in ("leave", "continue"):    # one that is gone is started by the next `train`
+        assert_never(do)
 
 
 def follow(plan: Plan, carry_out: Callable[[Obj], Answer]) -> Any:
@@ -4534,14 +4392,16 @@ def resolve_worker_command(base_url: str | None, supplied: str | None = None,
 # cycles. Correctness never depends on the gate.
 
 def fingerprint(issues: Iterable[Issue], prs: Iterable[PullRequest],
-                claims: Iterable[Claim]) -> str:
+                claims: Iterable[Claim], train: str = "") -> str:
     """
     Digest the observable fleet inputs — open issues (number + title + labels +
     updatedAt + open-blocker count, so a retitle, label churn, closes, fresh
     blocker comments and a dependency edge all move it), open PRs (number + head sha +
     updatedAt + `pr_checks_state` + the issues it closes, so pushes, CI finishing
     and a PR becoming an issue's all move it), and claim refs (number + sha +
-    owning instance, so peer claims/releases/reclaims move it).
+    owning instance, so peer claims/releases/reclaims move it) — and, where a
+    landing train runs, the `train`'s tip on the remote ("" when there is
+    none), so a PR joining it moves the digest though nothing on GitHub did.
 
     It holds everything `assemble_working_set` reads of those three lists: two
     gathers with one digest assemble one working set, whatever order their rows
@@ -4574,6 +4434,7 @@ def fingerprint(issues: Iterable[Issue], prs: Iterable[PullRequest],
                        sorted(ref["number"] for ref in p["closingIssuesReferences"] or [])]
                       for p in prs),
         "claims": sorted([c["number"], c["sha"] or "", c["instance"]] for c in claims),
+        **({"train": train} if train else {}),
     }
     blob = json.dumps(canon, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
@@ -4592,9 +4453,11 @@ OUTSIDE_THE_DIGEST: dict[str, str] = {
     "closed": "asked only of a claim whose issue is missing from the open list: the issue "
               "leaving that list moved the digest; a read that failed is retried by the "
               "forced tick",
-    "landed": "asked only of a claim of mine on an open issue no open PR closes, and true "
-              "only once its PR was pushed to the target: GitHub showing that PR merged "
-              "took it off the open list, which moved the digest",
+    "landed": "asked only of a claim of mine on an open issue, and true only once what lands "
+              "it was pushed to the target: the train that carried it there moved the digest, "
+              "and so did GitHub taking the merged PR off the open list",
+    "joined": "read off the landing train and the open PRs' heads, and the digest holds both: "
+              "the train's tip and every PR's head",
     "me": "the run's own instance id: no cycle changes it",
     "config": "the run's own config: no cycle changes it",
 }
@@ -4737,7 +4600,8 @@ def assemble_working_set(issues: list[Issue], prs: list[PullRequest], claims: li
                          heartbeats: Mapping[str, float], me: str, now: float, config: Config,
                          closed: Iterable[int] = (),
                          turns: Mapping[int, Turn] | None = None,
-                         landed: Iterable[int] = ()) -> WorkingSet:
+                         landed: Iterable[int] = (),
+                         joined: Iterable[int] = ()) -> WorkingSet:
     """
     The tick's whole working set from the raw observables. Pure — afk.py's
     `rebuild` gathers, this assembles, and a fixture pins the join.
@@ -4758,16 +4622,18 @@ def assemble_working_set(issues: list[Issue], prs: list[PullRequest], claims: li
       turns:       {number: its PR's `latest_turn`} for MY claims whose PR
                    carries a turn marker, whoever wrote it (`afk rebuild` asks
                    about each of mine that has a PR)
-      landed:      the numbers of MY claims on an open issue no open PR closes
-                   whose landing is already on the target (`afk rebuild` asks
-                   the target about each) — a `landed` row
+      landed:      the numbers of MY claims on an open issue whose landing is
+                   already on the target (`afk rebuild` asks the target about
+                   each) — a `landed` row
+      joined:      the numbers of the claims whose open PR is on the landing
+                   train, its head as it is now (`on_train`) — a `joined` row;
+                   where a train runs every other open PR of mine is `joining`
 
     Returns:
       {"frontier": {"dispatch": [{"number","title"}...], "excluded": [...]},
        "mine": [{"number","title","status","board_phase","pr","checks",
-                 "attempt","starting","stopped","batch","unbatched","given_up"}...],
+                 "attempt","starting","stopped","given_up"}...],
        "merge_order": [number...],   # the `landing` and `awaiting_turn` rows (`turn_order`)
-       "batches": [{"id","instance","members":[{"issue","pr"}...],"phase","at"}...],
        "peer_live": [{"number","instance"}...],
        "stale": [{"number","instance","sha"}...],   # sha feeds reclaim --expect-sha
        "stale_closed": [{"number","instance","sha"}...],  # sha feeds release --expect-sha
@@ -4780,16 +4646,8 @@ def assemble_working_set(issues: list[Issue], prs: list[PullRequest], claims: li
     `current_attempt` — the number `afk status` takes; `starting` is
     `attempt_starting` — a retry cut short, for `afk fail` to finish; `stopped` is the
     LAND_OUTCOMES word a `landing` or `fixing` row's `afk land` last stopped with,
-    None while it has not stopped and on every other row. `batch` is {"id", "members":
-    [issue...], "phase"} on a `landing` row whose turn is a merge batch's, else
-    None — such a row's board is written by the transitions that move the batch,
-    so its `board_phase` is None; `unbatched` is the UNBATCHED word of a PR that
-    left a batch without landing, else None; `given_up` says the PR gave a
-    landing turn up once, whoever had granted it.
-
-    `batches` is every merge batch a turn marker on one of MY claims' PRs names.
-    At most one is mine and holds my turn; one whose `instance` is not me is a
-    dead fleet's, on claims I took — to be abandoned (`afk turn --abandon`).
+    None while it has not stopped and on every other row; `given_up` says the PR
+    gave a landing turn up once, whoever had granted it.
 
     `stale` holds only work to continue: a stale claim on an OPEN issue. One whose
     issue is already closed — its worker landed it, or its fleet closed it, and the
@@ -4809,7 +4667,8 @@ def assemble_working_set(issues: list[Issue], prs: list[PullRequest], claims: li
 
     part = classify_claims(claims, heartbeats, me, now, ttl)
     by_claim = {c["number"]: c for c in claims}
-    closed, landed = set(closed), set(landed)
+    closed, landed, joined = set(closed), set(landed), set(joined)
+    train = train_runs(config)
 
     def stale_rows(numbers: Iterable[int]) -> list[StaleClaim]:
         return [{"number": n, "instance": by_claim[n]["instance"], "sha": by_claim[n]["sha"]}
@@ -4817,7 +4676,6 @@ def assemble_working_set(issues: list[Issue], prs: list[PullRequest], claims: li
 
     turns = turns or {}
     mine: list[MineRow] = []
-    batches: dict[str, Batch] = {}
     for n in part["mine"]:
         pr = pr_for.get(n)
         checks = pr_checks_state(pr["statusCheckRollup"]) if pr else None
@@ -4828,32 +4686,23 @@ def assemble_working_set(issues: list[Issue], prs: list[PullRequest], claims: li
         mine_given_up = turn if turn and turn["instance"] == me and turn_given_up(turn) else None
         status = claim_status(pr is not None, checks, ci_mode,
                               closed=n in closed, landing=bool(held), landed=n in landed,
-                              fixing=fixing_off_turn(mine_given_up))
+                              fixing=fixing_off_turn(mine_given_up),
+                              train=train, joined=n in joined)
         landing = held if status == "landing" else None
         phase = ("ready_again" if status == "awaiting_turn" and mine_given_up
                  else BOARD_PHASE_OF[status])
-        batch = landing["batch"] if landing else None
-        if turn and turn["batch"] and not turn["released"] and n not in closed:
-            seen = batches.setdefault(turn["batch"], {
-                "id": turn["batch"], "instance": turn["instance"], "members": turn["members"],
-                "phase": turn["phase"], "at": turn["at"]})
-            seen["at"] = max(seen["at"] or 0, turn["at"] or 0) or None
         mine.append({"number": n, "title": issue["title"] if issue else None,
-                     "status": status, "board_phase": None if batch else phase,
+                     "status": status, "board_phase": phase,
                      "pr": pr["number"] if pr else None, "checks": checks,
                      "attempt": current_attempt(labels),
                      "starting": attempt_starting(labels),
                      "stopped": (landing["stopped"] if landing
                                  else turn["stopped"] if turn and status == "fixing" else None),
-                     "batch": {"id": batch, "members": [m["issue"] for m in landing["members"]],
-                               "phase": landing["phase"]} if landing and batch else None,
-                     "unbatched": turn["unbatched"] if turn else None,
                      "given_up": bool(turn and turn["given_up"])})
 
     return {"frontier": frontier,
             "mine": mine,
             "merge_order": turn_order(mine),
-            "batches": [batches[k] for k in sorted(batches)],
             "peer_live": [{"number": n, "instance": by_claim[n]["instance"]}
                           for n in part["peer_live"]],
             "stale": stale_rows(n for n in part["stale"] if n not in closed),
