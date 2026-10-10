@@ -1914,7 +1914,8 @@ def stall_reason(reason: str, tail: Iterable[str] | None) -> str:
 # Every `outcome` `afk land` can stop with — the vocabulary the worker's prompt
 # routes on (a test holds the prompt and the docs to it). What each means is
 # `afk.cmd_land`'s docstring, and nowhere else in the code.
-LandOutcome = Literal["merged", "conflict", "gate_red", "awaiting_ci", "needs_verify", "no_checks"]
+LandOutcome = Literal["merged", "conflict", "gate_red", "target_moved", "awaiting_ci",
+                      "needs_verify", "no_checks"]
 LAND_OUTCOMES: tuple[LandOutcome, ...] = get_args(LandOutcome)
 
 # The landing outcomes where the next move is the TICK's, not the worker's: the

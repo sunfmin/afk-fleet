@@ -394,7 +394,9 @@ What a **worker** does on its **landing turn**, with one command in its own work
 gated head. It stops with an outcome the worker acts on itself: a **sync** conflict is left in
 progress and resolved in place, a red gate is fixed in place, and the worker lands again — no round
 trip through the tick, no **retry** spent, the PR and the turn kept. Checks that must run on the head
-it pushed are waited for by the landing itself, up to a bound. Where the next move is the
+it pushed are waited for by the landing itself, up to a bound. A gate run or that wait is long, so
+right before the merge the landing reads the turn and the target's tip again: a turn no longer its
+own lands nothing, and a target that moved is synced with and gated by the next run. Where the next move is the
 tick's (checks still running when that bound runs out, a verify owed on a moved head, absent checks) the
 worker **wakes** the launcher and stops, and the tick tells it to land again. The claim and the
 worktree are settled by the next cycle, from the claim whose issue is now closed (ADR-0027).

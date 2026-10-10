@@ -23,7 +23,10 @@ A PR may land only when **all** configured gates are green. Which **machine gate
   pre-PR sync, and **the landing runs it again** in the same worktree, on the head that lands — because
   the pre-PR pass tested pre-sync code, and two PRs can each be locally green yet conflict semantically. The
   invariant both runs serve: *what lands on the target branch was tested in the form it lands.* The
-  landing's run happens inside `afk land`, after its sync and before `gh pr merge`; a red one is the
+  landing's run happens inside `afk land`, after its sync and before `gh pr merge`. A target that
+  moved while it ran would make the merge commit a tree no run saw, so the landing reads the
+  target's tip again before merging and stops with `target_moved` instead — its next run syncs and
+  gates again. A red run is the
   worker's own `outcome: gate_red` with `gate: {status, exit_code, excerpt, omitted_lines, timed_out}`,
   and it fixes the code and lands again — you are not involved, and no attempt is spent. A run
   that outlives `--gate-timeout` is red, never green by default. The `excerpt` is also
