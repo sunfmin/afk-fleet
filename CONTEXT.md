@@ -432,7 +432,8 @@ whether to batch at all are the tick's, in code)
 **Merge queue**:
 The order **landing turns** are granted in (ADR-0027): among a **fleet instance**'s ready PRs, the
 one that already holds a turn first, then one that left a **merge batch** without landing, then the
-lower PR number. `afk rebuild` returns it as
+lower PR number, then — one PR closing several issues — the lower issue number: a total order,
+whatever order the claims were read in. `afk rebuild` returns it as
 `merge_order`, and the **tick** grants the turn to its first PR only when none of its claims is
 landing. Every other ready PR waits as `awaiting_turn` — not synced, not told anything, holding its
 slot, its **status board** saying so — so PRs that conflict with each other are each resolved once,

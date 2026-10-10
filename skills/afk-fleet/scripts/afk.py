@@ -1100,7 +1100,8 @@ def _settle_base(run: _Run, answer: str | None) -> Obj:
         return {"status": "ask", **found}
     now = run.now()
     claims, heartbeats = _scan(run)
-    live = [i for i, ts in heartbeats.items() if now - ts < afk_decide.CLAIM_LEASE_TTL_SECONDS]
+    live = [i for i, ts in heartbeats.items()
+            if not afk_decide.is_stale(ts, now, afk_decide.CLAIM_LEASE_TTL_SECONDS)]
     refusal = afk_decide.base_refusal(answer, recorded, _remote_heads(rem), len(claims), live)
     if refusal:
         raise ValueError(refusal)
@@ -3106,12 +3107,12 @@ def _land_batch(run: _Run, batch: str, limits: _GateLimits, merged_timeout: floa
                            f"files — what would be gated is not what would land. Commit your "
                            f"fix (or discard it) and run this again:\n{dirty}")
     prs = {p["number"]: p for p in _open_prs(run.repo)}
-    for m in members:
-        _aim_pr(run, prs[m["pr"]])
     closed = [m["pr"] for m in members if m["pr"] not in prs]
     if closed:
         raise RuntimeError(f"PR(s) {closed} of merge batch {batch} are no longer open; nothing "
                            f"was changed — send your wake and stop")
+    for m in members:
+        _aim_pr(run, prs[m["pr"]])
 
     # --- stack: every member on the target's tip, then the fixes carried so far ---
     log = _git(["-C", path, "log", "--first-parent", "--reverse", "--format=%H%x09%s",
@@ -3453,6 +3454,14 @@ def cmd_close(a: argparse.Namespace) -> Obj:
 # arg wiring                                                                  #
 # --------------------------------------------------------------------------- #
 
+def _count(text: str) -> int:
+    """A flag's value that counts something: an integer, never negative."""
+    n = int(text)
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"{text} is negative")
+    return n
+
+
 class _Parser(argparse.ArgumentParser):
     """argparse whose usage errors are the CLI's one error shape — `{"error": …}`,
     exit 3 — so a missing `--config` reads exactly like any other failure."""
@@ -3568,8 +3577,9 @@ def build_parser() -> _Parser:
                    help="land a merge batch, in the batch's worktree, instead of one PR: "
                         "the batch's id, as its brief gives it")
     gate_timeout(p)
-    p.add_argument("--excerpt-lines", type=int, default=afk_decide.GATE_EXCERPT_LINES, metavar="k",
-                   help="how many trailing log lines a red gate's excerpt keeps")
+    p.add_argument("--excerpt-lines", type=_count, default=afk_decide.GATE_EXCERPT_LINES,
+                   metavar="k", help="how many trailing log lines a red gate's excerpt keeps "
+                                     "(default %(default)s; 0: none)")
     p.add_argument("--merged-timeout", type=int, default=60, metavar="s",
                    help="--batch: seconds to wait for GitHub to show the landed PRs merged "
                         "before leaving their branches in place (default %(default)s)")

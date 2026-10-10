@@ -1017,7 +1017,9 @@ def select_frontier(issues: list[EligibleIssue], ready_label: str, epic_labels: 
 
 def is_stale(last_ts: float | None, now: float, ttl: float) -> bool:
     """A claim's owner is presumed dead when its heartbeat is missing or older
-    than `ttl`. Missing (None) counts as stale — an owner that never beat."""
+    than `ttl`. Missing (None) counts as stale — an owner that never beat. This
+    is the fleet's one lease comparison: whatever asks whether a fleet instance
+    is live asks here, so a heartbeat exactly `ttl` old is live to all of them."""
     if last_ts is None:
         return True
     return (now - int(last_ts)) > ttl
@@ -1156,10 +1158,10 @@ def gate_verdict(exit_code: int, output: str | None, max_lines: int = GATE_EXCER
     counts as green" — is fixture-pinned: ONLY 0 is green, and a run that timed out
     is red, never green-by-default. The excerpt is the LAST `max_lines` lines
     (where build/test runners put the failure summary), bounded so a 50k-line log
-    reaches the PR comment as a readable tail instead of flooding it.
+    reaches the PR comment as a readable tail instead of flooding it; 0 keeps none.
     """
     lines = [ln.rstrip() for ln in (output or "").splitlines()]
-    tail = lines[-max_lines:] if max_lines and max_lines > 0 else lines
+    tail = lines[-max_lines:] if max_lines > 0 else []
     return {"status": "green" if (int(exit_code) == 0 and not timed_out) else "red",
             "exit_code": int(exit_code),
             "timed_out": bool(timed_out),
@@ -1357,8 +1359,9 @@ def gate_comment(verdict: Obj, command: str) -> str:
            else f"exit {verdict['exit_code']}")
     omitted = (f"\n\n_({verdict['omitted_lines']} earlier line(s) omitted)_"
                if verdict["omitted_lines"] else "")
+    excerpt = f"\n\n```\n{verdict['excerpt']}\n```" if verdict["excerpt"] else ""
     return (f"**afk-fleet landing gate: red** — `{command}` → {how}, run after syncing "
-            f"with the merge target.\n\n```\n{verdict['excerpt']}\n```{omitted}")
+            f"with the merge target.{excerpt}{omitted}")
 
 
 # --------------------------------------------------------------------------- #
@@ -2173,14 +2176,16 @@ def turn_order(rows: list[MineRow]) -> list[int]:
     """
     The order landing turns are granted in — the merge queue: the issue numbers
     of the `mine` rows whose PR is ready, a PR that already holds a turn first,
-    then a PR that left a merge batch without landing, then the lower PR number.
+    then a PR that left a merge batch without landing, then the lower PR number,
+    then — one PR closing several issues — the lower issue number. That is a
+    total order, so the queue never depends on the order the rows came in.
 
       rows: `mine` rows {"number", "status", "pr", "unbatched"}; only `landing`
             and `awaiting_turn` ones are in the queue
     """
     ready = [r for r in rows if r["status"] in ("landing", "awaiting_turn")]
-    return [r["number"] for r in sorted(ready, key=lambda r: (r["status"] != "landing",
-                                                              not r["unbatched"], r["pr"]))]
+    return [r["number"] for r in sorted(ready, key=lambda r: (
+        r["status"] != "landing", not r["unbatched"], r["pr"], r["number"]))]
 
 
 # --------------------------------------------------------------------------- #
@@ -3244,9 +3249,10 @@ def cycle_state(raw: Any, instance: str | None = None,
                 worker_command: str | None = None) -> CycleState:
     """The cycle state from what the caller handed back (None / "" on the first
     cycle → CYCLE_START plus the two facts, which the first cycle must be given).
-    Raises ValueError on anything that is not a state this code produced — a
-    caller that mangled it must hear so, not run on zeros — and on a fact passed
-    again that disagrees with the one the state carries."""
+    Raises ValueError on anything that is not a state this code produced
+    (`_cycle_state_flaw`) — a caller that mangled it must hear so, not run on
+    zeros — and on a fact passed again that disagrees with the one the state
+    carries."""
     given = {"instance": instance, "worker_command": worker_command}
     if raw is None or raw == "":
         missing = [f"--{k.replace('_', '-')}" for k, v in given.items() if not v]
@@ -3254,22 +3260,48 @@ def cycle_state(raw: Any, instance: str | None = None,
             raise ValueError(f"the first cycle (no --state) needs {' and '.join(missing)}: "
                              f"they are carried in the state from then on")
         return cast("CycleState", {**CYCLE_START, "boards": {}, **given})
-    if not isinstance(raw, dict) or set(raw) != {*CYCLE_START, *CYCLE_FACTS} \
-            or not all(isinstance(raw[k], str) and raw[k] for k in CYCLE_FACTS) \
-            or not isinstance(raw["boards"], dict):
+    flaw = _cycle_state_flaw(raw)
+    if flaw:
         raise ValueError(f"--state is not a cycle state carrying the instance id and the worker "
-                         f"launch command (pass back the `state` the previous `afk cycle` "
-                         f"returned, verbatim): {raw!r}")
+                         f"launch command — {flaw} (pass back the `state` the previous "
+                         f"`afk cycle` returned, verbatim): {raw!r}")
     for key, value in given.items():
         if value and value != raw[key]:
             raise ValueError(f"--{key.replace('_', '-')} {value!r} is not the one --state carries "
                              f"({raw[key]!r}): omit it after the first cycle")
-    # the keys were just checked to be exactly a state's
-    return cast("CycleState", {
-        "fingerprint": str(raw["fingerprint"]), "unsettled": bool(raw["unsettled"]),
-        "boards": {str(n): str(key) for n, key in raw["boards"].items()},
-        **{k: int(raw[k]) for k in ("skips", "empty_streak", *TICK_COUNTS)},
-        **{k: raw[k] for k in CYCLE_FACTS}})
+    return cast("CycleState", {**raw, "boards": dict(raw["boards"])})
+
+
+def _cycle_state_flaw(raw: Any) -> str | None:
+    """Why `raw` is not a cycle state `cycle_wake`, `cycle_ticked` or
+    `cycle_drained` could have returned — None when it is one. Every field has
+    its own type, no count is negative, and the counts agree with each other the
+    way those three leave them:
+
+      skips         below FORCE_TICK_AFTER_SKIPS — the cycle that would reach it
+                    ticks, and a tick starts the count again;
+      skips > 0     only while nothing is `unsettled`: such a cycle ticks;
+      empty_streak  above 0 only with nothing in flight, nothing left on the
+                    frontier and nothing `unsettled` — else the cycle was not empty.
+    """
+    if not isinstance(raw, dict) or set(raw) != {*CYCLE_START, *CYCLE_FACTS}:
+        return "it does not have exactly a state's keys"
+    counts = ("skips", "empty_streak", *TICK_COUNTS)
+    wrong = [k for k in CYCLE_FACTS if not (isinstance(raw[k], str) and raw[k])]
+    wrong += [k for k in counts if type(raw[k]) is not int or raw[k] < 0]
+    wrong += [k for k, kind in (("fingerprint", str), ("unsettled", bool), ("boards", dict))
+              if not isinstance(raw[k], kind)]
+    if not wrong and not all(isinstance(x, str) for kv in raw["boards"].items() for x in kv):
+        wrong = ["boards"]
+    if wrong:
+        return f"{', '.join(f'`{k}`' for k in wrong)} cannot be what it holds"
+    if raw["skips"] >= FORCE_TICK_AFTER_SKIPS:
+        return f"`skips` is past the forced tick ({FORCE_TICK_AFTER_SKIPS})"
+    if raw["skips"] and raw["unsettled"]:
+        return "an `unsettled` cycle is never skipped"
+    if raw["empty_streak"] and (raw["in_flight"] or raw["frontier_remaining"] or raw["unsettled"]):
+        return "`empty_streak` counts cycles with nothing in flight, left or `unsettled`"
+    return None
 
 
 def cycle_wake(state: CycleState, current_fp: str, woke: bool = False) -> Obj:
@@ -3373,7 +3405,10 @@ def cycle_drained(state: CycleState, released: Collection[int], kept: Collection
     nothing follows a drain. One that met an error is `unsettled`, so a caller
     that does run it again is not told it has nothing to do.
     """
-    new: CycleState = {**state, "in_flight": len(kept), "unsettled": bool(errors)}
+    held = bool(kept or errors)     # a drain that leaves a claim held was not an empty cycle
+    new: CycleState = {**state, "in_flight": len(kept), "unsettled": bool(errors),
+                       "empty_streak": 0 if held else state["empty_streak"],
+                       "skips": 0 if errors else state["skips"]}
     parts = [f"{word} {', '.join(f'#{n}' for n in numbers)}"
              for word, numbers in (("released", released), ("kept", kept)) if numbers]
     parts += [f"{errors} error{'' if errors == 1 else 's'}"] if errors else []
