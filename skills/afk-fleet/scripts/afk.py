@@ -510,17 +510,17 @@ def _claim_turns(repo: str, prs: list[PullRequest], claims: list[Claim],
 
 def _single_turn(run: _Run, number: int, pr_number: int,
                  fresh: bool = False) -> tuple[str | None, Turn | None]:
-    """(the instance that holds issue <number>'s claim, the landing turn ONE PR
-    holds from it) — the turn is None when PR `pr_number` holds none from that
-    instance, or holds a merge batch's (`afk_decide.held_turn`). `fresh`: the
-    claims and the PR's comments are read now, whatever this process read
-    before — what a landing asks again once its gate has run."""
+    """(the instance that holds issue <number>'s claim, the turn PR `pr_number`'s
+    own worker lands under for it) — the turn ONE PR holds from that instance,
+    or the marker of one that gave that turn up; None when the PR has neither,
+    or holds a merge batch's (`afk_decide.own_landing`). `fresh`: the claims
+    and the PR's comments are read now, whatever this process read before —
+    what a landing asks again once its gate has run."""
     if fresh:
         _scan(run, fresh=True)
         _issue_comments(run.repo, pr_number, fresh=True)
     owner = _claim_owner(run, number)
-    turn = afk_decide.held_turn(_turn(run.repo, pr_number), owner)
-    return owner, None if turn is None or turn["batch"] else turn
+    return owner, afk_decide.own_landing(_turn(run.repo, pr_number), owner)
 
 
 def _record_turn(repo: str, pr_number: int, turn: Turn) -> int:
@@ -2136,24 +2136,27 @@ def _begin_worker(run: _Run, instance: str, agent: _Agent, issue: IssueRead, sta
     still here, else the pushed branch, else a fresh start from base: the
     continuation tiers of ADR-0011) — or "fresh": discard the previous attempt and
     start from base, which is what a retry is. A continued worker whose PR holds
-    this fleet's landing turn is started ON it, briefed only to land the PR — in
-    the worktree still here, else one recreated at the PR's head, never from base
-    (ADR-0027). The callable returns the tier taken plus where the worker now
+    this fleet's landing turn — or gave it up and is still being fixed — is
+    started ON that landing, briefed only to land the PR — in the worktree still
+    here, else one recreated at the PR's head, never from base (ADR-0027,
+    ADR-0045). The callable returns the tier taken plus where the worker now
     is: {tier, action, prompt, reason, worktree, branch, terminal}."""
     cfg = run.cfg
     number = issue["number"]
     if issue["state"] != "open":
         raise RuntimeError(f"issue #{number} is {issue['state']}, not open — there is nothing "
                            f"to retry (release the claim instead)")
-    discarded, landing = None, None      # landing: the PR this worker is started on the turn of
+    discarded, landing = None, None      # landing: the PR this worker is started to land
+    board: afk_decide.StatusPhase = "claimed"
     if start == "fresh":
         discarded = _discard_attempt(run, number)
         plan = afk_decide.select_recovery(None, None, fresh=True)
     else:
         pr = afk_decide.closing_pr(_open_prs(run.repo), number)
-        turn = afk_decide.held_turn(_turn(run.repo, pr["number"]), instance) if pr else None
-        if pr and turn and not turn["batch"]:    # a merge batch's turn is its batch worker's
-            landing = pr
+        # a merge batch's turn is its batch worker's; a PR ready again waits to be told
+        turn = afk_decide.own_landing(_turn(run.repo, pr["number"]), instance) if pr else None
+        if pr and turn and (not turn["released"] or afk_decide.fixing_off_turn(turn)):
+            landing, board = pr, "fixing" if turn["released"] else "landing"
         rec = _recovery(run, number, landing_pr=landing["number"] if landing else None)
         plan = {k: rec[k] for k in ("tier", "action", "prompt", "reason")}
 
@@ -2183,10 +2186,8 @@ def _begin_worker(run: _Run, instance: str, agent: _Agent, issue: IssueRead, sta
         handle = submit()
         if afk_decide.attempt_starting(issue["labels"]):    # the counted attempt has its worker
             _edit_labels(run.repo, number, [], [afk_decide.ATTEMPT_STARTING])
-        if landing:
-            _upsert_board(run, number, "landing", instance=instance, pr=landing["number"])
-        else:
-            _upsert_board(run, number, "claimed", instance=instance)
+        _upsert_board(run, number, board, instance=instance,
+                      pr=landing["number"] if landing else None)
         return {**plan, "worktree": path, "branch": branch, "terminal": handle,
                 **({"landing": landing["number"]} if landing else {}),
                 **({"discarded": discarded} if discarded else {})}
@@ -2553,7 +2554,9 @@ def cmd_turn(a: argparse.Namespace) -> Obj:
     again as for a terminal that is gone. Nothing else is touched; the restart
     is written on the turn marker (`restarted`), and a second one on the same
     turn is refused. When it is asked for, and what follows a second silence,
-    are `afk_decide.WORKER_CAUSES`'s rows.
+    are `afk_decide.WORKER_CAUSES`'s rows. A PR that gave its turn up and is
+    still being fixed has its silent worker replaced the same way — once, and
+    no turn is granted by it (`fixing`, ADR-0045).
 
       granted       the worker was told (`delivery`: "terminal" | "continuation").
                     `again` is true when the PR already held the turn and its
@@ -2564,6 +2567,12 @@ def cmd_turn(a: argparse.Namespace) -> Obj:
                     or been escalated (a released claim holds no turn).
       landing       this PR already holds the turn and its worker has not stopped
                     for the tick. Nothing was touched; `afk no-pr` watches it.
+      fixing        this PR gave its turn up — its landing stopped on a conflict
+                    or a red gate — and its worker is fixing that off the turn:
+                    it is granted none until `afk land` there says it is ready
+                    again. Nothing was touched, and `afk no-pr` watches it —
+                    unless `--restart` replaced its silent worker (`restarted`,
+                    `delivery`: "continuation").
       awaiting_ci   required mode: the PR's checks are still running. Leave it.
       gate_red      required mode: the PR's checks are red → `afk fail`.
       no_checks     required mode, and the PR has no checks at all — the
@@ -2615,16 +2624,30 @@ def _grant_turn(run: _Run, instance: str, agent: _Agent, number: int,
     held = {n: t for n, t in turns.items() if afk_decide.held_turn(t, instance)}
     others = sorted(n for n in held if n != number)
     held_here = held.get(number)
+    mine = afk_decide.own_landing(turns.get(number), instance)
+    fixing = mine if afk_decide.fixing_off_turn(mine) else None
     if restart:
-        if not held_here:
+        at_it = held_here or fixing
+        if not at_it:
             raise RuntimeError(f"PR #{pr['number']} does not hold this fleet's landing turn — "
                                f"there is no turn to restart issue #{number}'s worker onto "
                                f"(`afk turn --issue {number}` grants one)")
-        if held_here["restarted"]:
+        if at_it["restarted"]:
             raise RuntimeError(f"the worker on issue #{number} was already restarted onto this "
                                f"turn once — a second silence is escalated (`afk escalate`), "
                                f"with the PR kept, not restarted again")
-    elif others:
+    if fixing:
+        detail = ("this PR gave its landing turn up and its worker is fixing it off the turn; "
+                  "it is granted none until `afk land` there says it is ready again")
+        if not restart:
+            return stop("fixing", detail=f"{detail} — nothing was touched; `afk no-pr` watches it")
+        now = run.now()
+        out["comment_id"] = _record_turn(run.repo, pr["number"], afk_decide.next_turn(
+            fixing, at=now, restarted=now))
+        worker = _start_worker(run, instance, agent, issue, "auto")
+        return stop("fixing", restarted=now, delivery="continuation",
+                    terminal=worker["terminal"], worktree=worker["worktree"], detail=detail)
+    if not restart and others:
         return stop("waiting", holder=others[0],
                     detail=f"issue #{others[0]}'s PR holds this fleet's landing turn; nothing was "
                            f"touched — this PR's turn comes when that one has landed, failed or been escalated")
@@ -2706,6 +2729,10 @@ def cmd_land(a: argparse.Namespace) -> Obj:
       gate_red      local mode: the gate was red on the synced head (`gate.excerpt`,
                     also a PR comment). required mode: the PR's checks are red.
                     The worker fixes the code, commits, and runs this again.
+      awaiting_turn the PR gave its turn up, and is ready again: this run synced
+                    it and found the gate green off the turn, and merged
+                    nothing. The worker sends its wake and stops; it is told
+                    when the PR's next turn comes.
       target_moved  the target moved while the gate ran (or the checks were
                     waited for): the head that was gated no longer holds its
                     tip, so merging it would land a tree no gate saw. Nothing
@@ -2720,11 +2747,19 @@ def cmd_land(a: argparse.Namespace) -> Obj:
       no_checks     required mode, the PR has no checks at all, and the tick has
                     not said it may land so.
 
-    On the last three the next move is the tick's: the worker sends its wake and
-    stops, the turn stays its own, and it is told to run this again (`afk turn`).
-    No outcome spends an attempt, closes the PR or gives the turn up; every one
-    but `merged` is written onto the PR's turn comment (`stopped`), which is what
-    `afk rebuild` reports. A turn that is no longer this landing's once the gate
+    On `awaiting_ci`, `needs_verify` and `no_checks` the next move is the tick's:
+    the worker sends its wake and stops, the turn stays its own, and it is told
+    to run this again (`afk turn`). No outcome spends an attempt or closes the
+    PR; every one but `merged` is written onto the PR's turn comment (`stopped`),
+    which is what `afk rebuild` reports.
+
+    A turn covers the bounded part — sync, gate, merge. The first time a PR's
+    landing stops with `conflict` or `gate_red` it GIVES THE TURN UP (`turn`:
+    "given_up" in the result, `afk_decide.gives_turn_up`): the next PR lands
+    while the worker fixes this one in place, exactly as before. Run off the
+    turn, this still syncs and gates, stops with `conflict` / `gate_red` as
+    often as it takes, and merges nothing: green there is `awaiting_turn`. On
+    the PR's next turn those two outcomes keep the turn (ADR-0045). A turn that is no longer this landing's once the gate
     has run — the claim was released or taken over, the turn granted afresh — is
     refused like one never held: exit 3, nothing merged, nothing written. The claim is NOT released and the worktree is not
     removed here — this runs inside that worktree, and a worker holds no instance
@@ -2762,14 +2797,26 @@ def cmd_land(a: argparse.Namespace) -> Obj:
                            f"Do not land it any other way — you are told when its turn comes")
     branch, target = pr["headRefName"], _base(cfg)
     pr_number: int = pr["number"]
+    on_turn = not turn["released"]      # else the PR gave its turn up: nothing merges
     _aim_pr(run, pr)
-    out = {"issue": a.number, "pr": pr_number}
+    out = {"issue": a.number, "pr": pr_number, "turn": "held" if on_turn else "given_up"}
 
     def stop(outcome: afk_decide.LandOutcome, **more: Any) -> Obj:
-        """Stop short of merging, and say so on the PR's turn comment."""
+        """Stop short of merging, and say so on the PR's turn comment — giving
+        the turn up when that is what this stop does."""
         at = _git(["-C", path, "rev-parse", "HEAD"]).stdout.strip()
-        _record_turn(run.repo, pr_number, afk_decide.next_turn(
-            turn, at=run.now(), stopped=afk_decide.land_outcome(outcome), head=at))
+        if on_turn and afk_decide.gives_turn_up(turn, outcome):
+            _record_turn(run.repo, pr_number,
+                         afk_decide.given_up_turn(turn, run.now(), outcome, at))
+            _upsert_board(run, a.number, "fixing", instance=owner, pr=pr_number)
+            more = {**more, "turn": "given_up",
+                    "detail": f"{more['detail']}. This PR GAVE ITS LANDING TURN UP, so other "
+                              f"PRs land meanwhile: send your wake now, without waiting for "
+                              f"an answer, and carry on fixing. Off the turn this command "
+                              f"syncs and gates and merges nothing"}
+        else:
+            _record_turn(run.repo, pr_number, afk_decide.next_turn(
+                turn, at=run.now(), stopped=afk_decide.land_outcome(outcome), head=at))
         return {**out, "outcome": outcome, **more}
 
     # --- the PR's head, as this worktree has it: commits the worker made since
@@ -2815,15 +2862,22 @@ def cmd_land(a: argparse.Namespace) -> Obj:
         if checks_say == "gate_red":
             return stop(checks_say, checks=checks,
                         detail="the PR's checks are red — fix the code, commit, and run this again")
-        if checks_say == "awaiting_ci":
+        if on_turn and checks_say == "awaiting_ci":
             return stop(checks_say, checks=checks,
                         detail=f"the checks on this head were still running after "
                                f"{a.checks_timeout}s — send your wake and stop; you are told to "
                                f"run this again once they are in")
-        if checks_say != "green":
+        if on_turn and checks_say != "green":
             return stop(checks_say, checks=checks,
                         detail="send your wake and stop — you are told to run this again once "
                                "that is settled")
+    if not on_turn:
+        # what is left is the tick's to judge before the next grant (`afk turn`), and the merge
+        _upsert_board(run, a.number, "ready_again", instance=owner, pr=pr_number)
+        return stop("awaiting_turn",
+                    detail="this PR gave its landing turn up and is ready again: synced and "
+                           "gated here, nothing merged — send your wake and stop; you are told "
+                           "when its next turn comes")
     if afk_decide.verifies(cfg) and turn["verified"] != head:
         return stop("needs_verify",
                     detail="the head that would land is not the one that was verified — send "

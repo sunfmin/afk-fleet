@@ -9,6 +9,10 @@ adds is a field of the turn marker, in the encoding of
 [ADR-0032](0032-records-kept-in-comments-share-the-encoding-of-records-on-refs.md). While here, the
 stale consequence of [ADR-0013](0013-liveness-is-recency-not-accumulated-work.md) is marked
 superseded by the retry of [ADR-0017](0017-the-act-half-is-transitions.md).
+**Amended by [ADR-0045](0045-a-landing-that-stops-on-a-conflict-or-a-red-gate-gives-its-turn-up.md) (#151):** the
+same ladder bounds a worker fixing **off** a turn its PR gave up — nudge, one restart (`afk turn
+--restart`, which grants no turn there), then the escalation that keeps everything. Giving the turn
+up clears `restarted`, and the PR's next turn has a restart of its own.
 **Amended (#91):** the rung past the restart is an **escalation** that keeps the PR, not `afk
 fail` — see [the amendment](#amendment-91--a-landing-that-outlives-its-restart-is-escalated-with-everything-kept)
 at the end. Where decision 5 and the consequences below say the restarted worker's second silence

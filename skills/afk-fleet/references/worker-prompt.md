@@ -176,7 +176,8 @@ your PR holds the landing turn:
 It syncs your branch with the merge target (a merge, never a rebase), pushes, runs the gate on that
 exact head — or waits for the PR's checks on it, which can take as long as CI does: let it run — and,
 once it has read again that the turn is still yours and the target has not moved, merges the PR
-pinned to the head it gated. It ends with one JSON object. An
+pinned to the head it gated. It ends with one JSON object, whose `turn` says whether the PR still
+holds the turn (`held`) or has given it up (`given_up` — see below the table). An
 `"error"` saying the PR does **not hold the landing turn** means it is not your turn: nothing was
 changed — stop and wait to be told; do not land it any other way. An `"error"` saying the worktree
 is **not the commit that would land** means the gate could not prove that commit: there were
@@ -193,9 +194,19 @@ and run the command again. Otherwise act on its `outcome`:
 | `awaiting_ci` | The command waited for the PR's checks on the head that would land, and they had not finished when its wait ran out. | Wake the coordinator and stop. The turn stays yours; you are told to run the command again. |
 | `needs_verify` | The head that would land is not the one that was verified — the sync moved it. | Wake the coordinator and stop. The turn stays yours; you are told to run the command again. |
 | `no_checks` | The PR has no checks at all, and that has not been waived. | Wake the coordinator and stop. The turn stays yours; you are told to run the command again. |
+| `awaiting_turn` | The PR gave its turn up, and your fix holds: this run synced it and found the gate green, and merged nothing. | Wake the coordinator and stop. You are told when the PR's next turn comes; then run the command again. |
 
-No outcome costs an attempt or closes the PR, and the turn is yours until the PR has landed — every
-other finished PR waits behind it, so do not sit on it. Only **silence** fails it.
+**A turn covers only the sync, the gate and the merge.** The first time the command stops with
+`conflict` or `gate_red`, the PR **gives its turn up** — the result says `"turn": "given_up"` — so
+that other finished PRs land while you fix this one. Nothing else changes for you: wake the
+coordinator once, right away and without waiting for an answer, then do exactly what the table says —
+fix it here, commit, run the command again. Off the turn the command still syncs and gates, and
+stops with `conflict` or `gate_red` as often as it takes; it merges nothing, and ends with
+`awaiting_turn` once your fix holds. A PR gives its turn up **once**: on its next turn a `conflict` or
+a `gate_red` keeps the turn, and every other finished PR waits behind it — do not sit on it.
+
+No outcome costs an attempt or closes the PR. Only **silence** ends it: a worker that goes quiet is
+replaced once, and after that the PR is handed to a human as it is.
 
 **Waking the coordinator** is this line, run once, exactly as written, whenever the table says so
 (if it fails, ignore it — the coordinator polls anyway; never send anything else to that terminal):
