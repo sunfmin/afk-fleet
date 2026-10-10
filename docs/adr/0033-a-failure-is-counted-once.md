@@ -69,9 +69,11 @@ second comment, saying "without a retry".
 - One escalation is one comment, and says the retries the issue really had, however many times it
   runs to finish. An issue escalated again later, under a new claim, gets a comment of its own:
   the earlier one names another claim.
-- A count a hand-edit spelled differently (`afk-attempt/01`), or left a stray label beside, still
-  costs a counted failure no edit and no attempt: `retry_labels` compares the number, and the next
-  count tidies the labels in the edit it makes anyway.
+- A count a hand-edit left a stray label beside still costs a counted failure no edit and no
+  attempt: `retry_labels` compares the number, and the next count tidies the labels in the edit it
+  makes anyway. A count spelled as the fleet never writes one (`afk-attempt/01`, `afk-attempt/²`)
+  is not a count but one more stray label (`fleet_number`, #108): the issue reads as the attempt
+  its other labels say — never retried, if it has none — and the next count strips it.
 - An uninterrupted `afk fail` prints what it printed, and leaves the labels it left: the second
   label is gone again before it returns.
 - One more reserved label under the `afk-attempt/` prefix; `current_attempt` reads past it.

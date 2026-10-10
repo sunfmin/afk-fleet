@@ -661,6 +661,20 @@ def test_every_kind_of_record_kept_on_a_ref_round_trips_through_the_remote():
         assert git(b, "rev-parse", "FETCH_HEAD^{tree}") == tree
 
 
+def test_a_heartbeat_is_read_back_under_exactly_the_id_it_was_written_for():
+    """Whose a heartbeat is is its ref's name: every shape of id the grammar
+    admits is one ref path segment, so the scan reads each beat back under the
+    id that wrote it — prefix pairs and the longest id included."""
+    ids = ["fl", "fl-1", "fl-1-t170", "felix", "felix-2", "7", "a--b-", "a" * 40]
+    assert all(afk_decide.instance_id(i) == i for i in ids)
+    with sandbox() as sb:
+        w = sb.clones[0]
+        for k, instance in enumerate(ids):
+            beat = afk(w, "heartbeat", "--instance", instance, "--now", str(T0 + k))
+            assert beat["ref"] == f"refs/afk/heartbeat/{instance}"
+        assert afk(w, "scan")["heartbeats"] == {i: T0 + k for k, i in enumerate(ids)}
+
+
 def test_a_claim_and_a_heartbeat_already_on_the_remote_are_still_read():
     """A fleet that updates mid-run loses no claim: the refs a fleet wrote before
     records shared one encoding are read as what they are, and what is written
@@ -722,6 +736,33 @@ def test_malformed_refs_in_the_namespace_are_ignored_not_fatal():
         # an ownerless claim is nobody's: reclaimable as stale, never "mine"
         part = afk(w, "classify-claims", "--instance", "me", "--now", str(T0))
         assert part["mine"] == [5] and part["stale"] == [6, 7] and part["peer_live"] == []
+
+
+def test_a_claim_ref_not_named_as_the_fleet_names_one_is_no_claim():
+    """An issue has ONE claim ref, `<n>` as the fleet writes it. Another spelling
+    of the number — or a digit run no issue has — is not that issue's claim, and
+    a record whose time is no number is one that states no time."""
+    with sandbox() as sb:
+        w = sb.clones[0]
+        won = afk(w, "claim", "7", "--instance", "me", "--now", str(T0))
+        empty = git(w, "hash-object", "-t", "tree", os.devnull)
+        theirs = git(w, "commit-tree", empty, "-m", f"afk-claim instance=peer host=mac ts={T0}")
+        names = ["007", "07", "٧", "７", "²", "9" * 19, "1" + "0" * 200]
+        git(w, "push", "-q", "origin", *(f"{theirs}:refs/afk/claim/{name}" for name in names))
+        for i, ts in enumerate(("9" * 19, "7" * 4301, "٧", "²", "007")):
+            odd = git(w, "commit-tree", empty, "-m", f"afk-claim instance=peer host=mac ts={ts}")
+            beat = git(w, "commit-tree", empty, "-m", f"afk-heartbeat instance=p{i} ts={ts}")
+            git(w, "push", "-q", "origin", f"{odd}:refs/afk/claim/{20 + i}",
+                f"{beat}:refs/afk/heartbeat/p{i}")
+
+        scan = afk(w, "scan")
+        by = {c["number"]: c for c in scan["claims"]}
+        assert sorted(by) == [7, 20, 21, 22, 23, 24]
+        assert by[7] == {"number": 7, "instance": "me", "host": by[7]["host"], "ts": T0,
+                         "sha": won["sha"]}
+        assert all((by[n]["instance"], by[n]["ts"]) == ("peer", None) for n in range(20, 25))
+        assert scan["heartbeats"] == {"me": T0}
+        assert afk(w, "classify-claims", "--instance", "me", "--now", str(T0))["mine"] == [7]
 
 
 def test_every_ref_op_round_trips_under_the_refs_heads_fallback():

@@ -50,6 +50,8 @@ import sys
 import time
 from contextlib import contextmanager
 
+import pytest
+
 import afk
 import afk_decide
 from test_afk_refs import (ENV, NO_CONFIG, T0, TTL, afk as run, afk_error, git, last_beat,
@@ -2572,6 +2574,57 @@ def test_recovery_reads_pushed_progress_from_the_remote_alone():
             assert w.sb.bare in w.error(*gone, *how), how
 
 
+def _translating_locale():
+    """The environment of an installed locale git answers in a language other than
+    English under, or None when this machine has none (git built without its
+    translations)."""
+    for name in ("zh_CN.UTF-8", "de_DE.UTF-8", "fr_FR.UTF-8", "es_ES.UTF-8"):
+        env = {"LC_ALL": name, "LANGUAGE": name.split(".")[0]}
+        p = subprocess.run(["git", "fetch", os.devnull], capture_output=True, text=True,
+                           env={**ENV, **env}, cwd=os.path.dirname(os.path.abspath(__file__)))
+        if p.returncode != 0 and "fatal: " not in p.stderr:
+            return env
+    return None
+
+
+def test_gits_answers_are_read_the_same_in_every_locale():
+    """What git says is read under one fixed message locale, so a machine set to
+    Chinese or German tells "the branch is absent" from "could not look" exactly as
+    an English one does."""
+    foreign = _translating_locale()
+    if foreign is None:
+        pytest.skip("no installed locale makes this git answer in another language")
+    with world() as w:
+        cfg = ("--config", json.dumps({"base_branch": w.sb.base}))
+        gone = ("recovery", "--issue", "31", "--no-worktree", *R, *cfg)
+        git(w.cwd, "push", "-q", "origin", f"{w.sb.base}:refs/heads/sunfmin/issue-31-pushed")
+        for env in ({}, foreign):
+            # absent: a branch never pushed has nothing ahead, in any language
+            r = w.afk(*gone, "--branch", "sunfmin/issue-31-never-pushed", env=env)
+            assert (r["branch"]["commits_ahead"], r["tier"]) == (None, 3), r
+            # could not look: a base the remote lacks is an error, in the words read
+            err = w.error(*gone, "--branch", "sunfmin/issue-31-pushed",
+                          "--set", "base_branch=no-such-base", env=env)
+            assert "couldn't find remote ref refs/heads/no-such-base" in err, err
+        # …and so is a remote that cannot be read at all
+        os.rename(w.sb.bare, w.sb.bare + ".away")
+        for env in ({}, foreign):
+            err = w.error(*gone, "--branch", "sunfmin/issue-31-never-pushed", env=env)
+            assert w.sb.bare in err, err
+
+
+def test_a_present_branch_is_not_read_as_absent_for_prefixing_a_missing_base():
+    """Absent-versus-error is decided on the exact ref asked for: git naming the
+    missing base `main-gone` says nothing about the branch `main-g`, which is there."""
+    with world() as w:
+        cfg = ("--config", json.dumps({"base_branch": w.sb.base}))
+        recover = ("recovery", "--issue", "31", "--no-worktree", *R, *cfg, "--branch", "main-g")
+        w.commit("work.txt", branch="main-g")
+        git(w.cwd, "push", "-q", "origin", "HEAD")
+        assert w.afk(*recover)["branch"]["commits_ahead"] == 1
+        assert "main-gone" in w.error(*recover, "--set", "base_branch=main-gone")
+
+
 def test_recovery_finds_this_machines_worktree_through_orca():
     with world() as w:
         cfg = ("--config", json.dumps({"base_branch": w.sb.base}))
@@ -2805,7 +2858,7 @@ def test_what_a_turn_marker_says_survives_a_landing_that_stops_and_a_turn_grante
         on = (*local_gate("true"), "--set", "gate.adversarial_verify_prompt=re-derive it")
         d, head = with_pr(w, 7, 70)
         wt = d["worktree"]
-        left = afk_decide.unbatched_turn(None, "me", T0, "me-1", "left_out")
+        left = afk_decide.unbatched_turn(None, "me", T0, "me-t1", "left_out")
         w.set(comments={"70": [{"id": 2001, "html_url": "u", "body": afk_decide.turn_comment(
             afk_decide.single_turn(left, "me", T0, verified="0" * 40, allow_no_checks=True))}]})
 
@@ -2818,7 +2871,7 @@ def test_what_a_turn_marker_says_survives_a_landing_that_stops_and_a_turn_grante
         r = _land(w, 7, wt, *on, now=T0 + 10)
         assert r["outcome"] == "needs_verify", r
         assert marker() == {**before, "at": T0 + 10, "stopped": "needs_verify", "head": r["head"]}
-        assert (marker()["unbatched"], marker()["of"]) == ("left_out", "me-1")
+        assert (marker()["unbatched"], marker()["of"]) == ("left_out", "me-t1")
         assert (marker()["verified"], marker()["allow_no_checks"]) == ("0" * 40, True)
         # the turn is granted again, on a verify of that head
         assert w.afk(*_turn(7, *on, "--verified", r["head"], now=T0 + 20))["again"] is True
@@ -4708,7 +4761,7 @@ def test_land_batch_without_the_batchs_turn_changes_nothing():
 
         # not in the batch's worktree; not this batch
         assert "is not merge batch" in refused(cwd=d[1]["worktree"])
-        assert "is not merge batch" in refused(name="me-1")
+        assert "is not merge batch" in refused(name="me-t1")
         # a member whose marker is gone, or names another fleet instance
         w.set(comments={**marked, "20": []})
         assert "does not hold the landing turn of merge batch" in refused()
@@ -5801,6 +5854,26 @@ def test_the_subcommands_that_start_a_worker_are_the_ones_a_judgment_writes_the_
                 if any(act.required and "--worker-command" in act.option_strings
                        for act in sub._actions)}
     assert requires == set(afk_decide.STARTS_WORKER)
+
+
+def test_an_instance_outside_the_grammar_is_refused_on_every_subcommand_that_takes_one():
+    """The instance id's grammar is checked where `--instance` enters, on every
+    subcommand that has the flag — nothing downstream meets an id it would read
+    back as another's — and SKILL.md's "mint an instance id" step names it."""
+    parser = afk.build_parser()
+    takes = [n for n, sub in parser.subcommands.items()
+             if any("--instance" in act.option_strings for act in sub._actions)]
+    assert {"cycle", "claim", "heartbeat", "takeover", "turn", "status"} <= set(takes)
+    with world() as w:
+        for name in takes:
+            argv = [a for a in _minimal_argv(name, parser.subcommands[name])
+                    if a not in ("--instance", "me")]
+            for bad in ("fl/1", "fl 1", "Fl", ""):
+                err = w.error(*argv, "--instance", bad, "--config", "{}")
+                assert "--instance" in err and afk_decide.INSTANCE_ID_GRAMMAR in err, (name, err)
+    step = next(ln for ln in _skill_docs()["SKILL.md"].split("\n\n")
+                if "mint a short unique **instance id**" in ln)
+    assert f"`{afk_decide.INSTANCE_ID_GRAMMAR}`" in step
 
 
 def test_config_is_required_and_resolves_one_way_on_every_subcommand():

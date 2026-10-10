@@ -531,12 +531,23 @@ class FieldType(NamedTuple):
     many: bool = False              # a list: a word with no `=` after it is one more item
 
 
-def _digits(raw: str) -> int | None:
-    return int(raw) if raw.isascii() and raw.isdigit() else None
+# A number as the fleet writes one — `str(int(n))` of an issue, a PR, an attempt
+# or a time: ASCII digits, no sign, no leading zero, and no longer than any of
+# those ever gets (18 digits holds a nanosecond clock for centuries).
+_FLEET_NUMBER = re.compile(r"0|[1-9][0-9]{0,17}")
+
+
+def fleet_number(raw: str) -> int | None:
+    """Text the fleet did not necessarily write → the number it spells, or None.
+    The ONE rule for "is this a number" wherever a comment, a label, a ref name
+    or a commit subject is read: anyone can write those, so every other spelling
+    — `007`, `٧`, `²`, a digit run of any length — is not a number, rather than
+    another name for one or a conversion that raises."""
+    return int(raw) if _FLEET_NUMBER.fullmatch(raw) else None
 
 
 _FIELD_TYPES = {str: FieldType(str, lambda raw: raw),
-                int: FieldType(lambda value: str(int(value)), _digits)}
+                int: FieldType(lambda value: str(int(value)), fleet_number)}
 
 # A fact that is either so or not: written `=1` when so, left out when not.
 FLAG = FieldType(lambda value: "1" if value else "", lambda raw: True if raw == "1" else None,
@@ -546,7 +557,7 @@ FLAG = FieldType(lambda value: "1" if value else "", lambda raw: True if raw == 
 # (`#3`); anything else in the list is dropped.
 INTS = FieldType(lambda values: ",".join(str(int(v)) for v in values),
                  lambda raw: [n for x in raw.split(",")
-                              if (n := _digits(x.removeprefix("#"))) is not None] or None,
+                              if (n := fleet_number(x.removeprefix("#"))) is not None] or None,
                  empty=(), many=True)
 
 
@@ -2190,9 +2201,9 @@ UNBATCHED: tuple[Unbatched, ...] = get_args(Unbatched)
 def _batch_members(raw: str | None) -> list[dict[str, int]]:
     """`1:10,2:20` → [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}]; anything
     else in the list is dropped."""
-    pairs = [tok.split(":") for tok in (raw or "").split(",")]
-    return [{"issue": int(p[0]), "pr": int(p[1])} for p in pairs
-            if len(p) == 2 and p[0].isdigit() and p[1].isdigit()]
+    pairs = [[fleet_number(part) for part in tok.split(":")] for tok in (raw or "").split(",")]
+    return [{"issue": p[0], "pr": p[1]} for p in pairs
+            if len(p) == 2 and p[0] is not None and p[1] is not None]
 
 
 # The PRs a merge batch holds, in stack order, each with the issue it closes.
@@ -2508,20 +2519,41 @@ def turn_order(rows: list[MineRow]) -> list[int]:
 # fast-forward (`afk land --batch`). Still one turn out at a time; what the
 # gate proves is the stack, in the form it lands.
 
-_BATCH_ID_UNSAFE = re.compile(r"[^A-Za-z0-9_.-]")
+# The instance id's one grammar, checked once where `--instance` enters
+# (`afk.py`): lowercase letters, digits and `-`, opening with a letter or digit,
+# at most 40 characters. So an id is a bare token wherever it is written — one
+# ref path segment (its heartbeat is read back under exactly that name), part of
+# a branch name — and two ids never differ by case alone, which a
+# case-insensitive checkout would fold into one ref.
+INSTANCE_ID_GRAMMAR = r"[a-z0-9][a-z0-9-]{0,39}"
+
+
+def instance_id(text: str) -> str:
+    """`text` when it is an instance id (`INSTANCE_ID_GRAMMAR`); raises otherwise."""
+    if not re.fullmatch(INSTANCE_ID_GRAMMAR, text):
+        raise ValueError(f"{text!r} is not an instance id: it must match {INSTANCE_ID_GRAMMAR}")
+    return text
+
+
+def _batch_ids(instance: str) -> str:
+    """The regex of every batch id of `instance`. The `-t` in front of the second
+    is what keeps one instance's ids apart from another's: no id of `fl-1` is an
+    id of `fl`, and none is an id of `fl` behind orca's `-<k>` continuation
+    suffix either."""
+    return rf"{re.escape(instance)}-t\d+"
 
 
 def batch_id(instance: str, now: float) -> str:
     """A new merge batch's id: the granting fleet instance and the second it was
-    formed — unique, since an instance has one turn out at a time. It is a bare
-    token: it names a branch, a worktree and a marker field."""
-    return f"{_BATCH_ID_UNSAFE.sub('-', instance)}-{int(now)}"
+    formed — unique, since an instance has one turn out at a time, and never
+    another instance's (`_batch_ids`). It is a bare token: it names a branch, a
+    worktree and a marker field."""
+    return f"{instance}-t{int(now)}"
 
 
 def batch_formed_by(batch: str | None, instance: str | None) -> bool:
     """Is `batch` an id `batch_id` gives a batch of `instance`?"""
-    return bool(instance) and bool(
-        re.fullmatch(rf"{re.escape(_BATCH_ID_UNSAFE.sub('-', instance))}-\d+", batch or ""))
+    return bool(instance) and bool(re.fullmatch(_batch_ids(instance), batch or ""))
 
 
 def batch_name(batch: str) -> str:
@@ -2538,7 +2570,7 @@ def batch_branch_regex(batch: str | None = None,
     if batch:
         which = re.escape(batch)
     elif instance:
-        which = rf"({re.escape(_BATCH_ID_UNSAFE.sub('-', instance))}-\d+)"
+        which = f"({_batch_ids(instance)})"
     else:
         raise ValueError("batch_branch_regex takes a batch or an instance")
     return re.compile(rf"^(?:[^/]+/)?afk-batch-{which}(?:-\d+)?$")
@@ -2642,8 +2674,8 @@ def stacked_pr(parents: str, subject: str | None) -> int | None:
     way `stack_message` writes it. The subject alone decides, never the body;
     and a commit with one parent is never a member's, whatever its subject says
     — a fix titled `… (#<pr>)` is a fix."""
-    m = re.search(r" \(#(\d+)\)$", subject or "") if len(parents.split()) > 1 else None
-    return int(m.group(1)) if m else None
+    m = re.search(r" \(#([0-9]+)\)$", subject or "") if len(parents.split()) > 1 else None
+    return fleet_number(m.group(1)) if m else None
 
 
 def read_stack(commits: Iterable[tuple[str, str, str]],
@@ -3366,9 +3398,9 @@ def current_attempt(labels: Iterable[str] | None) -> int:
     attempts = [0]
     for lb in labels or []:
         if isinstance(lb, str) and lb.startswith(_ATTEMPT_PREFIX):
-            n = lb[len(_ATTEMPT_PREFIX):]
-            if n.isascii() and n.isdigit():
-                attempts.append(int(n))
+            n = fleet_number(lb[len(_ATTEMPT_PREFIX):])
+            if n is not None:
+                attempts.append(n)
     return max(attempts)
 
 
@@ -3427,9 +3459,10 @@ def retry_labels(labels: Iterable[str] | None, to_label: str) -> tuple[list[str]
     """The label edit that counts a failure: `(add, remove)`, made in ONE edit of
     the issue. Adds `to_label` and `ATTEMPT_STARTING` where the issue lacks them
     and removes every other attempt label it carries — so for a failure already
-    counted there is nothing to add or remove, and no edit to make: however a
-    hand-edit spelled the count (`afk-attempt/01`), or whatever it left beside
-    it, the number is the one `to_label` says and the next count tidies it."""
+    counted there is nothing to add or remove, and no edit to make: whatever a
+    hand-edit left beside the count, the number is the one `to_label` says and
+    the next count tidies it. A count spelled as the fleet never writes one
+    (`afk-attempt/01`) is no count (`fleet_number`): it goes out with the rest."""
     labels = list(labels or [])
     if attempt_starting(labels) and current_attempt(labels) == current_attempt([to_label]):
         return [], []
@@ -4630,11 +4663,12 @@ _UNFORMATTED = re.compile(
 
 # A closing keyword and the ONE reference after it — `Closes #1, #2` closes #1
 # alone — in each form GitHub autolinks: `#7`, `GH-7`, `owner/repo#7`, the URL.
+# The number is ASCII digits, and few enough that no body makes reading it raise.
 _REPO_NAME = r"[\w.-]+/[\w.-]+"
 _CLOSING_REFERENCE = re.compile(
     r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+"
     rf"(?:(?P<short>{_REPO_NAME})?#|GH-|https?://github\.com/(?P<url>{_REPO_NAME})/(?:issues|pull)/)"
-    r"(?P<number>\d+)\b", re.I)
+    r"(?P<number>[0-9]{1,18})\b", re.I)
 
 
 def issues_closed_by(body: str | None, linked: Iterable[IssueRef] | None,
