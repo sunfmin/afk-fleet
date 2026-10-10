@@ -2781,10 +2781,12 @@ def cmd_land(a: argparse.Namespace) -> Obj:
                     is merged into the branch first, so the worker has the red
                     tree. required mode: the PR's checks are red. The worker
                     fixes the code, commits, and runs this again.
-      awaiting_turn the PR gave its turn up, and is ready again: this run
-                    found the gate green off the turn, on what would land now,
-                    and merged nothing. The worker sends its wake and stops;
-                    it is told when the PR's next turn comes.
+      awaiting_turn the PR gave its turn up, and is ready again: this run,
+                    off the turn, found it merges with the target cleanly
+                    (required mode: and its checks not red), and merged
+                    nothing. In local mode no gate ran — the PR's next turn
+                    runs it (ADR-0047). The worker sends its wake and stops;
+                    it is told when that turn comes.
       target_moved  the target moved while the gate ran (or the checks were
                     waited for): what was gated is not what would land — the
                     fast-forward was refused, or the gated head no longer
@@ -2809,8 +2811,9 @@ def cmd_land(a: argparse.Namespace) -> Obj:
     landing stops with `conflict` or `gate_red` it GIVES THE TURN UP (`turn`:
     "given_up" in the result, `afk_decide.gives_turn_up`): the next PR lands
     while the worker fixes this one in place, exactly as before. Run off the
-    turn, this still gates what would land, stops with `conflict` / `gate_red` as
-    often as it takes, and merges nothing: green there is `awaiting_turn`. On
+    turn, this syncs and merges nothing: it stops with `conflict` as often as it
+    takes (required mode: or `gate_red`, on red checks), and a clean sync is
+    `awaiting_turn`. The local gate is not run there (ADR-0047). On
     the PR's next turn those two outcomes keep the turn (ADR-0045). A turn that is no longer this landing's once the gate
     has run — the claim was released or taken over, the turn granted afresh — is
     refused like one never held: exit 3, nothing merged, nothing written. The claim is NOT released and the worktree is not
@@ -2870,7 +2873,8 @@ def cmd_land(a: argparse.Namespace) -> Obj:
                     "detail": f"{more['detail']}. This PR GAVE ITS LANDING TURN UP, so other "
                               f"PRs land meanwhile: send your wake now, without waiting for "
                               f"an answer, and carry on fixing. Off the turn this command "
-                              f"syncs and gates and merges nothing"}
+                              f"syncs, runs no gate and merges nothing — prove a fix with "
+                              f"the tests that were red before you run it"}
         else:
             _record_turn(run.repo, pr_number, afk_decide.next_turn(
                 turn, at=run.now(), stopped=afk_decide.land_outcome(outcome), head=at))
@@ -2908,8 +2912,17 @@ def cmd_land(a: argparse.Namespace) -> Obj:
         _push_branch(run.repo, rem, path, head, branch)
     out.update(head=head, synced=pushed)
 
-    # --- the machine gate, against exactly `head` ---
+    # --- the machine gate, against exactly `head`. Off the turn the local gate is
+    # not run: the target moves under a PR that waits, and the run that counts is
+    # the one its next turn makes (ADR-0047) ---
     if cfg["gate"]["ci"] == "local":
+        if not on_turn:
+            _upsert_board(run, a.number, "ready_again", instance=owner, pr=pr_number)
+            return stop("awaiting_turn",
+                        detail=f"this PR gave its landing turn up and is ready again: synced "
+                               f"with {target}. Nothing was gated and nothing merged — the gate "
+                               f"runs on its next turn. Send your wake and stop; you are told "
+                               f"when that turn comes")
         gate = _gated(run, path, limits)
         if gate["status"] != "green":
             _pr_comment(run.repo, pr["number"], afk_decide.gate_comment(gate, gate["command"]))
@@ -2941,9 +2954,9 @@ def cmd_land(a: argparse.Namespace) -> Obj:
         # what is left is the tick's to judge before the next grant (`afk turn`), and the merge
         _upsert_board(run, a.number, "ready_again", instance=owner, pr=pr_number)
         return stop("awaiting_turn",
-                    detail="this PR gave its landing turn up and is ready again: synced and "
-                           "gated here, nothing merged — send your wake and stop; you are told "
-                           "when its next turn comes")
+                    detail="this PR gave its landing turn up and is ready again: synced, its "
+                           "checks not red, nothing merged — send your wake and stop; you are "
+                           "told when its next turn comes")
     if afk_decide.verifies(cfg) and turn["verified"] != head:
         return stop("needs_verify",
                     detail="the head that would land is not the one that was verified — send "
@@ -3003,8 +3016,8 @@ def _land_stacked(run: _Run, path: str, pr: PullRequest, pr_tip: str, issue: int
     A red gate is the worker's to fix where it works, so the tip the stack was
     made on is merged into the branch and pushed before `gate_red` is returned:
     the red tree is then the one in front of it. Off the turn (`held` is a
-    marker that gave it up) nothing is pushed to the target: green is
-    `awaiting_turn`. `stop` and `out` are `cmd_land`'s. The worktree is back
+    marker that gave it up) the stack is made and nothing more: no gate runs and
+    nothing is pushed to the target — a PR that stacks is `awaiting_turn`. `stop` and `out` are `cmd_land`'s. The worktree is back
     on its branch whenever this returns or raises."""
     rem, target = run.rem, _base(run.cfg)
     owner, turn = held
@@ -3025,6 +3038,14 @@ def _land_stacked(run: _Run, path: str, pr: PullRequest, pr_tip: str, issue: int
         commit, _, _ = _stack_pr(rem, path, pr, issue)
         if commit is None:
             return None
+        if turn["released"]:
+            out.update(head=head, synced=pushed)
+            _upsert_board(run, issue, "ready_again", instance=owner, pr=number)
+            return stopped("awaiting_turn",
+                           detail=f"this PR gave its landing turn up and is ready again: it "
+                                  f"merges onto {target} cleanly. Nothing was gated and nothing "
+                                  f"merged — the gate runs on its next turn. Send your wake and "
+                                  f"stop; you are told when that turn comes")
         out.update(head=head, synced=pushed, commit=commit)
         gate = _gated(run, path, limits)
         if gate["status"] != "green":
@@ -3041,12 +3062,6 @@ def _land_stacked(run: _Run, path: str, pr: PullRequest, pr_tip: str, issue: int
                                f"{target} is merged into the branch here, so that tree is the "
                                f"one in front of you — fix the code, commit, and run this again")
         out["gate"] = gate
-        if turn["released"]:
-            _upsert_board(run, issue, "ready_again", instance=owner, pr=number)
-            return stopped("awaiting_turn",
-                           detail=f"this PR gave its landing turn up and is ready again: gated "
-                                  f"here as it would land on {target}, nothing merged — send "
-                                  f"your wake and stop; you are told when its next turn comes")
         _require_same_turn(run, issue, number, held)
         p = _push_branch(run.repo, rem, path, commit, target, check=False)
         if p.returncode != 0:

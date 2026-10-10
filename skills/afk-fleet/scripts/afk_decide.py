@@ -2133,8 +2133,9 @@ def stall_reason(reason: str, tail: Iterable[str] | None) -> str:
 # GIVES THE TURN UP, once per PR (ADR-0045): the marker says when
 # (`given_up=<epoch>`, kept on every marker written for the PR from then on) and
 # holds no turn (`released=1`) until the PR is granted one again. Off the turn
-# the same worker fixes in the same worktree and `afk land` still syncs and
-# gates, but merges nothing; `stopped=awaiting_turn` says the PR is ready again.
+# the same worker fixes in the same worktree and `afk land` still syncs, but
+# runs no local gate (ADR-0047) and merges nothing; `stopped=awaiting_turn` says
+# the PR is ready again.
 #
 # A turn is held by one PR or by one MERGE BATCH (ADR-0029). A batch's turn is
 # the same marker on every member PR, with three more fields:

@@ -474,7 +474,8 @@ stopped on the PR:
   the turn**: the landing writes on the turn marker that the PR gave its turn up (`given_up`), the
   claim is `fixing`, and the next cycle grants the turn to the next PR of the merge queue, or to a
   merge batch. The worker is told nothing new: it fixes, commits and runs `afk land` again, which
-  off the turn still gates what would land and merges nothing; green there is `awaiting_turn` — the
+  off the turn syncs, runs no local gate (ADR-0047 — the target moves under a PR that waits, so the
+  run that counts is its next turn's) and merges nothing; a clean sync there is `awaiting_turn` — the
   worker wakes the launcher and stops, the PR is ready again, and it is granted its next turn
   ahead of every PR that never held one. A PR gives its turn up **once**: on that next turn a
   `conflict` or a `gate_red` is fixed with the turn held, so the landings that pass a PR cannot

@@ -3123,6 +3123,17 @@ def test_a_red_gate_on_the_turn_is_the_workers_to_fix_and_spends_nothing():
         assert _mine(w, red, 4) == ("fixing", "fixing", "gate_red")
         # the tick has nothing to add: the worker is fixing it
         assert w.afk(*_turn(4, *red, now=T0 + 90))["outcome"] == "fixing"
+        # off the turn the landing runs NO gate (ADR-0047): the PR merges onto the
+        # target cleanly, so it is ready again — proving the fix is its next turn's
+        r = _land(w, 4, wt, *red)
+        assert (r["outcome"], r["turn"], r["synced"]) == ("awaiting_turn", "given_up", False), r
+        assert "gate" not in r and "commit" not in r and "merged" not in w.pr(40)
+        assert len(w.state()["pr_comments"]["40"]) == 1
+        assert _mine(w, red, 4) == ("awaiting_turn", "ready_again", None)
+        # on that turn a red gate keeps the turn: a PR gives its turn up once
+        assert w.afk(*_turn(4, *red))["outcome"] == "granted"
+        r = _land(w, 4, wt, *red)
+        assert (r["outcome"], r["turn"], r["gate"]["source"]) == ("gate_red", "held", "run"), r
 
         # a hung gate is RED, never green-by-default; the excerpt is a bounded tail
         r = _land(w, 4, wt, *local_gate("sleep 30"), "--gate-timeout", "1")
@@ -3135,20 +3146,14 @@ def test_a_red_gate_on_the_turn_is_the_workers_to_fix_and_spends_nothing():
         assert (r["gate"]["excerpt"], r["gate"]["omitted_lines"]) == ("", 200)
         assert "```" not in w.state()["pr_comments"]["40"][-1]
         assert "--excerpt-lines" in _land_error(w, 4, wt, *red, "--excerpt-lines", "-1")
-        assert len(w.state()["pr_comments"]["40"]) == 4 and len(_turns(w, 40)) == 1
+        assert len(w.state()["pr_comments"]["40"]) == 5 and len(_turns(w, 40)) == 1
 
         # the worker fixes the code, commits, and lands again — its commit is pushed,
-        # gated green off the turn, and nothing is merged until the PR's next turn
+        # gated green, and merged
         fixed = w.work(wt, "fixed.txt", push=False)
         r = _land(w, 4, wt, *red)
         assert (r["outcome"], r["synced"], r["head"], r["gate"]["source"]) == \
-            ("awaiting_turn", True, fixed, "run"), r
-        assert "merged" not in w.pr(40) and _mine(w, red, 4) == ("awaiting_turn", "ready_again", None)
-        # on that turn the run made off the turn stands for the tree: a merge, no second run
-        assert w.afk(*_turn(4, *red))["outcome"] == "granted"
-        r = _land(w, 4, wt, *red)
-        assert (r["outcome"], r["synced"], r["head"], r["gate"]["source"]) == \
-            ("merged", False, fixed, "recorded"), r
+            ("merged", True, fixed, "run"), r
         assert w.pr(40)["merged"] == {"pushed": True, "head": fixed}
 
 
@@ -3207,12 +3212,14 @@ def test_a_sync_conflict_on_the_turn_is_resolved_in_place_by_the_worker():
         assert "uncommitted" in _land_error(w, 2, wt, *gate)
         git(wt, "commit", "-qm", "merge main: keep both")
 
-        # fixed: off the turn the landing pushes the resolution, gates the PR stacked on
-        # the target — what landed meanwhile included, with no second sync of the
-        # branch — and merges NOTHING; the PR is ready again
+        # fixed: off the turn the landing pushes the resolution and finds the PR
+        # stacks on the target — what landed meanwhile included, with no second sync
+        # of the branch. It runs NO gate (ADR-0047) and merges NOTHING; the PR is
+        # ready again
+        runs = _gate_runs(w)
         r = _land(w, 2, wt, *gate, now=T0 + 30)
-        assert (r["outcome"], r["turn"], r["synced"], r["gate"]["status"]) == \
-            ("awaiting_turn", "given_up", True, "green"), r
+        assert (r["outcome"], r["turn"], r["synced"]) == ("awaiting_turn", "given_up", True), r
+        assert "gate" not in r and _gate_runs(w) == runs
         assert w.sb.remote_ref(f"refs/heads/{w.sb.base}") == tip and "merged" not in w.pr(20)
         assert w.sb.remote_ref(f"refs/heads/{d['branch']}") == r["head"]
         assert not os.path.exists(os.path.join(wt, "feature3.txt"))
@@ -3225,8 +3232,7 @@ def test_a_sync_conflict_on_the_turn_is_resolved_in_place_by_the_worker():
         w.afk("release", "3", *ME, *R, *gate)
         assert w.afk("rebuild", *ME, *R, *NOW, *gate)["merge_order"] == [2, 1]
 
-        # its second turn: the gate run made off the turn stands for the tree, and a
-        # conflict now KEEPS the turn — a PR gives its turn up once
+        # its second turn: a conflict now KEEPS the turn — a PR gives its turn up once
         w.advance_base("shared.txt", text="someone else, again")
         assert w.afk(*_turn(2, *gate, now=T0 + 40))["outcome"] == "granted"
         r = _land(w, 2, wt, *gate, now=T0 + 50)
@@ -4660,14 +4666,14 @@ def test_a_pr_that_conflicts_with_the_stack_is_left_out_and_never_batched_again(
         assert (rows[2][0], rows[3][0], order) == ("fixing", "fixing", [])
         assert "errors" not in c and c["judgments"] == [], c
 
-        # #2 is resolved first: gated off the turn, then landed on its next one —
-        # which is the merge alone, the run made off the turn standing for the tree
+        # #2 is resolved first: ready again off the turn, where no gate runs
+        # (ADR-0047), then gated and landed on its next one
         _resolve(w, wt2, "shared.txt", "from #1 and #2")
-        assert _land(w, 2, wt2, *gate)["outcome"] == "awaiting_turn" and _gate_runs(w) == 2
+        assert _land(w, 2, wt2, *gate)["outcome"] == "awaiting_turn" and _gate_runs(w) == 1
         c = tick(w, c["state"], *gate)
         assert c["progress"].startswith("landing turn to #2; "), c["progress"]
         r = _land(w, 2, wt2, *gate)
-        assert (r["outcome"], r["gate"]["source"], _gate_runs(w)) == ("merged", "recorded", 2), r
+        assert (r["outcome"], r["gate"]["source"], _gate_runs(w)) == ("merged", "run", 2), r
 
         # #3 was resolved against a target that did not hold #2 yet. Off the turn its
         # landing syncs again and meets #2: the one more resolution giving a turn up

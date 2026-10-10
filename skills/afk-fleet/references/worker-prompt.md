@@ -196,15 +196,18 @@ and run the command again. Otherwise act on its `outcome`:
 | `awaiting_ci` | The command waited for the PR's checks on the head that would land, and they had not finished when its wait ran out. | Wake the coordinator and stop. The turn stays yours; you are told to run the command again. |
 | `needs_verify` | The head that would land is not the one that was verified — the sync moved it. | Wake the coordinator and stop. The turn stays yours; you are told to run the command again. |
 | `no_checks` | The PR has no checks at all, and that has not been waived. | Wake the coordinator and stop. The turn stays yours; you are told to run the command again. |
-| `awaiting_turn` | The PR gave its turn up, and your fix holds: this run found the gate green on what would land now, and merged nothing. | Wake the coordinator and stop. You are told when the PR's next turn comes; then run the command again. |
+| `awaiting_turn` | The PR gave its turn up, and is ready again: it merges with the target cleanly (with required checks: and they are not red). No gate ran and nothing was merged — the gate runs on the PR's next turn. | Wake the coordinator and stop. You are told when the PR's next turn comes; then run the command again. |
 
 **A turn covers only putting the PR together with the target, the gate and the merge.** The first time the command stops with
 `conflict` or `gate_red`, the PR **gives its turn up** — the result says `"turn": "given_up"` — so
 that other finished PRs land while you fix this one. Nothing else changes for you: wake the
 coordinator once, right away and without waiting for an answer, then do exactly what the table says —
-fix it here, commit, run the command again. Off the turn the command still gates what would land, and
-stops with `conflict` or `gate_red` as often as it takes; it merges nothing, and ends with
-`awaiting_turn` once your fix holds. (Just started here, and the first result already says
+fix it here, commit, run the command again. Off the turn the command syncs with the target and
+stops with `conflict` as often as it takes (with required checks: or `gate_red`); it **runs no gate**
+and merges nothing, and ends with `awaiting_turn` once the PR merges with the target cleanly. So
+after a `gate_red`, prove your fix yourself before you run it: run the tests that were red
+(`gate.excerpt` names them), not the whole gate — the whole gate runs on the PR's next turn, on
+what the target holds by then. (Just started here, and the first result already says
 `given_up`? The PR gave its turn up before you came: the same applies.) A PR gives its turn up **once**: on its next turn a `conflict` or
 a `gate_red` keeps the turn, and every other finished PR waits behind it — do not sit on it.
 
