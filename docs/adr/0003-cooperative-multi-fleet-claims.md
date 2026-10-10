@@ -47,6 +47,12 @@ the assignee onto an **atomic lock ref**, and liveness is carried by a **per-ins
    **peer's** claim only when that peer's heartbeat has expired (**stale claim**), via an atomic
    `git push --force-with-lease=afk-claim/<n>:<sha-it-read>` takeover so two reclaimers can't both win.
 
+   **The heartbeat comes first (#123).** "Only while it holds claims" left a window: a fleet that
+   held nothing had no fresh heartbeat, and its tick beat only after its claims were pushed — so a
+   peer scanning in between read a live fleet's new claim as stale and took it. Every push that puts
+   a claim in an instance's name (claim, reclaim, takeover) now refreshes that instance's heartbeat
+   first, if due; a fleet that holds nothing and claims nothing still writes none.
+
 4. **Open-PR guard.** An issue with an open linked PR is never in the frontier — a PR is itself
    durable in-flight evidence, independent of the claim ref. This hardens every recovery path (a
    released-but-still-finishing worker's PR is not re-dispatched) and makes the fleet correctly leave
@@ -92,6 +98,14 @@ second-guess a live owner's workers).
 - **Cleanup is load-bearing:** the claim ref must be deleted on merge, escalate, and release. A missed
   delete is a silent phantom lock (the one failure mode to guard hardest). ADR-0001's aversion to a
   second source of truth stands — the ref *is* the source of truth, and nothing reads the assignee.
+- **A release is leased, like a reclaim** *(amended)*. Whose a claim is, is read off the one scan a
+  process makes, and the delete comes later; a peer may have taken the claim in between (a takeover
+  of a fleet that was slow, not dead). So every delete of a claim ref — the release that ends a
+  transition, the drain, a landed claim's, a phantom lock's — is
+  `git push --force-with-lease=<ref>:<sha-it-read> :<ref>`: a claim that moved is left alone and the
+  caller is told it no longer holds it. And the delete is the last thing a release does: a landed
+  claim is settled (its batch-landed PR closed, its worktree removed, the checkout synced) *before*
+  its ref is deleted, so a settling that raised leaves the claim held for the next tick to finish.
 - **Graceful stop** releases no-PR claims immediately and retains has-PR claims, so a peer inherits
   and merges the finished PR after the lease expires (bounded merge latency, only at stop).
 - **Single-fleet is unchanged in behaviour** — one instance simply never sees a foreign claim, and its

@@ -33,7 +33,8 @@ epic_labels: [epic, prd, wayfinder:map]   # never dispatched (a PRD is not a wor
                                       #   issue blocked by one is never waited on
 
 # --- workers ---
-concurrency: 3                        # max workers running at once
+concurrency: 3                        # max claims held at once, a worker each: a stale claim or a
+                                      #   frontier issue is taken only into a free slot under it
 
 # --- completion gate ---
 gate:
@@ -60,6 +61,13 @@ escalate_label: ready-for-human        # applied (with ready_label removed, clai
 
 ## Notes
 
+- **A value is read as written.** Quotes delimit a value only when they wrap the whole of it —
+  `"pnpm build && pnpm test"` is the command between them, and `pytest -k 'a or b'` keeps both of
+  its quotes. A comment starts at a `#` that follows whitespace and is outside quotes, so
+  `curl http://h/#frag` keeps its `#`. A list is `[a, b]` on one line, and a quoted item keeps its
+  comma: `[a, "b,c"]` is two items. There is no escape: a wrapped value holds anything but its own
+  quote character. What that cannot hold — `"$PY" -m pytest`, whose opening quote closes before the
+  end — is an **error** naming the key, never a value quietly read as something else.
 - **This template is pinned to the code.** The defaults table in `afk_decide.py`
   (`CONFIG_DEFAULTS`) is the single source of truth; a fixture test parses this file's yaml block
   and fails if any value here drifts from that table (ADR-0009). Edit defaults there, then mirror
@@ -102,7 +110,8 @@ escalate_label: ready-for-human        # applied (with ready_label removed, clai
   of the same tree since, or a record more than a day old, and the landing runs the gate itself.
   There is no switch: what this gives up is a second, independent sample of a flaky or
   machine-dependent gate on unchanged content. A gate that leaves untracked, un-ignored files
-  behind makes every run "not on a committed tree" — ignore its artifacts. A remote that refuses
+  behind — or rewrites a tracked one — makes every run "not on a committed tree": never recorded,
+  and refused by the landing. Ignore its artifacts, and keep fixers out of the gate. A remote that refuses
   `refs/afk/gate/*` is a bootstrap warning: nothing is recorded and every landing gates.
 - **Fingerprint gate.** Each cycle, `afk cycle` (code, zero LLM tokens) runs its reconciliation pass
   only when the digest of observable state moved. On a skipped cycle no tick runs — its only cost is

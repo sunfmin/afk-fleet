@@ -438,6 +438,26 @@ IDLE_INTERVAL_SECONDS = 1500                # ... and once the fleet has gone qu
 IDLE_TICKS_BEFORE_SLEEP = 3                 # empty cycles in a row before it counts as quiet
 CLAIM_LEASE_TTL_SECONDS = 4500              # a claim is live while its heartbeat is this fresh
 FORCE_TICK_AFTER_SKIPS = 6                  # a full tick at least every N skipped cycles (ADR-0007)
+CLOCK_SKEW_TOLERANCE_SECONDS = 300          # how far ahead of the reader a stamp may be and still count
+
+
+def stamp_age(stamp: float | None, now: float) -> int | None:
+    """
+    How old a stamp another clock wrote is, in seconds — a heartbeat, a recorded
+    gate run, a commit, a file's mtime, orca's report — or None when it is no
+    evidence of anything: missing, or further ahead of `now` than
+    `CLOCK_SKEW_TOLERANCE_SECONDS`. A stamp ahead by no more than that is
+    ordinary skew between two hosts and reads as "just now" (0), never as a
+    negative age.
+
+    Every age the fleet acts on is read here, so this is the only place skew is
+    allowed for. Without the bound, age has no floor: a stamp from the future
+    stays fresh until the reader's clock catches up with it, however far that is.
+    """
+    if stamp is None:
+        return None
+    age = int(now) - int(stamp)
+    return None if age < -CLOCK_SKEW_TOLERANCE_SECONDS else max(0, age)
 
 
 # The two places claim + heartbeat refs can live, as namespace → (claim ref prefix,
@@ -481,10 +501,17 @@ BRANCH_NAMESPACE = "refs/heads"
 #   - of the comments on one issue or PR, the latest that carries a record is
 #     the record (`latest_record`).
 #
-# A value is percent-encoded only where it would break a word (whitespace, `%`,
-# anything outside ASCII), so an instance id or a hostname is written as itself.
-# The one value written raw is a kind's `tail`: the field a person fills in with
-# a phrase, which runs from its name to the end of the record.
+# Writing a record and reading it back is the identity, for every value, every
+# kind and both carriers (a generated test holds it). A value is percent-encoded
+# only where it would break that: whitespace, `%`, anything outside ASCII, and
+# the `>` of a `-->`, which would end a marker. So an instance id or a hostname
+# is written as itself. A kind's `tail` is the field a person fills in with a
+# phrase, running from its name to the end of the record: it keeps its spaces
+# and its own script, and is encoded only where it would not read back
+# (`_TAIL_BREAKS`).
+#
+# A list is the one value a hand may spread over several words: a word with no
+# `=` after a list's field is one more item of it (`blocked_by=3, 4`).
 
 class RecordKind(NamedTuple):
     word: str           # the record's first word: what kind of record this is
@@ -499,6 +526,7 @@ class FieldType(NamedTuple):
     write: Callable[[Any], str]     # value → its text; "" when there is nothing to write
     read: Callable[[str], Any]      # text (never empty) → value; None when it is no such value
     empty: object = None            # what a record that does not state the field reads as
+    many: bool = False              # a list: a word with no `=` after it is one more item
 
 
 def _digits(raw: str) -> int | None:
@@ -512,10 +540,12 @@ _FIELD_TYPES = {str: FieldType(str, lambda raw: raw),
 FLAG = FieldType(lambda value: "1" if value else "", lambda raw: True if raw == "1" else None,
                  empty=False)
 
-# Whole numbers, comma-separated; anything else in the list is dropped.
+# Whole numbers, comma-separated. A hand may write each as an issue is named
+# (`#3`); anything else in the list is dropped.
 INTS = FieldType(lambda values: ",".join(str(int(v)) for v in values),
-                 lambda raw: [int(x) for x in re.split(r"[,\s]+", raw) if _digits(x) is not None]
-                 or None, empty=())
+                 lambda raw: [n for x in raw.split(",")
+                              if (n := _digits(x.removeprefix("#"))) is not None] or None,
+                 empty=(), many=True)
 
 
 def one_of(vocabulary: tuple[str, ...]) -> FieldType:
@@ -556,6 +586,10 @@ def blank_record(kind: RecordKind) -> Obj:
 
 
 _RECORD_SAFE = "!\"#$&'()*+,/:;<=>?@[\\]^`{|}~"
+# What a tail may not hold as itself: a `%` that would read as an encoding, a
+# line break or any other control or odd whitespace, a space at either end
+# (reading trims them), and the `>` that would close a marker.
+_TAIL_BREAKS = re.compile(r"%(?=[0-9A-Fa-f]{2})|[^\S ]|[\x00-\x1f\x7f]|\A | \Z|(?<=--)>")
 
 
 def _field_words(kind: RecordKind, record: Obj, spell: Callable[[str, Any], str]) -> list[str]:
@@ -583,24 +617,32 @@ def record_message(kind: RecordKind, record: Obj) -> str:
     raises."""
     def spell(name: str, value: Any) -> str:
         text = _field_type(kind, name).write(value)
-        return text if name == kind.tail else urllib.parse.quote(text, safe=_RECORD_SAFE)
+        if name == kind.tail:
+            return _TAIL_BREAKS.sub(lambda m: urllib.parse.quote(m[0], safe=""), text)
+        return urllib.parse.quote(text, safe=_RECORD_SAFE).replace("-->", "--%3E")
     return " ".join([kind.word, *_field_words(kind, record, spell)])
 
 
 def _read_fields(kind: RecordKind, text: str) -> Obj | None:
     """What follows a kind's word → the record, or None when a required field is
-    missing. A comma may be followed by whitespace: a list is still one value."""
-    record: Obj = {}
-    tail = re.search(rf"\b{kind.tail}=(.*)$", text, re.DOTALL) if kind.tail else None
+    missing. A list may run over several words; no other value does."""
+    stated: dict[str, str] = {}
+    tail = re.search(rf"(?<!\S){kind.tail}=(.*)$", text, re.DOTALL) if kind.tail else None
     if kind.tail and tail:
         text = text[:tail.start()]
-        if tail.group(1).strip():
-            record[kind.tail] = tail.group(1).strip()
-    for word in re.sub(r",\s+", ",", text).split():
-        name, _, raw = word.partition("=")
-        if name not in kind.fields or not raw:
-            continue
-        value = _field_type(kind, name).read(urllib.parse.unquote(raw))
+        stated[kind.tail] = tail.group(1).strip()
+    listing = None      # the list field whose items the words with no `=` are
+    for word in text.split():
+        name, named, raw = word.partition("=")
+        if named:
+            listing = name if name in kind.fields and _field_type(kind, name).many else None
+            if name in kind.fields:
+                stated[name] = raw
+        elif listing:
+            stated[listing] += f",{word}"
+    record: Obj = {}
+    for name, raw in stated.items():
+        value = _field_type(kind, name).read(urllib.parse.unquote(raw)) if raw else None
         if value is not None:
             record[name] = value
     return record if all(name in record for name in kind.required) else None
@@ -755,6 +797,67 @@ def _renamed(dotted: str) -> str | None:
     return f"config: {dotted!r} was renamed to {new!r} — {why}"
 
 
+def _schema_default(section: str | None, key: str) -> Any:
+    """The default of one key of the schema — a top-level one's, or one of
+    `section`'s (a section's own default is its table). A key the schema does not
+    have raises, naming itself: with its migration note if it was renamed or
+    removed, else as unknown."""
+    if section is not None:
+        table = CONFIG_DEFAULTS.get(section, {})        # a retired section holds no key
+        if key not in table:
+            raise ValueError(_renamed(f"{section}.{key}") or f"config: unknown key {section}.{key}")
+        return table[key]
+    if key not in CONFIG_DEFAULTS:
+        raise ValueError(_renamed(key)
+                         or f"config: unknown key {key!r} (note: the instance id and "
+                            f"the worker launch command are per-run facts, never config keys)")
+    return CONFIG_DEFAULTS[key]
+
+
+def _typed(key: str, value: object, default: object) -> None:
+    """Raise unless `value` — one key's, as JSON carries it — has the type of the
+    key's default: what `_coerce` makes of the file's text, or nothing else."""
+    if isinstance(default, bool):
+        ok, want = isinstance(value, bool), "true/false"
+    elif isinstance(default, int):
+        ok, want = isinstance(value, int) and not isinstance(value, bool), "an integer"
+    elif isinstance(default, list):
+        ok = isinstance(value, list) and all(isinstance(item, str) for item in value)
+        want = "[a, b, ...]"
+    else:
+        ok, want = isinstance(value, str), "a string"
+    if not ok:
+        raise ValueError(f"config key {key!r}: expected {want}, got {value!r}")
+
+
+def check_config(partial: object) -> Obj:
+    """
+    A config as JSON carries it — partial or canonical, the `--config` of every
+    subcommand — held to the schema the file is held to (`parse_config_yaml`):
+    an unknown key raises, a renamed or removed one raises with its migration
+    note, and so does a value that is not of its key's type. The one difference
+    from the file is the settled fields, which the canonical config carries and
+    no file may set. Returns `partial`, every key of it one of the schema's.
+    """
+    if not isinstance(partial, dict):
+        raise ValueError(f"config: expected a JSON object of config keys, got {partial!r}")
+    for key, value in partial.items():
+        if key in CONFIG_SETTLED:
+            _typed(key, value, CONFIG_SETTLED[key])
+        elif key in _RETIRED_SECTIONS and isinstance(value, dict):
+            for sub in value:                       # each key under it has its own note
+                _schema_default(key, sub)
+        elif not isinstance(default := _schema_default(None, key), dict):
+            _typed(key, value, default)
+        elif not isinstance(value, dict):
+            raise ValueError(f"config key {key!r} is a section — expected an object of its "
+                             f"keys, got {value!r}")
+        else:
+            for sub, item in value.items():
+                _typed(f"{key}.{sub}", item, _schema_default(key, sub))
+    return partial
+
+
 def validate_config(cfg: Config) -> Config:
     """
     The semantic checks a per-key type cannot express, run on the CANONICAL config
@@ -802,26 +905,92 @@ def _yaml_block(text: str) -> str:
     return text
 
 
-def _strip_comment(line: str) -> str:
-    """Cut an unquoted trailing `# …` comment; quotes are respected."""
-    out, quote = [], None
-    for ch in line:
+# How the file writes a value — the whole of the dialect, and the one place it is
+# read. A value is read the way its author wrote it:
+#
+#   a comment  starts at a `#` that follows whitespace and is outside quotes;
+#              a `#` glued to a word (`http://h/#frag`) is the value's own.
+#   quotes     delimit only when they wrap the WHOLE value (or a whole list
+#              item): `"a b"` is `a b`, and `echo "hi"` is `echo "hi"`. Wrapped,
+#              a value holds anything but its own quote character — there is no
+#              escape — and keeps its edge spaces and its ` #`.
+#   a list     is `[a, b]` on one line; a quoted item keeps its comma.
+#
+# What that cannot hold is refused by the key's name (`_unrepresentable`), never
+# read as something else: a value that opens with a quote which does not close
+# at its end, and a ` #` after a quote that never closes.
+_QUOTES = "\"'"
+
+
+def _unrepresentable(key: str, raw: str, why: str) -> ValueError:
+    """The refusal of a value the dialect cannot hold, naming its key."""
+    return ValueError(f"config key {key!r}: cannot read {raw!r} — {why}. Quotes delimit a "
+                      f"value only when they wrap all of it, and a wrapped value cannot "
+                      f"hold its own quote character")
+
+
+def _cut_comment(key: str, text: str) -> str:
+    """`text` — what follows a key's colon — without its trailing comment, stripped."""
+    quote, opened = None, 0
+    for i, ch in enumerate(text):
         if quote:
-            out.append(ch)
             if ch == quote:
                 quote = None
-        elif ch in "\"'":
-            quote = ch
-            out.append(ch)
-        elif ch == "#":
-            break
+        elif ch in _QUOTES:
+            quote, opened = ch, i
+        elif ch == "#" and i and text[i - 1].isspace():
+            return text[:i].strip()
+    if quote and re.search(r"\s#", text[opened:]):
+        raise _unrepresentable(key, text.strip(),
+                               f"the {quote} never closes, so the # after it is either a "
+                               f"comment or part of the value")
+    return text.strip()
+
+
+def _closing(key: str, raw: str, start: int) -> int:
+    """Where the quote opening at `raw[start]` closes; refused when it never does."""
+    end = raw.find(raw[start], start + 1)
+    if end < 0:
+        raise _unrepresentable(key, raw, f"the {raw[start]} it opens with never closes")
+    return end
+
+
+def _string(key: str, raw: str) -> str:
+    """One string as its author wrote it: the inside of the quotes that wrap all
+    of `raw`, else `raw` itself — quotes within it and at its end included."""
+    if not raw or raw[0] not in _QUOTES:
+        return raw
+    if _closing(key, raw, 0) != len(raw) - 1:
+        raise _unrepresentable(key, raw, f"the {raw[0]} it opens with closes before its end")
+    return raw[1:-1]
+
+
+def _items(key: str, body: str) -> list[str]:
+    """The items between a list's brackets: split at the commas outside a quoted
+    item. An empty unquoted item — `[a, ]` — is no item."""
+    items, i = [], 0
+    while i < len(body):
+        if body[i].isspace():
+            i += 1
+        elif body[i] in _QUOTES:
+            end = _closing(key, body, i)
+            comma = body.find(",", end)
+            if body[end + 1:comma if comma >= 0 else len(body)].strip():
+                raise _unrepresentable(key, f"[{body}]",
+                                       f"the {body[i]} that opens an item closes before its end")
+            items.append(body[i + 1:end])
+            i = len(body) if comma < 0 else comma + 1
         else:
-            out.append(ch)
-    return "".join(out).strip()
+            comma = body.find(",", i)
+            end = len(body) if comma < 0 else comma
+            if body[i:end].strip():
+                items.append(body[i:end].strip())
+            i = end + 1
+    return items
 
 
 def _coerce(key: str, raw: str, default: object) -> bool | int | list[str] | str:
-    """One scalar, typed by its default: bool, int, [a, b] list, or string."""
+    """One value, typed by its default: bool, int, [a, b] list, or string."""
     if isinstance(default, bool):
         if raw in ("true", "True"):
             return True
@@ -836,8 +1005,8 @@ def _coerce(key: str, raw: str, default: object) -> bool | int | list[str] | str
     if isinstance(default, list):
         if not (raw.startswith("[") and raw.endswith("]")):
             raise ValueError(f"config key {key!r}: expected [a, b, ...], got {raw!r}")
-        return [i.strip().strip("'\"") for i in raw[1:-1].split(",") if i.strip()]
-    return raw.strip("'\"")
+        return _items(key, raw[1:-1])
+    return _string(key, raw)
 
 
 def parse_config_yaml(text: str) -> Obj:
@@ -845,8 +1014,8 @@ def parse_config_yaml(text: str) -> Obj:
     Read the per-repo config — the ```yaml block in docs/agents/afk-fleet.md
     (a whole markdown file or a bare block both work). Schema-aware, zero-dep:
     it parses only the dialect this schema uses (`key: value` scalars, one
-    inline `[a, b]` list, the one-level `gate:` section), and every key
-    and type is checked against CONFIG_DEFAULTS — so parsing IS validation. An
+    inline `[a, b]` list, the one-level `gate:` section — a value is read as
+    written, by the rules above `_cut_comment`), and every key and type is checked against CONFIG_DEFAULTS — so parsing IS validation. An
     unknown key raises (a typo silently ignored would be a config that lies to
     its author, and a launcher-held fact in a file is refused by construction); so does
     a wrong shape. Returns the PARTIAL config — only the keys present.
@@ -857,32 +1026,23 @@ def parse_config_yaml(text: str) -> Obj:
         if not ln.strip() or ln.lstrip().startswith("#"):
             continue
         indented = ln[0] in " \t"
-        s = _strip_comment(ln)
-        if not s:
-            continue
-        if ":" not in s:
+        key, colon, rest = ln.partition(":")
+        key = key.strip()
+        if not colon or "#" in key:
             raise ValueError(f"config: unparseable line {ln.strip()!r}")
-        key, _, raw = s.partition(":")
-        key, raw = key.strip(), raw.strip()
+        raw = _cut_comment(f"{section}.{key}" if indented and section else key, rest)
         if indented:
             if section is None:
                 raise ValueError(f"config: indented key {key!r} outside a gate: section")
-            sub = CONFIG_DEFAULTS.get(section, {})
-            if key not in sub:
-                raise ValueError(_renamed(f"{section}.{key}")
-                                 or f"config: unknown key {section}.{key}")
-            partial.setdefault(section, {})[key] = _coerce(f"{section}.{key}", raw, sub[key])
+            default = _schema_default(section, key)
+            partial.setdefault(section, {})[key] = _coerce(f"{section}.{key}", raw, default)
         else:
             if key in _RETIRED_SECTIONS and not raw:
                 section = key           # read on: each key under it has its own note
                 continue
             if key in CONFIG_SETTLED:
                 raise ValueError(_SETTLED_NOTES[key])
-            if key not in CONFIG_DEFAULTS:
-                raise ValueError(_renamed(key)
-                                 or f"config: unknown key {key!r} (note: the instance id and "
-                                    f"the worker launch command are per-run facts, never config keys)")
-            default = CONFIG_DEFAULTS[key]
+            default = _schema_default(None, key)
             if isinstance(default, dict):
                 if raw:
                     raise ValueError(f"config key {key!r} is a section — write `{key}:` "
@@ -895,16 +1055,20 @@ def parse_config_yaml(text: str) -> Obj:
     return partial
 
 
-def resolve_config(partial: Obj) -> Config:
+def resolve_config(partial: object) -> Config:
     """Partial config → the complete canonical config: every key present,
     defaults filled from CONFIG_DEFAULTS (one level deep for gate), and the
-    settled fields beside them. Idempotent — resolving an already-canonical
-    config is a no-op."""
+    settled fields beside them. The partial is held to the schema first
+    (`check_config`), whichever route it came by — a key the schema does not
+    have, or a value of the wrong type, raises ValueError and is never dropped
+    or carried through. Idempotent — resolving an already-canonical config is a
+    no-op."""
+    partial = check_config(partial)
     out: Obj = {}
     for k, dv in {**CONFIG_DEFAULTS, **CONFIG_SETTLED}.items():
         if isinstance(dv, dict):
             merged = dict(dv)
-            merged.update(partial.get(k) or {})
+            merged.update(partial.get(k, {}))
             out[k] = merged
         elif k in partial:
             out[k] = partial[k]
@@ -917,8 +1081,9 @@ def override_config(cfg: Config, assignments: Iterable[str] | None) -> Config:
     """Lay `key=value` overrides (the CLI's `--set`) onto a canonical config, in
     place, and return it. Keys are the config file's own — dotted for a section
     (`gate.ci=local`), plus the settled fields — and values are typed
-    by the key's default exactly as the file's are, except that a string is taken
-    verbatim (the shell already unquoted it). An unknown key, or an item with no `=`, raises ValueError; a
+    by the key's default exactly as the file's are, with two exceptions: a string is
+    taken verbatim (the shell already unquoted it, so its quotes are the value's
+    own), and nothing is a comment (the shell cut that too). An unknown key, or an item with no `=`, raises ValueError; a
     renamed or removed one raises with its migration note, as the file does."""
     keyed = cast(Obj, cfg)          # written by a key read off the command line
     for item in assignments or []:
@@ -1014,26 +1179,36 @@ def select_frontier(issues: list[EligibleIssue], ready_label: str, epic_labels: 
     return {"dispatch": dispatch, "excluded": excluded}
 
 
+def free_slots(concurrency: int, held: int) -> int:
+    """How many more claims a fleet holding `held` of them may take: `concurrency`
+    bounds the claims a fleet holds — a claim holds its slot whatever its worker
+    is doing — so it is what is left under the bound, and nothing at or over it.
+    The one count a tick takes a claim against, a stale peer's or a frontier
+    issue's alike."""
+    return max(0, concurrency - held)
+
+
 # --------------------------------------------------------------------------- #
 # Claim ownership + owner-liveness — the correctness-critical partition        #
 # --------------------------------------------------------------------------- #
 
 def is_stale(last_ts: float | None, now: float, ttl: float) -> bool:
-    """A claim's owner is presumed dead when its heartbeat is missing or older
-    than `ttl`. Missing (None) counts as stale — an owner that never beat. This
-    is the fleet's one lease comparison: whatever asks whether a fleet instance
-    is live asks here, so a heartbeat exactly `ttl` old is live to all of them."""
-    if last_ts is None:
-        return True
-    return (now - int(last_ts)) > ttl
+    """A claim's owner is presumed dead when its heartbeat is missing, older than
+    `ttl`, or stamped from the future (`stamp_age`). Missing (None) counts as
+    stale — an owner that never beat; so does a future stamp, which would
+    otherwise keep a dead fleet's claims live past the lease. This is the
+    fleet's one lease comparison: whatever asks whether a fleet instance is live
+    asks here, so a heartbeat exactly `ttl` old is live to all of them."""
+    age = stamp_age(last_ts, now)
+    return age is None or age > ttl
 
 
 def heartbeat_due(last_ts: float | None, now: float, ttl: float) -> bool:
-    """Refresh my own heartbeat once it is older than ttl/3 (or never beat). Beating
+    """Refresh my own heartbeat once it is older than ttl/3 (or never beat, or is
+    stamped from the future — `stamp_age` — which peers read as stale). Beating
     at ttl/3 keeps a comfortable 3x margin under the lease while staying cheap."""
-    if last_ts is None:
-        return True
-    return (now - int(last_ts)) > ttl / 3.0
+    age = stamp_age(last_ts, now)
+    return age is None or age > ttl / 3.0
 
 
 def classify_claims(claims: list[Claim], heartbeats: Mapping[str, float], me: str | None,
@@ -1226,11 +1401,16 @@ def gate_record_void(record: Obj | None, now: float) -> str | None:
     which command it is of are not questions left to ask here. A sync that
     brought the target in, a later commit or another command is another name,
     with its own record or none; a record older than `GATE_RECORD_TTL` is no
-    longer believed. Void is the safe side: the landing runs the gate.
+    longer believed, and neither is one stamped from the future (`stamp_age`),
+    whose day would never run out. Void is the safe side: the landing runs the
+    gate.
     """
     if record is None:
         return "no green run of the gate is on record for the tree that would land"
-    age = int(now) - record["at"]
+    age = stamp_age(record["at"], now)
+    if age is None:
+        return (f"the recorded run is stamped {record['at'] - int(now)}s ahead of this clock — "
+                f"past the {CLOCK_SKEW_TOLERANCE_SECONDS}s allowed for skew")
     if age > GATE_RECORD_TTL:
         return (f"the recorded run is {age}s old — a record is trusted for "
                 f"{GATE_RECORD_TTL}s")
@@ -1683,7 +1863,8 @@ def read_worker_state(row: Obj | None, now: float, grace_seconds: float,
             stop report is timed from the terminal's last output; a runtime that
             reports no state is not timed at all (None) — its idle screen redraws
             on a timer, so its output says nothing — and the worktree's own
-            clocks decide.
+            clocks decide. A clock stamped from the future (`stamp_age`) is
+            not read: output "then" is not output within grace.
     `state` is the report it was read from: the top-level agent that changed
     state last (an older pane's report, a subagent's, do not speak for it).
     """
@@ -1691,7 +1872,7 @@ def read_worker_state(row: Obj | None, now: float, grace_seconds: float,
         return {"terminal": "none", "terminal_idle_seconds": None, "state": None}
 
     def ago(ms: float | None) -> int | None:
-        return max(0, int(now) - int(ms) // 1000) if ms else None
+        return stamp_age(int(ms) // 1000, now) if ms else None
 
     output_idle = ago(row.get("lastOutputAt"))
     agents = [x for x in row.get("agents") or [] if x.get("state") and not x.get("parentPaneKey")]
@@ -1723,11 +1904,12 @@ def _idle_seconds(now: float, terminal_idle_seconds: float | None,
                   *signs: float | None) -> int | None:
     """Seconds since the MOST RECENT sign of life: the terminal's own clock, and
     each epoch-second `signs` that is known. None when none is known — which is
-    never "within grace"."""
-    seen = [int(t) for t in signs if t is not None]
+    never "within grace". A sign stamped from the future (`stamp_age`) is not
+    known: a file dated next week does not keep a stopped worker active."""
+    ages = [age for age in (stamp_age(t, now) for t in signs) if age is not None]
     if terminal_idle_seconds is not None:
-        seen.append(int(now) - int(terminal_idle_seconds))
-    return max(0, int(now) - max(seen)) if seen else None
+        ages.append(max(0, int(terminal_idle_seconds)))
+    return min(ages) if ages else None
 
 
 def settled_by_worker_state(reading: WorkerReading, now: float, grace_seconds: float,
@@ -1808,7 +1990,8 @@ def classify_stopped(progress: Progress | None, terminal_idle_seconds: float | N
 
     `idle_seconds` is the time since the MOST RECENT sign of life (last commit,
     newest file mtime, terminal activity, the nudge, the landing turn); None
-    when none is known, which is never "within grace". Commits ahead / a dirty
+    when none is known — or every one is stamped from the future (`stamp_age`)
+    — which is never "within grace". Commits ahead / a dirty
     tree are standing facts — true until the branch merges — never signs of life
     (ADR-0013). `pending_blockers` is `blocked_route`'s: the blocked_by not yet
     done, [] for any other verdict.
@@ -1970,7 +2153,7 @@ def _batch_members(raw: str | None) -> list[dict[str, int]]:
 
 # The PRs a merge batch holds, in stack order, each with the issue it closes.
 _MEMBERS = FieldType(lambda members: ",".join(f"{m['issue']}:{m['pr']}" for m in members),
-                     lambda raw: _batch_members(raw) or None, empty=())
+                     lambda raw: _batch_members(raw) or None, empty=(), many=True)
 
 # The landing turn, as the marker of one comment on a PR. A marker that names no
 # instance is not a record — nobody could hold it.
@@ -2352,32 +2535,35 @@ def stack_message(title: str | None, pr: int, issue: int) -> str:
     return f"{(title or '').strip() or f'PR {pr}'} (#{pr})\n\nCloses #{issue}\n"
 
 
-def stacked_pr(subject: str | None) -> int | None:
-    """The PR a commit subject names the way `stack_message` writes it — its
-    trailing ` (#<pr>)` — or None."""
-    m = re.search(r" \(#(\d+)\)$", subject or "")
+def stacked_pr(parents: str, subject: str | None) -> int | None:
+    """The PR a commit was stacked with, or None: a merge commit — `parents` is
+    its `git log --format=%P`, two hashes — whose subject ends ` (#<pr>)`, the
+    way `stack_message` writes it. The subject alone decides, never the body;
+    and a commit with one parent is never a member's, whatever its subject says
+    — a fix titled `… (#<pr>)` is a fix."""
+    m = re.search(r" \(#(\d+)\)$", subject or "") if len(parents.split()) > 1 else None
     return int(m.group(1)) if m else None
 
 
-def read_stack(commits: Iterable[tuple[str, str]],
+def read_stack(commits: Iterable[tuple[str, str, str]],
                prs: Collection[int]) -> tuple[dict[int, str], list[str]]:
     """
     A batch worktree's commits above the target, read back → (stacked, fixes):
 
-      commits: [(sha, subject)...] oldest first — `git log --first-parent
-               <target tip>..HEAD`: the stack's own line, without the commits
-               each PR brought
+      commits: [(sha, parents, subject)...] oldest first — `git log
+               --first-parent <target tip>..HEAD`: the stack's own line, without
+               the commits each PR brought
       prs:     the member PR numbers
 
       stacked: {pr: sha} — the merge commit each member was stacked with
-               (`stack_message`'s subject ends ` (#<pr>)`)
+               (`stacked_pr`)
       fixes:   [sha...] — every other commit, oldest first: what the batch
                worker committed to turn a red stack green
     """
     stacked: dict[int, str] = {}
     fixes: list[str] = []
-    for sha, subject in commits:
-        pr = stacked_pr(subject)
+    for sha, parents, subject in commits:
+        pr = stacked_pr(parents, subject)
         if pr is not None and pr in prs and pr not in stacked:
             stacked[pr] = sha
         else:
@@ -2514,33 +2700,34 @@ def plan_takeover(claims: Iterable[Claim] | None, heartbeats: Mapping[str, float
 # nothing. The selection is mechanics; "is this recovered state sane to build
 # on" stays tick judgment. Only tier 3 tears anything down.
 
-_PLACEHOLDER_RE = re.compile(r"\{(number|slug)\}")
+# What marks a branch as the fleet's: the fleet said so, on the issue, as orca cut
+# it (`afk._record_branch`). A branch is never recognised by its name — orca
+# names it, and `<anything>/issue-<n>-<anything>` is a name a person may give
+# their own. A continuation's branch is a new name, recorded the same way.
+BRANCH_RECORD = RecordKind("afk:branch", {"name": str}, ("name",))
 
 
-def branch_regex(number: int) -> re.Pattern[str]:
-    """
-    An issue number → the regex that matches the branch orca
-    ACTUALLY created for it. Two things are wildcards, by construction: orca
-    prefixes the branch with `<user>/` (ADR-0005 — the fleet reads the name back
-    rather than dictating it), and the slug is whatever the dispatching tick
-    passed. The number is not: it is the one field that identifies the issue.
-    """
-    out, pos = [], 0
-    pattern = BRANCH_PATTERN
-    for m in _PLACEHOLDER_RE.finditer(pattern):
-        out.append(re.escape(pattern[pos:m.start()]))
-        out.append(str(number) if m.group(1) == "number" else "[^/]*")
-        pos = m.end()
-    out.append(re.escape(pattern[pos:]))
-    return re.compile(r"^(?:[^/]+/)?" + "".join(out) + r"$")
+def branch_comment(name: str) -> str:
+    """The comment that records `name` as a branch the fleet cut for the issue
+    it is posted on."""
+    return record_comment(BRANCH_RECORD, {"name": name},
+                          f"afk-fleet: this issue's worker is on the branch `{name}`, cut by the "
+                          f"fleet. It is the fleet's to continue from, and to delete when the "
+                          f"attempt is discarded.")
 
 
-def branch_candidates(heads: Iterable[str] | None, number: int) -> list[str]:
-    """The remote branch names that could be issue <number>'s work branch, sorted.
-    Used when NO local worktree survived: the claim ref records the issue, not the
-    branch, so tier 2 has to recognise the branch by its name."""
-    rx = branch_regex(number)
-    return sorted(h for h in (heads or []) if h and rx.match(h))
+def recorded_branches(comments: Iterable[Comment] | None) -> list[str]:
+    """The branches the fleet recorded on one issue, from its comments — every
+    one of them, oldest first: each worktree cut for the issue left its own."""
+    records = (read_marker(BRANCH_RECORD, comment["body"]) for comment in comments or [])
+    return list(dict.fromkeys(record["name"] for record in records if record))
+
+
+def own_branches(heads: Iterable[str] | None, own: Iterable[str | None]) -> list[str]:
+    """The remote branch names that are the fleet's own for one issue, sorted:
+    the `heads` among `own`, the names the fleet knows it cut for it. Used when
+    NO local worktree survived: the claim ref records the issue, not the branch."""
+    return sorted(set(heads or []) & {name for name in own if name})
 
 
 def short_branch(ref: str | None) -> str:
@@ -2752,8 +2939,6 @@ PROMPT_VARIANTS: tuple[PromptVariant, ...] = get_args(PromptVariant)
 PROMPT_FIELDS = ("n", "title", "repo", "base_branch", "local_command", "afk_path", "config",
                  "branch", "worktree_path", "launcher_terminal")
 LANDING_FIELDS = ("pr", "pr_branch", "target")
-_PROMPT_SLOTS = ("opening", "step1", "retry_reason")
-_PROMPT_DERIVED = ("wake_command", "gate_command", "land_command", "verdict_marker")
 _NO_LOCAL_COMMAND = "true   # (no gate.local_command configured: run the repo's own build/test, if any)"
 _NO_WAKE = "true   # (no coordinator terminal to wake: it finds your outcome at its next poll)"
 _TERMINAL_HANDLE_RE = re.compile(r"[A-Za-z0-9_.:-]+")
@@ -2827,12 +3012,25 @@ def land_command(afk_path: str, number: int, repo: str, config: str) -> str:
             f"--config {shlex.quote(config)}")
 
 
+_PLACEHOLDER_RE = re.compile(r"\{([a-z_0-9]+)\}")
+
+
+def _fill(text: str, values: dict[str, str], what: str) -> str:
+    """Fill every `{name}` of an assembled template text from `values`, in one
+    pass: a value is written into the result and never read again, so one that
+    holds placeholder-shaped text — a title naming `{branch}`, a gate command's
+    `${var}` — arrives verbatim. Raises ValueError on a placeholder `values`
+    does not name; `what` names the brief in the message."""
+    left = sorted({m.group(0) for m in _PLACEHOLDER_RE.finditer(text) if m.group(1) not in values})
+    if left:
+        raise ValueError(f"{what}: unfilled placeholder(s) {', '.join(left)}")
+    return _PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], text).strip() + "\n"
+
+
 def _fill_prompt(text: str, fields: Obj, landing: Obj | None = None,
                  reason: str | None = None) -> str:
     """Fill every field of an assembled prompt text. Raises ValueError on a missing
-    field or a placeholder left unfilled; the free-text values (title, reason, the
-    land command's config) go in last and in one pass, so one that happens to
-    contain "{branch}" is never itself substituted into."""
+    field or a placeholder left unfilled."""
     missing = [k for k in PROMPT_FIELDS if k not in fields]
     missing += [k for k in LANDING_FIELDS if landing is not None and k not in landing]
     if missing:
@@ -2844,20 +3042,10 @@ def _fill_prompt(text: str, fields: Obj, landing: Obj | None = None,
     values["local_command"] = values["local_command"].strip() or _NO_LOCAL_COMMAND
     values["wake_command"] = wake_command(values.pop("launcher_terminal"), fields["n"])
     values["verdict_marker"] = verdict_marker_format(fields["n"])
-    # the land command carries the whole config, and a config may hold braces
-    free_text = {"title": values.pop("title"), "reason": (reason or "").strip(),
-                 "land_command": values.pop("land_command")}
+    values["reason"] = (reason or "").strip()
     if landing is not None:
         values.update({k: str(landing[k]) for k in LANDING_FIELDS})
-    for name, value in values.items():
-        text = text.replace("{" + name + "}", value)
-    known = (*PROMPT_FIELDS, *LANDING_FIELDS, *_PROMPT_SLOTS, *_PROMPT_DERIVED)
-    left = sorted(set(re.findall(r"\{(?:%s)\}" % "|".join(known), text))
-                  - {"{%s}" % k for k in free_text})
-    if left:
-        raise ValueError(f"worker prompt: unfilled placeholder(s) {', '.join(left)}")
-    text = re.sub(r"\{(%s)\}" % "|".join(free_text), lambda m: free_text[m.group(1)], text)
-    return text.strip() + "\n"
+    return _fill(text, values, "worker prompt")
 
 
 def render_worker_prompt(template: str, variant: PromptVariant, fields: Obj,
@@ -2918,18 +3106,11 @@ def render_batch_brief(template: str, fields: Obj) -> str:
     batch = str(fields["batch"])
     values = {k: str(fields[k]) for k in ("batch", "repo", "target", "branch", "worktree_path")}
     values["wake_command"] = wake_command(fields["launcher_terminal"], f"batch-{batch}")
-    # free text — titles, and a config that may hold braces — goes in last
-    free_text = {"members": "\n".join(f"- PR #{m['pr']} — closes #{m['issue']} — {m['title']}"
-                                      for m in fields["members"]),
-                 "batch_land_command": batch_land_command(str(fields["afk_path"]), batch,
-                                                          values["repo"], str(fields["config"]))}
-    for name, value in values.items():
-        text = text.replace("{" + name + "}", value)
-    left = sorted(set(re.findall(r"\{[a-z_]+\}", text)) - {"{%s}" % k for k in free_text})
-    if left:
-        raise ValueError(f"batch brief: unfilled placeholder(s) {', '.join(left)}")
-    text = re.sub(r"\{(%s)\}" % "|".join(free_text), lambda m: free_text[m.group(1)], text)
-    return text.strip() + "\n"
+    values["members"] = "\n".join(f"- PR #{m['pr']} — closes #{m['issue']} — {m['title']}"
+                                  for m in fields["members"])
+    values["batch_land_command"] = batch_land_command(str(fields["afk_path"]), batch,
+                                                      values["repo"], str(fields["config"]))
+    return _fill(text, values, "batch brief")
 
 
 def render_landing(template: str, fields: Obj, landing: Obj) -> str:
@@ -3745,8 +3926,9 @@ class TickBooks:
     WRITES_BOARD: tuple[TickDid, ...] = ("granted", "abandoned", "retried", "dispatched",
                                          "reclaimed", "restarted")
 
-    def __init__(self, ws: WorkingSet) -> None:
+    def __init__(self, ws: WorkingSet, concurrency: int) -> None:
         self.ws = ws
+        self.concurrency = concurrency
         self.mine: dict[int, MineRow] = {r["number"]: r for r in ws["mine"]}
         self.judgments: list[Judgment] = []
         self.errors: list[Obj] = []
@@ -3814,9 +3996,11 @@ class TickBooks:
 
     @property
     def slots(self) -> int:
-        """The dispatch slots still free for the frontier."""
-        return (self.ws["free_slots"] + len(self.settled) - len(self._took)
-                - len(self._fresh))
+        """The slots still free for a claim this fleet does not hold yet — a stale
+        one, then the frontier. A frontier issue takes its slot when its start is
+        begun; none is free while the fleet holds `concurrency` claims or more."""
+        return free_slots(self.concurrency, len(self.mine) - len(self.settled)
+                          + len(self._took) + len(self._fresh))
 
     @property
     def in_flight(self) -> int:
@@ -3860,19 +4044,25 @@ def tick_plan(ws: WorkingSet, call: Call, config: Config) -> Plan:
     one PR or to one merge batch (`_turn_plan`) → nudge / restart / fail / park /
     escalate where the reason is on record, or the judgment that stands in for one →
     release `closed` and `landed` rows and `stale_closed` phantom locks → begin the starts:
-    continuations of claims already held, each `stale` claim reclaimed, then the
+    continuations of claims already held, then the `stale` claims and then the
     frontier into the free slots → finish every start begun, at once → heartbeat
     → status boards → what a finished batch left behind.
 
     A step that fails is recorded in `errors` and settles nothing: its claim is
     still held and the rest of the tick goes on. A start that fails to BEGIN
     ends the starting for this tick — it is orca or the remote that is unwell,
-    and every further dispatch would take a claim it cannot staff. A claim
-    settled earlier in the tick frees its slot for the frontier; a stale claim
-    taken uses one; a frontier issue a peer won comes off the frontier and uses
-    none.
+    and every further dispatch would take a claim it cannot staff.
+
+    `concurrency` bounds the claims this fleet holds, and a tick takes a claim
+    only into a free slot (`free_slots`): a continuation is of a claim already
+    held and takes none; a stale claim taken uses one, lowest issue number
+    first, and the ones past the slots stay stale for a later tick; then the
+    frontier, in its order. A claim settled earlier in the tick frees its slot;
+    a stale claim or a frontier issue a peer won uses none. A fleet holding
+    more claims than `concurrency` — after a takeover, or once the key is
+    lowered — takes nothing until it is back under.
     """
-    tick = TickBooks(ws)
+    tick = TickBooks(ws, config["concurrency"])
     run = tick.run
 
     # --- observe: the claims waiting on their worker ---
@@ -3929,8 +4119,9 @@ def tick_plan(ws: WorkingSet, call: Call, config: Config) -> Plan:
         if do == "dispatch":
             yield from begin(number, "dispatched")
     for row in ws["stale"]:
-        took = (yield from run("reclaim", issue=row["number"], sha=row["sha"])) \
-            if tick.starting else None
+        if tick.slots <= 0 or not tick.starting:
+            break
+        took = yield from run("reclaim", issue=row["number"], sha=row["sha"])
         if took and took["won"]:
             tick.take(row["number"])
             yield from begin(row["number"], "reclaimed")
@@ -4377,15 +4568,16 @@ def unseen_prs(mine: list[MineRow], prs: Iterable[PullRequest]) -> list[int]:
                   if r["number"] in now and now[r["number"]]["number"] != r["pr"])
 
 
-def superseded_prs(prs: Iterable[PullRequest] | None, number: int) -> list[PullRequest]:
+def superseded_prs(prs: Iterable[PullRequest] | None, number: int,
+                   own: Iterable[str | None]) -> list[PullRequest]:
     """The open PRs a FRESH start of issue <number> supersedes: the ones that
-    close it from a branch shaped like the fleet's own (`branch_regex`). A PR a
-    human opened from some other branch is never one of them — the fleet closes
-    only what the fleet opened."""
-    rx = branch_regex(number)
+    close it from a branch that is the fleet's `own` for it (`own_branches`). A
+    PR a human opened from any other branch — whatever its name — is never one
+    of them: the fleet closes only what the fleet opened."""
+    own = {name for name in own if name}
     return [p for p in prs or []
             if any(ref["number"] == number for ref in p["closingIssuesReferences"] or [])
-            and rx.match(p["headRefName"] or "")]
+            and p["headRefName"] in own]
 
 
 def assemble_working_set(issues: list[Issue], prs: list[PullRequest], claims: list[Claim],
@@ -4426,7 +4618,7 @@ def assemble_working_set(issues: list[Issue], prs: list[PullRequest], claims: li
        "peer_live": [{"number","instance"}...],
        "stale": [{"number","instance","sha"}...],   # sha feeds reclaim --expect-sha
        "stale_closed": [{"number","instance","sha"}...],  # sha feeds release --expect-sha
-       "free_slots": <how many workers may be dispatched: concurrency - len(mine)>,
+       "free_slots": <how many more claims I may take: `free_slots` of len(mine)>,
        "fingerprint": <digest of the same observables the gate hashes>,
        "now": now}
 
@@ -4505,6 +4697,6 @@ def assemble_working_set(issues: list[Issue], prs: list[PullRequest], claims: li
                           for n in part["peer_live"]],
             "stale": stale_rows(n for n in part["stale"] if n not in closed),
             "stale_closed": stale_rows(n for n in part["stale"] if n in closed),
-            "free_slots": max(0, int(config["concurrency"]) - len(mine)),
+            "free_slots": free_slots(int(config["concurrency"]), len(mine)),
             "fingerprint": fingerprint(issues, prs, claims),
             "now": now}

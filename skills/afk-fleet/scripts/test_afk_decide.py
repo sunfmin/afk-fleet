@@ -91,6 +91,36 @@ def test_is_stale_and_due():
     assert d.heartbeat_due(1000, 1000 + TTL // 3 + 2, TTL) is True
 
 
+def test_a_stamp_from_the_future_is_not_evidence():
+    """Age is `now − written`, and the stamp is the writing host's clock: beyond
+    the one tolerance allowed for skew, a stamp ahead of the reader is read as
+    missing — wherever an age is acted on."""
+    now, skew = 1_000_000, d.CLOCK_SKEW_TOLERANCE_SECONDS
+    # the one reading: within the tolerance "just now", past it nothing at all
+    assert d.stamp_age(now - 40, now) == 40
+    assert d.stamp_age(now + skew, now) == 0
+    assert d.stamp_age(now + skew + 1, now) is None
+    assert d.stamp_age(None, now) is None
+
+    # a heartbeat a day ahead does not keep a dead fleet's claims live for a day
+    # past the lease — and its own fleet beats again rather than wait for it
+    assert d.is_stale(now + skew, now, TTL) is False
+    assert d.is_stale(now + skew + 1, now, TTL) is True
+    assert d.is_stale(now + 86400, now, TTL) is True
+    assert d.heartbeat_due(now + skew, now, TTL) is False
+    assert d.heartbeat_due(now + 86400, now, TTL) is True
+    part = d.classify_claims([{"number": 7, "instance": "peer"}], {"peer": now + 86400},
+                             "me", now, TTL)
+    assert part == {"mine": [], "peer_live": [], "stale": [7]}
+    assert d.group_instances([], {"peer": now + 86400}, "me", now, TTL)[0]["fresh"] is False
+
+    # a recorded gate run dated ten days ahead is void now, not trusted for eleven
+    ahead = lambda s: d.gate_record("abc123", "make test", now + s)   # noqa: E731
+    assert d.gate_record_void(ahead(skew), now) is None
+    assert "ahead of this clock" in d.gate_record_void(ahead(skew + 1), now)
+    assert "ahead of this clock" in d.gate_record_void(ahead(10 * 86400), now)
+
+
 def test_classify_claims():
     now = 100_000
     claims = [
@@ -378,8 +408,13 @@ def test_a_batch_is_known_by_its_id_wherever_orca_puts_its_branch():
     assert d.batch_formed_by(batch, "fl-1/x") and not d.batch_formed_by(batch, "fl-1")
     assert not d.batch_formed_by(batch, "") and not d.batch_formed_by(None, "fl-1/x")
     # the PR a stacked merge commit's subject names
-    assert d.stacked_pr(d.stack_message("a title", 12, 3).splitlines()[0]) == 12
-    assert d.stacked_pr("work: fix.txt") is None and d.stacked_pr(None) is None
+    subject = d.stack_message("a title", 12, 3).splitlines()[0]
+    assert d.stacked_pr("p1 p2", subject) == 12
+    assert d.stacked_pr("p1 p2", "work: fix.txt") is None and d.stacked_pr("p1 p2", None) is None
+    # …and only a merge commit's: the same subject on a commit with one parent, or none, names no PR
+    assert d.stacked_pr("p1", subject) is None and d.stacked_pr("", subject) is None
+    # the subject ENDS with it: a revert quotes it, and names no PR
+    assert d.stacked_pr("p1 p2", f'Revert "{subject}"') is None
     assert d.batch_branches(heads, "fl-9-1") == [] and d.batch_branches(None, "fl-1-170") == []
 
     def wt(branch, at=1, **more):
@@ -451,10 +486,13 @@ def test_the_cycle_forms_a_batch_only_from_two_or_more_eligible_prs():
 def test_a_stack_is_read_back_from_its_commits():
     assert d.stack_message("Add the thing", 12, 7) == "Add the thing (#12)\n\nCloses #7\n"
     assert d.stack_message("  ", 12, 7).startswith("PR 12 (#12)\n")
-    log = [("a1", "Add the thing (#12)"), ("b2", "Fix a typo (#13)"), ("c3", "make the stack green"),
-           ("d4", "refs issue (#99)"), ("e5", "Add the thing (#12)")]
-    stacked, fixes = d.read_stack(log, {12, 13})
-    assert stacked == {12: "a1", 13: "b2"} and fixes == ["c3", "d4", "e5"]
+    m, fix = "p1 p2", "p1"                        # a member is a merge commit; a fix has one parent
+    log = [("a1", m, "Add the thing (#12)"), ("b2", m, "Fix a typo (#13)"),
+           ("c3", fix, "make the stack green"), ("d4", m, "refs issue (#99)"),
+           ("e5", m, "Add the thing (#12)"), ("f6", fix, "repair the other thing (#14)")]
+    stacked, fixes = d.read_stack(log, {12, 13, 14})
+    # a fix titled like member 14's commit is still a fix: 14 is not on this stack
+    assert stacked == {12: "a1", 13: "b2"} and fixes == ["c3", "d4", "e5", "f6"]
     assert d.read_stack([], {12}) == ({}, [])
     said = d.batch_landed_comment("abc123", "main", "fl-1-5", [12, 13])
     assert "landed on `main` as abc123" in said and "#12, #13" in said and "did not mark this PR merged" in said
@@ -681,6 +719,89 @@ def test_records_kept_in_comments_share_the_encoding_of_records_on_refs():
     assert d.record_marker(d.CLAIM_RECORD, {"instance": "a", "ts": 1}) == "<!--afk-claim instance=a ts=1-->"
     assert d.read_record(d.TURN_RECORD, "afk:turn instance=a at=1 released=1") == \
         {"instance": "a", "at": 1, "released": True}
+
+
+# The pieces a generated value is made of: everything that separates, closes or
+# encodes something in a record, and text that needs none of it.
+_VALUE_PIECES = (",", "-->", "--", ">", "<!--", "%", "%2C", "%4", "=", " ", "\t", "\n", "\r\n",
+                 "\u3000", "\u2028", "\x00", "#", "é", "进度", "reason=", "ts=5", "a", "Z", "9", "-")
+
+
+def _generated_text(rng):
+    return "".join(rng.choice(_VALUE_PIECES) for _ in range(rng.randint(1, 8)))
+
+
+def _generated_members(rng):
+    return [{"issue": rng.randrange(10**6), "pr": rng.randrange(10**6)}
+            for _ in range(rng.randint(0, 4))]
+
+
+# One generator per way a field's value is spelled. A kind that declares a type
+# with none here fails the test below until it is given one.
+_GENERATED = {
+    str: _generated_text,
+    int: lambda rng: rng.randrange(10**12),
+    d.FLAG: lambda rng: rng.random() < 0.5,
+    d.INTS: lambda rng: [rng.randrange(10**6) for _ in range(rng.randint(0, 4))],
+    d.TURN_RECORD.fields["members"]: _generated_members,
+    d.TURN_RECORD.fields["stopped"]: lambda rng: rng.choice(d.LAND_OUTCOMES),
+    d.TURN_RECORD.fields["phase"]: lambda rng: rng.choice(d.BATCH_PHASES),
+    d.TURN_RECORD.fields["unbatched"]: lambda rng: rng.choice(d.UNBATCHED),
+}
+
+
+def test_every_record_value_round_trips_on_both_carriers():
+    """Writing a record and reading it back is the identity — for every declared
+    kind, on a ref and in a comment, over values made of what the encoding itself
+    uses (`,`, `-->`, `%`, `=`, whitespace, line breaks) and of other scripts. A
+    field left out reads as its type's `empty`, which is what writing nothing
+    says."""
+    kinds = {name: kind for name, kind in vars(d).items() if isinstance(kind, d.RecordKind)}
+    assert {"CLAIM_RECORD", "GATE_RUN_RECORD", "BASE_RECORD", "TURN_RECORD", "VERDICT_RECORD",
+            "ESCALATION_RECORD"} <= set(kinds)
+    rng = random.Random(114)
+    for name, kind in kinds.items():
+        blank = d.blank_record(kind)
+        for _ in range(400):
+            record = {field: _GENERATED[declared](rng) for field, declared in kind.fields.items()
+                      if field in kind.required or rng.random() < 0.7}
+            said = {**blank, **record}
+            message = d.record_message(kind, record)
+            assert "\n" not in message and "\r" not in message, (name, record)
+            on_ref = d.read_record(kind, message + "\n\nany body at all")
+            assert on_ref is not None and {**blank, **on_ref} == said, (name, record, message)
+            body = d.record_comment(kind, record, "worded for a human --> a=1, b=2")
+            in_comment = d.read_marker(kind, body)
+            assert in_comment is not None and {**blank, **in_comment} == said, (name, record, body)
+
+    # the two values that did not (#114), by name: a trailing comma took the next
+    # field with it, and `-->` in a value closed the marker
+    base = {"branch": "release,", "ts": 5}
+    assert d.read_record(d.BASE_RECORD, d.record_message(d.BASE_RECORD, base)) == base
+    gate = d.gate_record("abc123", "make test,", 7)
+    assert d.read_record(d.GATE_RUN_RECORD, d.record_message(d.GATE_RUN_RECORD, gate)) == gate
+    marker = d.verdict_marker(9, "giving-up", reason="it --> broke")
+    assert marker.count("-->") == 1 and _verdict_in(marker)["reason"] == "it --> broke"
+    turn = {"instance": "fl-1", "of": "a-->b,"}
+    assert d.read_marker(d.TURN_RECORD, d.record_marker(d.TURN_RECORD, turn)) == turn
+
+
+def test_a_hand_written_blocked_by_reads_as_the_issues_it_names():
+    """A worker types its verdict, and names issues the way issues are named: a
+    list spelled with `#`, or spread over words, is still those issues — never
+    a `blocked` verdict that names nobody, which would be escalated, not parked."""
+    for spelled in ("3,4", "#3,#4", "3 4", "#3 #4", "3, 4", "#3, #4", "#3 and #4", "3 ,4"):
+        for rest in ("", " reason=needs pages from #3"):
+            body = f"<!--afk:verdict n=12 phase=blocked blocked_by={spelled}{rest}-->"
+            assert _verdict_in(body)["blocked_by"] == [3, 4], body
+    # only a list runs over words: a stray word after any other value is read past
+    assert d.read_marker(d.VERDICT_RECORD, "<!--afk:verdict n=5 6 phase=blocked now-->") == \
+        {"n": 5, "phase": "blocked"}
+    assert d.read_record(d.BASE_RECORD, "afk-base branch=release, ts=5") == \
+        {"branch": "release,", "ts": 5}
+    # a batch's members are a list too
+    assert d.read_marker(d.TURN_RECORD, "<!--afk:turn instance=x members=1:10, 2:20 at=3-->") == \
+        {"instance": "x", "members": [{"issue": 1, "pr": 10}, {"issue": 2, "pr": 20}], "at": 3}
 
 
 def test_each_record_in_a_comment_round_trips_through_its_own_reader():
@@ -1142,6 +1263,17 @@ def test_classification_idle_seconds_is_the_most_recent_sign_of_life():
     assert r["idle_seconds"] is None and r["outcome"] == "idle_stalled"
     # a clock skewed into the future reads as "just now", never a negative age
     assert idle({**ZERO, "worktree_mtime_ts": NOW + 30}, None)["idle_seconds"] == 0
+    skew = d.CLOCK_SKEW_TOLERANCE_SECONDS
+    assert idle({**ZERO, "worktree_mtime_ts": NOW + skew}, None)["idle_seconds"] == 0
+    # …but only that far: a file dated next week is no sign of life, so it neither
+    # keeps a stopped worker within grace nor hides the signs that are real
+    r = idle({**ZERO, "worktree_mtime_ts": NOW + skew + 1}, None)
+    assert r["idle_seconds"] is None and r["outcome"] == "idle_stalled"
+    r = idle({**ZERO, "last_commit_ts": NOW - 5000, "worktree_mtime_ts": NOW + 7 * 86400}, 3000)
+    assert r["idle_seconds"] == 3000 and r["outcome"] == "idle_stalled"
+    # the same for the clocks orca reports: output dated ahead is not output now
+    assert _reading(_ps("working", 900, -30)) == ("busy", 0, "working")
+    assert _reading(_ps("working", 900, -skew - 1)) == ("idle", None, "working")
 
 
 def test_classification_routes_idle_workers_on_their_verdict():
@@ -1489,23 +1621,25 @@ def test_plan_takeover():
     assert r["action"] == "take" and r["fresh"] is False and r["heartbeat_age"] is None
 
 
-def test_branch_regex_and_candidates():
-    heads = [
-        "master",
-        "sunfmin/issue-9-continuation",          # orca's real shape: <user>/ prefix
-        "issue-9-continuation-second-try",       # no prefix, same issue
-        "sunfmin/issue-90-calibration",          # a DIFFERENT issue that starts with 9
-        "sunfmin/issue-10-takeover",
-        "sunfmin/feature/issue-9-nope",          # slug never spans a slash
-    ]
-    got = d.branch_candidates(heads, 9)
-    assert got == ["issue-9-continuation-second-try", "sunfmin/issue-9-continuation"], got
+def test_a_branch_is_the_fleets_by_its_record_never_by_its_name():
+    name, again = "sunfmin/issue-9-continuation", "sunfmin/issue-9-continuation-2"
+    comments = [{"id": 1, "body": "looks like <!--afk:status-->", "url": "u"},
+                {"id": 2, "body": d.branch_comment(name), "url": "u"},
+                {"id": 3, "body": "I pushed hotfix/issue-9-my-manual-fix", "url": "u"},
+                {"id": 4, "body": d.branch_comment(again), "url": "u"},      # a continuation's
+                {"id": 5, "body": d.branch_comment(name), "url": "u"},       # said twice: one name
+                {"id": 6, "body": "<!--afk:branch-->", "url": "u"}]          # names nothing
+    assert d.branch_comment(name).startswith(f"<!--afk:branch name={name}-->\n")
+    assert d.recorded_branches(comments) == [name, again]
+    assert d.recorded_branches(None) == []
 
-    # the number is the one field that is NOT a wildcard: 9 never matches 90
-    assert d.branch_candidates(heads, 90) == \
-        ["sunfmin/issue-90-calibration"]
-    assert d.branch_candidates(heads, 11) == []
-    assert d.branch_candidates(None, 9) == []
+    heads = ["master", again, name,
+             "hotfix/issue-9-my-manual-fix",          # a person's, shaped like orca's
+             "sunfmin/issue-9-continuation-3"]        # ... down to the suffix
+    assert d.own_branches(heads, [name, again]) == [name, again]
+    # a recorded branch the remote no longer has is no branch; None is no name
+    assert d.own_branches(heads, ["sunfmin/issue-9-gone", None, name]) == [name]
+    assert d.own_branches(heads, []) == [] and d.own_branches(None, [name]) == []
 
 
 def test_find_orca_worktree():
@@ -2386,9 +2520,6 @@ def test_find_orca_repo_and_worktree_name():
 
     name = d.worktree_name(31, "Fix the  Names inspector: tab (v2)!")
     assert name == "issue-31-fix-the-names-inspector-tab-v2"
-    # the name it produces is one recovery recognises as this issue's branch
-    assert d.branch_candidates([f"sunfmin/{name}", f"sunfmin/{name}-2", "sunfmin/issue-3-x"],
-                               31) == [f"sunfmin/{name}", f"sunfmin/{name}-2"]
     assert d.worktree_name(4, "中文标题") == "issue-4-work"
     assert d.worktree_name(4, None) == "issue-4-work"
     long = d.worktree_name(4, "word " * 40)
@@ -2407,11 +2538,14 @@ def test_closing_pr_and_superseded_prs():
             "closingIssuesReferences": [{"number": 30}]}]
     assert d.closing_pr(prs, 3)["number"] == 32                          # the latest closes it
     assert d.closing_pr(prs, 4)["number"] == 32 and d.closing_pr(prs, 99) is None
-    # a fresh start closes only what the FLEET opened for THIS issue: fleet-shaped
-    # branch AND closes the issue — never a human's PR, never issue 30's
-    assert [p["number"] for p in d.superseded_prs(prs, 3)] == [30, 31]
-    assert d.superseded_prs(prs, 4) == []
-    assert d.superseded_prs(None, 3) == []
+    # a fresh start closes only what the FLEET opened for THIS issue: from a branch
+    # that is the fleet's own AND closing the issue — never a human's PR, never
+    # issue 30's, and not #31 either while its fleet-shaped branch is not the fleet's
+    own = ["sunfmin/issue-3-x", "sunfmin/issue-3-y", "sunfmin/issue-30-x", None]
+    assert [p["number"] for p in d.superseded_prs(prs, 3, own)] == [30]
+    assert [p["number"] for p in d.superseded_prs(prs, 3, [*own, "sunfmin/issue-3-x-2"])] == [30, 31]
+    assert d.superseded_prs(prs, 3, []) == [] and d.superseded_prs(prs, 4, own) == []
+    assert d.superseded_prs(None, 3, own) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -2425,14 +2559,13 @@ class _Raises(str):
 _row = _mine
 
 
-def _working_set(mine=(), frontier=(), stale=(), stale_closed=(), batches=(), concurrency=3):
+def _working_set(mine=(), frontier=(), stale=(), stale_closed=(), batches=()):
     mine = list(mine)
     return {"mine": mine, "merge_order": d.turn_order(mine), "batches": list(batches),
             "frontier": {"dispatch": [{"number": n, "title": f"issue {n}"} for n in frontier]},
             "stale": [{"number": n, "instance": "dead", "sha": f"sha{n}"} for n in stale],
             "stale_closed": [{"number": n, "instance": "dead", "sha": f"sha{n}"}
-                             for n in stale_closed],
-            "free_slots": max(0, concurrency - len(mine))}
+                             for n in stale_closed]}
 
 
 def _batch(members, instance="fl-1", batch="b1"):
@@ -2440,13 +2573,14 @@ def _batch(members, instance="fl-1", batch="b1"):
             "members": [{"issue": n, "pr": n * 10} for n in members]}
 
 
-def _play(ws, answers=None, causes=None, config=None):
+def _play(ws, answers=None, causes=None, config=None, concurrency=3):
     """Carry a tick's plan out against a scripted world — the way `afk._tick`
     does, with no process → (the steps it handed out, what it returned).
 
       answers: {(do, issue or batch) | do: what that step's transition returns,
                 or `_Raises`}; a step with no answer here succeeds
       causes:  {issue or batch id: the cause `afk no-pr` classifies its worker with}
+      concurrency: the config's, where no whole `config` is given
     """
     answers, causes, steps = answers or {}, causes or {}, []
     stock = {"begin": d.BEGUN, "reclaim": {"won": True}, "fail": {"action": "retry"},
@@ -2471,7 +2605,7 @@ def _play(ws, answers=None, causes=None, config=None):
             return {"issue": key, "pr": key * 10, "head": "abc", "outcome": "granted"}, None
         return said(do, key)
 
-    plan = d.tick_plan(ws, CALL, config or d.resolve_config({}))
+    plan = d.tick_plan(ws, CALL, config or d.resolve_config({"concurrency": concurrency}))
     return steps, d.follow(plan, carry_out)
 
 
@@ -2571,14 +2705,95 @@ def test_a_claim_settled_this_tick_frees_its_slot_for_a_dispatch_in_the_same_tic
     assert done["did"] == _nothing_done(dispatched=[11], in_flight=3)
 
 
+def test_a_stale_claim_is_taken_into_a_free_slot_only_and_the_rest_wait_for_a_later_tick():
+    # one slot free, three dead peer's claims: the lowest is taken, the other two
+    # are not even tried, and the frontier — behind the stale claims — gets nothing
+    ws = _working_set(mine=[_row(1)], stale=[6, 7, 8], frontier=[11])
+    steps, done = _play(ws, concurrency=2)
+    assert _brief(steps) == [("no-pr", [1]), ("reclaim", 6), ("begin", 6), ("finish", [6]),
+                             ("heartbeat",)]
+    assert done["did"] == _nothing_done(reclaimed=[6], in_flight=2, frontier_remaining=1)
+    # a reclaim a peer won, or one that raised, used no slot: the next one is tried
+    steps, done = _play(ws, {("reclaim", 6): {"won": False}, ("reclaim", 7): _Raises("push")},
+                        concurrency=2)
+    assert [s for s in _brief(steps) if s[0] in ("reclaim", "begin")] == [
+        ("reclaim", 6), ("reclaim", 7), ("reclaim", 8), ("begin", 8)]
+    # the ones left are taken by later ticks, in order, as claims settle: here one
+    # claim of mine closes before each tick, and each tick takes exactly one
+    mine, stale, taken = [1, 2], [5, 6, 7, 8, 9], []
+    while stale:
+        ws = _working_set(mine=[_row(mine[0], "closed"), *map(_row, mine[1:])], stale=stale)
+        steps, done = _play(ws, concurrency=2)
+        assert done["did"]["in_flight"] == 2
+        taken += done["did"]["reclaimed"]
+        mine, stale = sorted(done["held"]), [n for n in stale if n not in taken]
+    assert taken == [5, 6, 7, 8, 9]
+    # a fleet over the bound takes nothing — no stale claim, no frontier issue, not
+    # even into the slot of the claim it settles — until it is back under; a claim
+    # it already holds is still continued, which takes no slot
+    mine = [_row(1), _row(2), _row(3), _row(4, "closed")]
+    steps, done = _play(_working_set(mine=mine, stale=[6], frontier=[11]), causes={1: "gone"},
+                        concurrency=2)
+    assert _brief(steps) == [("no-pr", [1, 2, 3]), ("release", 4), ("begin", 1), ("finish", [1]),
+                             ("heartbeat",)]
+    assert done["did"]["in_flight"] == 3 and done["held"] == {1, 2, 3}
+
+
+def test_no_tick_ends_holding_more_claims_than_the_bound_or_than_it_began_with():
+    """Whatever the working set — stale claims, more claims than slots — and
+    however each step ends, the claims held never pass max(`concurrency`, the
+    claims held as the tick began): a tick that starts at or under the bound
+    stays there, and one that starts over it takes nothing until it is back
+    under."""
+    causes = ("working", "gone", "silent", "blockers_waiting", "blocker_unmet",
+              "satisfied_refuted")
+    ends = {"reclaim": ({"won": True}, {"won": True}, {"won": False}, _Raises("push refused")),
+            "begin": (d.BEGUN, d.BEGUN, d.BEGUN, d.LOST, _Raises("no orca")),
+            "fail": ({"action": "retry"}, {"action": "escalate"}),
+            "finish": ({"ok": True}, {"ok": True}, _Raises("not ready"))}
+    releases = {"park", "escalate", "release"}
+    over = 0
+    for seed in range(3000):
+        rng = random.Random(seed)
+        concurrency = rng.randrange(5)
+        numbers = rng.sample(range(1, 40), rng.randrange(8) + rng.randrange(8) + rng.randrange(6))
+        mine, rest = numbers[:rng.randrange(8)], numbers[8:]
+        stale = sorted(rest[:rng.randrange(8)])
+        frontier = sorted(set(rest) - set(stale))
+        ws = _working_set(mine=[_row(n, rng.choice(("no_pr", "no_pr", "closed"))) for n in mine],
+                          stale=stale, frontier=frontier)
+        answers = {(do, n): rng.choice(how) for do, how in ends.items() for n in numbers}
+        steps, done = _play(ws, answers, causes={n: rng.choice(causes) for n in mine},
+                            concurrency=concurrency)
+        held, bound = set(mine), max(concurrency, len(mine))
+        over += len(mine) > concurrency
+        for step in steps:
+            do, n = step["do"], step.get("issue")
+            answer = answers.get((do, n))
+            if isinstance(answer, _Raises):
+                continue
+            if do in releases and "expect_sha" not in step or answer == {"action": "escalate"}:
+                held.discard(n)
+            elif answer in ({"won": True}, d.BEGUN) and n not in held:
+                # a claim is taken only into a free slot: over the bound, none is
+                assert len(held) < concurrency, (seed, step, held, concurrency)
+                held.add(n)
+            assert len(held) <= bound, (seed, step, held, concurrency)
+        assert done["did"]["in_flight"] <= len(held) <= bound, seed
+        # the stale claims tried are the first ones, in order: none is skipped
+        tried = [s["issue"] for s in steps if s["do"] == "reclaim"]
+        assert tried == stale[:len(tried)], (seed, tried)
+    assert over > 300       # it did meet fleets holding more claims than slots
+
+
 def test_a_transition_that_fails_settles_nothing_and_the_rest_of_the_tick_runs():
     mine = [_row(1), _row(2), _row(3), _row(4, "closed"), _row(5, "awaiting_turn", pr=50)]
-    ws = _working_set(mine=mine, frontier=[11], concurrency=5)
+    ws = _working_set(mine=mine, frontier=[11])
     causes = {1: "blocker_unmet", 2: "satisfied_refuted", 3: "blockers_waiting"}
     broken = {"escalate": _Raises("gh issue edit failed"), "park": _Raises("TypeError: null"),
               "release": _Raises("push refused"), "turn": _Raises("gh is down"),
               "heartbeat": _Raises("push refused")}
-    steps, done = _play(ws, broken, causes=causes)
+    steps, done = _play(ws, broken, causes=causes, concurrency=5)
     # every step is still handed out, in order, whatever the one before it did
     assert _brief(steps) == [("no-pr", [1, 2, 3]), ("turn", 5), ("escalate", 1), ("fail", 2),
                              ("park", 3), ("release", 4), ("heartbeat",)]
@@ -2705,10 +2920,9 @@ def test_a_tick_runs_its_stages_in_one_order_and_writes_each_board_once():
             _row(6, "failure", pr=60, board_phase="ci_failed", attempt=1),
             _row(7, "closed"), _row(8, "awaiting_ci", pr=80, board_phase="pr_open"),
             _row(9, board_phase="claimed")]
-    ws = _working_set(mine=mine, stale=[20], stale_closed=[21], frontier=[30, 31, 32],
-                      concurrency=11)
+    ws = _working_set(mine=mine, stale=[20], stale_closed=[21], frontier=[30, 31, 32])
     causes = {1: "silent", 2: "gone", 3: "blockers_waiting", 4: "satisfied", 9: "satisfied_refuted"}
-    steps, done = _play(ws, causes=causes)
+    steps, done = _play(ws, causes=causes, concurrency=11)
     assert _brief(steps) == [
         ("no-pr", [1, 2, 3, 4, 9]), ("turn", 5), ("nudge", 1), ("park", 3), ("fail", 9),
         ("release", 7), ("release", 21), ("begin", 2), ("reclaim", 20), ("begin", 20),
@@ -2923,7 +3137,7 @@ def test_a_worker_is_not_sent_to_this_repos_adrs():
 
 def test_render_worker_prompt_never_ships_a_placeholder():
     t = _prompt_template()
-    # free text is substituted LAST, so a title or reason that looks like a
+    # every field goes in in one pass, so a title or reason that looks like a
     # placeholder is delivered verbatim rather than filled in
     odd = d.render_worker_prompt(t, "fresh", {**PROMPT_FIELDS, "title": "Support {branch} and {n}"},
                                  reason="it printed {worktree_path}")
@@ -2946,11 +3160,80 @@ def test_render_worker_prompt_never_ships_a_placeholder():
     looping = (block("prompt", "{opening} {step1}") + block("opening.fresh", "O")
                + block("step1.fresh", "see {opening}"))
     refuses(looping, "fresh", PROMPT_FIELDS, why="unfilled")
+    # and so is a placeholder no field answers to — in any of the three briefs
+    unknown = block("prompt", "{opening} {step1} {nope}") + block("opening.fresh", "O") + block("step1.fresh", "S")
+    refuses(unknown, "fresh", PROMPT_FIELDS, why="unfilled placeholder(s) {nope}")
+    refuses(block("prompt", "{opening} {step1} {pr}") + block("opening.fresh", "O") + block("step1.fresh", "S"),
+            "fresh", PROMPT_FIELDS, why="unfilled placeholder(s) {pr}")
+    for render in (lambda: d.render_landing(block("landing", "{n} {nope}"), PROMPT_FIELDS, LANDING),
+                   lambda: d.render_batch_brief(block("batch", "{batch} {nope}"), BATCH_FIELDS)):
+        try:
+            render()
+            assert False, "expected ValueError"
+        except ValueError as e:
+            assert "unfilled placeholder(s) {nope}" in str(e), e
     # the minimal well-formed template renders
     ok = (block("prompt", "{opening}|{step1}|{n}{retry_reason}") + block("opening.fresh", "O")
           + block("step1.fresh", "S") + block("retry_reason", " because {reason}"))
     assert d.render_worker_prompt(ok, "fresh", PROMPT_FIELDS) == "O|S|31\n"
     assert d.render_worker_prompt(ok, "fresh", PROMPT_FIELDS, reason="R") == "O|S|31 because R\n"
+
+
+BATCH_FIELDS = {"batch": "me-100", "repo": "acme/widgets", "target": "main",
+                "branch": "u/afk-batch-me-100", "worktree_path": "/w/batch",
+                "members": [{"issue": 1, "pr": 10, "title": "one"}, {"issue": 2, "pr": 20, "title": "two"}],
+                "afk_path": "/s/afk.py", "config": '{"retry": 2}', "launcher_terminal": "term_1"}
+
+
+def test_no_field_value_is_scanned_for_placeholders():
+    """A value is written into the brief and never read again: whatever
+    placeholder-shaped text it holds arrives verbatim, for every field of every
+    brief. Held by rendering each field twice — once carrying every known
+    placeholder, once with the braces swapped for brackets no template reads —
+    and finding the two renderings equal but for the brackets."""
+    t = _prompt_template()
+    names = sorted(set(re.findall(r"\{([a-z_0-9]+)\}", t)))
+    assert {"title", "branch", "pr", "reason", "land_command", "batch", "members"} <= set(names)
+    braces = " ".join("${%s}" % n for n in names)
+    inert = braces.replace("{", "\u27e6").replace("}", "\u27e7")
+    restore = lambda body: body.replace("\u27e6", "{").replace("\u27e7", "}")
+
+    def held(render, field):
+        assert braces in restore(render(inert)) or field == "launcher_terminal", field
+        assert render(braces) == restore(render(inert)), field
+
+    for k in d.PROMPT_FIELDS:
+        with_k = lambda v: {**PROMPT_FIELDS, k: f"{PROMPT_FIELDS[k]}{v}"}
+        held(lambda v: d.render_worker_prompt(t, "fresh", with_k(v), reason="red")
+             + d.render_worker_prompt(t, "continue", with_k(v))
+             + d.render_landing(t, with_k(v), LANDING), k)
+    held(lambda v: d.render_worker_prompt(t, "fresh", PROMPT_FIELDS, reason=f"red{v}"), "reason")
+    for k in d.LANDING_FIELDS:
+        held(lambda v: d.render_landing(t, PROMPT_FIELDS, {**LANDING, k: f"{LANDING[k]}{v}"}), k)
+    for k in d.BATCH_FIELDS:
+        if k == "members":
+            for part in ("issue", "pr", "title"):
+                held(lambda v: d.render_batch_brief(t, {**BATCH_FIELDS, k: [
+                    {**m, part: f"{m[part]}{v}"} for m in BATCH_FIELDS[k]]}), f"members.{part}")
+        else:
+            held(lambda v: d.render_batch_brief(t, {**BATCH_FIELDS, k: f"{BATCH_FIELDS[k]}{v}"}), k)
+
+
+def test_a_gate_command_with_shell_variables_reaches_the_worker_as_configured():
+    """`${branch}` and `${title}` in `gate.local_command` are the shell's, not the
+    template's: the prompt renders, and the gate line and the land command's
+    config carry the one command the config holds."""
+    t = _prompt_template()
+    command = 'BRANCH=${branch} make test && echo "${title}" {pr}'
+    config = json.dumps({"gate": {"local_command": command}})
+    fields = {**PROMPT_FIELDS, "local_command": command, "config": config}
+    gate = d.gate_command(fields["afk_path"], command)
+    for variant in d.PROMPT_VARIANTS:
+        assert d.render_worker_prompt(t, variant, fields).count(gate) == 1, variant
+    land = d.land_command(fields["afk_path"], 31, "acme/widgets", config)
+    assert d.render_landing(t, fields, LANDING).count(land) == 1
+    carried = lambda line: json.loads(shlex.split(line)[-1])["gate"]["local_command"]
+    assert carried(gate) == carried(land) == command
 
 
 def test_fingerprint():
@@ -3413,6 +3696,49 @@ def test_resolve_config():
     assert d.resolve_config(r) == r
 
 
+def test_a_canonical_config_is_always_accepted_and_resolving_it_again_changes_nothing():
+    """Whatever `afk config`, `afk probe` or `--set` can make of a config is JSON
+    the `--config` route takes back whole: the schema check refuses nothing a
+    resolution produced, and a second resolution is the first."""
+    rng = random.Random(113)
+    words = ["", "a", "ready-for-agent", "make test && echo 'ok'", "需要人", "[a, b]", "3", "true"]
+    samples = {int: lambda: rng.randrange(-2, 50), str: lambda: rng.choice(words),
+               list: lambda: rng.sample(words, rng.randrange(0, 4))}
+    for _ in range(200):
+        partial: dict = {}
+        for dotted, default in _leaves({**d.CONFIG_DEFAULTS, **d.CONFIG_SETTLED}):
+            if rng.random() < 0.5:
+                section, _, key = dotted.rpartition(".")
+                (partial.setdefault(section, {}) if section else partial)[key] = samples[type(default)]()
+        canonical = d.resolve_config(partial)
+        assert set(canonical) == set(d.CONFIG_DEFAULTS) | set(d.CONFIG_SETTLED)
+        assert d.resolve_config(canonical) == canonical
+        assert d.resolve_config(json.loads(json.dumps(canonical))) == canonical     # as --config carries it
+
+
+def test_json_config_is_held_to_the_schema_where_the_file_cannot_say_it():
+    """What only JSON can spell — the file's text is typed by its key, JSON's
+    values come typed — is refused by the same check, each key naming itself."""
+    for bad, why in (([], "expected a JSON object"), ("retry: 3", "expected a JSON object"),
+                     (None, "expected a JSON object"),
+                     ({"ready_label": 3}, "'ready_label': expected a string"),
+                     ({"retry": None}, "'retry': expected an integer"),
+                     ({"retry": True}, "'retry': expected an integer"),
+                     ({"retry": 2.0}, "'retry': expected an integer"),
+                     ({"epic_labels": ["epic", 1]}, "'epic_labels': expected [a, b, ...]"),
+                     ({"gate": None}, "'gate' is a section"),
+                     ({"gate": ["ci"]}, "'gate' is a section"),
+                     ({"gate": {"local_command": ["make"]}}, "'gate.local_command': expected a string"),
+                     ({"base_branch": None}, "'base_branch': expected a string"),
+                     ({"claim_namespace": ["refs/afk"]}, "'claim_namespace': expected a string"),
+                     ({"merge": "x"}, "unknown key 'merge'")):
+        try:
+            d.resolve_config(bad)
+            assert False, f"expected ValueError for {bad!r}"
+        except ValueError as e:
+            assert why in str(e), (bad, str(e))
+
+
 def _leaves(table, prefix=""):
     for k, v in table.items():
         if isinstance(v, dict):
@@ -3465,6 +3791,122 @@ def test_override_config_types_every_key_like_the_file_does():
             assert False, f"expected ValueError for --set {bad!r}"
         except ValueError:
             pass
+
+
+# A value as its author wrote it, and what it is read as (None: refused, by the
+# key's name). Strings are written under `gate.local_command`, lists under
+# `epic_labels`.
+_STRINGS_AS_WRITTEN = [
+    # the issue's examples: a quote at the end, a # glued to a word
+    ('echo "hi"', 'echo "hi"'),
+    ("pytest -k 'a or b'", "pytest -k 'a or b'"),
+    ("curl http://h/#frag", "curl http://h/#frag"),
+    # quotes delimit only when they wrap the whole value
+    ('"pnpm build && pnpm test"', "pnpm build && pnpm test"),
+    ("'single'", "single"),
+    ('""', ""),
+    ('" kept edges "', " kept edges "),
+    ('"it\'s"', "it's"),                        # the other quote, inside a wrapped value
+    ("'say \"hi\"'", 'say "hi"'),
+    ('make X="a b" test', 'make X="a b" test'),         # embedded
+    ("it's", "it's"),                           # an apostrophe opens nothing to be closed
+    ('say "hi" twice', 'say "hi" twice'),
+    # a comment starts only at whitespace-then-#, outside quotes
+    ("make test   # the suite", "make test"),
+    ("make test\t# the suite", "make test"),
+    ("make#test", "make#test"),
+    ("a#b # c", "a#b"),
+    ('"needs #human"  # why', "needs #human"),
+    ('"a#b"#c', None),                          # glued: no comment, so the quote closes early
+    ("echo 'a # b'", "echo 'a # b'"),           # an embedded quote holds its #
+    ("echo 'a # b' # c", "echo 'a # b'"),
+    ("echo \"it's # in\" # c", "echo \"it's # in\""),
+    # what the dialect cannot hold
+    ('"a" and "b"', None),                      # opens with a quote that closes early
+    ('"$PY" -m pytest', None),
+    ('"unclosed', None),
+    ("'", None),
+    ("it's # comment or value?", None),         # a # after a quote that never closes
+]
+_LISTS_AS_WRITTEN = [
+    ('[a, "b,c"]', ["a", "b,c"]),               # the issue's example
+    ("[a, b]", ["a", "b"]),
+    ("[]", []),
+    ("[a, ]", ["a"]),
+    ("['a, b', c]", ["a, b", "c"]),
+    ('["a" , \'b\']', ["a", "b"]),
+    ('[""]', [""]),
+    ('[" a "]', [" a "]),
+    ("[wayfinder:map, it's]", ["wayfinder:map", "it's"]),   # a quote inside an item is its own
+    ('[a"b", c]', ['a"b"', "c"]),
+    ("[a#b, c]   # why", ["a#b", "c"]),
+    ('["a # b", c] # why', ["a # b", "c"]),
+    ('["a" b, c]', None),                       # an item's quote closes before its end
+    ('["a, b]', None),
+    ("a, b", None),                             # not a list
+]
+
+
+def _refused(read, key):
+    try:
+        got = read()
+    except ValueError as e:
+        assert repr(key) in str(e), e           # the message names the key
+        return
+    assert False, f"expected ValueError, got {got!r}"
+
+
+def test_a_config_value_is_read_as_written():
+    for written, want in _STRINGS_AS_WRITTEN:
+        def read():
+            return d.parse_config_yaml(f"gate:\n  local_command: {written}")["gate"]["local_command"]
+        if want is None:
+            _refused(read, "gate.local_command")
+        else:
+            assert read() == want, written
+    for written, want in _LISTS_AS_WRITTEN:
+        def read():
+            return d.parse_config_yaml(f"epic_labels: {written}\nretry: 1")["epic_labels"]
+        if want is None:
+            _refused(read, "epic_labels")
+        else:
+            assert read() == want, written
+
+    # a comment after any other kind of value, and after a section's own line
+    assert d.parse_config_yaml("retry: 4 # few\ngate:  # the gate\n  ci: local # ours") == {
+        "retry": 4, "gate": {"ci": "local"}}
+    for bad in ("retry: 4#few", 'retry: "4"'):
+        _refused(lambda: d.parse_config_yaml(bad), "retry")
+    try:
+        d.parse_config_yaml("retry # how many: 4")      # no comment before the colon
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "unparseable line" in str(e)
+
+
+def test_set_and_the_file_agree_on_a_value():
+    """`--set` types a value as the file does. The two exceptions are documented
+    (`override_config`): a string is verbatim, and nothing is a comment."""
+    def by_set(key, written):
+        section, _, leaf = key.rpartition(".")
+        cfg = d.override_config(d.resolve_config({}), [f"{key}={written}"])
+        return (cfg[section] if section else cfg)[leaf]
+
+    for written, want in _LISTS_AS_WRITTEN:
+        if " #" in written.split("]")[-1]:      # a comment is the file's, not the value's
+            continue
+        if want is None:
+            _refused(lambda: by_set("epic_labels", written), "epic_labels")
+        else:
+            assert by_set("epic_labels", written) == want, written
+    for written in ("3", " 3 ", "-1"):
+        assert by_set("retry", written) == d.parse_config_yaml(f"retry: {written}")["retry"]
+    for bad in ("soon", '"3"', "3#x", ""):
+        _refused(lambda: by_set("retry", bad), "retry")
+        _refused(lambda: d.parse_config_yaml(f"retry: {bad}"), "retry")
+    # a string is the exception: the shell already unquoted it, so every character is its own
+    for written, _ in _STRINGS_AS_WRITTEN:
+        assert by_set("gate.local_command", written) == written
 
 
 KIMI = "https://api.kimi.com/coding/"

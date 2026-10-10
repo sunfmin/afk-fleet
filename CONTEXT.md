@@ -124,7 +124,9 @@ a PR must pass (ADR-0012). It runs twice in a PR's life: the **worker** runs it 
 **sync**, so it tests "my code + current base"; and the worker's **landing** runs it again, after the
 landing's **sync**, in the same worktree. The invariant both runs serve: *what lands on the target
 branch was tested in the form it lands.* A green run on a committed tree becomes a **recorded gate
-run**, and a landing skips its own run when one stands for the tree that would land. GitHub checks
+run**, and a landing skips its own run when one stands for the tree that would land. A run is on a
+committed tree only when the worktree is exactly its commit before the run and after it — nothing
+uncommitted, nothing untracked; a landing refuses to merge on any other run. GitHub checks
 are never read in this mode — the repo is
 expected to scope remote CI away from worker branches, and a target branch whose protection requires
 checks is rejected at bootstrap. A red run at landing is the worker's to fix in place; its log
@@ -140,7 +142,8 @@ one committed tree. It is made by the tool that saw the exit code — never by a
 and kept on GitHub under the tree it tested, so it stands wherever that same content is about to
 land: the worker's worktree, one recreated from the pushed branch, another machine, another commit
 holding the same files, a **merge batch**'s stack. It is always trusted while it stands, and it
-stops standing when the same tree is later run red, or after a day. A **sync** that brought the
+stops standing when the same tree is later run red, or after a day. One stamped from the future
+never stood (see **heartbeat**). A **sync** that brought the
 target in or a later commit makes a different tree, which has its own record or none — and with
 none, the landing runs the gate (ADR-0030).
 _Avoid_: gate cache (it is evidence, not an optimisation that may be wrong), cached result, CI
@@ -234,9 +237,14 @@ _Avoid_: assignee (dropped as a claim signal), assignment, lock (too generic)
 
 **Heartbeat** (and its lease):
 The liveness signal a **fleet instance** publishes for itself — one ref `refs/afk/heartbeat/<id>` carrying
-a timestamp, refreshed while it holds any claim (per instance, not per claim; roughly once per
-a third of the claim lease, not once per tick). A claim is leased-live while its owner's heartbeat is within
+a timestamp, refreshed before it takes a claim and while it holds any (per instance, not per claim; roughly once per
+a third of the claim lease, not once per tick) — so a claim is never on the remote ahead of its owner's heartbeat. A claim is leased-live while its owner's heartbeat is within
 the claim lease (`CLAIM_LEASE_TTL_SECONDS`, the same in every repo); its freshness is the only thing that lets a peer tell a live owner from a dead one.
+The timestamp is the writing host's clock, so freshness has a floor as well as a ceiling: a stamp
+ahead of the reader by more than the skew tolerance (`CLOCK_SKEW_TOLERANCE_SECONDS`, the one place
+skew is allowed for) is not evidence — a heartbeat from the future is stale, a **recorded gate run**
+from the future does not stand, and a worker's sign of life from the future is no sign. Within the
+tolerance a stamp ahead reads as "just now".
 _Avoid_: ping, keepalive, liveness probe, **worker state** (that is per worker, read from orca — a
 different thing, at a different granularity)
 
@@ -267,7 +275,8 @@ _Avoid_: stuck issue, dead worker, zombie
 A **peer's** claim whose owner's **heartbeat** has expired past the claim lease — evidence the owning
 instance died mid-flight. It is the only claim a fleet may take from another *unattended*: reclaimed
 by an atomic `git push --force-with-lease` takeover of the ref, and only then, then recovered by
-**continuation**. A live peer's claim is never touched — that is what keeps cooperating fleets from
+**continuation**. A tick reclaims one only into a free slot under `concurrency` — lowest issue number
+first, ahead of the frontier — and leaves the rest stale for a later tick (ADR-0044). A live peer's claim is never touched — that is what keeps cooperating fleets from
 cannibalising each other's in-flight work. The lease-bypassing, human-authorized sibling of this
 reclaim is the **Takeover**. A stale claim whose issue is already **closed** is not work to continue
 but a **phantom lock** — the owner finished the issue and died before releasing — so the rebuild
@@ -306,7 +315,8 @@ one gate run came to), `giving-up` for an issue nobody could do as written
 **Retry**:
 What a failed attempt costs and gets: the failure is counted on the issue — its `afk-attempt/<n>`
 label goes up by one — the failed attempt is discarded (its PR closed, its branch deleted, its
-worktree removed) and a fresh **worker** starts from the base under the same **claim**, told why the
+worktree removed — the branches the fleet recorded on the issue as it cut them, never one a person
+gave a like name: ADR-0043) and a fresh **worker** starts from the base under the same **claim**, told why the
 last attempt failed — the branch is never handed on as-is (ADR-0017; the sentence of ADR-0013 that
 said otherwise is superseded). Config `retry` is how many an issue gets; the failure after the last one is
 escalated to a human instead. One **transition** (`afk fail`), and its one writer. A failure is

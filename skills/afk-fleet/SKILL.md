@@ -196,7 +196,8 @@ the opening working set differs:
    taken claims as `mine` and recovers each by
    [continuation](references/recovery.md) — tier 1 when the
    dead fleet ran on *this* box, since its worktrees are still here — **and** works the frontier up to
-   `concurrency`, until you stop it.
+   `concurrency` (a takeover may leave it holding more: it then takes nothing new until it is back
+   under), until you stop it.
 
 A takeover **is not a retry** (it never reads or increments `afk-attempt/<n>`) and **does not shorten the
 lease** — the unattended safety net stays exactly as wide; this is only the human-gated fast path across
@@ -341,9 +342,9 @@ In this order, each step the same `afk` transition you could type yourself
    merge batch pushed and was cut before closing the issue; delete every dead peer's phantom lock.
 6. **Start workers** (`afk dispatch`): first by [continuation](references/recovery.md) for claims
    already held — an **orphaned claim** (always continued, never released back), one whose blockers
-   have all closed, each **stale** peer claim it reclaims — then the frontier, in order, into the
-   free slots (plus one for every claim this pass settled).
-7. **Heartbeat**, then the **status board** of every claim nothing above touched.
+   have all closed. Then, into the free slots only ([Concurrency](#concurrency)): the **stale** peer
+   claims, lowest number first, each reclaimed and continued, then the frontier; the rest wait.
+7. **Heartbeat** (each claim push beat first), then the **status board** of every claim nothing above touched.
 
 A worker still coding, a PR whose checks are running, a finished PR waiting behind the one that
 holds the turn, a live peer's claim: all left exactly as they are.
@@ -567,7 +568,13 @@ one with nothing on its branch closes the issue once you confirm the empty diff.
 
 ## Concurrency
 
-`concurrency` (default 3) bounds parallel workers. Semantic ordering is the backlog's dependency DAG
+`concurrency` (default 3) bounds the claims a fleet instance holds, and so its parallel workers: a
+claim holds its slot from the moment it is taken until it is released, whatever its worker is doing.
+The **free slots** are what is left under the bound, and a pass takes a claim it does not hold — a
+**stale** peer claim first, then a frontier issue — only into one; a claim the pass settled frees
+its slot in the same pass. Continuing a claim already held takes none. A fleet holding more claims
+than `concurrency` (after a [`--takeover`](#takeover-mode---takeover), or once the key is lowered)
+takes nothing until it is back under. Semantic ordering is the backlog's dependency DAG
 (your responsibility when decomposing); textual conflicts between parallel PRs are caught by the
 one-at-a-time landing turn and resolved there by the worker that wrote the branch. Early machinery issues that all
 touch shared root config are naturally throttled by the DAG — chain them with `blocked_by`.
@@ -603,7 +610,8 @@ touch shared root config are naturally throttled by the DAG — chain them with 
 - **Claim before work; release on every terminal transition.** `afk dispatch` creates the
   `refs/afk/claim/<n>` ref first — if the create is rejected, a peer owns it and nothing is started.
   `afk escalate`, `afk park` and `afk close` each delete it as their last step; a claim that outlived
-  its issue — every landed PR leaves one — is released by the next pass (`afk release`). A leaked ref is a phantom lock. Reconcile only your own claims, and take a peer's
+  its issue — every landed PR leaves one — is released by the next pass (`afk release`). Every
+  release deletes only the claim it read: one a peer took since is left alone, and the call fails. A leaked ref is a phantom lock. Reconcile only your own claims, and take a peer's
   only when its heartbeat is expired (a **stale claim**) — the single exception is an explicit human
   [`--takeover`](#takeover-mode---takeover). A stale claim on a closed issue (`stale_closed`) is not
   taken at all: it is deleted, with `afk release --expect-sha`.
@@ -619,5 +627,7 @@ touch shared root config are naturally throttled by the DAG — chain them with 
   longer reads the assignee); keep the tracker honest so a peer fleet or a human never double-takes.
 - **Stay off the reserved namespaces.** The fleet manages the `afk-attempt/<n>` labels, the
   `refs/afk/*` ref namespace (the claim and heartbeat refs), the single status-board comment tagged
-  `<!--afk:status-->`, the `<!--afk:turn …-->` marker comment on a PR (which it parses), and the
+  `<!--afk:status-->`, the `<!--afk:turn …-->` marker comment on a PR (which it parses), the
+  `<!--afk:branch …-->` marker comments on an issue (which name the branches that are the fleet's to
+  continue from and to discard), and the
   worker-authored `<!--afk:verdict …-->` markers (which it parses) — leave them to the fleet, and reuse those prefixes / markers for nothing else.

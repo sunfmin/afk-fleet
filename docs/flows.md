@@ -25,9 +25,10 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 2. The **frontier** is selected: an issue is dispatchable only if it is open, carries the ready
    label, is not an epic, is unclaimed, has no open linked PR and has zero open blockers.
    `skills/afk-fleet/scripts/afk_decide.py:select_frontier`
-3. For each free slot under `concurrency`, the tick **dispatches** an issue, and the dispatch begins
-   by **claiming** it: creating its claim ref, which the server accepts for exactly one **fleet
-   instance**; a loser starts nothing.
+3. For each slot still free under `concurrency` — the bound on the claims a fleet holds — once the
+   **stale claims** have taken theirs, the tick **dispatches** an issue, and the dispatch begins
+   by **claiming** it: refreshing the fleet's **heartbeat** if it is due, and only then creating the
+   claim ref, which the server accepts for exactly one **fleet instance**; a loser starts nothing.
    `skills/afk-fleet/scripts/afk.py:cmd_dispatch`
 4. The dispatch fetches the base's tip from the remote and has orca create the worktree and branch
    at that sha, then asserts the worktree contains it.
@@ -37,8 +38,8 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    file plus one submitted line pointing at it. A tick filling several slots begins every start
    first and then waits for all the agents together.
    `skills/afk-fleet/scripts/afk.py:put`
-6. It upserts the issue's **status board** to "claimed"; the tick refreshes its **heartbeat**
-   and ends, without waiting for the worker.
+6. It upserts the issue's **status board** to "claimed"; the tick ends without waiting for the
+   worker, its **heartbeat** fresh since before step 3's claim.
    `skills/afk-fleet/scripts/afk.py:_upsert_board`
 7. The worker implements the issue's acceptance criteria, committing and pushing its own branch
    after every completed step so a hard stop loses at most the step in flight.
@@ -67,8 +68,9 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 14. It merges the PR, pinned to the gated head, which closes the issue, and upserts the status
     board to "merged"; the worker wakes the launcher and stops.
     `skills/afk-fleet/scripts/afk.py:cmd_land`
-15. The next tick finds a claim of its own whose issue is closed and releases it, which also has
-    orca remove the worktree, freeing the slot — and the landing turn goes to the next PR.
+15. The next tick finds a claim of its own whose issue is closed and releases it: orca removes
+    the worktree, then the claim is deleted, freeing the slot — and the landing turn goes to the
+    next PR.
     `skills/afk-fleet/scripts/afk.py:cmd_release`
 
 **Where it forks.**
@@ -173,14 +175,14 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 
 ## What happens to an issue when the fleet working on it dies?
 
-1. While it holds any claim, a fleet instance refreshes its one **heartbeat** ref whenever it is
-   older than a third of the lease.
+1. Before it takes a claim and while it holds any, a fleet instance refreshes its one **heartbeat**
+   ref whenever it is older than a third of the lease.
    `skills/afk-fleet/scripts/afk_decide.py:heartbeat_due`
 2. The fleet hard-stops and runs no code; a peer's next rebuild finds a claim whose owner's heartbeat
    is older than the claim lease, and classifies it a **stale claim**.
    `skills/afk-fleet/scripts/afk_decide.py:classify_claims`
-3. The peer takes the claim by re-stamping the ref with its own instance, a push the server rejects
-   unless the ref still points at the sha the peer read.
+3. The peer takes the claim: it refreshes its own heartbeat if due, then re-stamps the ref with its
+   own instance, a push the server rejects unless the ref still points at the sha the peer read.
    `skills/afk-fleet/scripts/afk.py:cmd_reclaim`
 4. The peer **dispatches** the issue it now holds; the dispatch asks what survived the death: a
    worktree for the issue still on this machine, and the issue's branch on the remote ahead of base.
@@ -204,7 +206,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 - The peer's heartbeat is fresh: the claim is left strictly alone, ADR-0003.
 - The dead fleet had already merged or closed the issue: the claim is a phantom lock with no work
   behind it, listed as `stale_closed` and deleted under the same lease instead of taken,
-  `skills/afk-fleet/scripts/afk.py:_clear`.
+  `skills/afk-fleet/scripts/afk.py:_release`.
 - Two peers reclaim at once: one push wins, the other reports a lost race,
   `skills/afk-fleet/scripts/afk.py:_force_take`.
 
@@ -263,15 +265,24 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 - A fleet never takes a peer's claim unattended while that peer's heartbeat is within the lease, and
   its own claims stay its own even when its heartbeat has expired. (ADR-0003;
   `test_classify_claims`, `test_classify_claims_my_own_expired_stays_mine`)
+- A claim is never on the remote without its owner's heartbeat within the lease: every push that
+  puts a claim in an instance's name — a claim, a stale reclaim, a takeover — refreshes that
+  instance's heartbeat first, so a peer scanning the instant the claim lands reads a live owner. A
+  fleet that holds nothing and claims nothing writes no heartbeat. (ADR-0003;
+  `test_a_claim_is_never_on_the_remote_without_its_owners_fresh_heartbeat`,
+  `test_a_peer_scanning_mid_tick_reads_a_first_claim_as_live`)
 - A claim is deleted at every terminal transition (escalate, park, close, release) and as its
   last step — after the relabel, after the dependency edge; a landed PR's claim by the next cycle's
-  release, which also removes its worktree — and a release that
-  left the ref on the remote is an error, never "released". (ADR-0016, ADR-0017;
+  release, after its worktree is removed, so a settling that raised leaves the claim held — and a
+  release that left the ref on the remote is an error, never "released". (ADR-0016, ADR-0017;
   `test_a_release_that_did_not_delete_the_claim_is_an_error`,
-  `test_escalate_relabels_before_it_releases`)
+  `test_escalate_relabels_before_it_releases`,
+  `test_a_landed_claim_whose_settling_failed_is_still_held_and_settled_by_the_next_tick`)
 - A release deletes only the caller's own claim, or — shown its sha — a dead peer's claim on a closed
-  issue; a stale claim on a closed issue is never reclaimed or dispatched.
-  (`test_release_deletes_only_my_claim_or_the_exact_claim_it_was_shown`,
+  issue, and either only while the ref still points at the sha it read: a claim a peer took since
+  survives. A stale claim on a closed issue is never reclaimed or dispatched. (ADR-0003;
+  `test_a_claim_a_peer_took_after_the_scan_survives_every_way_a_claim_ends`,
+  `test_release_deletes_only_my_claim_or_the_exact_claim_it_was_shown`,
   `test_rebuild_sets_a_dead_peers_claim_on_a_closed_issue_apart_from_work_to_reclaim`)
 - A dependency a worker discovers is recorded on GitHub and waited on, never handed to a human, while
   the backlog will resolve it; a parked issue keeps its ready label, costs no attempt, and cannot be
@@ -284,7 +295,10 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
   `test_in_required_mode_the_turn_waits_for_checks_on_the_head_that_lands`) The local gate is not run
   twice on one tree, and only on a record `afk` itself made of that tree, wherever it was made.
   (ADR-0030; `test_a_recorded_worker_gate_run_is_not_repeated_by_the_landing`,
-  `test_a_recorded_gate_run_is_void_unless_it_is_of_the_tree_that_lands`)
+  `test_a_recorded_gate_run_is_void_unless_it_is_of_the_tree_that_lands`) A run counts — for a
+  record and for a landing alike — only when the worktree is exactly its commit before the run and
+  after it. (ADR-0030; `test_a_landing_accepts_only_a_gate_run_of_the_committed_tree`,
+  `test_a_batch_lands_only_on_a_gate_run_of_the_committed_stack`)
 - A worker starts from the commit the remote has, never a stale local branch, and is told the branch
   orca actually created. (ADR-0017;
   `test_dispatch_starts_a_worker_on_the_remote_base_tip_and_submits_its_prompt`)
@@ -390,11 +404,13 @@ What the tick then does, each row a different mainline:
 - **#3** is the first mainline from step 11: it is alone in `merge_order`, so `afk turn` gives PR #30
   the landing turn, and its worker's `afk land` syncs, re-confirms the gate, merges it and
   sets the board to "merged"; the next tick releases the claim.
-- **#1** is the first mainline from step 3: `afk dispatch` claims it, has orca create the worktree,
-  and delivers the worker its prompt. The row also says `free_slots: 1` — one slot is all
-  `concurrency: 3` leaves beside the two claims held.
 - **#6** is the dead-fleet mainline from step 3: `peerB` last beat 5499 s ago, past the 4500 s
-  lease, so reclaim with `--expect-sha s6`, then `afk dispatch` recovers it by continuation.
+  lease, so reclaim with `--expect-sha s6`, then `afk dispatch` recovers it by continuation. It
+  takes the one free slot: the working set says `free_slots: 1`, all `concurrency: 3` leaves beside
+  the two claims held, and a stale claim comes before the frontier.
+- **#1** is the first mainline from step 3, one tick later: with no slot left it stays on the
+  frontier, and once a claim is released `afk dispatch` claims it, has orca create the worktree, and
+  delivers the worker its prompt.
 - **#4** has no PR, so the tick asks `afk no-pr` why — a worker orca reports busy is left at once; it is already on
   attempt 1, so if the answer is a failure, `afk fail` has one more retry left before it escalates
   (`retry`, default 2).

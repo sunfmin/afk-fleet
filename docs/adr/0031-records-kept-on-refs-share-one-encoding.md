@@ -31,9 +31,12 @@ its own rule for what is not a record, because there was nothing to reuse.
      optional field is absent from the record;
    - a commit whose subject does not open with the kind's word, or that lacks a required field, is
      **not a record** — it reads as `None`, never as a record with holes in it.
-5. **A value is percent-encoded only where it would break a word** — whitespace, `%`, anything
-   outside ASCII. An instance id or a hostname is written as itself, which is what keeps decision 6;
-   a gate command, which has spaces, is what needed it.
+5. **Writing a record and reading it back is the identity, for every value** (#114; a generated
+   test holds it for every declared kind and both carriers). A value is percent-encoded only where
+   it would break that — whitespace, `%`, anything outside ASCII, and the `>` of a `-->`, which
+   would close a comment's marker (ADR-0032). An instance id or a hostname is written as itself,
+   which is what keeps decision 6; a gate command, which has spaces, is what needed it. A word is
+   one field: reading never joins two, so a value that ends in a comma is only that value.
 6. **Claims and heartbeats on a remote keep working, both ways.** What the previous code wrote is
    read by this one, and what this one writes is the same bytes, so a fleet that updates mid-run
    loses no claim and a peer that has not updated still reads its neighbour. Tests pin a literal of

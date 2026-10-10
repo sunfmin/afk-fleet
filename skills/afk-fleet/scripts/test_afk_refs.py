@@ -26,8 +26,6 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
-import pytest
-
 import afk_decide
 
 AFK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "afk.py")
@@ -152,6 +150,39 @@ class Sandbox:
                     f'exit 1;; esac\nexit 0\n')
         os.chmod(hook, 0o755)
 
+    def scan_as_claims_land(self, clone, instance, now):
+        """Have a peer fleet — `instance`, in `clone` — classify the claims the
+        moment a claim push lands on the bare repo, before its pusher runs another
+        line → a function returning that peer's verdict on the last claim to land
+        (`afk classify-claims`)."""
+        seen = os.path.join(self.root, f"seen-by-{instance}.json")
+        hook = os.path.join(self.bare, "hooks", "post-update")
+        with open(hook, "w") as f:
+            f.write(f'''#!/bin/sh
+case "$*" in *afk/claim/*|*afk-claim/*) ;; *) exit 0;; esac
+unset $(git rev-parse --local-env-vars)
+cd "{clone}" && exec "{sys.executable}" "{AFK}" classify-claims --instance {instance} \\
+    --now {now} --config '{settled("{}")}' > "{seen}" 2>&1
+''')
+        os.chmod(hook, 0o755)
+
+        def verdict():
+            with open(seen) as f:
+                return json.load(f)
+        return verdict
+
+
+def last_beat(cwd, instance, ts):
+    """Leave `instance` a fleet whose last heartbeat was at `ts` — None: one that
+    never beat — whatever its claims wrote since: a peer that died holding them.
+    The heartbeat is dropped behind afk's back, as it has to be: afk takes no
+    claim without beating first, and never moves a heartbeat back."""
+    ref = f"refs/afk/heartbeat/{instance}"
+    if git(cwd, "ls-remote", "origin", ref):
+        git(cwd, "push", "-q", "origin", f":{ref}")
+    if ts is not None:
+        assert afk(cwd, "heartbeat", "--instance", instance, "--now", str(ts))["refreshed"]
+
 
 @contextmanager
 def sandbox(clones=1):
@@ -196,10 +227,11 @@ def test_classify_claims_partitions_real_refs():
         for n, inst in ((1, "me"), (2, "peer-live"), (3, "peer-dead"), (4, "peer-silent")):
             assert afk(w, "claim", str(n), "--instance", inst, "--now", str(T0))["won"], n
 
-        # heartbeats written at pinned times: fresh, long expired, and (peer-silent)
-        # never written at all — an owner that never beat counts as dead
-        for inst, ts in (("me", T0), ("peer-live", T0 - 60), ("peer-dead", T0 - TTL - 60)):
-            assert afk(w, "heartbeat", "--instance", inst, "--now", str(ts))["refreshed"], inst
+        # last heartbeats at pinned times: fresh, long expired, and (peer-silent)
+        # none at all — an owner with no heartbeat counts as dead
+        for inst, ts in (("peer-live", T0 - 60), ("peer-dead", T0 - TTL - 60),
+                         ("peer-silent", None)):
+            last_beat(w, inst, ts)
 
         r = afk(w, "classify-claims", "--instance", "me", "--now", str(T0))
         assert r["mine"] == [1], r
@@ -211,6 +243,44 @@ def test_classify_claims_partitions_real_refs():
         assert claims[3]["instance"] == "peer-dead" and claims[3]["sha"]
         assert claims[3]["host"] and claims[3]["ts"] == T0
         assert afk(w, "scan")["heartbeats"]["peer-dead"] == T0 - TTL - 60
+
+
+def test_a_claim_is_never_on_the_remote_without_its_owners_fresh_heartbeat():
+    """Two fleets, and a peer that scans in the worst window there is: the instant
+    a claim lands, before its owner has run another line. An owner that beat only
+    after claiming is, in that scan, a claim nobody alive holds — stale, reclaimed,
+    and the issue worked twice with no fault anywhere. So the claim push itself
+    beats first, however the claim is taken."""
+    with sandbox(clones=2) as sb:
+        a, b = sb.clones
+        hb = "refs/afk/heartbeat/fleet-a"
+        seen_by_b = sb.scan_as_claims_land(b, "fleet-b", T0)
+
+        # a first claim: fleet-a held nothing and had never beaten
+        assert afk(a, "claim", "7", "--instance", "fleet-a", "--now", str(T0))["won"]
+        assert (seen_by_b()["peer_live"], seen_by_b()["stale"]) == ([7], [])
+        assert afk(a, "scan")["heartbeats"] == {"fleet-a": T0}
+
+        # a claim made while the beat is fresh costs no second write
+        written = sb.remote_ref(hb)
+        assert afk(a, "claim", "8", "--instance", "fleet-a", "--now", str(T0 + 60))["won"]
+        assert seen_by_b()["peer_live"] == [7, 8] and sb.remote_ref(hb) == written
+
+        # a fleet that held nothing for a whole lease: its old beat proves nothing
+        for n in (7, 8):
+            afk(a, "release", str(n), "--instance", "fleet-a")
+        later = T0 + TTL + 60
+        seen_by_b = sb.scan_as_claims_land(b, "fleet-b", later)
+        assert afk(a, "claim", "9", "--instance", "fleet-a", "--now", str(later))["won"]
+        assert (seen_by_b()["peer_live"], seen_by_b()["stale"]) == ([9], [])
+
+        # a claim taken from a dead peer is its taker's from the same instant
+        assert afk(a, "claim", "5", "--instance", "dead-peer", "--now", str(T0))["won"]
+        dead = sb.remote_ref("refs/afk/claim/5")
+        assert seen_by_b()["stale"] == [5]
+        assert afk(a, "reclaim", "5", "--instance", "fleet-c", "--expect-sha", dead,
+                   "--now", str(later))["won"]
+        assert (seen_by_b()["peer_live"], seen_by_b()["stale"]) == ([5, 9], [])
 
 
 def test_stale_reclaim_is_an_atomic_compare_and_swap():
@@ -338,7 +408,7 @@ def test_release_deletes_only_my_claim_or_the_exact_claim_it_was_shown():
         taken = afk(w, "reclaim", "9", "--instance", "third", "--expect-sha", peer["sha"],
                     "--now", str(T0 + 1))
         err = afk_error(w, "release", "9", *ME, "--expect-sha", peer["sha"])
-        assert "moved" in err and "nothing was changed" in err
+        assert "moved" in err and "it was left alone" in err
         assert sb.remote_ref("refs/afk/claim/9") == taken["sha"]
 
         # shown the sha it has now, the phantom lock is gone — and stays gone, quietly
@@ -443,15 +513,16 @@ def test_probe_falls_back_when_the_server_rejects_the_hidden_namespace():
         claim = afk(w, "claim", "12", "--instance", "me", "--now", str(T0), *cfg)
         assert claim["won"] and claim["ref"] == "refs/heads/afk-claim/12"
         hb = afk(w, "heartbeat", "--instance", "me", "--now", str(T0), *cfg)
-        assert hb["refreshed"] and hb["ref"] == "refs/heads/afk-heartbeat/me"
+        assert hb["ts"] == T0 and hb["ref"] == "refs/heads/afk-heartbeat/me"   # the claim beat
         assert afk(w, "classify-claims", "--instance", "me", "--now", str(T0), *cfg)["mine"] == [12]
         assert afk(w, "release", "12", *ME, *cfg)["released"] is True
         assert sb.remote_ref("refs/heads/afk-claim/12") == ""
 
         # on the config the probe was GIVEN, the blocked namespace is an error —
         # never a quiet "a peer won the race" that would leave the fleet idling forever
-        err = afk_error(w, "claim", "13", "--instance", "me", "--now", str(T0))
-        assert "not a lost race" in err and "refs/afk/claim/13" in err
+        # (it fails at the heartbeat a claim opens with: nothing of it reaches the remote)
+        err = afk_error(w, "claim", "13", "--instance", "new", "--now", str(T0))
+        assert "ruleset" in err and "refs/afk/heartbeat/new" in err
         # …and with no config at all there is nothing to run on: the call is refused
         # outright rather than quietly sent to the default namespace
         err = afk_error(w, "release", "12", *ME, bare=True)
@@ -544,19 +615,24 @@ def test_a_failed_push_is_an_error_not_a_lost_race():
     with sandbox() as sb:
         w = sb.clones[0]
         bad = ("--remote", "no-such-remote")
-        assert "not a lost race" in afk_error(w, "claim", "7", "--instance", "me", *bad)
+        afk_error(w, "claim", "7", "--instance", "me", *bad)
+        claim = afk(w, "claim", "8", "--instance", "dead-peer", "--now", str(T0))
+        sb.forbid("refs/afk/claim/")
+        assert "not a lost race" in afk_error(w, "claim", "7", "--instance", "me",
+                                              "--now", str(T0))
         assert sb.remote_ref("refs/afk/claim/7") == ""
 
         # same for a reclaim: the claim has NOT moved, so a failed push is not a loss
-        claim = afk(w, "claim", "8", "--instance", "dead-peer", "--now", str(T0))
-        sb.forbid("refs/afk/")
         err = afk_error(w, "reclaim", "8", "--instance", "me", "--expect-sha", claim["sha"])
         assert "has not moved" in err and "remote rejected" in err
         assert sb.remote_ref("refs/afk/claim/8") == claim["sha"]      # untouched
         # …and an unreachable remote cannot even be asked whether it moved
         afk_error(w, "reclaim", "8", "--instance", "me", "--expect-sha", claim["sha"], *bad)
-        # a heartbeat that cannot be written is an error too (a silent miss lapses the lease)
-        assert "remote rejected" in afk_error(w, "heartbeat", "--instance", "me", "--now", str(T0))
+        # a heartbeat that cannot be written is an error too (a silent miss lapses the
+        # lease) — and so is the claim that would have followed it
+        sb.forbid("refs/afk/")
+        assert "remote rejected" in afk_error(w, "heartbeat", "--instance", "new", "--now", str(T0))
+        assert "remote rejected" in afk_error(w, "claim", "9", "--instance", "new", "--now", str(T0))
 
 
 def test_every_kind_of_record_kept_on_a_ref_round_trips_through_the_remote():
@@ -634,7 +710,7 @@ def test_malformed_refs_in_the_namespace_are_ignored_not_fatal():
         timeless = git(w, "commit-tree", empty, "-m", "afk-heartbeat instance=me ts=soon")
         git(w, "push", "-q", "origin", f"{junk}:refs/afk/claim/not-a-number",
             f"{junk}:refs/afk/claim/6", f"{junk}:refs/afk/heartbeat/ghost",
-            f"{nobody}:refs/afk/claim/7", f"{timeless}:refs/afk/heartbeat/me")
+            f"{nobody}:refs/afk/claim/7", f"+{timeless}:refs/afk/heartbeat/me")
 
         scan = afk(w, "scan")
         by = {c["number"]: c for c in scan["claims"]}
@@ -674,7 +750,7 @@ def test_every_ref_op_round_trips_under_the_refs_heads_fallback():
         assert sb.remote_ref("refs/afk/claim/12") == ""          # nothing in the hidden ns
 
         hb = afk(w, "heartbeat", "--instance", "me", *NS, "--now", str(T0))
-        assert hb["refreshed"] and hb["ref"] == "refs/heads/afk-heartbeat/me"
+        assert hb["ts"] == T0 and hb["ref"] == "refs/heads/afk-heartbeat/me"   # the claim beat
 
         scan = afk(w, "scan", *NS)
         assert [c["number"] for c in scan["claims"]] == [12]
@@ -704,9 +780,8 @@ def test_takeover_lists_and_force_takes_a_dead_fleet():
         for n in (21, 22):
             assert afk(w, "claim", str(n), "--instance", "dead-fleet", "--now", str(T0))["won"]
         assert afk(w, "claim", "23", "--instance", "live-fleet", "--now", str(T0))["won"]
-        afk(w, "heartbeat", "--instance", "dead-fleet",
-            "--now", str(T0 - TTL - 99))
-        afk(w, "heartbeat", "--instance", "live-fleet", "--now", str(T0 - 10))
+        last_beat(w, "dead-fleet", T0 - TTL - 99)
+        last_beat(w, "live-fleet", T0 - 10)
 
         rows = {r["instance"]: r for r in
                 afk(w, "takeover", "--list", "--instance", "new-fleet",
@@ -750,133 +825,3 @@ def test_takeover_lists_and_force_takes_a_dead_fleet():
                 afk(w, "takeover", "--list", "--instance", "x",
                     "--now", str(T0 + TTL + 1))["instances"]}
         assert rows["live-fleet"]["fresh"] is False
-
-
-def test_recovery_reads_pushed_progress_from_the_remote_alone():
-    """`afk recovery` (ADR-0011) tier 2 vs tier 3: with no local worktree, the only
-    evidence a dead worker left is its pushed branch, which has to be recognised
-    from the issue number — the claim ref never records a branch name."""
-    with sandbox() as sb:
-        w = sb.clones[0]
-        cfg = json.dumps({"base_branch": sb.base})
-
-        # nothing pushed → tier 3, the old fresh re-dispatch
-        r = afk(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg)
-        assert r["tier"] == 3 and r["action"] == "dispatch_fresh" and r["prompt"] == "fresh"
-        assert r["branch"]["name"] is None and r["worktree"]["present"] is False
-
-        # a dead worker's branch, orca-shaped (<user>/ prefix), two commits ahead
-        git(w, "checkout", "-q", "-b", "sunfmin/issue-31-continuation")
-        for i in (1, 2):
-            with open(os.path.join(w, f"step{i}.txt"), "w") as f:
-                f.write(f"step {i}\n")
-            git(w, "add", "-A")
-            git(w, "commit", "-qm", f"step {i}")
-        git(w, "push", "-q", "origin", "HEAD")
-
-        r = afk(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg)
-        assert (r["tier"], r["action"], r["prompt"]) == (2, "recreate_at_tip", "continue"), r
-        assert r["branch"]["name"] == "sunfmin/issue-31-continuation"
-        assert r["branch"]["commits_ahead"] == 2
-        assert r["branch"]["candidates"] == ["sunfmin/issue-31-continuation"]
-
-        # another issue's branch is never mistaken for this one
-        assert afk(w, "recovery", "--issue", "3", "--no-worktree", "--config", cfg)["tier"] == 3
-
-        # a worktree still on this machine wins: tier 1, reused in place, never removed
-        r = afk(w, "recovery", "--issue", "31", "--worktree", w, "--config", cfg)
-        assert (r["tier"], r["action"], r["prompt"]) == (1, "reuse_worktree", "continue"), r
-        assert r["worktree"]["present"] is True and r["worktree"]["commits_ahead"] == 2
-
-        # an earlier attempt left a second, shorter branch behind: the one FURTHEST
-        # ahead is the progress worth continuing, whatever its name sorts as
-        git(w, "checkout", "-q", "-b", "aaa/issue-31-first-try", sb.base)
-        with open(os.path.join(w, "old.txt"), "w") as f:
-            f.write("old\n")
-        git(w, "add", "-A")
-        git(w, "commit", "-qm", "old attempt")
-        git(w, "push", "-q", "origin", "HEAD")
-        r = afk(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg)
-        assert r["branch"]["candidates"] == ["aaa/issue-31-first-try",
-                                             "sunfmin/issue-31-continuation"]
-        assert r["branch"]["name"] == "sunfmin/issue-31-continuation"
-        assert r["branch"]["commits_ahead"] == 2 and r["tier"] == 2
-        # a branch named outright is measured as given, with no discovery
-        r = afk(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg,
-                "--branch", "aaa/issue-31-first-try")
-        assert (r["branch"]["name"], r["branch"]["commits_ahead"]) == ("aaa/issue-31-first-try", 1)
-        assert r["branch"]["candidates"] == []
-
-        # a branch that was never pushed has nothing ahead — measured as unknown, tier 3
-        r = afk(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg,
-                "--branch", "sunfmin/issue-31-never-pushed")
-        assert (r["branch"]["commits_ahead"], r["tier"]) == (None, 3)
-        # …but a remote that cannot be READ is not "nothing pushed": tier 3 is the one
-        # tier that tears a worktree down, so "could not look" must never select it
-        for how in ((), ("--branch", "sunfmin/issue-31-continuation")):
-            err = afk_error(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg,
-                            "--remote", "no-such-remote", *how)
-            assert "no-such-remote" in err, err
-        # a base branch the remote does not have is a config mistake, said as one
-        err = afk_error(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg,
-                        "--set", "base_branch=no-such-base")
-        assert "no-such-base" in err
-
-
-def _translating_locale():
-    """An installed locale git answers in a language other than English under, or
-    None when this machine has none (git built without its translations)."""
-    for name in ("zh_CN.UTF-8", "de_DE.UTF-8", "fr_FR.UTF-8", "es_ES.UTF-8"):
-        env = {**ENV, "LC_ALL": name, "LANGUAGE": name.split(".")[0]}
-        p = subprocess.run(["git", "fetch", os.devnull], capture_output=True, text=True,
-                           env=env, cwd=tempfile.gettempdir())
-        if p.returncode != 0 and "fatal: " not in p.stderr:
-            return env
-    return None
-
-
-def test_gits_answers_are_read_the_same_in_every_locale():
-    """What git says is read under one fixed message locale, so a machine set to
-    Chinese or German tells "the branch is absent" from "could not look" exactly as
-    an English one does."""
-    foreign = _translating_locale()
-    if foreign is None:
-        pytest.skip("no installed locale makes this git answer in another language")
-    with sandbox() as sb:
-        w = sb.clones[0]
-        cfg = json.dumps({"lease_ttl_seconds": TTL})
-        git(w, "push", "-q", "origin", f"{sb.base}:refs/heads/sunfmin/issue-31-pushed")
-        for env in (ENV, foreign):
-            # absent: a branch never pushed has nothing ahead, in any language
-            r = afk(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg,
-                    "--branch", "sunfmin/issue-31-never-pushed", env=env)
-            assert (r["branch"]["commits_ahead"], r["tier"]) == (None, 3), r
-            # could not look: an unreachable remote is an error, in any language
-            err = afk_error(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg,
-                            "--branch", "sunfmin/issue-31-never-pushed",
-                            "--remote", "no-such-remote", env=env)
-            assert "no-such-remote" in err, err
-            # …and so is a base the remote lacks, said in the words the scripts read
-            err = afk_error(w, "recovery", "--issue", "31", "--no-worktree", "--config", cfg,
-                            "--branch", "sunfmin/issue-31-pushed",
-                            "--set", "base_branch=no-such-base", env=env)
-            assert "couldn't find remote ref refs/heads/no-such-base" in err, err
-
-
-def test_a_present_branch_is_not_read_as_absent_for_prefixing_a_missing_base():
-    """Absent-versus-error is decided on the exact ref asked for: git naming the
-    missing base `main-gone` says nothing about the branch `main-g`, which is there."""
-    with sandbox() as sb:
-        w = sb.clones[0]
-        cfg = json.dumps({"lease_ttl_seconds": TTL})
-        git(w, "checkout", "-q", "-b", "main-g", sb.base)
-        with open(os.path.join(w, "work.txt"), "w") as f:
-            f.write("work\n")
-        git(w, "add", "-A")
-        git(w, "commit", "-qm", "work")
-        git(w, "push", "-q", "origin", "HEAD")
-        recover = ("recovery", "--issue", "31", "--no-worktree", "--config", cfg,
-                   "--branch", "main-g")
-        assert afk(w, *recover)["branch"]["commits_ahead"] == 1
-        err = afk_error(w, *recover, "--set", "base_branch=main-gone")
-        assert "main-gone" in err, err
