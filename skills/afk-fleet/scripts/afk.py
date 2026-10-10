@@ -707,8 +707,9 @@ def _scan(run: _Run, fresh: bool = False) -> tuple[list[Claim], dict[str, int]]:
 
 def _train_tip(run: _Run) -> str:
     """The landing train's tip on the remote as the scan saw it, its commits in
-    this repo — "" when no train runs under this config, or none is there."""
-    if not afk_decide.train_runs(run.cfg):
+    this repo — "" when no train runs under this config, or none is there:
+    nothing joins a train before a launch settled the base branch it lands on."""
+    if not afk_decide.train_runs(run.cfg) or not run.cfg["base_branch"]:
         return ""
     _scan(run)
     return _git(["rev-parse", "-q", "--verify", f"{_LOCAL_SCAN}/train/{_base(run.cfg)}"],
@@ -1712,6 +1713,13 @@ class _Worktree:
         with open(_worker_file(self._here, _TOLD_MARK), "w") as f:
             json.dump({"tip": tip, "at": at}, f)
 
+    def _close_terminals(self) -> None:
+        """Close every terminal in this worktree. One with none is as wanted."""
+        try:
+            _orca(["terminal", "close", "--worktree", f"path:{self.path}", "--all"])
+        except RuntimeError:
+            pass
+
     def clear(self, at: str) -> Obj:
         """Empty the train's worktree for the next train, and keep it: every
         terminal closed, a merge in progress and anything uncommitted
@@ -1720,10 +1728,7 @@ class _Worktree:
         `remove`: a worktree that is not here has nothing to clear."""
         if not self.path:
             return {"cleared": False, "path": self.remembered}
-        try:
-            _orca(["terminal", "close", "--worktree", f"path:{self.path}", "--all"])
-        except RuntimeError:
-            pass
+        self._close_terminals()
         for args in (["merge", "--abort"], ["reset", "-q", "--hard"], ["clean", "-qfd"],
                      ["checkout", "-q", "--detach", at]):
             _git(["-C", self.path, *args], check=False)
@@ -1802,10 +1807,7 @@ class _Worktree:
         brief FILE with only a one-line pointer for the agent — a whole prompt
         sent as text arrives as one paste, which the agent reads as quoted
         material and asks to have confirmed instead of starting."""
-        try:
-            _orca(["terminal", "close", "--worktree", f"path:{self.path}", "--all"])
-        except RuntimeError:
-            pass
+        self._close_terminals()
         brief = self.write_brief(prompt)
         term = _orca(["terminal", "create", "--worktree", f"path:{self.path}",
                       "--command", agent.command]).get("terminal") or {}
@@ -3177,8 +3179,27 @@ def _push_line(run: _Run, path: str, commit: str) -> bool:
     """Push `commit` as the train's new tip — a plain push, which the remote
     takes only as a fast-forward of the tip this repo last fetched → whether it
     did. That refusal is the train's one lock."""
-    return _git(["-C", path, "push", "--quiet", run.rem,
+    took = _git(["-C", path, "push", "--quiet", run.rem,
                  f"{commit}:{_train_refs(run.cfg)[0]}"], check=False).returncode == 0
+    if took:
+        _forget(_scan_key(run))      # the scan holds the train's tip
+    return took
+
+
+def _mark_red(run: _Run, path: str, commit: str) -> None:
+    """Record `commit` as the one the train worker last gated red (`_train_base`
+    reads it). Best effort: a train whose red commit is not on record is only
+    merged into a worker's branch red."""
+    _git(["-C", path, "push", "--quiet", "--force", run.rem,
+          f"{commit}:{_train_refs(run.cfg)[1]}"], check=False)
+
+
+def _drop_train(run: _Run) -> None:
+    """Delete the train's refs: what was on it is on no train from here on, and
+    the next join starts one at the target's tip."""
+    for ref in _train_refs(run.cfg):
+        _git(["push", "--quiet", run.rem, "--delete", ref], check=False)
+    _forget(_scan_key(run))
 
 
 def _train_base(run: _Run, path: str) -> tuple[str, str]:
@@ -3374,7 +3395,7 @@ def _land_train(run: _Run, limits: _GateLimits, merged_timeout: float) -> Obj:
 
     gate = _gated(run, path, limits)
     if gate["status"] != "green":
-        _git(["-C", path, "push", "--quiet", "--force", rem, f"{head}:{red_ref}"], check=False)
+        _mark_red(run, path, head)
         still_open = {p["number"] for p in _open_prs(run.repo)}
         for number in out["prs"]:
             if number in still_open:
@@ -3454,8 +3475,11 @@ def _turn_train(run: _Run, agent: _Agent) -> Obj:
 
     if not train.ahead:
         return stop("idle")
-    wt = _Worktree.of_train(run.repo)
-    if wt.path and _Workers(run).at(wt.path).busy:
+    # asked the hard way: an orca that cannot say is never "the train has no
+    # worktree", or a second one is cut beside it (ADR-0021)
+    worker = _Workers(run).of_train()
+    wt = _Worktree.at(worker.path)
+    if worker.busy:
         return stop("landing", worktree=wt.path)
     there = wt.path is not None and wt.terminal is not None
     if there and (wt.told or {}).get("tip") == train.tip:
@@ -3535,9 +3559,7 @@ def _abandon_train(run: _Run, instance: str) -> Obj:
             _record_turn(run.repo, number, afk_decide.abandoned_turn(turn, instance, run.now()))
             _upsert_board(run, issue, "joining", instance=instance, pr=number)
             again.append(issue)
-    for ref in _train_refs(cfg):
-        _git(["push", "--quiet", rem, "--delete", ref], check=False)
-    _forget(_scan_key(run))
+    _drop_train(run)
     cleared = _Worktree.of_train(run.repo).clear(train.target)
     told = []
     for issue in again:
