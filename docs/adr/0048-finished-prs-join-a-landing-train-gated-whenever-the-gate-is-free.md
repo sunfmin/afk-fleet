@@ -150,7 +150,9 @@ own claims from the target.
 
 **The train's worktree.** One per repo, found by name, **kept**: across trains, across launches,
 across abandonment (cleared, not removed). It is what the gate's build caches live in. It is never
-swept as an orphan and holds no claim and no slot.
+swept as an orphan and holds no claim and no slot. It is an ordinary worktree, on the branch it was
+cut with: `afk land --train` moves that branch to the commit it gates, and puts a worktree found on
+a detached HEAD back on it.
 
 **A red train.** Fixed forward, as above. Never bisected, never unstacked: the fix is a commit, and
 every PR that was on the red run lands with it.
