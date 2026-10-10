@@ -26,8 +26,8 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    label, is not an epic, is unclaimed, has no open linked PR and has zero open blockers.
    `skills/afk-fleet/scripts/afk_decide.py:select_frontier`
 3. For each free slot under `concurrency`, the tick **dispatches** an issue, and the dispatch begins
-   by **claiming** it: creating its claim ref, which the server accepts for exactly one **fleet
-   instance**; a loser starts nothing.
+   by **claiming** it: refreshing the fleet's **heartbeat** if it is due, and only then creating the
+   claim ref, which the server accepts for exactly one **fleet instance**; a loser starts nothing.
    `skills/afk-fleet/scripts/afk.py:cmd_dispatch`
 4. The dispatch fetches the base's tip from the remote and has orca create the worktree and branch
    at that sha, then asserts the worktree contains it.
@@ -37,8 +37,8 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
    file plus one submitted line pointing at it. A tick filling several slots begins every start
    first and then waits for all the agents together.
    `skills/afk-fleet/scripts/afk.py:put`
-6. It upserts the issue's **status board** to "claimed"; the tick refreshes its **heartbeat**
-   and ends, without waiting for the worker.
+6. It upserts the issue's **status board** to "claimed"; the tick ends without waiting for the
+   worker, its **heartbeat** fresh since before step 3's claim.
    `skills/afk-fleet/scripts/afk.py:_upsert_board`
 7. The worker implements the issue's acceptance criteria, committing and pushing its own branch
    after every completed step so a hard stop loses at most the step in flight.
@@ -67,8 +67,9 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 14. It merges the PR, pinned to the gated head, which closes the issue, and upserts the status
     board to "merged"; the worker wakes the launcher and stops.
     `skills/afk-fleet/scripts/afk.py:cmd_land`
-15. The next tick finds a claim of its own whose issue is closed and releases it, which also has
-    orca remove the worktree, freeing the slot — and the landing turn goes to the next PR.
+15. The next tick finds a claim of its own whose issue is closed and releases it: orca removes
+    the worktree, then the claim is deleted, freeing the slot — and the landing turn goes to the
+    next PR.
     `skills/afk-fleet/scripts/afk.py:cmd_release`
 
 **Where it forks.**
@@ -173,14 +174,14 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 
 ## What happens to an issue when the fleet working on it dies?
 
-1. While it holds any claim, a fleet instance refreshes its one **heartbeat** ref whenever it is
-   older than a third of the lease.
+1. Before it takes a claim and while it holds any, a fleet instance refreshes its one **heartbeat**
+   ref whenever it is older than a third of the lease.
    `skills/afk-fleet/scripts/afk_decide.py:heartbeat_due`
 2. The fleet hard-stops and runs no code; a peer's next rebuild finds a claim whose owner's heartbeat
    is older than the claim lease, and classifies it a **stale claim**.
    `skills/afk-fleet/scripts/afk_decide.py:classify_claims`
-3. The peer takes the claim by re-stamping the ref with its own instance, a push the server rejects
-   unless the ref still points at the sha the peer read.
+3. The peer takes the claim: it refreshes its own heartbeat if due, then re-stamps the ref with its
+   own instance, a push the server rejects unless the ref still points at the sha the peer read.
    `skills/afk-fleet/scripts/afk.py:cmd_reclaim`
 4. The peer **dispatches** the issue it now holds; the dispatch asks what survived the death: a
    worktree for the issue still on this machine, and the issue's branch on the remote ahead of base.
@@ -204,7 +205,7 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 - The peer's heartbeat is fresh: the claim is left strictly alone, ADR-0003.
 - The dead fleet had already merged or closed the issue: the claim is a phantom lock with no work
   behind it, listed as `stale_closed` and deleted under the same lease instead of taken,
-  `skills/afk-fleet/scripts/afk.py:_clear`.
+  `skills/afk-fleet/scripts/afk.py:_release`.
 - Two peers reclaim at once: one push wins, the other reports a lost race,
   `skills/afk-fleet/scripts/afk.py:_force_take`.
 
@@ -224,12 +225,13 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 5. A fresh worker is started from the base under the same claim, its prompt ending with the failure
    reason.
    `skills/afk-fleet/scripts/afk.py:cmd_fail`
-6. When the attempts are exhausted, the status board is upserted to "escalated" and the issue is
-   relabelled: the escalate label on, the ready label and the attempt label off.
-   `skills/afk-fleet/scripts/afk_decide.py:escalation_labels`
-7. The stuck point is commented with the PR, and only then is the claim released; the issue is now
-   a human's, with its PR and worktree left as evidence — a worktree with no work on its branch is
-   removed instead.
+6. When the attempts are exhausted, the status board is upserted to "escalated" and the stuck
+   point is commented with the PR, under a record of whose escalation it is and after how many
+   retries — what a run that finds the claim still held finishes the escalation from.
+   `skills/afk-fleet/scripts/afk_decide.py:escalation_comment`
+7. The issue is relabelled — the escalate label on, the ready label and the attempt label off —
+   and only then is the claim released; the issue is now a human's, with its PR and worktree left
+   as evidence — a worktree with no work on its branch is removed instead.
    `skills/afk-fleet/scripts/afk.py:_escalate`
 
 **Where it forks.**
@@ -262,15 +264,24 @@ the `mainline` skill's `verify-anchors.sh docs/flows.md`.
 - A fleet never takes a peer's claim unattended while that peer's heartbeat is within the lease, and
   its own claims stay its own even when its heartbeat has expired. (ADR-0003;
   `test_classify_claims`, `test_classify_claims_my_own_expired_stays_mine`)
+- A claim is never on the remote without its owner's heartbeat within the lease: every push that
+  puts a claim in an instance's name — a claim, a stale reclaim, a takeover — refreshes that
+  instance's heartbeat first, so a peer scanning the instant the claim lands reads a live owner. A
+  fleet that holds nothing and claims nothing writes no heartbeat. (ADR-0003;
+  `test_a_claim_is_never_on_the_remote_without_its_owners_fresh_heartbeat`,
+  `test_a_peer_scanning_mid_tick_reads_a_first_claim_as_live`)
 - A claim is deleted at every terminal transition (escalate, park, close, release) and as its
   last step — after the relabel, after the dependency edge; a landed PR's claim by the next cycle's
-  release, which also removes its worktree — and a release that
-  left the ref on the remote is an error, never "released". (ADR-0016, ADR-0017;
+  release, after its worktree is removed, so a settling that raised leaves the claim held — and a
+  release that left the ref on the remote is an error, never "released". (ADR-0016, ADR-0017;
   `test_a_release_that_did_not_delete_the_claim_is_an_error`,
-  `test_escalate_relabels_before_it_releases`)
+  `test_escalate_relabels_before_it_releases`,
+  `test_a_landed_claim_whose_settling_failed_is_still_held_and_settled_by_the_next_tick`)
 - A release deletes only the caller's own claim, or — shown its sha — a dead peer's claim on a closed
-  issue; a stale claim on a closed issue is never reclaimed or dispatched.
-  (`test_release_deletes_only_my_claim_or_the_exact_claim_it_was_shown`,
+  issue, and either only while the ref still points at the sha it read: a claim a peer took since
+  survives. A stale claim on a closed issue is never reclaimed or dispatched. (ADR-0003;
+  `test_a_claim_a_peer_took_after_the_scan_survives_every_way_a_claim_ends`,
+  `test_release_deletes_only_my_claim_or_the_exact_claim_it_was_shown`,
   `test_rebuild_sets_a_dead_peers_claim_on_a_closed_issue_apart_from_work_to_reclaim`)
 - A dependency a worker discovers is recorded on GitHub and waited on, never handed to a human, while
   the backlog will resolve it; a parked issue keeps its ready label, costs no attempt, and cannot be

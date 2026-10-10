@@ -16,7 +16,8 @@ each one runs is shown so the mechanism is legible, but the tick calls the tool.
 - **Instance id** — minted once per launcher run at bootstrap, injected into every tick. It stamps
   every claim this fleet makes (`--instance <id>`) and names this fleet's heartbeat.
 - **Claim → the first step of `afk dispatch`** (`afk claim <n> --instance <id>` is the same step on
-  its own). Internally it creates `refs/afk/claim/<n>` pointing at a
+  its own). Internally it **first refreshes this fleet's heartbeat if due** (below), and only then
+  creates `refs/afk/claim/<n>` pointing at a
   marker commit carrying `instance=<id> host=<host>`; the ref name is the issue number *only*. Creating
   a ref that already exists is **rejected by the server** — that rejection *is* the compare-and-swap.
   Won → the dispatch goes on to start the worker; lost (the result names the current `owner`) → a peer
@@ -37,10 +38,18 @@ each one runs is shown so the mechanism is legible, but the tick calls the tool.
   on a tick, and by the gate on a cycle that skips. One ref `refs/afk/heartbeat/<id>`
   carries a timestamp; the tool refreshes it **only if due** (`now - ts > ttl/3`) by force-pushing a
   new marker (it reads the old ts itself, so this stays stateless). **Per instance, not per claim**
-  (claim refs never churn); a fleet holding no claims never beats.
+  (claim refs never churn); a fleet that holds no claims and takes none never beats.
+- **The order: heartbeat, then claim.** A missing heartbeat reads as a dead owner, so a claim that
+  reached the remote ahead of its owner's heartbeat would be `stale` to any peer scanning in
+  between — reclaimed from a live fleet, and the issue worked twice. Every push that puts a claim in
+  an instance's name therefore runs the heartbeat step itself, before the push: `afk claim` (and so
+  `afk dispatch`), `afk reclaim` and `afk takeover`. From the moment a claim is on the remote its
+  owner's heartbeat is within the lease; the heartbeat at the end of a tick and on a skipped cycle
+  only keeps it there. A claim attempt that loses its race has still beaten — harmless: a heartbeat
+  with no claim behind it protects nothing.
 - **Reclaim a stale peer claim → `afk reclaim <n> --instance <id> --expect-sha <sha>`.** Only the
   `stale` list is reclaimable — a stale claim whose issue is still open. The takeover is atomic (two
-  reclaimers can't both win):
+  reclaimers can't both win), and beats first, like a claim:
   ```bash
   git push origin --force-with-lease="refs/afk/claim/$n:$sha_i_read" "$my_sha:refs/afk/claim/$n"
   ```
@@ -58,7 +67,9 @@ each one runs is shown so the mechanism is legible, but the tick calls the tool.
   `ready_label` would be back on the frontier for a peer to dispatch), `afk park` (after the
   `blocked_by` edge is recorded — for the same reason), `afk close`. `afk release <n> --instance <id>`
   (idempotent: a claim already gone counts as released; a claim another instance holds is refused) is
-  the same step on its own, for an **orphan-release**, a `closed` row — which is what every landed PR leaves, since `afk land` runs in the worker's worktree and holds no instance id: releasing it also removes that worktree — and the drain. A delete that fails with the claim still on the
+  the same step on its own, for an **orphan-release**, a `closed` row — which is what every landed PR leaves, since `afk land` runs in the worker's worktree and holds no instance id: releasing it also removes that worktree, before the claim is deleted, so a settling that raised leaves the claim held and the next tick finishes it — and the drain. Every one of these deletes rides the lease above, on the sha
+  of the claim the scan showed as mine: a claim a peer took since (a takeover of a fleet that was
+  slow, not dead) is left alone, and the release exits 3 — the claim is no longer the caller's. A delete that fails with the claim still on the
   remote exits 3 — `released` is never reported for a claim that is still there. On **graceful stop**, the drain — `afk cycle --drain`, the run's last cycle — releases claims with **no PR yet** and
   **retains** those with an open PR (a peer inherits it once the lease expires — giving it a landing turn if it is
   finished, **continuing** it if it is not).

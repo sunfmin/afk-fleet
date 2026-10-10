@@ -6,8 +6,10 @@ Run: under pytest — the command is `gate.local_command` in docs/agents/afk-fle
 These cover the correctness-critical verdicts (esp. classify_claims: the
 mine/peer_live/stale partition whose wrong answer silently corrupts state).
 """
+import itertools
 import json
 import os
+import random
 import re
 import shlex
 import typing
@@ -78,6 +80,12 @@ def test_is_stale_and_due():
     assert d.is_stale(None, 1000, TTL) is True          # never beat → dead
     assert d.is_stale(1000, 1000 + TTL, TTL) is False   # exactly ttl → still live
     assert d.is_stale(1000, 1000 + TTL + 1, TTL) is True
+    # the one lease comparison: the takeover picker reads a heartbeat exactly at
+    # the lease as live, as the partition of claims does
+    at_lease = {"claims": [{"number": 1, "instance": "peer", "host": "h", "sha": "s"}],
+                "heartbeats": {"peer": 1000}, "me": "me", "now": 1000 + TTL, "ttl": TTL}
+    assert d.classify_claims(**at_lease)["peer_live"] == [1]
+    assert d.group_instances(**at_lease)[0]["fresh"] is True
     assert d.heartbeat_due(None, 1000, TTL) is True
     assert d.heartbeat_due(1000, 1000 + TTL // 3, TTL) is False
     assert d.heartbeat_due(1000, 1000 + TTL // 3 + 2, TTL) is True
@@ -164,19 +172,31 @@ def test_claim_status():
     assert d.claim_status(False, None, "local") == "no_pr"
 
     # every board phase a status is shown as is one the board renders — the tick
-    # never translates — and only a `closed` row has none
-    assert {st for st, phase in d.BOARD_PHASE_OF.items() if phase is None} == {"closed"}
+    # never translates — and only a row the tick releases has none: its board is
+    # final already (`closed`), or the release writes it (`landed`)
+    assert {st for st, phase in d.BOARD_PHASE_OF.items() if phase is None} == {"closed", "landed"}
     assert {p for p in d.BOARD_PHASE_OF.values() if p} <= set(d.STATUS_PHASES)
     assert (d.BOARD_PHASE_OF["failure"], d.BOARD_PHASE_OF["awaiting_ci"],
             d.BOARD_PHASE_OF["no_pr"]) == ("ci_failed", "pr_open", "claimed")
 
     # CLAIM_STATUSES is exactly what it can return: no status the docs were never
     # held to, and none listed that cannot happen
-    seen = {d.claim_status(has_pr, checks, ci, closed=closed, landing=landing)
+    seen = {d.claim_status(has_pr, checks, ci, closed=closed, landing=landing, landed=landed)
             for ci in d.GATE_CI_MODES for has_pr in (True, False)
             for checks in ("green", "red", "pending", None)
-            for closed in (True, False) for landing in (True, False)}
+            for closed in (True, False) for landing in (True, False)
+            for landed in (True, False)}
     assert seen == set(d.CLAIM_STATUSES)
+
+    # no open PR, the issue open, and its landing on the target: a merge batch
+    # pushed it and was cut before it closed the issue. Never `no_pr` — nobody is
+    # asked why work that landed has no PR. An open PR is still landing, and a
+    # closed issue is closed
+    for ci in d.GATE_CI_MODES:
+        assert d.claim_status(False, None, ci, landed=True) == "landed"
+        assert d.claim_status(False, None, ci, closed=True, landed=True) == "closed"
+        assert d.claim_status(True, "green", ci, landed=True) == "awaiting_turn"
+        assert d.claim_status(True, "green", ci, landing=True, landed=True) == "landing"
 
     # the issue is CLOSED but the claim is still mine — its worker landed the PR, or
     # an `afk close` crashed before releasing. Nothing else about it matters, and
@@ -265,6 +285,15 @@ def test_a_batchs_turn_is_one_marker_on_every_member_and_leaving_it_is_remembere
     assert (rec["unbatched"], rec["released"], rec["stopped"]) == (None, False, None)
     # held like any turn: by the instance that holds the claim, and by no other
     assert d.held_turn(rec, "fl-1") is rec and d.held_turn(rec, "fl-2") is None
+    # the PR landed its issue under a claim made before the batch's turn, by the
+    # instance that granted it — not one made since (the issue was reopened), not
+    # another instance's, not a claim that names nobody
+    claim = {"number": 1, "instance": "fl-1", "host": "h", "ts": 500, "sha": "c"}
+    assert d.landed_under(rec, claim) and d.landed_under(rec, {**claim, "ts": 100})
+    for other in ({"ts": 501}, {"instance": "fl-2"}, {"instance": None, "ts": None}):
+        assert not d.landed_under(rec, {**claim, **other}), other
+    assert not d.landed_under(None, claim)
+    assert not d.landed_under(d.single_turn(None, "fl-1", 600), claim)     # no batch landed it
 
     # leaving: the marker holds NO turn, whoever reads it — and remembers why
     for why in d.UNBATCHED:
@@ -379,8 +408,13 @@ def test_a_batch_is_known_by_its_id_wherever_orca_puts_its_branch():
     assert d.batch_formed_by(batch, "fl-1/x") and not d.batch_formed_by(batch, "fl-1")
     assert not d.batch_formed_by(batch, "") and not d.batch_formed_by(None, "fl-1/x")
     # the PR a stacked merge commit's subject names
-    assert d.stacked_pr(d.stack_message("a title", 12, 3).splitlines()[0]) == 12
-    assert d.stacked_pr("work: fix.txt") is None and d.stacked_pr(None) is None
+    subject = d.stack_message("a title", 12, 3).splitlines()[0]
+    assert d.stacked_pr("p1 p2", subject) == 12
+    assert d.stacked_pr("p1 p2", "work: fix.txt") is None and d.stacked_pr("p1 p2", None) is None
+    # …and only a merge commit's: the same subject on a commit with one parent, or none, names no PR
+    assert d.stacked_pr("p1", subject) is None and d.stacked_pr("", subject) is None
+    # the subject ENDS with it: a revert quotes it, and names no PR
+    assert d.stacked_pr("p1 p2", f'Revert "{subject}"') is None
     assert d.batch_branches(heads, "fl-9-1") == [] and d.batch_branches(None, "fl-1-170") == []
 
     def wt(branch, at=1, **more):
@@ -452,10 +486,13 @@ def test_the_cycle_forms_a_batch_only_from_two_or_more_eligible_prs():
 def test_a_stack_is_read_back_from_its_commits():
     assert d.stack_message("Add the thing", 12, 7) == "Add the thing (#12)\n\nCloses #7\n"
     assert d.stack_message("  ", 12, 7).startswith("PR 12 (#12)\n")
-    log = [("a1", "Add the thing (#12)"), ("b2", "Fix a typo (#13)"), ("c3", "make the stack green"),
-           ("d4", "refs issue (#99)"), ("e5", "Add the thing (#12)")]
-    stacked, fixes = d.read_stack(log, {12, 13})
-    assert stacked == {12: "a1", 13: "b2"} and fixes == ["c3", "d4", "e5"]
+    m, fix = "p1 p2", "p1"                        # a member is a merge commit; a fix has one parent
+    log = [("a1", m, "Add the thing (#12)"), ("b2", m, "Fix a typo (#13)"),
+           ("c3", fix, "make the stack green"), ("d4", m, "refs issue (#99)"),
+           ("e5", m, "Add the thing (#12)"), ("f6", fix, "repair the other thing (#14)")]
+    stacked, fixes = d.read_stack(log, {12, 13, 14})
+    # a fix titled like member 14's commit is still a fix: 14 is not on this stack
+    assert stacked == {12: "a1", 13: "b2"} and fixes == ["c3", "d4", "e5", "f6"]
     assert d.read_stack([], {12}) == ({}, [])
     said = d.batch_landed_comment("abc123", "main", "fl-1-5", [12, 13])
     assert "landed on `main` as abc123" in said and "#12, #13" in said and "did not mark this PR merged" in said
@@ -496,7 +533,32 @@ def test_turns_are_granted_in_one_order_a_held_turn_first_then_pr_number():
             row(7, "closed", None)]
     assert d.turn_order(rows) == [4, 3, 1]
     assert d.turn_order(reversed(rows)) == [4, 3, 1]                # not input order
+    # one PR closing several issues: its rows share everything but the issue number,
+    # and still come out one way under every order they could be scanned in
+    shared = [row(9, "awaiting_turn", 10), row(8, "awaiting_turn", 10), row(3, "awaiting_turn", 10),
+              row(6, "landing", 40), row(4, "landing", 40), row(1, "awaiting_turn", 30),
+              _mine(2, "awaiting_turn", pr=50, unbatched="left_out"),
+              _mine(5, "awaiting_turn", pr=50, unbatched="left_out")]
+    assert {tuple(d.turn_order(list(p))) for p in itertools.permutations(shared)} == \
+        {(4, 6, 2, 5, 3, 8, 9, 1)}
     assert d.turn_order([]) == [] and d.turn_order(rows[1:2]) == []
+
+
+def test_an_escalate_label_the_escalation_edit_would_also_remove_is_refused():
+    """An escalation adds `escalate_label` and removes `ready_label` and every
+    attempt label in ONE edit: a label on both sides of it is a config that
+    cannot mean anything."""
+    d.validate_config(d.resolve_config({"ready_label": "go", "escalate_label": "human"}))
+    for bad, says in (({"escalate_label": "ready-for-agent"}, "is ready_label too"),
+                      ({"ready_label": "x", "escalate_label": "x"}, "is ready_label too"),
+                      ({"escalate_label": "afk-attempt/human"}, "attempt labels"),
+                      ({"escalate_label": "afk-attempt/3"}, "attempt labels"),
+                      ({"escalate_label": d.ATTEMPT_STARTING}, "attempt labels")):
+        try:
+            d.validate_config(d.resolve_config(bad))
+            assert False, f"expected ValueError for {bad}"
+        except ValueError as e:
+            assert "escalate_label" in str(e) and says in str(e)
 
 
 def test_validate_config():
@@ -569,6 +631,9 @@ def test_gate_verdict():
     assert r["excerpt"] == "one\ntwo" and r["omitted_lines"] == 0
     assert d.gate_verdict(0, "")["excerpt"] == ""
     assert d.gate_verdict(0, None)["excerpt"] == ""
+    # an excerpt of no lines is none of the log, all of it reported as omitted
+    r = d.gate_verdict(1, log, max_lines=0)
+    assert (r["excerpt"], r["omitted_lines"], r["status"]) == ("", 100, "red")
 
     # a timed-out run is RED, never green-by-default, whatever it exited with
     r = d.gate_verdict(0, "hung", timed_out=True)
@@ -1473,23 +1538,25 @@ def test_plan_takeover():
     assert r["action"] == "take" and r["fresh"] is False and r["heartbeat_age"] is None
 
 
-def test_branch_regex_and_candidates():
-    heads = [
-        "master",
-        "sunfmin/issue-9-continuation",          # orca's real shape: <user>/ prefix
-        "issue-9-continuation-second-try",       # no prefix, same issue
-        "sunfmin/issue-90-calibration",          # a DIFFERENT issue that starts with 9
-        "sunfmin/issue-10-takeover",
-        "sunfmin/feature/issue-9-nope",          # slug never spans a slash
-    ]
-    got = d.branch_candidates(heads, 9)
-    assert got == ["issue-9-continuation-second-try", "sunfmin/issue-9-continuation"], got
+def test_a_branch_is_the_fleets_by_its_record_never_by_its_name():
+    name, again = "sunfmin/issue-9-continuation", "sunfmin/issue-9-continuation-2"
+    comments = [{"id": 1, "body": "looks like <!--afk:status-->", "url": "u"},
+                {"id": 2, "body": d.branch_comment(name), "url": "u"},
+                {"id": 3, "body": "I pushed hotfix/issue-9-my-manual-fix", "url": "u"},
+                {"id": 4, "body": d.branch_comment(again), "url": "u"},      # a continuation's
+                {"id": 5, "body": d.branch_comment(name), "url": "u"},       # said twice: one name
+                {"id": 6, "body": "<!--afk:branch-->", "url": "u"}]          # names nothing
+    assert d.branch_comment(name).startswith(f"<!--afk:branch name={name}-->\n")
+    assert d.recorded_branches(comments) == [name, again]
+    assert d.recorded_branches(None) == []
 
-    # the number is the one field that is NOT a wildcard: 9 never matches 90
-    assert d.branch_candidates(heads, 90) == \
-        ["sunfmin/issue-90-calibration"]
-    assert d.branch_candidates(heads, 11) == []
-    assert d.branch_candidates(None, 9) == []
+    heads = ["master", again, name,
+             "hotfix/issue-9-my-manual-fix",          # a person's, shaped like orca's
+             "sunfmin/issue-9-continuation-3"]        # ... down to the suffix
+    assert d.own_branches(heads, [name, again]) == [name, again]
+    # a recorded branch the remote no longer has is no branch; None is no name
+    assert d.own_branches(heads, ["sunfmin/issue-9-gone", None, name]) == [name]
+    assert d.own_branches(heads, []) == [] and d.own_branches(None, [name]) == []
 
 
 def test_find_orca_worktree():
@@ -1678,11 +1745,65 @@ def test_attempt_and_escalation_labels():
     add, remove = d.escalation_labels(["go"], {**cfg, "ready_label": "go", "escalate_label": "human"})
     assert (add, remove) == (["human"], ["go"])
 
-    body = d.escalation_comment("  the gate needs a secret CI has and I do not  ", 2, pr=31)
+    body = d.escalation_comment("  the gate needs a secret CI has and I do not  ", 2, "c1", pr=31)
     assert "escalated to a human" in body and "after 2 retries" in body and "#31" in body
     assert body.endswith("the gate needs a secret CI has and I do not")
-    assert "after 1 retry)" in d.escalation_comment("x", 1)
-    assert "without a retry" in d.escalation_comment("x", 0) and "PR" not in d.escalation_comment("x", 0)
+    assert "after 1 retry)" in d.escalation_comment("x", 1, "c1")
+    assert "without a retry" in d.escalation_comment("x", 0, "c1")
+    assert "PR" not in d.escalation_comment("x", 0, "c1")
+
+
+def test_an_escalation_is_recorded_in_its_comment_as_the_claims():
+    """The relabel of an escalation strips the attempt count, so what says "this
+    claim is already being escalated, after n retries" is the comment (ADR-0033)."""
+    def comments(*bodies):
+        return [{"id": 100 + i, "body": b, "url": "u"} for i, b in enumerate(bodies)]
+
+    mine = d.escalation_comment("stuck", 2, "c2", pr=31)
+    assert mine.startswith("<!--afk:escalation claim=c2 attempt=2-->\n**afk-fleet: escalated")
+    assert d.escalation_begun(comments("chat", mine, "more chat"), "c2") == \
+        {"attempt": 2, "comment_id": 101}
+    # an escalation without a retry is one too: its count is 0, not missing
+    assert d.escalation_begun(comments(d.escalation_comment("x", 0, "c2")), "c2") == \
+        {"attempt": 0, "comment_id": 100}
+    # nothing begun: no comment, one a human wrote, one from before the record existed
+    assert d.escalation_begun(None, "c2") is None
+    assert d.escalation_begun(comments("**afk-fleet: escalated to a human** (x)"), "c2") is None
+    # an earlier escalation of the issue was of another claim — it ended in a release
+    earlier = d.escalation_comment("first time", 2, "c1")
+    assert d.escalation_begun(comments(earlier), "c2") is None
+    assert d.escalation_begun(comments(earlier, mine), "c2")["comment_id"] == 101
+    assert d.escalation_begun(comments("<!--afk:escalation claim=c2-->"), "c2") is None
+
+    # a failure being escalated escalates, whatever the labels still say: stripped,
+    # they read as attempt 0 — which would start the whole ladder over
+    begun = d.escalation_begun(comments(mine), "c2")
+    assert d.next_attempt(0, 2, escalation=begun) == {"action": "escalate", "attempt": 2}
+    assert d.next_attempt(1, 2, counted=True, escalation=begun)["action"] == "escalate"
+    assert d.next_attempt(0, 2, escalation=None)["action"] == "retry"
+
+
+def test_a_hand_edited_attempt_label_costs_no_edit_and_no_attempt():
+    """`afk-attempt/<n>` is the fleet's to write, but a human can: a count spelled
+    another way, or a label under the prefix that is no count at all."""
+    starting = d.ATTEMPT_STARTING
+    assert d.current_attempt(["afk-attempt/01"]) == 1
+    assert d.current_attempt(["afk-attempt/²", "afk-attempt/x"]) == 0     # a digit, not a number
+    # counted once more: the odd spelling goes out in the edit that writes the next count
+    step = d.next_attempt(d.current_attempt(["afk-attempt/01", "afk-attempt/x"]), 2)
+    assert step == {"action": "retry", "attempt": 2, "to_label": "afk-attempt/2"}
+    assert d.retry_labels(["afk-attempt/01", "afk-attempt/x"], step["to_label"]) == \
+        (["afk-attempt/2", starting], ["afk-attempt/01", "afk-attempt/x"])
+    # the same failure again: the attempt it already made, and no edit — the count is
+    # the number `to_label` says, however it is spelled and whatever sits beside it
+    for labels in (["afk-attempt/01", starting], ["afk-attempt/1", starting, "afk-attempt/x"]):
+        again = d.next_attempt(d.current_attempt(labels), 2, counted=d.attempt_starting(labels))
+        assert (again["action"], again["attempt"]) == ("retry", 1), labels
+        assert d.retry_labels(labels, again["to_label"]) == ([], []), labels
+    # an escalation strips them all in its one edit
+    cfg = d.resolve_config({})
+    assert d.escalation_labels(["afk-attempt/01", "afk-attempt/x", starting], cfg)[1] == \
+        ["afk-attempt/01", starting, "afk-attempt/x"]
 
 
 def test_render_status_board():
@@ -1787,8 +1908,8 @@ def test_cycle_state_is_validated_not_guessed():
     assert first == {**d.CYCLE_START, **FACTS} == d.cycle_state("", **FACTS)
     assert d.cycle_state(first) == first                      # …so a later cycle passes neither
     assert d.cycle_state(first, **FACTS) == first             # the same ones again are harmless
-    st = {"fingerprint": "abc", "skips": 2, "empty_streak": 1, "in_flight": 0,
-          "frontier_remaining": 4, "unsettled": True, "boards": {"7": "0a1b2c3d"}, **FACTS}
+    st = {"fingerprint": "abc", "skips": 2, "empty_streak": 0, "in_flight": 1,
+          "frontier_remaining": 4, "unsettled": False, "boards": {"7": "0a1b2c3d"}, **FACTS}
     assert d.cycle_state(st) == st
     assert d.cycle_state(None, **FACTS)["boards"] is not d.CYCLE_START["boards"]   # never shared
     # a caller that mangled the state must hear so — run on zeros, a fleet holding
@@ -1796,12 +1917,29 @@ def test_cycle_state_is_validated_not_guessed():
     no_facts = {k: v for k, v in st.items() if k not in FACTS}
     for bad in ({"fingerprint": "abc"}, {**st, "extra": 1}, [], "abc", {**st, "skips": "x"},
                 no_facts, {**no_facts, "instance": "fl-1"}, {**st, "worker_command": ""},
-                {**st, "instance": None}):
+                {**st, "instance": None},
+                # a field of the wrong type — never coerced into one of the right type
+                {**st, "skips": "2"}, {**st, "skips": [2]}, {**st, "skips": 2.0},
+                {**st, "skips": True}, {**st, "in_flight": None}, {**st, "empty_streak": {}},
+                {**st, "unsettled": 0}, {**st, "fingerprint": None}, {**st, "boards": []},
+                {**st, "boards": {"7": 1}},
+                # a count no cycle leaves: negative (it would put the forced tick
+                # off by that many cycles), or at the forced tick and past it
+                {**st, "skips": -39}, {**st, "in_flight": -1}, {**st, "frontier_remaining": -1},
+                {**st, "empty_streak": -1}, {**st, "skips": d.FORCE_TICK_AFTER_SKIPS},
+                # counts that contradict each other
+                {**st, "unsettled": True}, {**st, "empty_streak": 1},
+                {**st, "skips": 0, "in_flight": 0, "empty_streak": 1},
+                {**st, "skips": 0, "in_flight": 0, "frontier_remaining": 0, "empty_streak": 1,
+                 "unsettled": True}):
         try:
             d.cycle_state(bad)
             assert False, f"expected ValueError for {bad!r}"
         except ValueError:
             pass
+    assert d.cycle_state({**st, "skips": 0, "unsettled": True})["unsettled"] is True
+    assert d.cycle_state({**st, "skips": 0, "in_flight": 0, "frontier_remaining": 0,
+                          "empty_streak": 9})["empty_streak"] == 9
     # a first cycle without them, and a fact that disagrees with the state's
     for raw, given in ((None, {}), (None, {"instance": "fl-1"}), ("", {"worker_command": "x"}),
                        (st, {"instance": "fl-2"}), (st, {"worker_command": "claude"})):
@@ -1810,6 +1948,34 @@ def test_cycle_state_is_validated_not_guessed():
             assert False, f"expected ValueError for {given!r}"
         except ValueError as e:
             assert "--instance" in str(e) or "--worker-command" in str(e)
+
+
+def test_every_state_a_cycle_leaves_is_one_the_next_cycle_takes():
+    """Whatever run of wakes, ticks and drains a fleet goes through, the state
+    each one returns — through the JSON a launcher carries it in — is taken back
+    unchanged."""
+    def back(state):
+        carried = json.loads(json.dumps(state))
+        assert d.cycle_state(carried) == state, state
+        return d.cycle_state(carried)
+
+    for seed in range(200):
+        rng = random.Random(seed)
+        count = lambda: rng.choice((0, 0, 1, 3))                            # noqa: E731
+        state = d.cycle_state(None, **FACTS)
+        for _ in range(40):
+            if rng.random() < 0.1:
+                kept = list(range(count()))
+                state = back(d.cycle_drained(state, [9] * count(), kept, count())["state"])
+                continue
+            woke = d.cycle_wake(state, rng.choice(("a", "a", "a", "b")), woke=rng.random() < 0.1)
+            state = back(woke["state"])
+            if woke["action"] == "tick":
+                did = _did(dispatched=[1] * count(), in_flight=count(), frontier_remaining=count())
+                state = back(d.cycle_ticked(
+                    state, did, judgments=count(), errors=count(), unseen=count(),
+                    left=rng.choice((None, "a", "c")),
+                    boards=rng.choice((None, {7: "0a1b2c3d"})))["state"])
 
 
 def _did(**did):
@@ -1888,6 +2054,14 @@ def test_cycle_drained_folds_the_stop_and_schedules_nothing():
     failed = d.cycle_drained(st, [1], [2, 7], errors=1)
     assert failed["progress"] == "drained; released #1; kept #2, #7; 1 error"
     assert failed["state"]["unsettled"] is True
+    # claims found held by a fleet that thought itself idle (a takeover's): no longer empty
+    idle = {**d.cycle_state(None, **FACTS), "fingerprint": "abc", "skips": 2, "empty_streak": 5}
+    assert d.cycle_drained(idle, [], [])["state"] == idle
+    kept = d.cycle_drained(idle, [], [7])["state"]
+    assert (kept["empty_streak"], kept["skips"], kept["in_flight"]) == (0, 2, 1)
+    failed = d.cycle_drained(idle, [], [], errors=1)["state"]
+    assert (failed["empty_streak"], failed["skips"], failed["unsettled"]) == (0, 0, True)
+    assert d.cycle_state(kept) == kept and d.cycle_state(failed) == failed
 
 
 def test_cycle_wake_gates_beats_and_paces_a_skipped_cycle():
@@ -2263,9 +2437,6 @@ def test_find_orca_repo_and_worktree_name():
 
     name = d.worktree_name(31, "Fix the  Names inspector: tab (v2)!")
     assert name == "issue-31-fix-the-names-inspector-tab-v2"
-    # the name it produces is one recovery recognises as this issue's branch
-    assert d.branch_candidates([f"sunfmin/{name}", f"sunfmin/{name}-2", "sunfmin/issue-3-x"],
-                               31) == [f"sunfmin/{name}", f"sunfmin/{name}-2"]
     assert d.worktree_name(4, "中文标题") == "issue-4-work"
     assert d.worktree_name(4, None) == "issue-4-work"
     long = d.worktree_name(4, "word " * 40)
@@ -2284,11 +2455,14 @@ def test_closing_pr_and_superseded_prs():
             "closingIssuesReferences": [{"number": 30}]}]
     assert d.closing_pr(prs, 3)["number"] == 32                          # the latest closes it
     assert d.closing_pr(prs, 4)["number"] == 32 and d.closing_pr(prs, 99) is None
-    # a fresh start closes only what the FLEET opened for THIS issue: fleet-shaped
-    # branch AND closes the issue — never a human's PR, never issue 30's
-    assert [p["number"] for p in d.superseded_prs(prs, 3)] == [30, 31]
-    assert d.superseded_prs(prs, 4) == []
-    assert d.superseded_prs(None, 3) == []
+    # a fresh start closes only what the FLEET opened for THIS issue: from a branch
+    # that is the fleet's own AND closing the issue — never a human's PR, never
+    # issue 30's, and not #31 either while its fleet-shaped branch is not the fleet's
+    own = ["sunfmin/issue-3-x", "sunfmin/issue-3-y", "sunfmin/issue-30-x", None]
+    assert [p["number"] for p in d.superseded_prs(prs, 3, own)] == [30]
+    assert [p["number"] for p in d.superseded_prs(prs, 3, [*own, "sunfmin/issue-3-x-2"])] == [30, 31]
+    assert d.superseded_prs(prs, 3, []) == [] and d.superseded_prs(prs, 4, own) == []
+    assert d.superseded_prs(None, 3, own) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -2414,6 +2588,11 @@ def test_a_claim_settled_this_tick_frees_its_slot_for_a_dispatch_in_the_same_tic
     # three claims fill the fleet. One is parked, one escalated, one outlived its
     # issue: three slots, filled from the frontier before the tick ends — and a
     # dead peer's phantom lock, which was never a slot of mine, frees none
+    for settled in ("closed", "landed"):        # a `landed` row is released like a `closed` one
+        ws = _working_set(mine=[_row(3, settled)])
+        steps, done = _play(ws)
+        assert _brief(steps) == [("release", 3)] and done["did"]["cleared"] == [3], settled
+        assert d.asks_after(ws["mine"]) == [] and d.turn_order(ws["mine"]) == []
     mine = [_row(1), _row(2), _row(3, "closed")]
     ws = _working_set(mine=mine, frontier=[11, 12, 13, 14], stale_closed=[9])
     blocked = {1: "blockers_waiting", 2: "blocker_unmet"}
@@ -2838,7 +3017,8 @@ def test_fingerprint():
 
     # canonical: row order, label order and fields outside the digest never move it
     assert fp == d.fingerprint(list(reversed(issues)), prs, claims)
-    assert fp == d.fingerprint([{**issues[0], "title": "retitled"}, issues[1]], prs, claims)
+    assert fp == d.fingerprint([{**issues[0], "id": 99}, issues[1]], prs, claims)
+    assert fp != d.fingerprint([{**issues[0], "title": "retitled"}, issues[1]], prs, claims)
     two = [{**issues[0], "labels": ["a", "b"]}, issues[1]]
     assert d.fingerprint(two, prs, claims) == \
         d.fingerprint([{**issues[0], "labels": ["b", "a"]}, issues[1]], prs, claims)
@@ -2854,6 +3034,7 @@ def test_fingerprint():
     pushed = [{**prs[0], "headRefOid": "def"}]
     assert fp != d.fingerprint(issues, pushed, claims)                        # worker pushed
     assert fp != d.fingerprint(issues, prs, [{"number": 1, "instance": "peer", "sha": "s2"}])  # reclaimed
+    assert fp != d.fingerprint(issues, prs, [{**claims[0], "instance": "peer"}])   # another owner
     edged = [{**issues[0], "blocked_by": 1}, issues[1]]
     assert fp != d.fingerprint(edged, prs, claims)                            # a blocker recorded
     # a PR becomes an issue's only through what it closes, and GitHub may list
@@ -2880,6 +3061,182 @@ def test_fingerprint():
     assert fp != d.fingerprint(issues, checks(), claims)                      # no checks at all
     # heartbeats are not an input at all — the launcher's own skip-cycle refresh
     # can't move the digest (that is what keeps the gate from defeating itself).
+
+
+# --- the digest and the working set (ADR-0007) ------------------------------ #
+#
+# Generated worlds: a small backlog, its PRs and its claims, drawn so that every
+# branch of the assembly is taken — a claim on a closed issue, two PRs closing one
+# issue, a turn held, a turn of a dead fleet's, a batch.
+
+_LABELS = ["ready-for-agent", "epic", "afk-attempt/1", "afk-attempt/2", d.ATTEMPT_STARTING, "bug"]
+_ROLLUPS = [None, [], [{"conclusion": "SUCCESS"}], [{"conclusion": "FAILURE"}],
+            [{"status": "QUEUED", "conclusion": None}],
+            [{"conclusion": "SUCCESS"}, {"state": "PENDING"}, {"conclusion": "SKIPPED"}]]
+_INSTANCES = ["me", "peerA", "peerB", None]
+
+# One more value of each field of a gathered row, for a world to be changed by:
+# a field with none here is a field these tests do not cover, and they say so.
+_OTHER_VALUE = {
+    "Issue": {"number": lambda rng: rng.randrange(50, 60), "id": lambda rng: rng.randrange(10**6),
+              "title": lambda rng: rng.choice(["a", "b", "c"]),
+              "labels": lambda rng: rng.sample(_LABELS, rng.randrange(len(_LABELS))),
+              "updatedAt": lambda rng: f"T{rng.randrange(9)}",
+              "blocked_by": lambda rng: rng.randrange(3)},
+    "PullRequest": {"number": lambda rng: rng.randrange(60, 70),
+                    "title": lambda rng: rng.choice(["a", "b", "c"]),
+                    "headRefName": lambda rng: rng.choice(["x", "y"]),
+                    "headRefOid": lambda rng: rng.choice(["aaa", "bbb"]),
+                    "baseRefName": lambda rng: rng.choice(["main", "dev"]),
+                    "updatedAt": lambda rng: f"T{rng.randrange(9)}",
+                    "statusCheckRollup": lambda rng: rng.choice(_ROLLUPS),
+                    "closingIssuesReferences": lambda rng: [
+                        {"number": n} for n in rng.sample(range(1, 9), rng.randrange(3))]},
+    "Claim": {"number": lambda rng: rng.randrange(70, 80),
+              "instance": lambda rng: rng.choice(_INSTANCES),
+              "host": lambda rng: rng.choice(["h1", "h2", None]),
+              "ts": lambda rng: rng.randrange(1000),
+              "sha": lambda rng: rng.choice(["s1", "s2", "s3"])},
+}
+
+
+def _gathered_row(rng, kind, number):
+    return {"number": number, **{field: value(rng) for field, value in _OTHER_VALUE[kind].items()
+                                 if field != "number"}}
+
+
+def _world(rng):
+    """(issues, prs, claims), and what the working set reads besides them
+    (`OUTSIDE_THE_DIGEST`, as keyword arguments)."""
+    now = 100_000
+    numbers = rng.sample(range(1, 9), rng.randrange(1, 8))
+    issues = [_gathered_row(rng, "Issue", n) for n in numbers]
+    prs = [_gathered_row(rng, "PullRequest", n) for n in rng.sample(range(20, 26), rng.randrange(5))]
+    claimed = rng.sample(range(1, 11), rng.randrange(6))
+    claims = [_gathered_row(rng, "Claim", n) for n in claimed]
+    turns = {}
+    for n in claimed:
+        turn = rng.choice([
+            None, d.single_turn(None, rng.choice(["me", "peerB"]), now),
+            d.next_turn(d.single_turn(None, "me", now), stopped="awaiting_ci", head="aaa"),
+            d.next_turn(None, instance=rng.choice(["me", "peerB"]), at=now + n, batch="b1",
+                        members=[{"issue": n, "pr": 20}], phase=rng.choice(d.BATCH_PHASES))])
+        if turn:
+            turns[n] = d.latest_turn([{"id": n, "body": d.turn_comment(turn)}])
+    outside = {
+        "now": now, "me": "me",
+        "heartbeats": {i: now - rng.choice([10, TTL + 99]) for i in ("me", "peerA", "peerB")
+                       if rng.random() < 0.8},
+        "turns": turns,
+        "closed": [n for n in claimed if n not in numbers and rng.random() < 0.7],
+        "landed": [n for n in claimed if n in numbers and rng.random() < 0.3],
+        "config": d.resolve_config({"epic_labels": ["epic"], "concurrency": rng.randrange(1, 5),
+                                    "gate": {"ci": rng.choice(["required", "local"])}}),
+    }
+    return (issues, prs, claims), outside
+
+
+def _shuffled(rng, rows):
+    """`rows` in another order, every list inside a row in another order too."""
+    rows = [{k: rng.sample(v, len(v)) if isinstance(v, list) else v for k, v in row.items()}
+            for row in rows]
+    return rng.sample(rows, len(rows))
+
+
+def _changed(rng, lists):
+    """`lists` with ONE thing different: a field of one row, a row gone, or a row
+    more → (the new lists, what was changed)."""
+    kinds = ("Issue", "PullRequest", "Claim")
+    at = rng.randrange(3)
+    rows = lists[at]
+    if rows and rng.random() < 0.8:
+        k, field = rng.randrange(len(rows)), rng.choice(sorted(_OTHER_VALUE[kinds[at]]))
+        new = [*rows[:k], {**rows[k], field: _OTHER_VALUE[kinds[at]][field](rng)}, *rows[k + 1:]]
+        what = f"{kinds[at]}.{field}"
+    elif rows and rng.random() < 0.5:
+        k = rng.randrange(len(rows))
+        new, what = rows[:k] + rows[k + 1:], f"{kinds[at]} gone"
+    else:
+        new = [*rows, _gathered_row(rng, kinds[at], _OTHER_VALUE[kinds[at]]["number"](rng) + 100)]
+        what = f"{kinds[at]} more"
+    return (*lists[:at], new, *lists[at + 1:]), what
+
+
+def test_the_working_set_does_not_depend_on_the_order_rows_arrive_in():
+    """Any shuffle of every input list — the rows, and the labels, checks and
+    closed issues inside a row — assembles the same working set, digest and
+    dispatch order included."""
+    import random
+    rng = random.Random(120)
+    dispatched = set()
+    for _ in range(400):
+        (issues, prs, claims), outside = _world(rng)
+        ws = d.assemble_working_set(issues, prs, claims, **outside)
+        for _ in range(4):
+            again = {**outside, "closed": rng.sample(outside["closed"], len(outside["closed"])),
+                     "heartbeats": dict(rng.sample(sorted(outside["heartbeats"].items()),
+                                                   len(outside["heartbeats"]))),
+                     "turns": dict(rng.sample(sorted(outside["turns"].items()),
+                                              len(outside["turns"])))}
+            assert d.assemble_working_set(_shuffled(rng, issues), _shuffled(rng, prs),
+                                          _shuffled(rng, claims), **again) == ws
+        order = [i["number"] for i in ws["frontier"]["dispatch"]]
+        assert order == sorted(order)
+        dispatched.add(len(order))
+    assert max(dispatched) >= 2, dispatched     # worlds where the order is a question at all
+
+
+def test_one_digest_means_one_working_set():
+    """Two gathers with one digest assemble one working set, given the same
+    OUTSIDE_THE_DIGEST: whatever a change to a gathered row does to the working
+    set, it does to the digest first."""
+    import random
+    rng = random.Random(7)
+    kept, moved = {}, {}
+    for _ in range(600):
+        lists, outside = _world(rng)
+        ws = d.assemble_working_set(*lists, **outside)
+        for _ in range(12):
+            other, what = _changed(rng, lists)
+            ws2 = d.assemble_working_set(*other, **outside)
+            if ws2["fingerprint"] == ws["fingerprint"]:
+                assert ws2 == ws, what
+                kept[what] = kept.get(what, 0) + 1
+            else:
+                moved[what] = moved.get(what, 0) + 1
+    # the generator covers every field of every gathered row ...
+    fields = {f"{kind.__name__}.{f}" for kind in (d.Issue, d.PullRequest, d.Claim)
+              for f in typing.get_type_hints(kind)}
+    assert fields == {f"{kind}.{f}" for kind, of in _OTHER_VALUE.items() for f in of}
+    assert fields <= set(kept) | set(moved), fields - set(kept) - set(moved)
+    # ... and both sides of the claim are real: fields the working set never reads
+    # leave the digest alone, and the ones it reads are seen to move it
+    assert {"Issue.id", "Claim.host", "PullRequest.headRefName",
+            "PullRequest.statusCheckRollup"} <= set(kept), sorted(kept)
+    assert {"Issue.title", "Issue.labels", "Issue.blocked_by", "Claim.instance",
+            "PullRequest.closingIssuesReferences", "Issue gone", "Claim more"} <= set(moved)
+
+
+def test_what_the_working_set_reads_outside_the_digest_is_named():
+    """Every input of the working set is one the digest holds, or is named in
+    OUTSIDE_THE_DIGEST with why a skipped cycle may go without it — and ADR-0007
+    lists exactly those."""
+    import inspect
+    digested = set(inspect.signature(d.fingerprint).parameters)
+    reads = set(inspect.signature(d.assemble_working_set).parameters)
+    assert digested == {"issues", "prs", "claims"} and digested <= reads
+    assert reads - digested == set(d.OUTSIDE_THE_DIGEST)
+
+    # the glossary and the ADRs live in the source repo only
+    adr = os.path.join(os.path.dirname(__file__), "..", "..", "..", "docs", "adr",
+                       "0007-fingerprint-gated-ticks.md")
+    if os.path.exists(adr):
+        with open(adr) as f:
+            text = f.read()
+        table = text[text.index("## What the working set reads outside the digest"):]
+        table = table[:table.index("\n## ", 3)]
+        listed = set(re.findall(r"^\| `(\w+)`", table, re.M))
+        assert listed == set(d.OUTSIDE_THE_DIGEST), listed ^ set(d.OUTSIDE_THE_DIGEST)
 
 
 def test_unseen_prs_are_the_claims_whose_pr_is_not_the_one_the_tick_worked_from():

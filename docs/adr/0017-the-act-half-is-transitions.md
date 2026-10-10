@@ -22,7 +22,7 @@ exactly where the next move is judgment:
 | `afk dispatch` | read issue → claim (won / held / lost) → continuation tier → orca worktree at the right commit → agent started with the worker launch command → wait until ready → prompt rendered, delivered, submitted → status board | `--start fresh` (is the recovered state sane to build on?) |
 | `afk merge` | require my claim → find the PR → worktree (the worker's, else recreated at the PR head) → sync by merge → push → machine gate on that head → adversarial-verify check → `gh pr merge --match-head-commit` → status board → release → cleanup | `conflict`, `gate_red`, `awaiting_ci`, `no_checks` (`--allow-no-checks`), `needs_verify` (`--verified <head>`) |
 | `afk fail` | require my claim → read the attempt → **retry**: swap the attempt label, discard the failed attempt (PR, branch, worktree), start a fresh worker with the reason; or **escalate** | `--reason` |
-| `afk escalate` | require my claim → status board → relabel → comment → **release last** | `--reason` |
+| `afk escalate` | *(amended, ADR-0033)* require my claim → status board → comment → relabel → **release last** | `--reason` |
 | `afk close` | require my claim → status board → close the issue → release → cleanup | (the empty-diff check before calling it) |
 | `afk cycle` | *(amended)* one call, the whole cycle: digest → tick-or-skip (+ the skipped cycle's heartbeat and sleep); on a tick, the pass itself — rebuild → `no-pr` → at most one `turn` → `nudge` / `fail` / `park` / `escalate` where the reason is on record → `release` → `reclaim` → `dispatch` → `heartbeat` → `status` — then fold what it did → sleep and a progress line | the `judgments` it returns: `empty_diff`, `no_checks`, `adversarial_verify`, `reason` |
 
