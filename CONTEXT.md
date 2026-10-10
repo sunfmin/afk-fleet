@@ -412,7 +412,9 @@ its members and its phase — `stacking`, `gating` or `fixing` — and it is the
 are kept: the batch's worktree holds no list of them. A **batch worker** stacks the members
 on the target's tip with one merge commit per PR, in **merge queue** order, gates the stack once, and
 pushes it to the target as a fast-forward: that push is the only lock, and a target that moved
-refuses it. Each PR's own head is then on the target, so GitHub shows it *merged* by itself. A red stack is repaired with a fix commit on top, never
+refuses it. Each PR's own head is then on the target, so GitHub shows it *merged* by itself. What is
+on the target has landed, whatever cut the batch worker short after the push: a member whose issue is
+still open is settled by the next **tick** from its commit there, and an abandon leaves it alone. A red stack is repaired with a fix commit on top, never
 bisected. Whether the turn goes to a batch or to one PR is decided in code
 (`afk_decide.batch_candidates`): never while a turn is out, never a PR that owes an adversarial
 verify, whose own worker is still working, or that is a peer's. A PR that leaves a batch without

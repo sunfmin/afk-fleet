@@ -337,8 +337,8 @@ In this order, each step the same `afk` transition you could type yourself
    `already-satisfied`, a PR-less silence that outlasted its nudge is failed (`afk fail`); a
    `blocked` verdict is parked while the backlog will resolve its blockers (`afk park`, ADR-0022)
    and escalated when nothing will — as a `needs-decision` one is at once (`afk escalate`, ADR-0041).
-5. **Release** every claim that outlived its issue — a PR its worker landed — and delete every dead
-   peer's phantom lock, under the sha it was read at.
+5. **Release** every claim that outlived its issue — a PR its worker landed — or whose landing a
+   merge batch pushed and was cut before closing the issue; delete every dead peer's phantom lock.
 6. **Start workers** (`afk dispatch`): first by [continuation](references/recovery.md) for claims
    already held — an **orphaned claim** (always continued, never released back), one whose blockers
    have all closed, each **stale** peer claim it reclaims — then the frontier, in order, into the
@@ -490,7 +490,8 @@ is closed. Which PRs are batched, and whether any are, is decided in code — yo
 members' own workers are told nothing, and a batch worker holds no claim and no slot. The pass
 watches the batch worker as it watches any worker on a turn: gone, it is continued; silent, it is
 nudged once and then the batch is **abandoned** (`afk turn --abandon`) with nothing landed — which
-fails no PR and spends no attempt. A PR the batch left out (it conflicts with the others) or an
+fails no PR and spends no attempt. A batch cut short after its push has landed: its members are
+settled from the target by the next pass, and an abandon does not touch them. A PR the batch left out (it conflicts with the others) or an
 abandoned batch's PRs land on single turns, as above, and are never batched again.
 
 The turn guards against a worker that **strays**, not a malicious one: worker and launcher share one

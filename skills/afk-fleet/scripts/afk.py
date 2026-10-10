@@ -821,7 +821,10 @@ def cmd_release(a: argparse.Namespace) -> Obj:
           issue's worktree is never touched: it may hold work. A PR a merge
           batch landed that GitHub still does not show merged is closed here
           (`closed_pr`), and the landing is fast-forwarded into the fleet's own
-          checkout (`synced`, ADR-0037).
+          checkout (`synced`, ADR-0037). An OPEN issue whose landing is
+          already on the target — a merge batch pushed it and was cut before
+          it closed the issue: a `landed` row — is closed first, its status
+          board says merged, and it is settled like any closed one.
       afk release <n> --instance <id> --expect-sha <sha>
           a `stale_closed` row of rebuild — a dead peer's claim on an issue that
           is already closed: a phantom lock, deleted instead of reclaimed."""
@@ -842,13 +845,18 @@ def _release_claim(run: _Run, instance: str, number: int,
 def _release_mine(run: _Run, instance: str, number: int) -> Obj:
     """Release `instance`'s claim on issue <number> — refused for a claim
     another instance holds — and, when the issue is CLOSED, settle what its
-    landing left behind (`_settle_landed`)."""
+    landing left behind (`_settle_landed`). An OPEN issue a merge batch landed
+    (`_cut_landing`) is closed first, and so settled the same way."""
     owner = _claim_owner(run, number)
     if owner not in (None, instance):
         raise RuntimeError(f"issue #{number} is not this fleet's claim "
                            f"({_claim_ref(run.cfg, number)} is held by {owner!r}); nothing was "
                            f"changed. A dead peer's claim on a closed issue — a `stale_closed` "
                            f"row — is released with --expect-sha <the sha rebuild reported>")
+    claim = next((c for c in _scan(run)[0] if c["number"] == number), None)
+    landed = _cut_landing(run, claim) if run.repo and claim else None
+    if landed:          # the issue first: closed, it is settled below whatever cuts this short
+        _finish_member(run, instance, {"issue": number, "pr": landed})
     released = _release(run, number)
     if run.repo and _issue_state(run.repo, number) == "closed":
         released.update(_settle_landed(run, number))
@@ -1397,15 +1405,19 @@ def _rebuild(run: _Run, instance: str, gathered: _Gathered | None = None) -> Wor
     `_gather` the caller already made — or a fresh one. The frontier costs no
     read of its own: every issue's open-blocker count came with the issue list.
     A per-issue state read is paid only by a claim whose issue is missing from
-    the open list, and the landing-turn read only by a claim of mine that has a PR."""
+    the open list, and the landing-turn read only by a claim of mine that has a PR.
+    The target is fetched once when a claim of mine has an open issue and no
+    open PR, and asked about each such claim in this repo (`_cut_landing`)."""
     cfg = run.cfg
     issues, prs, claims, heartbeats = gathered or _gather(run)
     listed = {i["number"] for i in issues}
     closed = [c["number"] for c in claims
               if c["number"] not in listed and _issue_state(run.repo, c["number"]) == "closed"]
+    landed = [c["number"] for c in claims
+              if c["instance"] == instance and _cut_landing(run, c)]
     return afk_decide.assemble_working_set(
         issues, prs, claims, heartbeats, instance, run.now(), cfg, closed=closed,
-        turns=_claim_turns(run.repo, prs, claims, instance))
+        turns=_claim_turns(run.repo, prs, claims, instance), landed=landed)
 
 
 def cmd_rebuild(a: argparse.Namespace) -> WorkingSet:
@@ -2938,16 +2950,26 @@ def _abandon_batch(run: _Run, instance: str, batch: str) -> Obj:
     mine is in may be abandoned by me. The markers go first: they are what
     `afk land --batch` checks before it pushes anything.
 
-      {"outcome": "abandoned", "batch", "issues", "prs", "deleted_branches", "cleanup"}"""
+    An abandon that arrives after the batch's push abandons nothing that
+    landed: a member whose merge commit is on the target keeps its marker and
+    is finished instead (`_finish_member`) — `landed`, never in `issues` — and
+    the next cycle settles it from its closed issue.
+
+      {"outcome": "abandoned", "batch", "issues", "prs", "landed",
+       "deleted_branches", "cleanup"}"""
     rem = run.rem
     found = _require_my_batch(run, instance, batch)
     claims = _scan(run)[0]
     mine = {c["number"] for c in claims if c["instance"] == instance}
     still_open = {p["number"] for p in _open_prs(run.repo)}
-    left = []
+    left, landed = [], []
     for m in found["members"]:
         turn = _turn(run.repo, m["pr"]) if m["pr"] in still_open else None
         if not turn or turn["batch"] != batch or turn["released"]:
+            continue
+        if _landed_commit(".", _target_tip(run), m["pr"]):
+            _finish_member(run, found["instance"], m)
+            landed.append(m)
             continue
         _unbatch(run, instance, batch, m, "abandoned", board=m["issue"] in mine)
         left.append(m)
@@ -2956,6 +2978,7 @@ def _abandon_batch(run: _Run, instance: str, batch: str) -> Obj:
     cleanup = wt.remove() if wt.path else None
     return {"outcome": afk_decide.batch_turn_outcome("abandoned"), "batch": batch,
             "issues": [m["issue"] for m in left], "prs": [m["pr"] for m in left],
+            "landed": [m["issue"] for m in landed],
             "deleted_branches": deleted, **({"cleanup": cleanup} if cleanup else {})}
 
 
@@ -3000,6 +3023,42 @@ def _landed_commit(path: str, tip: str, pr_number: int) -> str | None:
                 f"--grep= (#{pr_number})", tip]).stdout.strip()
     sha, _, subject = out.partition("\t")
     return sha if sha and subject.endswith(f" (#{pr_number})") else None
+
+
+def _target_tip(run: _Run) -> str:
+    """The tip of the merge target on the remote, fetched into this repo — once
+    for the whole process, for the reads that ask it what has landed."""
+    target = _base(run.cfg)
+    return _once(("tip", run.rem, target), lambda: _fetch_tip(run.rem, target))
+
+
+def _cut_landing(run: _Run, claim: Claim) -> int | None:
+    """The PR a merge batch landed `claim`'s still-open issue with, when the
+    batch's finishing was cut short after its push — the one cut `afk land
+    --batch` cannot finish itself: GitHub shows the PR merged, so no open PR
+    carries the batch's turn marker and nothing lists the batch any more
+    (ADR-0029) → that PR's number, else None. The target itself is asked: the
+    merge commit on its own line that closes the issue, by a PR that was in a
+    batch under this claim (`afk_decide.landed_under`). None too for an issue
+    that is closed, or that an open PR closes: those are settled, or still
+    landing, by the paths that already exist."""
+    number = claim["number"]
+    if _issue_state(run.repo, number) != "open" or afk_decide.closing_pr(_open_prs(run.repo),
+                                                                         number):
+        return None
+    pr = _landed_pr(".", _target_tip(run), number)
+    return pr if pr and afk_decide.landed_under(_turn(run.repo, pr), claim) else None
+
+
+def _finish_member(run: _Run, instance: str | None, member: BatchMember) -> None:
+    """Finish one PR a merge batch landed, as far as its issue goes: the status
+    board says merged and the issue is closed — which GitHub does itself only
+    on the default branch. Each step is skipped when already done; the claim,
+    the worktree and a PR GitHub still shows open are the next cycle's, from
+    the closed issue (`_settle_landed`)."""
+    _upsert_board(run, member["issue"], "merged", instance=instance, pr=member["pr"])
+    if _issue_state(run.repo, member["issue"]) == "open":
+        _close_issue(run.repo, member["issue"])
 
 
 def _close_landed_pr(run: _Run, number: int) -> int | None:
@@ -3117,7 +3176,9 @@ def _land_batch(run: _Run, batch: str, limits: _GateLimits, merged_timeout: floa
     The invariant every path keeps: the target is only ever moved to a commit
     the gate passed on, and what the gate proved is the stack in the form it
     lands. No claim is released and no worktree removed here — the next cycle
-    settles each member from its closed issue, and removes the batch's worktree.
+    settles each member from its closed issue, or, cut before that issue was
+    closed, from its commit on the target (`_cut_landing`), and removes the
+    batch's worktree.
 
     Which PRs the batch holds is read from their turn markers on every run
     (`_members_of_batch`): the worktree keeps no list, so one recreated from the
@@ -3250,7 +3311,8 @@ def _finish_batch(run: _Run, batch: str, landed: Sequence[Stacked],
     """Finish every PR a batch landed. Each step is skipped when already done,
     so a finishing that was cut short is finished by the next run. Issues first:
     a member whose issue is closed is settled by the next cycle whatever happens
-    here. The PRs are GitHub's to finish: each one's head is on the target, so
+    here — and so is one whose issue this was cut before closing, once GitHub
+    shows its PR merged (`_cut_landing`): no run of this is owed for it. The PRs are GitHub's to finish: each one's head is on the target, so
     it shows the PR merged, and the PR's branch is deleted once it does —
     deleted sooner, the PR would read closed instead. One still open after
     `merged_timeout` seconds is left as it is, branch and all: the next cycle's
@@ -3261,9 +3323,7 @@ def _finish_batch(run: _Run, batch: str, landed: Sequence[Stacked],
     granted = _turn(run.repo, landed[0]["pr"])
     instance = granted["instance"] if granted else None
     for m in landed:
-        _upsert_board(run, m["issue"], "merged", instance=instance, pr=m["pr"])
-        if _issue_state(run.repo, m["issue"]) == "open":
-            _close_issue(run.repo, m["issue"])
+        _finish_member(run, instance, m)
     _delete_batch_branches(rem, batch)
     still_open = _await_merged(run.repo, [m["pr"] for m in landed], merged_timeout)
     heads = _remote_heads(rem)
